@@ -1,0 +1,29 @@
+# 现有能力去留提案
+
+> 这是我通读旧项目 `AGENTS.md` 后，给每一项现有能力提的"做成哪个插件、放哪个阶段"建议，不是定论——请勾改。"运行时形态"对应 [PLUGIN_SPEC.md](PLUGIN_SPEC.md) 第3节的 `in_process` / `subprocess_service`。
+
+| 旧项目能力 | 新插件（建议ID） | 建议阶段 | 运行时形态 | 备注 |
+|---|---|---|---|---|
+| md/txt 原生读取 | `official-extractor-text` | Phase 1 | in_process | 无外部依赖，最简单 |
+| PDF 文字层(pymupdf4llm) | `official-extractor-pdf-text` | Phase 1 | in_process | |
+| DOCX(python-docx) | `official-extractor-docx` | Phase 1 | in_process | |
+| BGE-M3 向量化 | `official-embedder-bge-m3` | Phase 1 | in_process | torch 依赖较重但纯 Python，暂定 in_process；如果安装包体积问题突出可改 subprocess_service，Phase 1 中评估 |
+| Chroma 向量库 | `official-vector-store-chroma` | Phase 1 | in_process | |
+| BM25+jieba | `official-lexical-bm25` | Phase 1 | in_process | |
+| RRF 融合 | `official-fusion-rrf` | Phase 1 | in_process | |
+| 重排器 | `official-reranker` | Phase 1 | in_process | |
+| 多库/路径级勾选(`decide_included`) | `official-library-manager` | Phase 1 | in_process | 默认必装插件（不是核心，但安装包强制预置），检索建立在"库范围"之上 |
+| pywebview GUI 壳+基础面板 | `official-gui-shell` | Phase 1 | in_process | 只做壳+库管理/搜索/结果三个面板，其余面板随对应功能插件各自带 |
+| MCP 检索工具 | 随各功能插件自己注册 `mcp_tool_provider` | Phase 1起逐步 | — | 不集中在一个插件，谁提供功能谁注册对应工具 |
+| MinerU 云端 OCR | `official-ocr-mineru-cloud` | Phase 2 | subprocess_service（网络调用，隔离 API Key 相关代码） | |
+| MinerU 本机 OCR | `official-ocr-mineru-local` | Phase 2 | subprocess_service | 独立 py3.12/uv 环境，按需下载，不进核心 venv |
+| WEMM 页级视觉检索 | `official-visual-wemm` | Phase 2 | subprocess_service | 复杂度最高的一项，建议 Phase 2 单独评估是否降级为"社区插件"而非官方默认——**请确认是否仍要作为官方一等公民** |
+| MinHash+LSH 去重 | `official-dedup` | Phase 3 | in_process | |
+| 库 AI 摘要(HyDE 式 LLM 调用) | `official-library-summary` | Phase 3 | in_process | 依赖 `llm_provider` 扩展点 |
+| GPU 显存仲裁 | 核心服务（不是插件） | Phase 2起随 subprocess_service 插件出现而启用 | — | 见 ARCHITECTURE.md 2.1节"资源仲裁器" |
+| Agent 写权限门禁(`selection_gate`/`summary_gate`) | 核心服务（不是插件） | Phase 0起可用，Phase 3实际被`library-manager`/`library-summary`插件使用 | — | 见 ARCHITECTURE.md 2.2节 |
+| 导出/导入(换电脑搬家) | `official-import-export` | Phase 3 | in_process | |
+| 旧 `libraries.json` 迁移脚本 | 一次性 CLI 工具，不常驻 | Phase 3 | — | 已确认要做 |
+| Flet 经典 GUI | **不迁移** | — | — | 和 guiweb 功能重复，新架构下 `gui_panel` 扩展点本身就支持替换整个 GUI，想要 Flet 体验的话可以有人做成一个独立的 `gui_panel` 实现，但不作为官方维护对象——**请确认是否同意直接砍掉** |
+
+**请重点确认的3处判断**：① WEMM 是否降级为非官方插件；② Flet GUI 直接不迁移；③ Agent 写权限门禁+GPU 仲裁定为"核心服务"而非"插件"。

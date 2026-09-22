@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+
+# subprocess_service 插件自带的独立依赖环境
+plugins/*/.venv/
+plugins/*/env/
+
+# OS
+.DS_Store
+Thumbs.db
