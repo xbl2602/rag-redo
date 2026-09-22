@@ -1,0 +1,18 @@
+id = "official-extractor-pdf-text"
+name = "文字层 PDF 提取器"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+"extractor:pdf" = "multi"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_extractor_pdf_text.plugin:PdfTextExtractorPlugin"
+
+[permissions]
+filesystem = ["vault_read"]
+network = false
+gpu = false
