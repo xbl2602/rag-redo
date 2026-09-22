@@ -17,13 +17,13 @@
 | MCP 检索工具 | 随各功能插件自己注册 `mcp_tool_provider` | Phase 1起逐步 | — | 不集中在一个插件，谁提供功能谁注册对应工具 |
 | MinerU 云端 OCR | `official-ocr-mineru-cloud` | Phase 2 | subprocess_service（网络调用，隔离 API Key 相关代码） | |
 | MinerU 本机 OCR | `official-ocr-mineru-local` | Phase 2 | subprocess_service | 独立 py3.12/uv 环境，按需下载，不进核心 venv |
-| WEMM 页级视觉检索 | `official-visual-wemm` | Phase 2 | subprocess_service | 复杂度最高的一项，建议 Phase 2 单独评估是否降级为"社区插件"而非官方默认——**请确认是否仍要作为官方一等公民** |
+| WEMM 页级视觉检索 | `official-visual-wemm` | Phase 2 | subprocess_service | **已确认：官方独立插件**，不降级为社区插件。复杂度最高的一项，Phase 2 单独评估工作量 |
 | MinHash+LSH 去重 | `official-dedup` | Phase 3 | in_process | |
 | 库 AI 摘要(HyDE 式 LLM 调用) | `official-library-summary` | Phase 3 | in_process | 依赖 `llm_provider` 扩展点 |
 | GPU 显存仲裁 | 核心服务（不是插件） | Phase 2起随 subprocess_service 插件出现而启用 | — | 见 ARCHITECTURE.md 2.1节"资源仲裁器" |
 | Agent 写权限门禁(`selection_gate`/`summary_gate`) | 核心服务（不是插件） | Phase 0起可用，Phase 3实际被`library-manager`/`library-summary`插件使用 | — | 见 ARCHITECTURE.md 2.2节 |
 | 导出/导入(换电脑搬家) | `official-import-export` | Phase 3 | in_process | |
 | 旧 `libraries.json` 迁移脚本 | 一次性 CLI 工具，不常驻 | Phase 3 | — | 已确认要做 |
-| Flet 经典 GUI | **不迁移** | — | — | 和 guiweb 功能重复，新架构下 `gui_panel` 扩展点本身就支持替换整个 GUI，想要 Flet 体验的话可以有人做成一个独立的 `gui_panel` 实现，但不作为官方维护对象——**请确认是否同意直接砍掉** |
+| Flet 经典 GUI | **已确认：不迁移** | — | — | 和 guiweb 功能重复、维护负担已确认不值得——操作者已同意直接砍掉。新架构下 `gui_panel` 扩展点本身就支持替换整个 GUI，想要 Flet 体验的话可以有人做成一个独立的 `gui_panel` 实现，但不作为官方维护对象 |
 
-**请重点确认的3处判断**：① WEMM 是否降级为非官方插件；② Flet GUI 直接不迁移；③ Agent 写权限门禁+GPU 仲裁定为"核心服务"而非"插件"。
+**仍待确认的1处判断**：Agent 写权限门禁+GPU 仲裁定为"核心服务"而非"插件"（见 [ROADMAP.md](ROADMAP.md)"开放问题"）。WEMM 官方插件、Flet 不迁移两处已在 2026-09-22 确认。

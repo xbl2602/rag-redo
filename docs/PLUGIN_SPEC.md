@@ -75,3 +75,9 @@ gpu = false
 ## 6. 官方插件集（Phase 1 默认打包哪些）
 
 见 [FEATURE_TRIAGE.md](FEATURE_TRIAGE.md) 第2列标"Phase 1"的条目——安装包/便携版默认包含这些，其余插件 Phase 2+ 以后作为可选下载。
+
+## 7. 依赖装在哪：不碰系统环境
+
+- `in_process` 插件在 `plugin.toml` 里声明的 Python 依赖，由插件运行时统一装进**核心自己的隔离虚拟环境**（比如 `.venv/` 或等价机制），不使用、不修改用户机器上任何已存在的系统 Python 或全局 site-packages。
+- `subprocess_service` 插件的 `env_bootstrap` 负责建一个**只属于这个插件自己**的隔离环境（独立 venv/uv 环境），既不进核心 venv，也不和其他 `subprocess_service` 插件共享——避免旧项目里"MinerU 本机 OCR 需要独立 py3.12 环境"这种重依赖污染或冲突主环境的问题重演。
+- 任何插件都不允许在 `on_load`/`on_enable` 里执行会修改系统级状态的操作（写系统 PATH、装到全局 site-packages、写注册表非安装器管辖的部分）——这属于 [AGENTS.md](../AGENTS.md) 架构红线7的范围，校验阶段如果侦测到明显违反（比如声明的 `permissions` 之外的可疑行为），应该在插件管理器里警示而不是静默放行。
