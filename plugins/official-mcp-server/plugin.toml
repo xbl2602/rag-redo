@@ -1,0 +1,17 @@
+id = "official-mcp-server"
+name = "MCP 工具服务"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+mcp_tool_provider = "multi"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_mcp_server.plugin:McpServerPlugin"
+
+[permissions]
+network = false
+gpu = false
