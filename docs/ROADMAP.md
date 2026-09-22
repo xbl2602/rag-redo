@@ -4,6 +4,8 @@
 
 ## Phase 0 — 插件运行时骨架（无 RAG 功能）
 
+**状态：已实现并验证（2026-09-22）。** 代码在 `core/`（manifest/registry/datastore/resource_arbiter/runtime/cli），示例插件在 `examples/`，测试在 `tests/`（45 用例，`.venv/bin/python tests/run.py` 全绿）。实现过程中在真实跑通 CLI 演示时发现并修了一个真实设计缺陷：扩展点的单例/多值判定最初写死在核心的一份固定名单里，导致插件自己发明的新扩展点名字永远不会被判定为单例、冲突检测形同虚设——这违反了"核心不该预先知道每个可能出现的扩展点名字"的原则。改成由声明扩展点的插件自己在 manifest 里说明基数（`provides.<point> = "singleton" | "multi"`），两个插件声明不一致时保守按 singleton 处理。
+
 **目标**：证明"两个核心组件+插件"这套架构本身能跑通，不涉及任何检索/embedding 逻辑。
 
 **验收标准**：

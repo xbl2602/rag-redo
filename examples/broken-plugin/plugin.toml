@@ -1,0 +1,17 @@
+id = "example-broken"
+name = "故障演示插件"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "broken_plugin.plugin:BrokenPlugin"
+
+[permissions]
+filesystem = []
+network = false
+gpu = false

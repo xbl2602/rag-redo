@@ -1,0 +1,18 @@
+id = "example-hello-conflict"
+name = "Hello 冲突演示插件"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+demo_singleton = "singleton"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "hello_plugin_conflict.plugin:HelloPluginConflict"
+
+[permissions]
+filesystem = []
+network = false
+gpu = false
