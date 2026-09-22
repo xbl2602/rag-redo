@@ -51,11 +51,13 @@ class PluginRuntime:
         plugins_dir: Path,
         *,
         state_file: Path | None = None,
+        data_dir: Path = Path("data"),
         data_store: DataStore | None = None,
         resource_arbiter: ResourceArbiter | None = None,
     ) -> None:
         self.plugins_dir = plugins_dir
         self.state_file = state_file
+        self.data_dir = data_dir
         self.registry = ExtensionRegistry()
         self.data_store = data_store if data_store is not None else DataStore()
         self.resource_arbiter = resource_arbiter if resource_arbiter is not None else ResourceArbiter()
@@ -189,6 +191,7 @@ class PluginRuntime:
             logger=logging.getLogger(f"rag_redo.plugin.{plugin_id}"),
             data_store=self.data_store,
             resource_arbiter=self.resource_arbiter,
+            data_dir=self.data_dir,
         )
 
     def _require(self, plugin_id: str) -> Plugin:

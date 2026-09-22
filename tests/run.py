@@ -27,6 +27,7 @@ CORE_SUITES = [
     "test_datastore",
     "test_resource_arbiter",
     "test_runtime",
+    "test_pipeline_e2e",
 ]
 
 

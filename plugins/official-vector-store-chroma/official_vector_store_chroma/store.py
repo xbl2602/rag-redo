@@ -29,10 +29,27 @@ class ChromaVectorStore:
         chunk_ids: list[str],
         vectors: list[list[float]],
         documents: list[str] | None = None,
+        metadatas: list[dict] | None = None,
     ) -> None:
         if not chunk_ids:
             return
-        self._collection(library_id).upsert(ids=chunk_ids, embeddings=vectors, documents=documents)
+        self._collection(library_id).upsert(
+            ids=chunk_ids, embeddings=vectors, documents=documents, metadatas=metadatas
+        )
+
+    def get_by_ids(self, library_id: str, chunk_ids: list[str]) -> dict[str, dict]:
+        """按 chunk_id 直接取记录（不是相似度查询）——查询管道融合词法/
+        向量两路排名后，需要把任意来源（哪怕只被 BM25 命中、没进向量
+        Top-K）的 chunk_id 都能取到完整文本+元数据用于装配最终结果，
+        Chroma 原生的按 id get() 正好承担这个"chunk 存储"的角色，不用
+        另起一个并行的数据结构维护同一份东西两份拷贝。"""
+        if not chunk_ids:
+            return {}
+        result = self._collection(library_id).get(ids=chunk_ids, include=["documents", "metadatas"])
+        return {
+            chunk_id: {"document": doc, "metadata": meta}
+            for chunk_id, doc, meta in zip(result["ids"], result["documents"], result["metadatas"])
+        }
 
     def delete(self, library_id: str, chunk_ids: list[str]) -> None:
         if not chunk_ids:

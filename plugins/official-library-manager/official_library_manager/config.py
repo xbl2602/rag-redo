@@ -1,4 +1,5 @@
-"""库配置的持久化：data/libraries.json。
+"""库配置的持久化：<data_dir>/libraries.json（data_dir 由核心通过
+PluginContext.data_dir 提供，见 core/context.py，插件自己不拼路径）。
 
 **已知的、刻意的 Phase 1 简化**：本模块直接负责自己配置的读写，而不是先
 设计一套通用的"DataStore 落盘后端"再削足适履——目前只有这一个插件需要

@@ -1,0 +1,17 @@
+id = "official-embedder-bge-m3"
+name = "BGE-M3 向量化"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+embedder = "singleton"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_embedder_bge_m3.plugin:EmbedderPlugin"
+
+[permissions]
+network = true
+gpu = true

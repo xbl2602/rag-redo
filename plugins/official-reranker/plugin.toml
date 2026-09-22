@@ -1,0 +1,17 @@
+id = "official-reranker"
+name = "Cross-Encoder 重排器"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+reranker = "singleton"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_reranker.plugin:RerankerPlugin"
+
+[permissions]
+network = true
+gpu = true

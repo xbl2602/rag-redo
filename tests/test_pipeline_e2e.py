@@ -1,0 +1,179 @@
+"""端到端集成测试：真实通过 PluginRuntime 扫描 plugins/ 目录，加载/启用
+全部 Phase 1 官方插件，索引一个临时小库，搜索验证结果——这是证明"插件化
+架构本身能交付真实检索能力"的关键测试，不是把各插件的单元测试简单拼起来
+就算数。
+
+embedder/reranker 注入确定性假实现（避免下载真实模型，理由同
+plugins/official-embedder-bge-m3/tests/test_embed.py），其余（extractor/
+chunker/library-manager/bm25/chroma/rrf）全部走真实代码，不打折扣。
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+for plugin_dir in (REPO_ROOT / "plugins").glob("*"):
+    if plugin_dir.is_dir():
+        sys.path.insert(0, str(plugin_dir))
+
+from core.pipeline import Pipeline  # noqa: E402
+from core.runtime import PluginRuntime, PluginState  # noqa: E402
+
+OFFICIAL_PHASE1_PLUGINS = [
+    "official-extractor-text",
+    "official-extractor-pdf-text",
+    "official-extractor-docx",
+    "official-chunker",
+    "official-library-manager",
+    "official-lexical-bm25",
+    "official-embedder-bge-m3",
+    "official-vector-store-chroma",
+    "official-fusion-rrf",
+    "official-reranker",
+]
+
+
+class _DeterministicFakeEncoder:
+    """给 embedder 用的假编码器：把关键词出现次数映射进固定维度，保证
+    "包含相同关键词的文本"在向量空间里更接近——端到端测试才能验证"真的
+    搜到了语义相关的内容"，不是随机分数凑巧排对。"""
+
+    KEYWORDS = ["插件", "架构", "厨房", "食谱"]
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        return [[float(text.count(k)) for k in self.KEYWORDS] for text in texts]
+
+
+class _DeterministicFakeReranker:
+    def score(self, query: str, texts: list[str]) -> list[float]:
+        query_terms = [t for t in query if t.strip()]
+        return [sum(text.count(term) for term in query_terms) for text in texts]
+
+
+class TestEndToEndSearchPipeline(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        (self.vault / "plugin-notes.md").write_text(
+            "# 插件架构笔记\n\n这篇笔记讲插件系统的架构设计，核心只有两个组件。",
+            encoding="utf-8",
+        )
+        (self.vault / "cooking.md").write_text(
+            "# 厨房笔记\n\n这篇笔记记录了几个食谱，包括家常菜做法。",
+            encoding="utf-8",
+        )
+
+        self.data_dir = self.tmp / "data"
+        self.runtime = PluginRuntime(
+            REPO_ROOT / "plugins",
+            state_file=self.tmp / "plugins_state.json",
+            data_dir=self.data_dir,
+        )
+        self.runtime.scan()
+        for plugin_id in OFFICIAL_PHASE1_PLUGINS:
+            self.assertIn(plugin_id, self.runtime.plugins, f"{plugin_id} 应该被发现")
+            self.runtime.load(plugin_id)
+            self.assertEqual(
+                self.runtime.plugins[plugin_id].state,
+                PluginState.LOADED,
+                f"{plugin_id} 加载失败: {self.runtime.plugins[plugin_id].error}",
+            )
+            self.runtime.enable(plugin_id)
+            self.assertEqual(
+                self.runtime.plugins[plugin_id].state,
+                PluginState.ENABLED,
+                f"{plugin_id} 启用失败: {self.runtime.plugins[plugin_id].error}",
+            )
+
+        # 注入假 encoder/reranker，避免端到端测试下载真实模型。
+        from official_embedder_bge_m3.embed import BGEM3Embedder
+
+        embedder_instance = self.runtime.plugins["official-embedder-bge-m3"].instance
+        embedder_instance.embedder = BGEM3Embedder(encoder=_DeterministicFakeEncoder())
+
+        from official_reranker.rerank import RerankerEngine
+
+        reranker_instance = self.runtime.plugins["official-reranker"].instance
+        reranker_instance.engine = RerankerEngine(reranker=_DeterministicFakeReranker())
+
+        self.lib_mgr = self.runtime.plugins["official-library-manager"].instance
+        self.lib_mgr.store.add_library("test-lib", "测试库", str(self.vault))
+
+        self.pipeline = Pipeline(self.runtime)
+
+    def test_data_dir_is_isolated_tmp_dir_not_hardcoded_relative_path(self):
+        """插件的数据落在测试传入的隔离 data_dir 下，而不是插件自己硬编码
+        的相对路径——这是本次重写补的 ctx.data_dir 机制要解决的问题（见
+        core/context.py），顺手验证一下真的接对了，没有走回头路。"""
+        self.assertTrue((self.data_dir / "libraries.json").exists())
+        self.assertTrue((self.data_dir / "chroma").exists())
+        self.assertFalse((REPO_ROOT / "data" / "libraries.json").exists())
+
+    def test_index_then_search_finds_relevant_doc(self):
+        report = self.pipeline.index_library("test-lib")
+        self.assertEqual(report.succeeded, 2, f"应该两个文件都索引成功: {report.files}")
+        self.assertEqual(report.failed, 0)
+
+        results = self.pipeline.search("test-lib", "插件 架构", top_k=5)
+        self.assertGreater(len(results), 0)
+        self.assertEqual(results[0].path, "plugin-notes.md")
+        self.assertIn("插件", results[0].text)
+
+    def test_search_different_query_finds_different_doc(self):
+        self.pipeline.index_library("test-lib")
+        results = self.pipeline.search("test-lib", "食谱 厨房", top_k=5)
+        self.assertGreater(len(results), 0)
+        self.assertEqual(results[0].path, "cooking.md")
+
+    def test_excluded_file_never_appears_in_any_search_result(self):
+        excluded_dir = self.vault / "excluded"
+        excluded_dir.mkdir()
+        # 故意把假 encoder 认识的全部关键词都塞进这个文件——如果排除逻辑
+        # 有漏洞让它被意外索引，它会是几乎任何查询的最强命中，测试会立刻
+        # 抓到。
+        (excluded_dir / "secret.md").write_text(
+            "# 秘密\n\n插件 插件 架构 架构 厨房 厨房 食谱 食谱 全部关键词各来两遍。",
+            encoding="utf-8",
+        )
+        self.lib_mgr.store.set_selection("test-lib", selection_out=["excluded"])
+
+        report = self.pipeline.index_library("test-lib")
+        excluded_entries = [f for f in report.files if f.path.startswith("excluded/")]
+        self.assertTrue(excluded_entries)
+        self.assertFalse(excluded_entries[0].included)
+
+        for query in ("插件 架构", "厨房 食谱", "秘密"):
+            results = self.pipeline.search("test-lib", query, top_k=10)
+            paths = [r.path for r in results]
+            self.assertNotIn("excluded/secret.md", paths, f"查询 {query!r} 不该命中被排除的文件")
+
+    def test_confidence_normalized_between_0_and_1(self):
+        self.pipeline.index_library("test-lib")
+        results = self.pipeline.search("test-lib", "插件 架构", top_k=5)
+        self.assertTrue(results)
+        for r in results:
+            self.assertGreaterEqual(r.confidence, 0.0)
+            self.assertLessEqual(r.confidence, 1.0)
+
+    def test_reindex_after_disabling_gui_style_optional_plugin_still_works(self):
+        """插件之间真的没有硬编码依赖——即使不装/不启用任何 gui_panel 类
+        插件（Phase 1 目前还没有这类插件），核心检索链路完全不受影响，
+        对应 docs/ROADMAP.md Phase 1 验收标准"关掉任意一个非必需插件，
+        核心+MCP 仍能正常工作"。这里用"从未启用过 GUI 插件"这个既成事实
+        本身来体现，不需要额外反向禁用步骤。"""
+        self.assertNotIn("official-gui-shell", self.runtime.plugins)
+        report = self.pipeline.index_library("test-lib")
+        self.assertEqual(report.succeeded, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

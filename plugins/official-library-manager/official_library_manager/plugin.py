@@ -17,11 +17,7 @@ class LibraryManagerPlugin:
         self.store: LibraryConfigStore | None = None
 
     def on_load(self, ctx):
-        # Phase 1 简化：固定用相对路径 data/libraries.json；Phase 4 打包后
-        # 改成从核心传入的"本应用数据根目录"派生（呼应 AGENTS.md"所有数据
-        # 落在 data/ 目录下"这条红线，目前先满足其精神，路径来源留待核心
-        # 提供统一的数据根目录配置时再接）。
-        self.store = LibraryConfigStore(Path("data") / "libraries.json")
+        self.store = LibraryConfigStore(ctx.data_dir / "libraries.json")
         ctx.logger.info("library-manager 已加载，%d 个库", len(self.store.list_libraries()))
 
     def on_enable(self, ctx):
