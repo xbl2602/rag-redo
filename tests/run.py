@@ -1,18 +1,27 @@
 """统一测试入口，风格对齐旧 obsidian-rag 项目 tests/run.py：单进程跑完全部
 套件，打印"结果：N/M 套通过"。见 ../AGENTS.md 测试纪律一节。
+
+覆盖两类测试：
+- 核心测试（本目录下的 test_*.py，测 core/ 里的两个核心组件）
+- 插件测试（plugins/*/tests/test_*.py，随插件自己走——每个插件自带测试，
+  方便将来独立分发时测试也跟着走，不用依赖仓库中心 tests/ 目录）
+每个插件的测试模块用它自己的完整相对路径生成唯一模块名，避免"两个插件都
+有一个 test_plugin.py"这种同名冲突。
 """
 from __future__ import annotations
 
+import importlib.util
 import sys
 import time
 import unittest
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).parent.parent
 TESTS_DIR = Path(__file__).parent
 sys.path.insert(0, str(TESTS_DIR))
-sys.path.insert(0, str(TESTS_DIR.parent))
+sys.path.insert(0, str(REPO_ROOT))
 
-SUITES = [
+CORE_SUITES = [
     "test_manifest",
     "test_registry",
     "test_datastore",
@@ -21,25 +30,58 @@ SUITES = [
 ]
 
 
+def _discover_plugin_test_files() -> list[Path]:
+    plugins_dir = REPO_ROOT / "plugins"
+    if not plugins_dir.exists():
+        return []
+    return sorted(plugins_dir.glob("*/tests/test_*.py"))
+
+
+def _load_module_from_path(path: Path):
+    module_name = "plugin_test__" + "__".join(path.relative_to(REPO_ROOT).with_suffix("").parts)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def main() -> int:
     loader = unittest.TestLoader()
     total_ok = 0
+    total = 0
     timings: list[tuple[str, float]] = []
-    for name in SUITES:
+
+    for name in CORE_SUITES:
+        total += 1
         module = __import__(name)
         suite = loader.loadTestsFromModule(module)
         start = time.time()
         result = unittest.TextTestRunner(verbosity=0).run(suite)
         elapsed = time.time() - start
-        timings.append((name, elapsed))
+        timings.append((f"core/{name}", elapsed))
         ok = result.wasSuccessful()
         total_ok += 1 if ok else 0
-        print(f"{'PASS' if ok else 'FAIL'} {name} ({result.testsRun} 用例, {elapsed:.2f}s)")
+        print(f"{'PASS' if ok else 'FAIL'} core/{name} ({result.testsRun} 用例, {elapsed:.2f}s)")
 
-    print(f"\n结果：{total_ok}/{len(SUITES)} 套通过")
+    for path in _discover_plugin_test_files():
+        label = str(path.relative_to(REPO_ROOT))
+        total += 1
+        module = _load_module_from_path(path)
+        suite = loader.loadTestsFromModule(module)
+        start = time.time()
+        result = unittest.TextTestRunner(verbosity=0).run(suite)
+        elapsed = time.time() - start
+        timings.append((label, elapsed))
+        ok = result.wasSuccessful()
+        total_ok += 1 if ok else 0
+        print(f"{'PASS' if ok else 'FAIL'} {label} ({result.testsRun} 用例, {elapsed:.2f}s)")
+
+    print(f"\n结果：{total_ok}/{total} 套通过")
     timings.sort(key=lambda t: -t[1])
     print("耗时前5：", ", ".join(f"{n}={t:.2f}s" for n, t in timings[:5]))
-    return 0 if total_ok == len(SUITES) else 1
+    return 0 if total_ok == total else 1
 
 
 if __name__ == "__main__":

@@ -1,0 +1,18 @@
+id = "official-library-manager"
+name = "多库与路径级勾选管理"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+library_manager = "singleton"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_library_manager.plugin:LibraryManagerPlugin"
+
+[permissions]
+filesystem = ["vault_read", "data_write"]
+network = false
+gpu = false

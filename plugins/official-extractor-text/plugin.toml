@@ -1,0 +1,19 @@
+id = "official-extractor-text"
+name = "纯文本/Markdown 提取器"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+"extractor:md" = "multi"
+"extractor:txt" = "multi"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_extractor_text.plugin:TextExtractorPlugin"
+
+[permissions]
+filesystem = ["vault_read"]
+network = false
+gpu = false

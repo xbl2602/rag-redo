@@ -7,7 +7,8 @@
 | md/txt 原生读取 | `official-extractor-text` | Phase 1 | in_process | 无外部依赖，最简单 |
 | PDF 文字层(pymupdf4llm) | `official-extractor-pdf-text` | Phase 1 | in_process | |
 | DOCX(python-docx) | `official-extractor-docx` | Phase 1 | in_process | |
-| BGE-M3 向量化 | `official-embedder-bge-m3` | Phase 1 | in_process | torch 依赖较重但纯 Python，暂定 in_process；如果安装包体积问题突出可改 subprocess_service，Phase 1 中评估 |
+| 切块策略 | `official-chunker` | Phase 1 | in_process | 2026-09-22 补录：ARCHITECTURE.md 扩展点表里一直有 `chunker`，这张表最初漏列了对应的插件行 |
+| BGE-M3 向量化 | `official-embedder-bge-m3` | Phase 1 | in_process | torch 依赖较重但纯 Python，暂定 in_process；如果安装包体积问题突出可改 subprocess_service，Phase 1 中评估。实现上懒加载真实模型（`import sentence_transformers` 延迟到真正加载模型那一刻），单测用注入的假编码器（同旧项目的"假编码器 numpy 零向量"手法），不依赖真下载模型 |
 | Chroma 向量库 | `official-vector-store-chroma` | Phase 1 | in_process | |
 | BM25+jieba | `official-lexical-bm25` | Phase 1 | in_process | |
 | RRF 融合 | `official-fusion-rrf` | Phase 1 | in_process | |
