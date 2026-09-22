@@ -1,0 +1,18 @@
+id = "official-vector-store-chroma"
+name = "Chroma 向量库"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+vector_store = "singleton"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_vector_store_chroma.plugin:ChromaVectorStorePlugin"
+
+[permissions]
+filesystem = ["data_write"]
+network = false
+gpu = false
