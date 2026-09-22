@@ -1,0 +1,17 @@
+id = "official-lexical-bm25"
+name = "BM25 + jieba 词法检索"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+lexical_index = "singleton"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_lexical_bm25.plugin:LexicalBM25Plugin"
+
+[permissions]
+network = false
+gpu = false

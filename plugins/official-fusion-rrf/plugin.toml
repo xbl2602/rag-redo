@@ -1,0 +1,17 @@
+id = "official-fusion-rrf"
+name = "RRF 排名融合"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+fusion = "singleton"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_fusion_rrf.plugin:FusionRRFPlugin"
+
+[permissions]
+network = false
+gpu = false
