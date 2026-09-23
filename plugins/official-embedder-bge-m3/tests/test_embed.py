@@ -14,6 +14,7 @@ sentence_transformers/torch——这条测试当场从"几毫秒的轻量断言"
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -24,7 +25,8 @@ for p in (_REPO_ROOT, _PLUGIN_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from official_embedder_bge_m3.embed import BGEM3Embedder, _RealEncoder  # noqa: E402
+from core.resource_arbiter import ResourceArbiter  # noqa: E402
+from official_embedder_bge_m3.embed import GPU_HOLDER_ID, GPU_RESOURCE_ID, BGEM3Embedder, _RealEncoder  # noqa: E402
 
 
 class _FakeEncoder:
@@ -75,6 +77,49 @@ class TestRealEncoderLazyLoading(unittest.TestCase):
         with patch.dict(sys.modules, {"sentence_transformers": None}):
             with self.assertRaises(ImportError):
                 encoder.encode(["test"])
+
+
+class TestRealEncoderGpuArbitration(unittest.TestCase):
+    """GPU 生命周期管理回归测试（2026-09-23 补，按 obsidian-rag 真实行为
+    移植，见 embed.py 模块 docstring）：设备选择、检索侧高优先级抢占、
+    空闲卸载。这台开发机上 torch 是真实装了的（CPU-only），用 mock 强制
+    走 CUDA 分支，不依赖真实有没有 GPU 硬件。"""
+
+    def test_no_cuda_selects_cpu_without_touching_arbiter(self):
+        arb = ResourceArbiter()
+        encoder = _RealEncoder(resource_arbiter=arb)
+        with patch("torch.cuda.is_available", return_value=False):
+            self.assertEqual(encoder._select_device(), "cpu")
+        self.assertIsNone(arb.holder_of(GPU_RESOURCE_ID))
+
+    def test_cuda_preempts_lower_priority_wemm_style_holder(self):
+        """检索侧优先抢占（对齐旧项目行为）：bge-m3 要用 CUDA 时，如果
+        WEMM/OCR-local 这类低优先级消费者正占着"gpu:0"，应该被挤开。"""
+        arb = ResourceArbiter()
+        preempted = []
+        arb.acquire("gpu:0", "official-visual-wemm", priority=10, on_preempt=lambda: preempted.append("wemm"), preempt_equal=True)
+        encoder = _RealEncoder(resource_arbiter=arb)
+        with patch("torch.cuda.is_available", return_value=True), patch(
+            "official_embedder_bge_m3.embed.gpu_arbiter.wait_for_vram", return_value=True
+        ):
+            device = encoder._select_device()
+        self.assertEqual(device, "cuda")
+        self.assertEqual(preempted, ["wemm"])
+        self.assertEqual(arb.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
+
+    def test_idle_check_unloads_model_after_timeout(self):
+        encoder = _RealEncoder()
+        encoder._model = object()  # 假装模型已加载，不需要真的加载一遍
+        encoder._last_use = time.time() - 10_000  # 远超默认 300s 空闲阈值
+        encoder.idle_check()
+        self.assertIsNone(encoder._model)
+
+    def test_idle_check_does_not_unload_recently_used_model(self):
+        encoder = _RealEncoder()
+        encoder._model = object()
+        encoder._last_use = time.time()
+        encoder.idle_check()
+        self.assertIsNotNone(encoder._model)
 
 
 if __name__ == "__main__":

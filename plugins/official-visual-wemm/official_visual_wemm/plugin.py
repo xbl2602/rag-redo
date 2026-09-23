@@ -27,6 +27,20 @@ Chroma 文件、不同 collection"的隔离粒度更彻底，行为效果一致�
 - `env_bootstrap` 还没被核心真正执行（同 official-ocr-mineru-local 的
   已知限制，见 core/subprocess_service.py::resolve_plugin_python 的
   docstring），子进程目前会退化用核心自己的解释器。
+
+**GPU 生命周期管理（2026-09-23 补齐，按 obsidian-rag 真实行为移植）**：
+子进程自己在 server.py 里做懒加载+两级空闲释放（空闲卸载模型/再空闲更久
+整体自退出）+ VRAM 门槛等待，这个类只负责三件配合的事：①用
+`preempt_equal=True` 向资源仲裁器申请"gpu:0"名额——和
+official-ocr-mineru-local 是同一层级的"按需占用"消费者，谁刚需要谁能把
+对方挤开（对应旧项目 WEMM/MinerU 互相抢占显存的真实行为，见
+core/resource_arbiter.py::acquire 的 preempt_equal 参数说明）；②
+`on_preempt` 回调只请求子进程"软驱逐"（调 `/evict` 卸载模型、不杀子进程
+本身——比整个重启轻，重新可用只需模型冷加载不需要重新拉起解释器）；
+③`_ensure_alive()` 在每次真正使用前按需重新拉起子进程（同旧项目
+`gpu_arbiter.ensure_server` 的幂等语义）——子进程可能因为空闲自退出已经
+不在了，不这样做的话"空闲自退出省资源"这个优化会变成"用久了突然不工作"
+的真实回归。
 """
 from __future__ import annotations
 
@@ -40,6 +54,7 @@ from core.subprocess_service import SubprocessServiceError, SubprocessServiceHan
 
 PLUGIN_ID = "official-visual-wemm"
 GPU_RESOURCE_ID = "gpu:0"
+GPU_PRIORITY = 10  # 和 official-ocr-mineru-local 同一层级，互相抢占（preempt_equal）
 WEMM_RENDER_DPI = 60  # 页图渲染 DPI，行为对齐旧项目 wemm_indexer.py 的默认值
 WEMM_DIM = 512  # 输出向量维度，行为对齐旧项目 config.py 的默认值
 
@@ -53,6 +68,10 @@ class VisualWemmPlugin:
         self._handle: SubprocessServiceHandle | None = None
         self._client = None
         self._logger = None
+        self._enabled = False
+        self._plugin_dir: Path | None = None
+        self._runtime_health_check: str | None = None
+        self._runtime_command: tuple[str, ...] | None = None
 
     def on_load(self, ctx):
         persist_dir = ctx.data_dir / "visual_wemm" / "chroma"
@@ -64,30 +83,60 @@ class VisualWemmPlugin:
     def on_enable(self, ctx):
         # 名额协商，不是真实GPU探测——见模块docstring、
         # official-ocr-mineru-local/plugin.py 的同名注释。
-        ctx.resource_arbiter.acquire(GPU_RESOURCE_ID, ctx.plugin_id, on_preempt=self._stop_handle)
-
-        plugin_dir = Path(__file__).parent
-        python = resolve_plugin_python(plugin_dir)
-        command = tuple(arg.replace("{python}", python) for arg in ctx.runtime.command)
-        self._handle = SubprocessServiceHandle(
-            command,
-            health_check=ctx.runtime.health_check,
-            cwd=plugin_dir,
+        ctx.resource_arbiter.acquire(
+            GPU_RESOURCE_ID, ctx.plugin_id, priority=GPU_PRIORITY, on_preempt=self._soft_evict, preempt_equal=True
         )
-        self._handle.start()
-        ctx.logger.info("WEMM页级视觉导航子进程已启动（端口=%d）", self._handle.port)
+        self._plugin_dir = Path(__file__).parent
+        self._runtime_health_check = ctx.runtime.health_check
+        self._runtime_command = ctx.runtime.command
+        self._enabled = True
+        self._start_handle()
 
     def on_disable(self, ctx):
+        self._enabled = False
         self._stop_handle()
         ctx.resource_arbiter.release(GPU_RESOURCE_ID, ctx.plugin_id)
 
     def on_unload(self, ctx):
+        self._enabled = False
         self._stop_handle()
+
+    def _start_handle(self) -> None:
+        assert self._plugin_dir is not None and self._runtime_command is not None
+        python = resolve_plugin_python(self._plugin_dir)
+        command = tuple(arg.replace("{python}", python) for arg in self._runtime_command)
+        self._handle = SubprocessServiceHandle(command, health_check=self._runtime_health_check, cwd=self._plugin_dir)
+        self._handle.start()
+        self._logger.info("WEMM页级视觉导航子进程已启动（端口=%d）", self._handle.port)
 
     def _stop_handle(self) -> None:
         if self._handle is not None:
             self._handle.stop()
             self._handle = None
+
+    def _soft_evict(self) -> None:
+        """资源仲裁器的抢占回调：只请求子进程卸载模型释放显存，不杀子进程
+        本身。HTTP 调用失败也绝不阻塞抢占方——fail-open，同
+        core/gpu_arbiter.py::request_evict 的策略（这里直接用已经建好的
+        handle 发请求，不复用那个独立函数——子进程边的 server.py 完全
+        隔离，import 不到 core.*，见 server.py 模块 docstring）。"""
+        if self._handle is not None and self._handle.is_alive:
+            try:
+                self._handle.call("evict", {}, timeout=15.0)
+            except SubprocessServiceError:
+                pass
+
+    def _ensure_alive(self) -> bool:
+        if not self._enabled:
+            return False
+        if self._handle is not None and self._handle.is_alive:
+            return True
+        try:
+            self._start_handle()
+            return True
+        except SubprocessServiceError as exc:
+            self._logger.warning("WEMM子进程重新拉起失败：%s", exc)
+            return False
 
     def _collection(self, library_id: str):
         return self._client.get_or_create_collection(
@@ -103,7 +152,7 @@ class VisualWemmPlugin:
         自己的契约，同 extractor "绝不抛异常"的纪律）。pdf_paths 由编排层
         传入（已经是 library_manager 唯一裁决过的结果），这个方法自己不
         重新判断"这个文件算不算在检索范围内"（数据流铁律4）。"""
-        if self._handle is None or not self._handle.is_alive:
+        if not self._ensure_alive():
             self._logger.warning("WEMM子进程未运行，页级索引本轮跳过")
             return
 
@@ -167,7 +216,7 @@ class VisualWemmPlugin:
     # ---- 查询态 ----------------------------------------------------------
 
     def navigate(self, library_id: str, query: str, top_k: int = 5) -> list[PageHit]:
-        if self._handle is None or not self._handle.is_alive:
+        if not self._ensure_alive():
             self._logger.warning("WEMM子进程未运行，页级导航返回空结果")
             return []
         try:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,7 +15,8 @@ for p in (_REPO_ROOT, _PLUGIN_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from official_reranker.rerank import RerankerEngine, _RealReranker  # noqa: E402
+from core.resource_arbiter import ResourceArbiter  # noqa: E402
+from official_reranker.rerank import GPU_HOLDER_ID, GPU_RESOURCE_ID, RerankerEngine, _RealReranker  # noqa: E402
 
 
 class _FakeReranker:
@@ -54,6 +56,39 @@ class TestRealRerankerLazyLoading(unittest.TestCase):
         with patch.dict(sys.modules, {"sentence_transformers": None}):
             with self.assertRaises(ImportError):
                 reranker.score("q", ["a", "b"])
+
+
+class TestRealRerankerGpuArbitration(unittest.TestCase):
+    """GPU 生命周期管理回归测试，同 official-embedder-bge-m3/tests/
+    test_embed.py::TestRealEncoderGpuArbitration 的覆盖点，这里不重复
+    展开设计理由。"""
+
+    def test_no_cuda_selects_cpu_without_touching_arbiter(self):
+        arb = ResourceArbiter()
+        reranker = _RealReranker(resource_arbiter=arb)
+        with patch("torch.cuda.is_available", return_value=False):
+            self.assertEqual(reranker._select_device(), "cpu")
+        self.assertIsNone(arb.holder_of(GPU_RESOURCE_ID))
+
+    def test_cuda_shares_holder_id_with_embedder_without_self_preempting(self):
+        """embedder 和 reranker 共用同一个 GPU_HOLDER_ID——先后各自加载
+        不该互相驱逐（见 rerank.py 模块 docstring 的共享 holder_id 设计）。"""
+        arb = ResourceArbiter()
+        arb.acquire(GPU_RESOURCE_ID, GPU_HOLDER_ID, priority=100)  # 模拟 embedder 先加载过了
+        reranker = _RealReranker(resource_arbiter=arb)
+        with patch("torch.cuda.is_available", return_value=True), patch(
+            "official_reranker.rerank.gpu_arbiter.wait_for_vram", return_value=True
+        ):
+            device = reranker._select_device()
+        self.assertEqual(device, "cuda")
+        self.assertEqual(arb.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
+
+    def test_idle_check_unloads_model_after_timeout(self):
+        reranker = _RealReranker()
+        reranker._model = object()
+        reranker._last_use = time.time() - 10_000
+        reranker.idle_check()
+        self.assertIsNone(reranker._model)
 
 
 if __name__ == "__main__":

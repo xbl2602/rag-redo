@@ -56,6 +56,26 @@ class TestResourceArbiter(unittest.TestCase):
         self.assertFalse(ResourceArbiter.probe(lambda: False))
         self.assertTrue(ResourceArbiter.probe(lambda: True))
 
+    def test_equal_priority_does_not_preempt_by_default(self):
+        arb = ResourceArbiter()
+        arb.acquire("gpu:0", "holder-a", priority=5)
+        self.assertFalse(arb.acquire("gpu:0", "holder-b", priority=5))
+        self.assertEqual(arb.holder_of("gpu:0"), "holder-a")
+
+    def test_equal_priority_preempts_when_opted_in(self):
+        """preempt_equal=True 对应同一层级里"谁刚需要谁拿"（旧项目 WEMM/MinerU
+        互相抢占显存），不需要靠优先级数值分高低才能互相驱逐对方。"""
+        arb = ResourceArbiter()
+        preempted = []
+        arb.acquire("gpu:0", "wemm", priority=10, on_preempt=lambda: preempted.append("wemm-evicted"), preempt_equal=True)
+        self.assertTrue(arb.acquire("gpu:0", "mineru", priority=10, preempt_equal=True))
+        self.assertEqual(preempted, ["wemm-evicted"])
+        self.assertEqual(arb.holder_of("gpu:0"), "mineru")
+        # 反过来 wemm 再申请一次同样能把 mineru 挤回去——双向、不是单向的
+        preempted.clear()
+        self.assertTrue(arb.acquire("gpu:0", "wemm", priority=10, preempt_equal=True))
+        self.assertEqual(arb.holder_of("gpu:0"), "wemm")
+
     def test_full_acquire_preempt_release_flow(self):
         """完整流程：A拿到→B抢占A→B释放→资源空闲，对应 ROADMAP.md Phase 0
         验收标准"资源仲裁器能演示一次申请锁→抢占→释放的完整流程"。"""

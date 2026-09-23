@@ -11,6 +11,15 @@
 plugin.py 模块 docstring）。`RAG_REDO_FAKE_OCR` 环境变量存在时用确定性
 假实现，只给测试/架构验证用——生产环境绝不该设这个变量，设了也没意义
 （真实用户会希望真的做OCR，不是拿到"[fake-ocr]"这种占位文本）。
+
+**`/evict` 端点（2026-09-23 补：GPU 资源仲裁的软驱逐协议，和
+official-visual-wemm/server.py 是同一套协议，供 plugin.py 的
+resource_arbiter 抢占回调调用）目前是安全的空操作**——这个沙盒环境还
+没有真实OCR引擎可卸载（`_real_ocr` 还没接入真实模型，见 TODO 第2条），
+先把协议端点占住，接入真实模型时在这里补真正的"卸载引擎/释放显存"逻辑
+（结构对齐 official-visual-wemm/server.py 的 `_unload_engine_locked`/
+`_check_idle_unload`/两级空闲释放），不是遗漏，是"先把协议打通、模型
+到位后再补真正的生命周期管理"这个已知顺序的一部分。
 """
 from __future__ import annotations
 
@@ -41,6 +50,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        if self.path == "/evict":
+            # 见模块 docstring："安全的空操作"——没有真实引擎可卸载，回 ok
+            # 让抢占方的 fail-open 语义正常工作，不是假装做了什么。
+            self._json(200, {"ok": True})
+            return
         if self.path != "/extract":
             self._json(404, {"error": "not found"})
             return

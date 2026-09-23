@@ -143,6 +143,42 @@ class TestVisualWemmPlugin(unittest.TestCase):
         # 不该抛异常——同 extractor "绝不抛异常"的纪律，见 plugin.py 模块 docstring
         self.instance.index_library("lib1", self.vault, ["doc.pdf"])
 
+    def test_ensure_alive_restarts_subprocess_after_it_exits(self):
+        """子进程可能因为空闲自退出（server.py 的 idle-exit 机制）而不在
+        了——模拟这个场景（直接把子进程停掉，不经过 on_disable，插件本身
+        仍处于 enabled 状态），下一次真正调用必须透明地重新拉起，不是永久
+        瘫痪（否则"空闲自退出省资源"这个优化会变成用户遇到的真实回归）。"""
+        old_pid = self.instance._handle._process.pid  # noqa: SLF001
+        self.instance._handle.stop()  # noqa: SLF001 - 模拟子进程自己没了，不走 on_disable
+        self.assertFalse(self.instance._handle.is_alive)  # noqa: SLF001
+        self.instance.index_library("lib1", self.vault, ["doc.pdf"])
+        self.assertIsNotNone(self.instance._handle)  # noqa: SLF001
+        self.assertNotEqual(self.instance._handle._process.pid, old_pid)  # noqa: SLF001
+        collection = self.instance._collection("lib1")  # noqa: SLF001
+        self.assertEqual(collection.count(), 2)
+
+    def test_ensure_alive_does_not_restart_after_explicit_disable(self):
+        """区别于上一条：真正被 disable 之后，直接调用这个实例的方法不该
+        意外把子进程又偷偷拉起来——disable 就是 disable，不是"暂时睡着"。"""
+        self.rt.disable("official-visual-wemm")
+        self.instance.navigate("lib1", "query")
+        self.assertIsNone(self.instance._handle)  # noqa: SLF001
+
+    def test_resource_arbiter_soft_evict_unloads_model_without_killing_subprocess(self):
+        """同一优先级层级的另一个 GPU 消费者申请"gpu:0"时，WEMM 应该只被
+        软驱逐（子进程收到 /evict 请求、继续存活），不是被整个杀掉——软
+        驱逐比整个重启轻，重新可用只需模型冷加载。"""
+        pid_before = self.instance._handle._process.pid  # noqa: SLF001
+        acquired = self.rt.resource_arbiter.acquire(
+            "gpu:0", "some-other-gpu-consumer", priority=10, preempt_equal=True
+        )
+        self.assertTrue(acquired)
+        self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "some-other-gpu-consumer")
+        # 子进程本身还活着、还是同一个 pid——只是模型被卸载了，不是整个被杀掉
+        self.assertIsNotNone(self.instance._handle)  # noqa: SLF001
+        self.assertEqual(self.instance._handle._process.pid, pid_before)  # noqa: SLF001
+        self.assertTrue(self.instance._handle.is_alive)
+
 
 if __name__ == "__main__":
     unittest.main()

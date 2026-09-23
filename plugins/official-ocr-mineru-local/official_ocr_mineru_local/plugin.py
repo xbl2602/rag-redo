@@ -24,6 +24,14 @@ server.py 里真正调用模型的分支懒导入，没装就折叠成清楚的�
 docstring。对于这个只用标准库的参考实现，这个简化本身没有问题；一旦
 真的要接入需要重依赖的真实OCR模型，`env_bootstrap` 的执行逻辑必须先
 落地。
+
+**GPU 资源仲裁（2026-09-23 补齐，和 official-visual-wemm 是同一套协议）**：
+和 official-visual-wemm 处于同一优先级层级——两者都是"按需占用"的
+subprocess_service GPU 消费者，谁刚需要谁能把对方挤开（`preempt_equal`，
+对应旧项目 WEMM/MinerU 互相抢占显存的真实行为）；`on_preempt` 回调只
+请求子进程"软驱逐"（`/evict`），不整个杀掉子进程；`_ensure_alive()` 在
+真正调用前按需重新拉起（子进程接入真实模型后会有空闲自退出机制，见
+server.py TODO 说明，这里先把协议对称打通）。
 """
 from __future__ import annotations
 
@@ -36,6 +44,7 @@ from core.subprocess_service import SubprocessServiceError, SubprocessServiceHan
 EXTRACTOR_VERSION = "0.1.0"
 PLUGIN_ID = "official-ocr-mineru-local"
 GPU_RESOURCE_ID = "gpu:0"
+GPU_PRIORITY = 10  # 和 official-visual-wemm 同一层级，互相抢占（preempt_equal）
 
 
 def _content_hash(data: bytes) -> str:
@@ -45,42 +54,75 @@ def _content_hash(data: bytes) -> str:
 class MineruLocalOcrPlugin:
     def __init__(self) -> None:
         self._handle: SubprocessServiceHandle | None = None
+        self._logger = None
+        self._enabled = False
+        self._plugin_dir: Path | None = None
+        self._runtime_health_check: str | None = None
+        self._runtime_command: tuple[str, ...] | None = None
 
     def on_load(self, ctx):
+        self._logger = ctx.logger
         ctx.logger.info("MinerU本机OCR已加载")
 
     def on_enable(self, ctx):
         # 名额协商，不是真实GPU探测——见模块docstring。
-        ctx.resource_arbiter.acquire(GPU_RESOURCE_ID, ctx.plugin_id, on_preempt=self._stop_handle)
-
-        plugin_dir = Path(__file__).parent
-        python = resolve_plugin_python(plugin_dir)
-        command = tuple(arg.replace("{python}", python) for arg in ctx.runtime.command)
-        self._handle = SubprocessServiceHandle(
-            command,
-            health_check=ctx.runtime.health_check,
-            cwd=plugin_dir,
+        ctx.resource_arbiter.acquire(
+            GPU_RESOURCE_ID, ctx.plugin_id, priority=GPU_PRIORITY, on_preempt=self._soft_evict, preempt_equal=True
         )
-        self._handle.start()
-        ctx.logger.info("MinerU本机OCR子进程已启动（端口=%d）", self._handle.port)
+        self._plugin_dir = Path(__file__).parent
+        self._runtime_health_check = ctx.runtime.health_check
+        self._runtime_command = ctx.runtime.command
+        self._enabled = True
+        self._start_handle()
 
     def on_disable(self, ctx):
+        self._enabled = False
         self._stop_handle()
         ctx.resource_arbiter.release(GPU_RESOURCE_ID, ctx.plugin_id)
 
     def on_unload(self, ctx):
+        self._enabled = False
         self._stop_handle()
+
+    def _start_handle(self) -> None:
+        assert self._plugin_dir is not None and self._runtime_command is not None
+        python = resolve_plugin_python(self._plugin_dir)
+        command = tuple(arg.replace("{python}", python) for arg in self._runtime_command)
+        self._handle = SubprocessServiceHandle(command, health_check=self._runtime_health_check, cwd=self._plugin_dir)
+        self._handle.start()
+        self._logger.info("MinerU本机OCR子进程已启动（端口=%d）", self._handle.port)
 
     def _stop_handle(self) -> None:
         if self._handle is not None:
             self._handle.stop()
             self._handle = None
 
+    def _soft_evict(self) -> None:
+        """见 official-visual-wemm/plugin.py 同名方法的说明——只请求软
+        驱逐，不整个杀掉子进程；HTTP 失败 fail-open，不阻塞抢占方。"""
+        if self._handle is not None and self._handle.is_alive:
+            try:
+                self._handle.call("evict", {}, timeout=15.0)
+            except SubprocessServiceError:
+                pass
+
+    def _ensure_alive(self) -> bool:
+        if not self._enabled:
+            return False
+        if self._handle is not None and self._handle.is_alive:
+            return True
+        try:
+            self._start_handle()
+            return True
+        except SubprocessServiceError as exc:
+            self._logger.warning("MinerU本机OCR子进程重新拉起失败：%s", exc)
+            return False
+
     def extract(self, library_id: str, path: str, root: Path) -> ExtractedDocument:
         full_path = root / path
         if full_path.suffix.lower() != ".pdf":
             return self._fail(library_id, path, "不是PDF，本机OCR跳过")
-        if self._handle is None or not self._handle.is_alive:
+        if not self._ensure_alive():
             return self._fail(library_id, path, "本机OCR子进程未运行")
 
         try:

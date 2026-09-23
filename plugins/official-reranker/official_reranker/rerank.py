@@ -1,11 +1,37 @@
 """Cross-Encoder 重排器。懒加载契约和 official-embedder-bge-m3 完全同一
 套理由，见该插件 embed.py 的模块 docstring——这里不重复展开。
+
+**GPU 生命周期管理**：和 official-embedder-bge-m3 是同一个"检索侧"GPU
+消费群体——用同一个 `GPU_HOLDER_ID` 向资源仲裁器申请"gpu:0"名额（同一个
+holder_id 意味着两边互相不冲突：谁先加载谁申请到，另一边后来加载时是
+"同一持有者再次申请"的幂等续期，不会互相抢占/驱逐），同一套设备选择+
+空闲卸载逻辑（详细设计理由见 embed.py 模块 docstring，这里不重复展开，
+两个插件各自维护一份小实现，是插件互相隔离原则下的刻意小重复）。
+
+**已知的、刻意的简化（这份文件独有的一条）**：`GPU_HOLDER_ID` 共享同一个
+字符串意味着"embedder 和 reranker 只要有一个还启用着，就该一直占着这个
+名额"这件事没有真正的引用计数——如果只禁用其中一个插件（比如只关掉
+reranker，embedder 还启用着、模型还在显存里），这个插件的 on_disable 会
+把共享名额释放掉，理论上给了 WEMM/OCR-local 一个"名额空出来了"的抢占
+窗口，即使 embedder 的模型其实还实际占着显存。这是一个真实但很窄的边界
+情况（重排器脱离向量检索单独禁用是罕见配置），如实记录不假装解决了——
+真正解决需要给"检索侧GPU消费群体"整体加一层核心才能提供的引用计数服务，
+超出这一轮"让 WEMM/OCR-local 不再永远抢不到资源"这个核心目标的范围。
 """
 from __future__ import annotations
 
+import threading
+import time
 from typing import Protocol
 
+from core import gpu_arbiter
+
 MODEL_VERSION = "BAAI/bge-reranker-v2-m3"
+GPU_RESOURCE_ID = "gpu:0"
+GPU_HOLDER_ID = "official-text-retrieval-gpu"  # 和 official-embedder-bge-m3 共用，见模块 docstring
+GPU_PRIORITY = 100
+MIN_VRAM_GB = 3.5
+IDLE_UNLOAD_SECONDS = 300
 
 
 class Reranker(Protocol):
@@ -13,26 +39,77 @@ class Reranker(Protocol):
 
 
 class _RealReranker:
-    def __init__(self, model_name: str = MODEL_VERSION) -> None:
+    def __init__(self, model_name: str = MODEL_VERSION, *, resource_arbiter=None, logger=None) -> None:
         self._model_name = model_name
         self._model = None
+        self._resource_arbiter = resource_arbiter
+        self._logger = logger
+        self._last_use = time.time()
+        self._lock = threading.Lock()
+
+    def _log(self, message: str) -> None:
+        if self._logger is not None:
+            self._logger.info(message)
 
     def _ensure_loaded(self):
-        if self._model is None:
-            from sentence_transformers import CrossEncoder  # noqa: PLC0415 - 故意懒加载
+        with gpu_arbiter.GPU_LOCK:
+            if self._model is None:
+                from sentence_transformers import CrossEncoder  # noqa: PLC0415 - 故意懒加载
 
-            self._model = CrossEncoder(self._model_name)
-        return self._model
+                device = self._select_device()
+                self._model = CrossEncoder(self._model_name, device=device)
+                self._log(f"重排器模型已加载（device={device}）")
+            self._last_use = time.time()
+            return self._model
+
+    def _select_device(self) -> str:
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return "cpu"
+        except Exception:  # noqa: BLE001
+            return "cpu"
+        if self._resource_arbiter is not None:
+            self._resource_arbiter.acquire(GPU_RESOURCE_ID, GPU_HOLDER_ID, priority=GPU_PRIORITY, on_preempt=self._unload_locked)
+        gpu_arbiter.wait_for_vram(MIN_VRAM_GB, timeout_s=900.0, log=self._log)
+        return "cuda"
 
     def score(self, query: str, texts: list[str]) -> list[float]:
         model = self._ensure_loaded()
         pairs = [[query, text] for text in texts]
-        return list(model.predict(pairs))
+        result = list(model.predict(pairs))
+        self._last_use = time.time()
+        return result
+
+    def idle_check(self) -> None:
+        if IDLE_UNLOAD_SECONDS <= 0 or self._model is None:
+            return
+        if time.time() - self._last_use > IDLE_UNLOAD_SECONDS:
+            with self._lock:
+                if time.time() - self._last_use > IDLE_UNLOAD_SECONDS and self._model is not None:
+                    self._unload_locked()
+
+    def _unload_locked(self) -> None:
+        if self._model is None:
+            return
+        self._model = None
+        try:
+            import gc
+
+            gc.collect()
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        self._log("重排器模型空闲卸载，显存已释放")
 
 
 class RerankerEngine:
-    def __init__(self, reranker: Reranker | None = None) -> None:
-        self._reranker = reranker if reranker is not None else _RealReranker()
+    def __init__(self, reranker: Reranker | None = None, *, resource_arbiter=None, logger=None) -> None:
+        self._reranker = reranker if reranker is not None else _RealReranker(resource_arbiter=resource_arbiter, logger=logger)
 
     def rerank(
         self, query: str, chunk_id_text_pairs: list[tuple[str, str]], top_k: int = 10
@@ -44,3 +121,8 @@ class RerankerEngine:
         scores = self._reranker.score(query, texts)
         ranked = sorted(zip(ids, scores), key=lambda kv: kv[1], reverse=True)
         return ranked[:top_k]
+
+    def idle_check(self) -> None:
+        check = getattr(self._reranker, "idle_check", None)
+        if check is not None:
+            check()

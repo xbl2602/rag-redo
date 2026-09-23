@@ -35,6 +35,7 @@ CORE_SUITES = [
     "test_registry",
     "test_datastore",
     "test_resource_arbiter",
+    "test_gpu_arbiter",
     "test_write_gate",
     "test_runtime",
     "test_subprocess_service",

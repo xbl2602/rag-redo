@@ -29,12 +29,18 @@ class ResourceArbiter:
         *,
         priority: int = 0,
         on_preempt: Callable[[], None] | None = None,
+        preempt_equal: bool = False,
     ) -> bool:
         """申请一个资源锁。
 
         - 当前无人占用 → 直接拿到
         - 已经是自己占用 → 幂等返回 True
         - 别人占用、且新请求优先级更高 → 抢占（调用被抢占方的 on_preempt 回调后接管）
+        - 别人占用、且优先级相同、且 preempt_equal=True → 同样抢占（"同一层级里
+          谁刚需要谁拿"，不是严格数值更高才行——对应旧项目 obsidian-rag
+          gpu_arbiter.py 里 WEMM 和 MinerU 互相抢占显存的真实行为：两者是同一
+          优先级层级的"按需占用"资源消费者，不分谁天生更重要，纯粹看谁现在要用；
+          默认 False 保持原有"严格更高优先级才能抢占"语义不变，不影响既有调用方）
         - 别人占用、且优先级不够 → 拿不到，返回 False
         """
         current = self._holders.get(resource_id)
@@ -43,7 +49,7 @@ class ResourceArbiter:
             return True
         if current.holder_id == holder_id:
             return True
-        if priority > current.priority:
+        if priority > current.priority or (preempt_equal and priority == current.priority):
             if current.on_preempt is not None:
                 current.on_preempt()
             self._holders[resource_id] = _Holder(holder_id, priority, on_preempt)
