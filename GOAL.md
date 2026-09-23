@@ -41,8 +41,8 @@
 
 ## 当前进度
 
-- [ ] C1 全部测试套件保持全绿（持续验证项，每完成一个子任务后重跑）
-- [ ] C2 MCP 工具集对齐16个（当前覆盖8/16：list_libraries/get_library_sample/propose_library_summary/apply_library_summary/search_knowledge/reindex_knowledge/navigate_knowledge/wemm_status）
-- [ ] C3 后台索引 + index_status
+- [ ] C1 全部测试套件保持全绿（持续验证项，每完成一个子任务后重跑；最近一次 `tests/run.py` 结果 36/36）
+- [ ] C2 MCP 工具集对齐16个（当前覆盖11/16：list_libraries/get_library_sample/propose_library_summary/apply_library_summary/search_knowledge/reindex_knowledge/index_status/navigate_knowledge/wemm_status/read_document/find_duplicates；`export_library`/`import_library` 是 rag-redo 独有额外工具，不计入16个对齐范围。仍缺5个：`get_selection`/`propose_selection_changes`/`apply_selection_changes`（B类选择写权限门禁）、`note_relations`（依赖C4 wikilink解析）、`index_failures`（简化版）——以 `test_tools_are_discoverable_with_schema` 的实际断言集合为准）
+- [x] C3 后台索引 + index_status——`reindex_knowledge` 已改为调用 `Pipeline.start_index_library()` 后台执行+立即返回，新增 `index_status(library_id)` 工具查询真实进度/心跳健康；底层 `core/index_progress.py` 真实抓到并修复两个并发bug（`Path.write_text`非原子导致读到截断JSON、Windows下`os.replace`撞上并发读句柄的瞬时`PermissionError`）。验证：`.venv/Scripts/python.exe -m unittest plugins.official-mcp-server.tests.test_tools -k index_status` 2 用例通过。
 - [ ] C4 wikilink 解析 + note_relations
 - [ ] C5 ROADMAP.md 文档闭环
