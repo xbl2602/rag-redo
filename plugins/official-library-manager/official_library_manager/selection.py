@@ -24,10 +24,12 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
 NewFileDefault = Literal["include", "exclude"]
+SELECTION_ACTIONS = ("in", "out", "neutral")
 
 
 def _segments(path: str) -> tuple[str, ...]:
@@ -116,3 +118,71 @@ def collect_included_files(
         ))
         for path in all_paths
     ]
+
+
+# ---------------------------------------------------------------------------
+# 勾选变更（get_selection/propose_selection_changes/apply_selection_changes
+# 三个 MCP 工具的数据面，2026-09-23 全面功能审计发现的缺口B类）：判定逻辑
+# 上面早就有了（decide_included），缺的是"AI 想改这份配置"这条写路径本身
+# ——对齐 obsidian-rag library.py::norm_sel_path/set_selection 的校验与
+# 合并语义，写权限门禁部分复用 core/write_gate.py（在 plugin.py 里接线，
+# 这里只放纯函数）。
+# ---------------------------------------------------------------------------
+
+
+def norm_selection_path(path: object) -> str:
+    """校验并规范化一条勾选路径：必须是库内相对路径，拒绝绝对路径/盘符/
+    UNC/`~`/`..`逃逸——对齐 obsidian-rag `library.py::norm_sel_path` 的
+    防御性校验（防止 MCP 提案挟带恶意路径试图越出库根目录范围）。返回
+    不带首尾斜杠、正斜杠分隔的规范化路径。"""
+    if not isinstance(path, str):
+        raise ValueError(f"勾选路径必须是字符串：{path!r}")
+    s = path.strip().replace("\\", "/")
+    if s.startswith("/") or s.startswith("~") or re.match(r"^[A-Za-z]:", s):
+        raise ValueError(f"必须是库内相对路径（不含盘符/UNC/~/正斜杠根）：{path!r}")
+    s = s.strip("/")
+    if not s:
+        raise ValueError("勾选路径不能为空")
+    parts = s.split("/")
+    if any(part.strip() in ("", ".", "..") for part in parts):
+        raise ValueError(f"路径非法（不得含空段/./..）：{path!r}")
+    return "/".join(part.strip() for part in parts)
+
+
+def normalize_selection_changes(changes: Sequence[dict] | None) -> list[dict]:
+    """校验+规范化一批勾选变更：路径合法、action 合法——整体通过或整体
+    拒绝（有一条非法就整体报错，不做"部分生效"）。"""
+    if not changes:
+        raise ValueError("changes 为空：至少提供一项 {path, action}")
+    norm = []
+    for ch in changes:
+        if not isinstance(ch, dict):
+            raise ValueError(f"变更项必须是字典：{ch!r}")
+        action = ch.get("action")
+        if action not in SELECTION_ACTIONS:
+            raise ValueError(f"非法 action：{action!r}（只接受 {'/'.join(SELECTION_ACTIONS)}）")
+        path = norm_selection_path(ch.get("path"))
+        norm.append({"path": path, "action": action})
+    return norm
+
+
+def apply_selection_changes(
+    selection_in: Sequence[str], selection_out: Sequence[str], changes: Sequence[dict]
+) -> tuple[list[str], list[str]]:
+    """按顺序应用一批已规范化的勾选变更，返回新的 (selection_in,
+    selection_out)——同一路径出现多条变更时后写覆盖先写，对齐
+    obsidian-rag `library.py::set_selection` 的合并语义。"""
+    sin = list(selection_in)
+    sout = list(selection_out)
+    for ch in changes:
+        path, action = ch["path"], ch["action"]
+        if path in sin:
+            sin.remove(path)
+        if path in sout:
+            sout.remove(path)
+        if action == "in":
+            sin.append(path)
+        elif action == "out":
+            sout.append(path)
+        # action == "neutral"：已经从两份名单里都移除，不需要再做什么
+    return sin, sout

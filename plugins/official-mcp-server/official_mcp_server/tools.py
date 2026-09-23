@@ -227,6 +227,66 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         return rows
 
     @server.tool()
+    def get_selection(library_id: str) -> dict[str, Any]:
+        """查看某库的路径级勾选状态（只读，对齐 obsidian-rag 的
+        `get_selection` 工具）：显式纳入/排除清单——用于提议变更前了解
+        现状。未列出的文件是"中性"，按格式开关与库默认策略
+        （`new_file_default`）判定，不在这两份清单里。
+
+        Args:
+            library_id: 要查看的库的 id
+        """
+        try:
+            result = lib_mgr.get_selection(library_id)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, **result}
+
+    @server.tool()
+    def propose_selection_changes(library_id: str, changes: list[dict]) -> dict[str, Any]:
+        """提议库内路径级勾选变更（对齐 obsidian-rag 的
+        `propose_selection_changes` 工具）：`changes` 是一批
+        `{"path": "库内相对路径", "action": "in"|"out"|"neutral"}`——
+        `in`=显式纳入，`out`=显式排除，`neutral`=撤回显式规则、恢复跟随
+        库的格式开关/默认策略判定。被排除的文件会从整个检索流程中消失
+        （不提取、不嵌入、不建页级导航）。
+
+        ⚠ 硬性确认门禁：本工具绝不直接生效，只生成一份待确认提案并返回
+        变更清单、提案号与6位确认码；你必须把变更清单完整展示给用户、
+        得到用户明确同意后，才能携带 proposal_id 与确认码调用
+        apply_selection_changes。未经用户同意就调用 apply 是严重违规。
+        提案10分钟后过期。
+
+        Args:
+            library_id: 要变更的库的 id
+            changes: 变更列表，每项 {"path": ..., "action": "in"|"out"|"neutral"}
+        """
+        try:
+            result = lib_mgr.propose_selection_changes(library_id, changes)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return result
+
+    @server.tool()
+    def apply_selection_changes(library_id: str, proposal_id: str, confirmation_code: str) -> dict[str, Any]:
+        """应用已获用户确认的路径级勾选变更提案（对齐 obsidian-rag 的
+        `apply_selection_changes` 工具）。只有 propose_selection_changes
+        返回的提案号 + 用户看到的确认码二者匹配、且未过期（10分钟）时才
+        会生效——硬编码门禁，无任何配置可绕过。生效后下一轮
+        reindex_knowledge 自动应用新的勾选状态。
+
+        Args:
+            library_id: 目标库的 id
+            proposal_id: propose_selection_changes 返回的提案号
+            confirmation_code: 用户确认后提供的6位数字确认码
+        """
+        try:
+            result = lib_mgr.apply_selection_changes(library_id, proposal_id, confirmation_code)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return result
+
+    @server.tool()
     def reindex_knowledge(library_id: str) -> dict[str, Any]:
         """后台重建索引，立即返回（对齐 obsidian-rag 的 `reindex_knowledge`
         "后台执行+立即返回"语义，2026-09-23 全面功能审计发现的缺口——

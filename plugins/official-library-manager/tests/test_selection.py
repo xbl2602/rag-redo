@@ -13,7 +13,13 @@ for p in (_REPO_ROOT, _PLUGIN_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from official_library_manager.selection import collect_included_files, decide_included  # noqa: E402
+from official_library_manager.selection import (  # noqa: E402
+    apply_selection_changes,
+    collect_included_files,
+    decide_included,
+    normalize_selection_changes,
+    norm_selection_path,
+)
 
 
 class TestDecideIncluded(unittest.TestCase):
@@ -126,6 +132,96 @@ class TestCollectIncludedFiles(unittest.TestCase):
         self.assertTrue(decisions["a.md"])
         self.assertTrue(decisions["b.md"])
         self.assertFalse(decisions["excluded/c.md"])
+
+
+class TestNormSelectionPath(unittest.TestCase):
+    def test_plain_relative_path_passes_through(self):
+        self.assertEqual(norm_selection_path("docs/a.md"), "docs/a.md")
+
+    def test_backslashes_normalized_to_forward_slashes(self):
+        self.assertEqual(norm_selection_path("docs\\a.md"), "docs/a.md")
+
+    def test_trailing_slash_stripped(self):
+        # 前导 "/" 本身就被当成"看起来像绝对路径"直接拒绝（见下面
+        # test_absolute_unix_path_rejected）——只有尾部斜杠会被剥掉。
+        self.assertEqual(norm_selection_path("docs/a.md/"), "docs/a.md")
+
+    def test_absolute_unix_path_rejected(self):
+        with self.assertRaises(ValueError):
+            norm_selection_path("/etc/passwd")
+
+    def test_windows_drive_letter_path_rejected(self):
+        with self.assertRaises(ValueError):
+            norm_selection_path("C:/Windows/System32")
+
+    def test_home_dir_shortcut_rejected(self):
+        with self.assertRaises(ValueError):
+            norm_selection_path("~/secrets.md")
+
+    def test_parent_dir_escape_rejected(self):
+        with self.assertRaises(ValueError):
+            norm_selection_path("../outside.md")
+
+    def test_empty_path_rejected(self):
+        with self.assertRaises(ValueError):
+            norm_selection_path("   ")
+
+    def test_non_string_rejected(self):
+        with self.assertRaises(ValueError):
+            norm_selection_path(123)  # type: ignore[arg-type]
+
+
+class TestNormalizeSelectionChanges(unittest.TestCase):
+    def test_valid_changes_normalized(self):
+        result = normalize_selection_changes([{"path": "a.md", "action": "in"}])
+        self.assertEqual(result, [{"path": "a.md", "action": "in"}])
+
+    def test_empty_changes_rejected(self):
+        with self.assertRaises(ValueError):
+            normalize_selection_changes([])
+
+    def test_invalid_action_rejected(self):
+        with self.assertRaises(ValueError):
+            normalize_selection_changes([{"path": "a.md", "action": "delete"}])
+
+    def test_invalid_path_in_one_of_several_changes_rejects_whole_batch(self):
+        """整体通过或整体拒绝——不做部分生效，同 obsidian-rag
+        normalize_changes 的"提案要么全部合法要么整体拒绝"策略一致。"""
+        with self.assertRaises(ValueError):
+            normalize_selection_changes([{"path": "a.md", "action": "in"}, {"path": "/etc/passwd", "action": "out"}])
+
+
+class TestApplySelectionChanges(unittest.TestCase):
+    def test_in_action_adds_to_selection_in(self):
+        sin, sout = apply_selection_changes([], [], [{"path": "a.md", "action": "in"}])
+        self.assertEqual(sin, ["a.md"])
+        self.assertEqual(sout, [])
+
+    def test_out_action_adds_to_selection_out(self):
+        sin, sout = apply_selection_changes([], [], [{"path": "a.md", "action": "out"}])
+        self.assertEqual(sin, [])
+        self.assertEqual(sout, ["a.md"])
+
+    def test_neutral_action_removes_from_both_lists(self):
+        sin, sout = apply_selection_changes(["a.md"], ["a.md"], [{"path": "a.md", "action": "neutral"}])
+        self.assertEqual(sin, [])
+        self.assertEqual(sout, [])
+
+    def test_moving_from_out_to_in_removes_stale_out_entry(self):
+        sin, sout = apply_selection_changes([], ["a.md"], [{"path": "a.md", "action": "in"}])
+        self.assertEqual(sin, ["a.md"])
+        self.assertEqual(sout, [])
+
+    def test_later_change_to_same_path_overrides_earlier_one(self):
+        sin, sout = apply_selection_changes(
+            [], [], [{"path": "a.md", "action": "in"}, {"path": "a.md", "action": "out"}]
+        )
+        self.assertEqual(sin, [])
+        self.assertEqual(sout, ["a.md"])
+
+    def test_unrelated_existing_entries_are_preserved(self):
+        sin, sout = apply_selection_changes(["existing.md"], [], [{"path": "new.md", "action": "in"}])
+        self.assertEqual(sin, ["existing.md", "new.md"])
 
 
 if __name__ == "__main__":

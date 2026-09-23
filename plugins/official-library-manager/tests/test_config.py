@@ -12,6 +12,7 @@ for p in (_REPO_ROOT, _PLUGIN_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
+from core.runtime import PluginRuntime, PluginState  # noqa: E402
 from core.settings import SettingsStore  # noqa: E402
 from official_library_manager.config import LibraryConfigStore  # noqa: E402
 from official_library_manager.plugin import LibraryManagerPlugin  # noqa: E402
@@ -169,6 +170,101 @@ class TestResolveLibraries(unittest.TestCase):
         self.plugin._settings.set("default_libraries", ["lib-a"])
         result = self.plugin.resolve_libraries("lib-b")
         self.assertEqual({c.library_id for c in result}, {"lib-b"})
+
+
+class TestSelectionWriteGate(unittest.TestCase):
+    """get_selection/propose_selection_changes/apply_selection_changes——
+    对齐 obsidian-rag 的同名三件套（2026-09-23 全面功能审计B类缺口）：
+    路径级勾选变更永远走写权限门禁确认，没有"此前非用户手写就直接生效"
+    的快捷分支（同 official-library-summary::propose() 不一样，见
+    plugin.py 里这三个方法的说明）。真实通过 PluginRuntime 走一遍完整
+    生命周期，拿到真实 ctx.write_gate，不是假的（同
+    official-library-summary/tests/test_plugin.py 的验证方式）。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.rt = PluginRuntime(
+            _REPO_ROOT / "plugins", state_file=self.tmp / "state.json", data_dir=self.tmp / "data"
+        )
+        self.rt.scan()
+        self.rt.load("official-library-manager")
+        self.rt.enable("official-library-manager")
+        self.assertEqual(
+            self.rt.plugins["official-library-manager"].state,
+            PluginState.ENABLED,
+            self.rt.plugins["official-library-manager"].error,
+        )
+        self.instance = self.rt.plugins["official-library-manager"].instance
+        self.instance.store.add_library("lib1", "库1", "/vaults/lib1")
+
+    def test_get_selection_on_fresh_library_is_empty(self):
+        result = self.instance.get_selection("lib1")
+        self.assertEqual(result, {"selection_in": [], "selection_out": []})
+
+    def test_get_selection_unknown_library_raises_keyerror(self):
+        with self.assertRaises(KeyError):
+            self.instance.get_selection("no-such-lib")
+
+    def test_propose_never_applies_directly(self):
+        """硬性确认门禁：不管此前状态如何，propose 永远只生成提案，绝不
+        直接生效——这是与库简介 propose() 最大的行为差异，必须显式钉住。"""
+        result = self.instance.propose_selection_changes("lib1", [{"path": "private/", "action": "out"}])
+        self.assertTrue(result["ok"])
+        self.assertIn("proposal_id", result)
+        self.assertIn("confirmation_code", result)
+        # 还没 apply，get_selection 应该看不到任何变化
+        self.assertEqual(self.instance.get_selection("lib1"), {"selection_in": [], "selection_out": []})
+
+    def test_propose_then_apply_with_correct_code_takes_effect(self):
+        propose_result = self.instance.propose_selection_changes(
+            "lib1", [{"path": "private", "action": "out"}, {"path": "private/keep.md", "action": "in"}]
+        )
+        apply_result = self.instance.apply_selection_changes(
+            "lib1", propose_result["proposal_id"], propose_result["confirmation_code"]
+        )
+        self.assertTrue(apply_result["ok"])
+        self.assertEqual(apply_result["selection_in"], ["private/keep.md"])
+        self.assertEqual(apply_result["selection_out"], ["private"])
+        self.assertEqual(
+            self.instance.get_selection("lib1"),
+            {"selection_in": ["private/keep.md"], "selection_out": ["private"]},
+        )
+
+    def test_apply_with_wrong_code_is_rejected_and_does_not_take_effect(self):
+        propose_result = self.instance.propose_selection_changes("lib1", [{"path": "a.md", "action": "out"}])
+        apply_result = self.instance.apply_selection_changes("lib1", propose_result["proposal_id"], "000000")
+        self.assertFalse(apply_result["ok"])
+        self.assertEqual(self.instance.get_selection("lib1"), {"selection_in": [], "selection_out": []})
+
+    def test_apply_proposal_twice_second_time_rejected(self):
+        """一次性有效——同 core/write_gate.py 的一次性提案纪律，这里只是
+        确认它真的接上了。"""
+        propose_result = self.instance.propose_selection_changes("lib1", [{"path": "a.md", "action": "out"}])
+        first = self.instance.apply_selection_changes(
+            "lib1", propose_result["proposal_id"], propose_result["confirmation_code"]
+        )
+        self.assertTrue(first["ok"])
+        second = self.instance.apply_selection_changes(
+            "lib1", propose_result["proposal_id"], propose_result["confirmation_code"]
+        )
+        self.assertFalse(second["ok"])
+
+    def test_propose_with_illegal_path_raises_before_creating_proposal(self):
+        with self.assertRaises(ValueError):
+            self.instance.propose_selection_changes("lib1", [{"path": "../escape.md", "action": "in"}])
+
+    def test_propose_unknown_library_raises_keyerror(self):
+        with self.assertRaises(KeyError):
+            self.instance.propose_selection_changes("no-such-lib", [{"path": "a.md", "action": "in"}])
+
+    def test_apply_with_mismatched_library_id_is_rejected(self):
+        self.instance.store.add_library("lib2", "库2", "/vaults/lib2")
+        propose_result = self.instance.propose_selection_changes("lib1", [{"path": "a.md", "action": "out"}])
+        apply_result = self.instance.apply_selection_changes(
+            "lib2", propose_result["proposal_id"], propose_result["confirmation_code"]
+        )
+        self.assertFalse(apply_result["ok"])
 
 
 if __name__ == "__main__":

@@ -303,6 +303,79 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertFalse(result.is_error)
         self.assertFalse(result.structured_content["ok"])
 
+    async def test_get_selection_tool_reflects_empty_state_on_fresh_library(self):
+        result = await self.server.call_tool("get_selection", {"library_id": "test-lib"})
+        self.assertFalse(result.is_error)
+        payload = result.structured_content
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["selection_in"], [])
+        self.assertEqual(payload["selection_out"], [])
+
+    async def test_get_selection_tool_unknown_library_reports_error(self):
+        result = await self.server.call_tool("get_selection", {"library_id": "no-such-lib"})
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+
+    async def test_propose_then_apply_selection_changes_roundtrip(self):
+        """硬性确认门禁：propose 绝不直接生效，必须走 apply 携带正确的
+        提案号+确认码才会真正改变 get_selection 能看到的状态。"""
+        propose_result = await self.server.call_tool(
+            "propose_selection_changes",
+            {"library_id": "test-lib", "changes": [{"path": "notes.md", "action": "out"}]},
+        )
+        self.assertFalse(propose_result.is_error)
+        propose_payload = propose_result.structured_content
+        self.assertTrue(propose_payload["ok"])
+        self.assertIn("proposal_id", propose_payload)
+        self.assertIn("confirmation_code", propose_payload)
+
+        # 还没 apply：get_selection 应该看不到任何变化
+        before = await self.server.call_tool("get_selection", {"library_id": "test-lib"})
+        self.assertEqual(before.structured_content["selection_out"], [])
+
+        apply_result = await self.server.call_tool(
+            "apply_selection_changes",
+            {
+                "library_id": "test-lib",
+                "proposal_id": propose_payload["proposal_id"],
+                "confirmation_code": propose_payload["confirmation_code"],
+            },
+        )
+        self.assertFalse(apply_result.is_error)
+        self.assertTrue(apply_result.structured_content["ok"])
+
+        after = await self.server.call_tool("get_selection", {"library_id": "test-lib"})
+        self.assertEqual(after.structured_content["selection_out"], ["notes.md"])
+
+    async def test_apply_selection_changes_wrong_code_reports_error_not_crash(self):
+        propose_result = await self.server.call_tool(
+            "propose_selection_changes",
+            {"library_id": "test-lib", "changes": [{"path": "notes.md", "action": "out"}]},
+        )
+        proposal_id = propose_result.structured_content["proposal_id"]
+        apply_result = await self.server.call_tool(
+            "apply_selection_changes",
+            {"library_id": "test-lib", "proposal_id": proposal_id, "confirmation_code": "000000"},
+        )
+        self.assertFalse(apply_result.is_error)
+        self.assertFalse(apply_result.structured_content["ok"])
+
+    async def test_propose_selection_changes_illegal_path_reports_error(self):
+        result = await self.server.call_tool(
+            "propose_selection_changes",
+            {"library_id": "test-lib", "changes": [{"path": "../escape.md", "action": "in"}]},
+        )
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+
+    async def test_propose_selection_changes_unknown_library_reports_error(self):
+        result = await self.server.call_tool(
+            "propose_selection_changes",
+            {"library_id": "no-such-lib", "changes": [{"path": "a.md", "action": "in"}]},
+        )
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+
     async def test_reindex_then_navigate_knowledge_tool(self):
         """真实走一遍 navigate_knowledge——不是 search_knowledge 的变体，
         是完全独立的"第二检索系统"（页级视觉导航，见
@@ -425,6 +498,9 @@ class TestMcpTools(TestMcpToolsAsyncBase):
                 "read_document",
                 "find_duplicates",
                 "note_relations",
+                "get_selection",
+                "propose_selection_changes",
+                "apply_selection_changes",
             },
         )
         search_tool = next(t for t in tools if t.name == "search_knowledge")

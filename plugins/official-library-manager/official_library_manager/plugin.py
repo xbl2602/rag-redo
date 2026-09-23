@@ -8,18 +8,24 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from core.write_gate import WriteGateError
+
 from .config import LibraryConfig, LibraryConfigStore
-from .selection import collect_included_files
+from .selection import apply_selection_changes, collect_included_files, normalize_selection_changes
 
 
 class LibraryManagerPlugin:
     def __init__(self) -> None:
         self.store: LibraryConfigStore | None = None
         self._settings = None
+        self._write_gate = None
+        self._logger = None
 
     def on_load(self, ctx):
         self.store = LibraryConfigStore(ctx.data_dir / "libraries.json")
         self._settings = ctx.settings
+        self._write_gate = ctx.write_gate
+        self._logger = ctx.logger
         ctx.logger.info("library-manager 已加载，%d 个库", len(self.store.list_libraries()))
 
     def on_enable(self, ctx):
@@ -31,6 +37,8 @@ class LibraryManagerPlugin:
     def on_unload(self, ctx):
         self.store = None
         self._settings = None
+        self._write_gate = None
+        self._logger = None
 
     def resolve_libraries(self, libraries: str = "", exclude: str = "") -> list[LibraryConfig]:
         """按"白名单减法"解析出这次检索该覆盖哪些库——对齐 obsidian-rag/
@@ -100,3 +108,63 @@ class LibraryManagerPlugin:
         if not root.exists():
             return []
         return sorted(str(p.relative_to(root)).replace("\\", "/") for p in root.rglob("*") if p.is_file())
+
+    # ---- 路径级勾选变更（写权限门禁保护，2026-09-23 全面功能审计B类）------
+    #
+    # 对齐 obsidian-rag 的 get_selection/propose_selection_changes/
+    # apply_selection_changes：判定逻辑（decide_included）早就有了，缺的
+    # 是"AI 想改这份配置"这条写路径。与 official-library-summary 的
+    # propose()/apply() 不同之处——**这里没有"此前非用户手写就直接生效"
+    # 的分支，永远走门禁**：被排除的文件会从整个 RAG 流程里消失（不扫描/
+    # 不嵌入/不OCR），风险等级比库简介文本高一截，obsidian-rag 原文档
+    # 用词是"硬性确认门禁：本工具绝不直接生效"，逐字照做。
+
+    def get_selection(self, library_id: str) -> dict:
+        """只读：查看某库当前的路径级勾选状态。"""
+        cfg = self.store.get(library_id) if self.store else None
+        if cfg is None:
+            raise KeyError(f"未知库: {library_id}")
+        return {"selection_in": list(cfg.selection_in), "selection_out": list(cfg.selection_out)}
+
+    def propose_selection_changes(self, library_id: str, changes: list[dict]) -> dict:
+        assert self.store is not None and self._write_gate is not None
+        cfg = self.store.get(library_id)
+        if cfg is None:
+            raise KeyError(f"未知库: {library_id}")
+        norm = normalize_selection_changes(changes)  # 非法项直接抛异常，整体拒绝
+        ticket = self._write_gate.propose(f"变更库「{library_id}」的路径级勾选", {
+            "library_id": library_id,
+            "changes": norm,
+        })
+        self._logger.info(
+            "勾选变更提案已生成（库=%s，提案=%s，%d 项）——等待用户确认",
+            library_id, ticket.proposal_id, len(norm),
+        )
+        return {
+            "ok": True,
+            "proposal_id": ticket.proposal_id,
+            "confirmation_code": ticket.confirmation_code,
+            "changes": norm,
+        }
+
+    def apply_selection_changes(self, library_id: str, proposal_id: str, confirmation_code: str) -> dict:
+        assert self.store is not None and self._write_gate is not None
+        try:
+            payload = self._write_gate.confirm(proposal_id, confirmation_code)
+        except WriteGateError as exc:
+            self._logger.warning(
+                "AUDIT 勾选变更提案被拒（库=%s，提案=%s）：%s", library_id, proposal_id, exc
+            )
+            return {"ok": False, "error": str(exc)}
+        if payload.get("library_id") != library_id:
+            return {"ok": False, "error": "提案与库名不匹配"}
+        cfg = self.store.get(library_id)
+        if cfg is None:
+            return {"ok": False, "error": f"未知库: {library_id}"}
+        new_in, new_out = apply_selection_changes(cfg.selection_in, cfg.selection_out, payload["changes"])
+        self.store.set_selection(library_id, selection_in=new_in, selection_out=new_out)
+        self._logger.info(
+            "AUDIT 勾选变更已生效（库=%s，提案=%s，经用户确认，%d 项）",
+            library_id, proposal_id, len(payload["changes"]),
+        )
+        return {"ok": True, "selection_in": new_in, "selection_out": new_out}
