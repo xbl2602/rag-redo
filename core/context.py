@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .datastore import DataStore
 from .resource_arbiter import ResourceArbiter
+from .write_gate import WriteGate
 
 
 @dataclass
@@ -19,6 +20,7 @@ class PluginContext:
     logger: logging.Logger
     data_store: DataStore
     resource_arbiter: ResourceArbiter
+    write_gate: WriteGate
     #: 本应用的数据根目录（向量库/配置/缓存都应该落在这底下）。插件绝不
     #: 应该自己硬编码一个相对路径当数据目录——那样的插件在"从桌面快捷方式
     #: 启动、cwd 不是仓库根目录"这种真实场景下会把数据写到意料之外的地方，

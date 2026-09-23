@@ -17,6 +17,7 @@ from .datastore import DataStore
 from .manifest import ManifestError, PluginManifest, load_manifest, validate_manifest
 from .registry import ExtensionRegistry
 from .resource_arbiter import ResourceArbiter
+from .write_gate import WriteGate
 
 
 class PluginState(str, Enum):
@@ -54,6 +55,7 @@ class PluginRuntime:
         data_dir: Path = Path("data"),
         data_store: DataStore | None = None,
         resource_arbiter: ResourceArbiter | None = None,
+        write_gate: WriteGate | None = None,
     ) -> None:
         self.plugins_dir = plugins_dir
         self.state_file = state_file
@@ -61,6 +63,7 @@ class PluginRuntime:
         self.registry = ExtensionRegistry()
         self.data_store = data_store if data_store is not None else DataStore()
         self.resource_arbiter = resource_arbiter if resource_arbiter is not None else ResourceArbiter()
+        self.write_gate = write_gate if write_gate is not None else WriteGate()
         self.plugins: dict[str, Plugin] = {}
         self._logger = logging.getLogger("rag_redo.core.runtime")
         self._enabled_ids: set[str] = self._load_state()
@@ -191,6 +194,7 @@ class PluginRuntime:
             logger=logging.getLogger(f"rag_redo.plugin.{plugin_id}"),
             data_store=self.data_store,
             resource_arbiter=self.resource_arbiter,
+            write_gate=self.write_gate,
             data_dir=self.data_dir,
         )
 
