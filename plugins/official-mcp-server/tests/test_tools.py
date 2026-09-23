@@ -265,6 +265,44 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertFalse(result.is_error)
         self.assertFalse(result.structured_content["ok"])
 
+    async def test_note_relations_tool_resolves_mutual_wikilinks(self):
+        vault = self.tmp / "vault"
+        (vault / "notes.md").write_text(
+            "# 插件架构\n\n这篇笔记讲插件系统的架构设计，参见 [[笔记B]]。", encoding="utf-8"
+        )
+        (vault / "笔记B.md").write_text("# 笔记B\n\n回链到 [[notes|插件架构]]。", encoding="utf-8")
+        await self._reindex_and_wait("test-lib")
+
+        forward = await self.server.call_tool("note_relations", {"library_id": "test-lib", "path": "notes.md"})
+        self.assertFalse(forward.is_error)
+        forward_payload = forward.structured_content
+        self.assertTrue(forward_payload["ok"])
+        self.assertTrue(forward_payload["resolved"])
+        self.assertEqual(forward_payload["file"], "notes.md")
+        self.assertEqual(forward_payload["outlinks"], ["笔记B.md"])
+        self.assertEqual(forward_payload["inlinks"], ["笔记B.md"])  # 笔记B也反过来链了回来
+
+        # 按不含扩展名的标题查询同一篇笔记，应解析到同一个文件
+        by_title = await self.server.call_tool("note_relations", {"library_id": "test-lib", "path": "notes"})
+        self.assertEqual(by_title.structured_content["file"], "notes.md")
+
+    async def test_note_relations_tool_unresolved_note_reports_resolved_false(self):
+        await self._reindex_and_wait("test-lib")
+        result = await self.server.call_tool(
+            "note_relations", {"library_id": "test-lib", "path": "不存在的笔记"}
+        )
+        self.assertFalse(result.is_error)
+        payload = result.structured_content
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["resolved"])
+
+    async def test_note_relations_tool_unknown_library_reports_error(self):
+        result = await self.server.call_tool(
+            "note_relations", {"library_id": "no-such-lib", "path": "notes.md"}
+        )
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+
     async def test_reindex_then_navigate_knowledge_tool(self):
         """真实走一遍 navigate_knowledge——不是 search_knowledge 的变体，
         是完全独立的"第二检索系统"（页级视觉导航，见
@@ -386,6 +424,7 @@ class TestMcpTools(TestMcpToolsAsyncBase):
                 "wemm_status",
                 "read_document",
                 "find_duplicates",
+                "note_relations",
             },
         )
         search_tool = next(t for t in tools if t.name == "search_knowledge")

@@ -18,6 +18,7 @@ from typing import Callable
 from .contracts import DocumentContent, ExtractedDocument, LibrarySummary, PageHit, SampledChunk, SearchResult
 from .extract_cache import ExtractCache
 from .index_progress import IndexProgressTracker
+from .note_relations import NoteRelationsStore, extract_wikilink_targets
 from .runtime import PluginRuntime
 
 
@@ -97,6 +98,7 @@ class Pipeline:
         # 持有，同"谁需要就给谁配、不无谓扩大插件可见接口"的原则。
         self._extract_cache = ExtractCache(runtime.data_dir / "extracted")
         self._index_progress = IndexProgressTracker(runtime.data_dir / "index_progress")
+        self._note_relations = NoteRelationsStore(runtime.data_dir / "note_relations")
 
     # ---- 插件解析 --------------------------------------------------------
 
@@ -172,6 +174,7 @@ class Pipeline:
 
         report = IndexReport(library_id=library_id)
         pdf_paths: list[str] = []  # 供后面 visual_index 后置阶段复用，不再问 library_manager 第二遍
+        links_by_path: dict[str, list[str]] = {}  # 供 note_relations 现算入链，见 core/note_relations.py 模块 docstring
         included_files = lib_mgr.resolve_included_files(library_id)
         files_total = len(included_files)
         for files_done, (path, included, reason) in enumerate(included_files, start=1):
@@ -192,6 +195,9 @@ class Pipeline:
             # 缓存工作，不需要索引之后再重新跑一遍提取（尤其是OCR，重新
             # 跑代价很高）。见 core/extract_cache.py 模块 docstring。
             self._extract_cache.write(library_id, path, doc.text)
+            # wikilink 出链记录（core/note_relations.py，2026-09-23 补齐）
+            # ——复用同一份已提取正文，不额外触发一次提取或额外的插件调用。
+            links_by_path[path] = extract_wikilink_targets(doc.text)
 
             chunks = chunker.chunk(doc)
             if not chunks:
@@ -238,7 +244,27 @@ class Pipeline:
             visual = self._plugin(plugin_id)
             visual.index_library(library_id, root, pdf_paths)
 
+        # 整库出链数据一次性覆盖写（不是逐文件增量写）——同索引本身"不做
+        # 增量、全量重跑"的节奏一致，见 core/note_relations.py 模块 docstring。
+        self._note_relations.write_library(library_id, links_by_path)
+
         return report
+
+    def note_relations(self, library_id: str, path: str) -> dict:
+        """双链关系查询（对齐 obsidian-rag 的 `note_relations` 工具）：
+        给定笔记标识（库内相对路径，或不含扩展名的标题），返回其出链
+        （本文链接到谁）与入链（谁链接到本文），基于最近一次
+        `index_library()` 记录的 `[[wikilink]]` 目标现算——只存出链，
+        入链永远现算，见 `core/note_relations.py` 模块 docstring。
+
+        库不存在会报错（同其他工具一致的"未知库"处理）；库存在但从没
+        索引过、或指定的笔记不存在/找不到，都返回 `resolved=False`，
+        不是错误，调用方自己决定怎么展示这两种"没有关系数据"的情况。
+        """
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+        return self._note_relations.resolve(library_id, path)
 
     def start_index_library(self, library_id: str) -> tuple[bool, str]:
         """后台重建索引——对齐 obsidian-rag 的 `reindex_knowledge`"后台

@@ -41,6 +41,7 @@ CORE_SUITES = [
     "test_settings",
     "test_extract_cache",
     "test_index_progress",
+    "test_note_relations",
     "test_runtime",
     "test_subprocess_service",
     "test_pipeline_e2e",

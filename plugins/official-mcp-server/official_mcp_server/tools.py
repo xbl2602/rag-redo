@@ -177,6 +177,29 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         return {"ok": True, "groups": groups_by_provider}
 
     @server.tool()
+    def note_relations(library_id: str, path: str) -> dict[str, Any]:
+        """查询某篇笔记的双链关系（出链=本文链接到谁、入链=谁链接到本文），
+        基于 Obsidian `[[wiki链接]]` 语法（对齐 obsidian-rag 的
+        `note_relations` 工具）。这是独立于 search_knowledge 的关系查询，
+        不参与语义检索排序，用于在搜到一篇笔记后"顺着链接找相关笔记"。
+
+        `path`：笔记的库内相对路径（如 "20-Projects/机器.md"）或不含扩展名
+        的标题（如 "机器"，Obsidian 双链引用同款写法）——先按路径精确匹配，
+        找不到再按标题匹配，标题在库内重名时任取其一，与 Obsidian 自身
+        处理同名笔记的方式一样存在歧义。库从没建过索引、或指定的笔记
+        不存在/无法解析，都返回 `resolved=False`（不是错误）。
+
+        Args:
+            library_id: 笔记所在库的 id（用 list_libraries 查看有哪些库）
+            path: 库内相对路径，或不含扩展名的标题
+        """
+        try:
+            result = pipeline.note_relations(library_id, path)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, **result}
+
+    @server.tool()
     def list_libraries() -> list[dict]:
         """列出所有已注册的库及其基本信息，含每个库的简介（导航/澄清性质
         的一段话，帮你在真正检索/通读全文之前先判断"这个库值不值得往这
