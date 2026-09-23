@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .datastore import DataStore
+from .manifest import RuntimeSpec
 from .resource_arbiter import ResourceArbiter
 from .write_gate import WriteGate
 
@@ -27,3 +28,10 @@ class PluginContext:
     #: 或者压根找不到之前写的数据。AGENTS.md 架构红线7"所有数据落在 data/
     #: 目录下"说的就是这个目录，来源必须是 ctx，不是插件自己拼字符串。
     data_dir: Path
+    #: 这个插件自己在 plugin.toml 里声明的 [runtime] 段——subprocess_service
+    #: 插件的 on_enable/on_disable 从这里读 command/health_check/
+    #: env_bootstrap，用 core.subprocess_service.SubprocessServiceHandle
+    #: 启动/终止自己的子进程，而不是在 Python 代码里把 command 再硬编码
+    #: 一遍（plugin.toml 是唯一权威来源，见 docs/DATA_FLOW.md"同一件事只
+    #: 能在一处定义"）。in_process 插件通常用不到这个字段。
+    runtime: RuntimeSpec

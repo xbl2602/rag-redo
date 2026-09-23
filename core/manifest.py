@@ -130,8 +130,17 @@ def validate_manifest(manifest: PluginManifest) -> list[str]:
         )
     if manifest.runtime.kind == "in_process" and not manifest.runtime.entry:
         errors.append("in_process 插件必须声明 runtime.entry")
-    if manifest.runtime.kind == "subprocess_service" and not manifest.runtime.command:
-        errors.append("subprocess_service 插件必须声明 runtime.command")
+    if manifest.runtime.kind == "subprocess_service":
+        if not manifest.runtime.command:
+            errors.append("subprocess_service 插件必须声明 runtime.command")
+        if not manifest.runtime.entry:
+            # subprocess_service 插件也要有一个本地 Python 入口类——它在
+            # on_enable/on_disable 里用 core.subprocess_service 启动/终止
+            # 声明的 command、暴露的方法内部转发成对子进程的HTTP调用，见
+            # docs/PLUGIN_SPEC.md 第3节生命周期表"subprocess_service在这
+            # 一步拉起子进程"。真正跑模型/重依赖的是子进程，entry 指向的
+            # 这个类本身很薄，不需要装任何重依赖。
+            errors.append("subprocess_service 插件必须声明 runtime.entry（本地转发类，见 core/subprocess_service.py）")
     for point, cardinality in manifest.provides.items():
         if cardinality not in ("singleton", "multi"):
             errors.append(

@@ -171,14 +171,16 @@ class PluginRuntime:
     # ---- 内部 ----------------------------------------------------------
 
     def _instantiate(self, manifest: PluginManifest) -> object:
-        if manifest.runtime.kind != "in_process":
-            raise NotImplementedError(
-                f"{manifest.id}: subprocess_service 插件的启动在 Phase 2 实现，"
-                "Phase 0 只跑 in_process 示例"
-            )
+        # in_process 和 subprocess_service 用同一条实例化路径：两者都通过
+        # runtime.entry 指向一个本地 Python 类。区别只在于这个类的
+        # on_enable/on_disable 内部做什么——in_process 直接做真正的工作，
+        # subprocess_service 用 core.subprocess_service.SubprocessServiceHandle
+        # 启动/终止一个真正跑重依赖的子进程，把方法调用转发成本机HTTP请求。
+        # 见 docs/PLUGIN_SPEC.md 第3节。
+        #
         # 简化处理：把插件目录加进 sys.path 才能 import 它的入口模块。真正的
-        # 每插件导入隔离（防止两个插件用了同名顶层模块互相冲突）留给 Phase 1
-        # 有真实依赖冲突风险时再做，Phase 0 的目标只是证明生命周期机制本身能跑通。
+        # 每插件导入隔离（防止两个插件用了同名顶层模块互相冲突）留给有真实
+        # 依赖冲突风险时再做，当前的目标只是证明生命周期机制本身能跑通。
         source_dir = str(manifest.source_dir)
         if source_dir not in sys.path:
             sys.path.insert(0, source_dir)
@@ -189,6 +191,8 @@ class PluginRuntime:
         return cls()
 
     def _make_context(self, plugin_id: str) -> PluginContext:
+        manifest = self.plugins[plugin_id].manifest
+        assert manifest is not None  # ctx 只在插件通过校验后才会被构造
         return PluginContext(
             plugin_id=plugin_id,
             logger=logging.getLogger(f"rag_redo.plugin.{plugin_id}"),
@@ -196,6 +200,7 @@ class PluginRuntime:
             resource_arbiter=self.resource_arbiter,
             write_gate=self.write_gate,
             data_dir=self.data_dir,
+            runtime=manifest.runtime,
         )
 
     def _require(self, plugin_id: str) -> Plugin:
