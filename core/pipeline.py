@@ -141,6 +141,16 @@ class Pipeline:
             file_report.extracted = True
             file_report.chunk_count = len(chunks)
 
+        if hasattr(lexical, "save"):
+            # BM25 索引不像 Chroma 那样每次 upsert 自动落盘，攒到一整个库
+            # 处理完再存一次——见 official-lexical-bm25 插件的模块 docstring
+            # （早期实现完全没有这一步，进程重启后 BM25 那一路会悄悄清空，
+            # 是端到端测试之外才发现的真实缺口）。`hasattr` 判断是因为
+            # `lexical_index` 扩展点目前没有强制的接口契约，不是所有实现
+            # 都必须支持持久化——见 docs/PLUGIN_SPEC.md 对 Phase 1 阶段
+            # "先把官方实现做对、通用契约留给后续显现真实需求"的说明。
+            lexical.save(library_id)
+
         return report
 
     # ---- 查询态 --------------------------------------------------------

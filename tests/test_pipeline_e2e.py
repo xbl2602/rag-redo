@@ -73,42 +73,55 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         )
 
         self.data_dir = self.tmp / "data"
-        self.runtime = PluginRuntime(
+        self.runtime, self.pipeline = self._build_runtime()
+        self.lib_mgr = self.runtime.plugins["official-library-manager"].instance
+        self.lib_mgr.store.add_library("test-lib", "测试库", str(self.vault))
+
+    def _build_runtime(self) -> tuple[PluginRuntime, Pipeline]:
+        """启动一套完整的插件运行时+Pipeline，指向 self.data_dir。独立成
+        方法是为了能在同一个 data_dir 上模拟"进程重启"——新建一个运行时
+        实例、重新扫描/加载/启用，验证数据是不是真的从磁盘活过来了，而
+        不是只活在第一个运行时实例的内存里（见
+        test_bm25_search_survives_process_restart）。"""
+        runtime = PluginRuntime(
             REPO_ROOT / "plugins",
             state_file=self.tmp / "plugins_state.json",
             data_dir=self.data_dir,
         )
-        self.runtime.scan()
+        runtime.scan()
         for plugin_id in OFFICIAL_PHASE1_PLUGINS:
-            self.assertIn(plugin_id, self.runtime.plugins, f"{plugin_id} 应该被发现")
-            self.runtime.load(plugin_id)
+            self.assertIn(plugin_id, runtime.plugins, f"{plugin_id} 应该被发现")
+            # scan() 会自动恢复"重启前就是启用状态"的插件（Phase 0 验证过
+            # 的行为：核心重启后插件自己回到之前的状态，不需要用户每次都
+            # 手动重新启用）。模拟重启时这里会正好命中这条路径——插件在
+            # scan() 这一步就已经是 ENABLED 了，不需要（也不能）再走一遍
+            # load()，那样什么都不做（load 只处理 DISCOVERED 状态）。
+            if runtime.plugins[plugin_id].state != PluginState.ENABLED:
+                runtime.load(plugin_id)
+                self.assertEqual(
+                    runtime.plugins[plugin_id].state,
+                    PluginState.LOADED,
+                    f"{plugin_id} 加载失败: {runtime.plugins[plugin_id].error}",
+                )
+                runtime.enable(plugin_id)
             self.assertEqual(
-                self.runtime.plugins[plugin_id].state,
-                PluginState.LOADED,
-                f"{plugin_id} 加载失败: {self.runtime.plugins[plugin_id].error}",
-            )
-            self.runtime.enable(plugin_id)
-            self.assertEqual(
-                self.runtime.plugins[plugin_id].state,
+                runtime.plugins[plugin_id].state,
                 PluginState.ENABLED,
-                f"{plugin_id} 启用失败: {self.runtime.plugins[plugin_id].error}",
+                f"{plugin_id} 启用失败: {runtime.plugins[plugin_id].error}",
             )
 
         # 注入假 encoder/reranker，避免端到端测试下载真实模型。
         from official_embedder_bge_m3.embed import BGEM3Embedder
 
-        embedder_instance = self.runtime.plugins["official-embedder-bge-m3"].instance
+        embedder_instance = runtime.plugins["official-embedder-bge-m3"].instance
         embedder_instance.embedder = BGEM3Embedder(encoder=_DeterministicFakeEncoder())
 
         from official_reranker.rerank import RerankerEngine
 
-        reranker_instance = self.runtime.plugins["official-reranker"].instance
+        reranker_instance = runtime.plugins["official-reranker"].instance
         reranker_instance.engine = RerankerEngine(reranker=_DeterministicFakeReranker())
 
-        self.lib_mgr = self.runtime.plugins["official-library-manager"].instance
-        self.lib_mgr.store.add_library("test-lib", "测试库", str(self.vault))
-
-        self.pipeline = Pipeline(self.runtime)
+        return runtime, Pipeline(runtime)
 
     def test_data_dir_is_isolated_tmp_dir_not_hardcoded_relative_path(self):
         """插件的数据落在测试传入的隔离 data_dir 下，而不是插件自己硬编码
@@ -163,6 +176,23 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         for r in results:
             self.assertGreaterEqual(r.confidence, 0.0)
             self.assertLessEqual(r.confidence, 1.0)
+
+    def test_bm25_search_survives_process_restart(self):
+        """真实缺口回归测试：早期实现里 BM25 词法索引完全只活在内存里，
+        Chroma 向量数据落盘了但 BM25 没有——进程一重启，词法这一路会悄悄
+        变空，检索质量在用户不知情的情况下退化（不报错，只是排名/召回
+        变差），比直接崩溃更难发现。用 self._build_runtime() 新建一个
+        运行时实例模拟"重启"，只走 search，不重新 index_library，如果
+        BM25 索引真的从磁盘活过来了，检索质量应该和重启前一样。"""
+        self.pipeline.index_library("test-lib")
+        before = self.pipeline.search("test-lib", "插件 架构", top_k=5)
+        self.assertTrue(before)
+
+        _restarted_runtime, restarted_pipeline = self._build_runtime()
+        after = restarted_pipeline.search("test-lib", "插件 架构", top_k=5)
+
+        self.assertTrue(after, "重启后应该还能搜到结果，不该因为BM25索引丢失而变空")
+        self.assertEqual([r.path for r in before], [r.path for r in after])
 
     def test_lexical_search_is_isolated_per_library(self):
         """回归测试：official-lexical-bm25 早期实现只有一个全局 BM25Index，

@@ -8,10 +8,12 @@
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import jieba
 
@@ -107,3 +109,40 @@ class BM25Index:
                 scores[posting.doc_id] += idf * (posting.term_freq * (self.k1 + 1)) / denom
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
         return ranked[:top_k]
+
+    def save(self, path: Path) -> None:
+        """落盘：只存 doc_lengths + doc_tokens_cache，_postings 是它俩的
+        倒排索引视图，加载时重新推导即可，不用重复存一份容易和原数据
+        对不上的冗余状态。用 JSON 不用 pickle——这份数据完全是简单类型
+        （字符串/整数的字典），JSON 够用且没有反序列化任意代码执行的
+        隐患，没有理由为了省几行代码换一个有安全面的格式。"""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "k1": self.k1,
+            "b": self.b,
+            "doc_lengths": self._doc_lengths,
+            "doc_tokens_cache": {doc_id: dict(counts) for doc_id, counts in self._doc_tokens_cache.items()},
+        }
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: Path) -> "BM25Index":
+        """文件不存在或损坏都安全降级成空索引，不崩溃——同
+        AGENTS.md"失败折叠成诚实终态"纪律；空索引意味着这个库下一次
+        reindex_knowledge 之前搜不到东西，比进程直接崩溃或读到一份
+        损坏数据继续跑安全得多。"""
+        if not path.exists():
+            return cls()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return cls()
+        idx = cls(k1=data.get("k1", 1.5), b=data.get("b", 0.75))
+        idx._doc_lengths = dict(data.get("doc_lengths", {}))
+        idx._doc_tokens_cache = {
+            doc_id: Counter(counts) for doc_id, counts in data.get("doc_tokens_cache", {}).items()
+        }
+        for doc_id, counts in idx._doc_tokens_cache.items():
+            for term, freq in counts.items():
+                idx._postings[term].append(_Posting(doc_id=doc_id, term_freq=freq))
+        return idx

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -80,6 +82,57 @@ class TestBM25Index(unittest.TestCase):
         idx.add("d2", "今天天气")
         results = idx.search("embedder 扩展点")
         self.assertEqual(results[0][0], "d1")
+
+
+class TestBM25IndexPersistence(unittest.TestCase):
+    """索引重启后不该悄悄清空——这是端到端场景里才会暴露的真实缺口
+    （Chroma 向量数据持久化，BM25 原本完全不落盘），见
+    official_lexical_bm25/plugin.py 模块 docstring。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = self.tmp / "lib1.json"
+
+    def test_load_missing_file_returns_empty_index(self):
+        idx = BM25Index.load(self.path)
+        self.assertEqual(idx.doc_count, 0)
+
+    def test_save_then_load_preserves_search_results(self):
+        idx = BM25Index()
+        idx.add("d1", "插件系统的架构设计")
+        idx.add("d2", "今天天气不错")
+        idx.save(self.path)
+
+        loaded = BM25Index.load(self.path)
+        self.assertEqual(loaded.doc_count, 2)
+        results = loaded.search("插件系统")
+        self.assertEqual(results[0][0], "d1")
+
+    def test_save_then_load_preserves_k1_and_b(self):
+        idx = BM25Index(k1=2.0, b=0.5)
+        idx.add("d1", "内容")
+        idx.save(self.path)
+        loaded = BM25Index.load(self.path)
+        self.assertEqual(loaded.k1, 2.0)
+        self.assertEqual(loaded.b, 0.5)
+
+    def test_corrupted_file_degrades_to_empty_not_crash(self):
+        self.path.write_text("{not valid json", encoding="utf-8")
+        idx = BM25Index.load(self.path)
+        self.assertEqual(idx.doc_count, 0)
+
+    def test_loaded_index_supports_further_add_and_remove(self):
+        idx = BM25Index()
+        idx.add("d1", "插件系统")
+        idx.save(self.path)
+
+        loaded = BM25Index.load(self.path)
+        loaded.add("d2", "又一篇插件笔记")
+        loaded.remove("d1")
+        self.assertEqual(loaded.doc_count, 1)
+        results = loaded.search("插件")
+        self.assertEqual(results[0][0], "d2")
 
 
 if __name__ == "__main__":
