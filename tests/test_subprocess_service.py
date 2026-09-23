@@ -168,5 +168,102 @@ class TestFindFreePort(unittest.TestCase):
         self.assertEqual(len(ports), 5)
 
 
+class _FakeLogger:
+    def __init__(self) -> None:
+        self.infos: list[str] = []
+        self.warnings: list[str] = []
+
+    def info(self, msg, *args):
+        self.infos.append(msg % args if args else msg)
+
+    def warning(self, msg, *args):
+        self.warnings.append(msg % args if args else msg)
+
+
+class TestResolvePluginPythonEnvBootstrap(unittest.TestCase):
+    """env_bootstrap 真正执行的回归测试（2026-09-23 补齐，此前只有
+    "已知简化"的占位）。用真实子进程跑一个自包含的临时脚本（不碰真实
+    网络/pip，只是脚本自己在约定路径造一个假 python 可执行文件），验证
+    的是"核心真的会跑这个脚本、真的按约定路径重新探测"这条编排逻辑本身
+    对不对，不是"pip 装依赖装得对不对"——后者是插件自己 env_bootstrap
+    脚本内容的责任，不是 core/subprocess_service.py 的责任。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _venv_python_path(self) -> Path:
+        if sys.platform == "win32":
+            return self.tmp / ".venv" / "Scripts" / "python.exe"
+        return self.tmp / ".venv" / "bin" / "python"
+
+    def test_no_venv_no_bootstrap_falls_back_to_core_interpreter(self):
+        from core.subprocess_service import resolve_plugin_python
+
+        self.assertEqual(resolve_plugin_python(self.tmp), sys.executable)
+
+    def test_existing_venv_returned_without_running_bootstrap(self):
+        from core.subprocess_service import resolve_plugin_python
+
+        venv_python = self._venv_python_path()
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("not a real interpreter, just needs to exist", encoding="utf-8")
+        # env_bootstrap 指向一个不存在的脚本——如果真的被跑了会报错，这里
+        # 用来证明"已经有独立venv"这条分支绝不会真的去跑脚本（幂等）。
+        self.assertEqual(
+            resolve_plugin_python(self.tmp, env_bootstrap="does-not-exist.py"), str(venv_python)
+        )
+
+    def test_bootstrap_script_runs_and_new_venv_is_picked_up(self):
+        """脚本真的执行（真实子进程，不是 mock）、在约定路径造出解释器
+        文件后，重新探测应该真的找到它——证明"跑完脚本→重新探测"这条
+        编排逻辑是真实生效的，不是纸面设计。"""
+        from core.subprocess_service import resolve_plugin_python
+
+        script = self.tmp / "env_bootstrap.py"
+        script.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "venv_python = Path(__file__).parent / '.venv' / ('Scripts/python.exe' if sys.platform == 'win32' else 'bin/python')\n"
+            "venv_python.parent.mkdir(parents=True, exist_ok=True)\n"
+            "venv_python.write_text('fake interpreter created by bootstrap')\n",
+            encoding="utf-8",
+        )
+        logger = _FakeLogger()
+        result = resolve_plugin_python(self.tmp, env_bootstrap="env_bootstrap.py", logger=logger, bootstrap_timeout=30.0)
+        self.assertEqual(result, str(self._venv_python_path()))
+        self.assertTrue(any("首次启用" in msg for msg in logger.infos))
+
+    def test_missing_bootstrap_script_folds_to_core_interpreter_with_warning(self):
+        from core.subprocess_service import resolve_plugin_python
+
+        logger = _FakeLogger()
+        result = resolve_plugin_python(self.tmp, env_bootstrap="no-such-script.py", logger=logger)
+        self.assertEqual(result, sys.executable)
+        self.assertTrue(logger.warnings)
+
+    def test_bootstrap_script_nonzero_exit_folds_to_core_interpreter_with_warning(self):
+        from core.subprocess_service import resolve_plugin_python
+
+        script = self.tmp / "env_bootstrap.py"
+        script.write_text("import sys\nsys.stderr.write('boom')\nsys.exit(1)\n", encoding="utf-8")
+        logger = _FakeLogger()
+        result = resolve_plugin_python(self.tmp, env_bootstrap="env_bootstrap.py", logger=logger, bootstrap_timeout=30.0)
+        self.assertEqual(result, sys.executable)
+        self.assertTrue(any("boom" in msg for msg in logger.warnings))
+
+    def test_bootstrap_succeeds_but_no_venv_produced_folds_to_core_interpreter(self):
+        """脚本本身"成功"退出（returncode=0）但没有在约定路径生成解释器
+        （比如脚本写错了路径）——不该假装找到了什么，老老实实退化。"""
+        from core.subprocess_service import resolve_plugin_python
+
+        script = self.tmp / "env_bootstrap.py"
+        script.write_text("pass\n", encoding="utf-8")
+        logger = _FakeLogger()
+        result = resolve_plugin_python(self.tmp, env_bootstrap="env_bootstrap.py", logger=logger, bootstrap_timeout=30.0)
+        self.assertEqual(result, sys.executable)
+        self.assertTrue(logger.warnings)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -66,6 +66,11 @@ class TestMcpToolsAsyncBase(unittest.IsolatedAsyncioTestCase):
 
         self._wemm_env_backup = os.environ.get("RAG_REDO_FAKE_WEMM")
         os.environ["RAG_REDO_FAKE_WEMM"] = "1"
+        # official-visual-wemm 现在声明了真实的 env_bootstrap（会真的 pip
+        # install torch 等重依赖）——理由同 official-visual-wemm/tests/
+        # test_plugin.py 里同名注释，测试跳过真实建独立环境这一步。
+        self._skip_bootstrap_backup = os.environ.get("RAG_REDO_SKIP_ENV_BOOTSTRAP")
+        os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = "1"
         self.addCleanup(self._restore_wemm_env)
 
         vault = self.tmp / "vault"
@@ -125,6 +130,10 @@ class TestMcpToolsAsyncBase(unittest.IsolatedAsyncioTestCase):
             os.environ.pop("RAG_REDO_FAKE_WEMM", None)
         else:
             os.environ["RAG_REDO_FAKE_WEMM"] = self._wemm_env_backup
+        if self._skip_bootstrap_backup is None:
+            os.environ.pop("RAG_REDO_SKIP_ENV_BOOTSTRAP", None)
+        else:
+            os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = self._skip_bootstrap_backup
 
 
 class TestMcpTools(TestMcpToolsAsyncBase):

@@ -63,6 +63,13 @@ class TestVisualWemmPlugin(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self._env_backup = os.environ.get("RAG_REDO_FAKE_WEMM")
         os.environ["RAG_REDO_FAKE_WEMM"] = "1"
+        # 这个插件现在声明了真实的 env_bootstrap（会真的 pip install
+        # torch 等几GB重依赖）——测试纪律要求不碰真实网络/不拖成几分钟
+        # （见 core/subprocess_service.py::resolve_plugin_python 的
+        # RAG_REDO_SKIP_ENV_BOOTSTRAP 说明），这里显式跳过，测试只关心
+        # 子进程+HTTP+仲裁这条架构链路，不关心真实依赖装没装。
+        self._skip_bootstrap_backup = os.environ.get("RAG_REDO_SKIP_ENV_BOOTSTRAP")
+        os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = "1"
         self.addCleanup(self._restore_env)
 
         self.vault = self.tmp / "vault"
@@ -88,6 +95,10 @@ class TestVisualWemmPlugin(unittest.TestCase):
             os.environ.pop("RAG_REDO_FAKE_WEMM", None)
         else:
             os.environ["RAG_REDO_FAKE_WEMM"] = self._env_backup
+        if self._skip_bootstrap_backup is None:
+            os.environ.pop("RAG_REDO_SKIP_ENV_BOOTSTRAP", None)
+        else:
+            os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = self._skip_bootstrap_backup
 
     def test_enable_acquires_gpu_lease(self):
         self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "official-visual-wemm")

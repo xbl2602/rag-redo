@@ -72,6 +72,7 @@ class VisualWemmPlugin:
         self._plugin_dir: Path | None = None
         self._runtime_health_check: str | None = None
         self._runtime_command: tuple[str, ...] | None = None
+        self._runtime_env_bootstrap: str | None = None
 
     def on_load(self, ctx):
         persist_dir = ctx.data_dir / "visual_wemm" / "chroma"
@@ -89,6 +90,7 @@ class VisualWemmPlugin:
         self._plugin_dir = Path(__file__).parent
         self._runtime_health_check = ctx.runtime.health_check
         self._runtime_command = ctx.runtime.command
+        self._runtime_env_bootstrap = ctx.runtime.env_bootstrap
         self._enabled = True
         self._start_handle()
 
@@ -103,7 +105,7 @@ class VisualWemmPlugin:
 
     def _start_handle(self) -> None:
         assert self._plugin_dir is not None and self._runtime_command is not None
-        python = resolve_plugin_python(self._plugin_dir)
+        python = resolve_plugin_python(self._plugin_dir, env_bootstrap=self._runtime_env_bootstrap, logger=self._logger)
         command = tuple(arg.replace("{python}", python) for arg in self._runtime_command)
         self._handle = SubprocessServiceHandle(command, health_check=self._runtime_health_check, cwd=self._plugin_dir)
         self._handle.start()

@@ -27,26 +27,92 @@ import urllib.request
 from pathlib import Path
 
 
-def resolve_plugin_python(plugin_dir: Path) -> str:
+class EnvBootstrapError(Exception):
+    """env_bootstrap 脚本执行失败（venv 创建失败/脚本报错/超时）。调用方
+    （resolve_plugin_python）自己捕获并折叠成"退化用核心解释器"，这个
+    异常类型本身只是让失败原因可读，不是要往外传播炸宿主进程。"""
+
+
+def _venv_python_path(venv_dir: Path) -> Path:
+    if sys.platform == "win32":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
+def _run_env_bootstrap(plugin_dir: Path, env_bootstrap: str, *, timeout: float, logger) -> None:
+    """用核心自己的解释器跑一次插件声明的 env_bootstrap 脚本——脚本本身
+    负责"在 <plugin_dir>/.venv 建一个独立 venv、pip 装好 requirements.txt
+    列的依赖"，核心不替插件决定装什么，只负责"跑这个脚本、把结果记录
+    下来"。约定脚本是一个 `.py` 文件（不是 `.sh`/`.bat`）——Windows 优先
+    是硬性要求（AGENTS.md 五条约束第5条），一份纯 Python 脚本不需要用户
+    机器上有 bash/WSL 才能跑，用核心自己已经在跑的这个解释器执行就行，
+    不需要额外引入 shell 依赖。"""
+    script = plugin_dir / env_bootstrap
+    if not script.is_file():
+        raise EnvBootstrapError(f"env_bootstrap 脚本缺失: {script}")
+    logger.info("插件 %s 首次启用，正在建独立环境（%s）……这一步可能要几分钟", plugin_dir.name, env_bootstrap)
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(plugin_dir),
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise EnvBootstrapError(f"env_bootstrap 超时（>{timeout:.0f}s）: {exc}") from exc
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")[:2000]
+        raise EnvBootstrapError(f"env_bootstrap 退出码 {result.returncode}: {stderr}")
+    logger.info("插件 %s 独立环境已就绪", plugin_dir.name)
+
+
+def resolve_plugin_python(
+    plugin_dir: Path,
+    *,
+    env_bootstrap: str | None = None,
+    logger=None,
+    bootstrap_timeout: float = 1800.0,
+) -> str:
     """subprocess_service 插件应该用自己 env_bootstrap 建出来的独立解释器
     跑子进程，不是核心的 `.venv`——两者必须互相隔离（架构红线7"不碰系统/
     其他环境"的插件间版本）。按约定路径找：
     `<plugin_dir>/.venv/bin/python`（POSIX）或
     `<plugin_dir>/.venv/Scripts/python.exe`（Windows）。
 
-    **已知的、刻意的简化**：`env_bootstrap` 声明字段目前还没有被核心真正
-    执行过（见 docs/ROADMAP.md Phase 2 状态说明），约定路径下大概率找不到
-    独立 venv——这时退化成用核心自己的解释器，不是假装这件事已经解决了。
-    对于当前用纯标准库、不需要任何重依赖的 subprocess_service 参考实现
-    （official-ocr-mineru-local）来说这个退化本身没有问题；一旦真的需要
-    安装重依赖（比如真实 OCR 模型），`env_bootstrap` 的执行逻辑必须先落地，
-    不能让插件在没有真正独立环境的情况下悄悄把重依赖装进核心 venv。"""
-    posix_python = plugin_dir / ".venv" / "bin" / "python"
-    if posix_python.exists():
-        return str(posix_python)
-    windows_python = plugin_dir / ".venv" / "Scripts" / "python.exe"
-    if windows_python.exists():
-        return str(windows_python)
+    **env_bootstrap 真正执行（2026-09-23 补齐，此前是已知的刻意简化）**：
+    约定路径下找不到独立 venv、且插件声明了 `env_bootstrap` 时，"首次
+    启用时跑一次"（docs/PLUGIN_SPEC.md 第3节的原话）——阻塞式跑一遍脚本
+    （可能要几分钟，同"第一次搜索要下载模型"的用户预期一致，不是卡死），
+    再重新探测。跑完探测还是找不到、或者脚本本身执行失败，一律 fail-open
+    退化用核心自己的解释器（同没声明 env_bootstrap 时的原有行为）并把
+    原因记进日志——不是静默假装成功，调用方（插件的 on_enable，最终会
+    体现成子进程用错误的解释器启动失败）能看到清楚的失败原因。没有声明
+    env_bootstrap 的插件（比如当前的 official-ocr-mineru-local 参考
+    实现，只用标准库、没有真实重依赖）行为不变。
+
+    **`RAG_REDO_SKIP_ENV_BOOTSTRAP` 环境变量**：测试套件用——真实的
+    env_bootstrap 脚本可能会真的 `pip install torch` 这种几百MB到几GB
+    的重依赖，测试纪律要求 `tests/run.py` 不碰真实网络/不拖成几分钟
+    （同 `RAG_REDO_FAKE_OCR`/`RAG_REDO_FAKE_WEMM` 这两个已有先例同一条
+    纪律）。设了这个变量时，即使插件声明了 env_bootstrap 也直接跳过，
+    按"没声明"处理——测试本来就该走假实现（子进程内部的 FAKE_* 变量），
+    不需要真的建出一个装好 torch 的独立环境。"""
+    venv_python = _venv_python_path(plugin_dir / ".venv")
+    if venv_python.exists():
+        return str(venv_python)
+    if env_bootstrap and not os.environ.get("RAG_REDO_SKIP_ENV_BOOTSTRAP"):
+        import logging
+
+        log = logger if logger is not None else logging.getLogger("rag_redo.core.subprocess_service")
+        try:
+            _run_env_bootstrap(plugin_dir, env_bootstrap, timeout=bootstrap_timeout, logger=log)
+        except EnvBootstrapError as exc:
+            log.warning("插件 %s 的 env_bootstrap 未能建出独立环境，退化用核心解释器：%s", plugin_dir.name, exc)
+        else:
+            if venv_python.exists():
+                return str(venv_python)
+            log.warning("插件 %s 的 env_bootstrap 跑完了但没有在约定路径生成解释器，退化用核心解释器", plugin_dir.name)
     return sys.executable
 
 

@@ -1,0 +1,14 @@
+# official-visual-wemm 子进程独立环境的依赖——不装进核心 .venv（架构
+# 红线7），由 env_bootstrap.py 在这个插件自己的 .venv 里装。
+#
+# 版本不锁死具体号——这几个包在这台真实 Windows 机器上用 pip 官方源装过
+# 一遍、真实跑通了 tencent/WeMM-Embedding-2B 的推理并验证过跨模态语义
+# 判别力（见 docs/ROADMAP.md Phase 2 状态段落），但当时是临时装进核心
+# venv 验证用的，没有特意固定版本号；等这个 env_bootstrap.py 真的跑过
+# 一次干净安装、确认这份不锁版本的列表长期可重复之后，再考虑要不要锁定
+# 具体版本（过早锁定一个只验证过一次的版本号，遇到上游发新版反而更容易
+# 悄悄装出一个从没测过的组合）。
+torch
+transformers
+qwen_vl_utils
+torchvision
