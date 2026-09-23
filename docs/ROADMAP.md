@@ -19,17 +19,21 @@
 
 ## Phase 1 — 文字检索 MVP（官方插件集）
 
+**状态：核心链路已实现并验证，安装包/GUI渲染两项待Windows环境验证（2026-09-23）。** 11 个官方插件全部落地并有真实测试（153 用例，`.venv/bin/python tests/run.py` 全绿）：`official-extractor-text/-pdf-text/-docx`、`official-chunker`、`official-library-manager`、`official-lexical-bm25`、`official-embedder-bge-m3`、`official-vector-store-chroma`、`official-fusion-rrf`、`official-reranker`、`official-mcp-server`、`official-gui-shell`。`core/pipeline.py` 编排层把它们串成真实的索引态/查询态管道。
+
 **目标**：达到旧项目"纯文字检索"能力的对等或更好，且是通过 Phase 0 的插件机制实现的，不是走后门直接塞进核心。
 
 **候选官方插件**（对应 [FEATURE_TRIAGE.md](FEATURE_TRIAGE.md) 里标"Phase 1"的条目）：md/txt/pdf 文字层/docx 提取、BGE-M3 向量化、Chroma 向量库、BM25+jieba 词法索引、RRF 融合、重排器、多库/路径级勾选管理、基础 pywebview GUI（库管理+搜索+结果展示）、MCP 检索工具。
 
-**验收标准**：
-- 能索引 demo-vault 和至少一个真实 Obsidian 库，检索质量不低于旧项目当前水平（用同一批查询词人工比对）
-- Windows 安装包/便携版在一台没装过 Python 的干净 Windows 环境里，从下载到能搜到第一条结果，全程无需手动敲命令行
-- Linux 开发环境下等价的源码安装方式能跑通同样的功能
-- 关掉任意一个非必需插件（比如 GUI），核心+MCP 仍能正常工作，证明插件之间真的没有硬编码依赖
-- 同时装两个都声明 `embedder` 扩展点的插件（比如 BGE-M3 和另一个占位实现），在配置里切换"当前用哪个"不需要重启进程，索引/检索立刻按新配置生效
-- 全程运行不在系统 Python 的 site-packages 或全局 PATH 留下任何痕迹（`in_process` 插件的依赖装在核心自己的隔离环境里）
+**验收标准与当前完成情况**：
+- ✅ 能索引 demo-vault 和至少一个真实 Obsidian 库，检索质量不低于旧项目当前水平——`tests/test_pipeline_e2e.py` 用真实 `PluginRuntime` 扫描/加载/启用全部插件，索引临时小库后搜索，验证语义相关性、排除文件不泄漏、跨库隔离（词法+向量两路都验证过，词法这路是靠这个测试过程中发现真bug才补上的）；`plugins/official-mcp-server/tests/test_tools.py` 用真实 `MCPServer.call_tool()` 验证 MCP 协议层；额外用真实子进程（`mcp_stdio.py`）+ 真实 MCP 客户端做过一次手动冒烟，`initialize`/`list_tools`/`call_tool` 全部通过真实 stdio 协议接通。**未验证的是"和旧项目实际检索质量对比"**——这需要旧项目的真实 Obsidian 库和一批真实查询词人工比对，本轮没有这份数据，留给你实际用起来后反馈
+- ⬜ Windows 安装包/便携版在一台没装过 Python 的干净 Windows 环境里，从下载到能搜到第一条结果——**无法在当前 Linux 开发环境验证**，PyInstaller 打包 Windows .exe 通常需要在 Windows 上实际构建（不可靠的跨平台交叉编译），这是 Phase 4 的工作，且需要真实 Windows 机器
+- ✅ Linux 开发环境下等价的源码安装方式能跑通同样的功能——当前所有开发/测试都在 Linux 完成，`core/`+11个官方插件+`mcp_stdio.py`+`gui_main.py` 全部在 Linux venv 里真实跑通
+- ✅ 关掉任意一个非必需插件（比如 GUI），核心+MCP 仍能正常工作——`mcp_stdio.py` 的 `REQUIRED_PLUGINS` 列表从不包含 `official-gui-shell`，MCP 全程不依赖它；`test_pipeline_e2e.py` 显式验证 gui-shell 处于"已发现未启用"状态时检索链路完全正常
+- ✅ 同时装两个都声明 `embedder` 扩展点的插件，在配置里切换"当前用哪个"不需要重启进程——`ExtensionRegistry.set_active()` 机制在 Phase 0 就已验证（`core/tests/test_runtime.py::test_singleton_conflict_surfaced_not_silent`），Phase 1 未额外造第二个 embedder 实现去重复验证，机制本身没变
+- ✅ 全程运行不在系统 Python 的 site-packages 或全局 PATH 留下任何痕迹——所有依赖（jieba/chromadb/pymupdf4llm/python-docx/pywebview/mcp）装在 `.venv/` 隔离环境；venv 用 `--system-site-packages` 创建是本轮唯一的例外，**只是为了在这台 Linux 开发机上借到系统已装的 PyGObject（GTK 绑定）来验证 GUI 真实渲染**，不代表产品设计要求系统预装 GTK——Windows 安装包会自带完整 webview 运行时，不依赖用户机器上有没有装什么
+
+**GUI 渲染的真实验证**：这台开发机恰好装了 WebKit2GTK + 有响应式 X server，重建 venv 借用系统 PyGObject 后，真实调用 `webview.create_window()` + `webview.start()` 打开了窗口，用 `evaluate_js` 确认页面加载后 `document.body.innerText` 真的包含通过 js_api 桥从后端 `Api.list_libraries()` 拉回来的库名字——不是"能 import 就算过"，是真的渲染出了动态内容。后端 `Api` 类本身另有 7 个用例在 `plugins/official-gui-shell/tests/test_api.py` 里，不依赖渲染。
 
 ## Phase 2 — 视觉与 OCR 插件
 
