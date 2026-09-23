@@ -146,6 +146,15 @@ class Pipeline:
     # ---- 查询态 --------------------------------------------------------
 
     def search(self, library_id: str, query: str, top_k: int = 10) -> list[SearchResult]:
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            # 不校验的话，Chroma 的 get_or_create_collection 会给一个不存在
+            # 的 library_id 静默造一个空 collection、BM25 那一路对未知库也
+            # 只是返回空列表——两边都不报错，最终结果是"安安静静地搜到0条"，
+            # 用户/调用方没法区分"这个库真的没有相关内容"和"library_id 打
+            # 错了"。宁可现在就报清楚，不要在查询态悄悄放过一个打错的id。
+            raise KeyError(f"未知库: {library_id}")
+
         lexical = self._singleton("lexical_index")
         embedder = self._singleton("embedder")
         vector_store = self._singleton("vector_store")
@@ -153,7 +162,7 @@ class Pipeline:
         reranker = self._singleton("reranker")
 
         candidate_pool = top_k * 3
-        lexical_hits = lexical.search(query, top_k=candidate_pool)
+        lexical_hits = lexical.search(library_id, query, top_k=candidate_pool)
         (query_vector,) = embedder.embed_texts([query])
         vector_hits = vector_store.query(library_id, list(query_vector), top_k=candidate_pool)
 

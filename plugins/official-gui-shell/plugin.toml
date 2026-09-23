@@ -1,0 +1,18 @@
+id = "official-gui-shell"
+name = "桌面 GUI 壳"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+gui_panel = "multi"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_gui_shell.plugin:GuiShellPlugin"
+
+[permissions]
+filesystem = []
+network = false
+gpu = false

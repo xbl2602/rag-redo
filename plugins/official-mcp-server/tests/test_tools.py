@@ -111,6 +111,7 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         # 对象已经是合法的顶层结构，SDK不需要再包一层。这也是真实踩出来的
         # 行为差异，不是猜的。
         report = reindex_result.structured_content
+        self.assertTrue(report["ok"])
         self.assertEqual(report["succeeded"], 1)
         self.assertEqual(report["failed"], 0)
 
@@ -118,7 +119,9 @@ class TestMcpTools(TestMcpToolsAsyncBase):
             "search_knowledge", {"query": "插件 架构", "library_id": "test-lib"}
         )
         self.assertFalse(search_result.is_error)
-        hits = search_result.structured_content["result"]
+        payload = search_result.structured_content
+        self.assertTrue(payload["ok"])
+        hits = payload["results"]
         self.assertGreater(len(hits), 0)
         self.assertEqual(hits[0]["path"], "notes.md")
         self.assertIn("confidence", hits[0])
@@ -129,10 +132,16 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertFalse(result.is_error)
 
     async def test_unknown_library_id_reports_error_not_crash(self):
+        """实测过：MCP SDK 2.2.0 的工具函数如果裸抛异常，call_tool() 会
+        把异常原样往上炸、不会自动转成 is_error 结果（这一层"友好化"发生
+        在更外层的真实 JSON-RPC 请求处理里，MCPServer.call_tool() 这个
+        Python 便捷方法本身不做）。所以 search_knowledge 自己必须显式
+        try/except，绝不能指望 SDK 兜底——这条断言就是钉住这一点：调用
+        本身要能正常返回（不抛异常），且结果里明确标 ok=False。"""
         result = await self.server.call_tool("search_knowledge", {"query": "x", "library_id": "no-such-lib"})
-        # 不管 MCP SDK 把这个包装成 is_error 还是异常内容，服务进程本身
-        # 不应该崩溃——call_tool 能返回（不管 error 与否）就已经证明了这点。
-        self.assertIsNotNone(result)
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+        self.assertIn("error", result.structured_content)
 
     async def test_tools_are_discoverable_with_schema(self):
         tools = await self.server.list_tools()

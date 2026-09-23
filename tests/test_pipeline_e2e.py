@@ -164,13 +164,38 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
             self.assertGreaterEqual(r.confidence, 0.0)
             self.assertLessEqual(r.confidence, 1.0)
 
+    def test_lexical_search_is_isolated_per_library(self):
+        """回归测试：official-lexical-bm25 早期实现只有一个全局 BM25Index，
+        没有按库分开，会导致"搜库B却搜到库A内容"的跨库数据泄漏——具体
+        经过见 plugins/official-lexical-bm25/official_lexical_bm25/plugin.py
+        模块 docstring。这里用两个库、内容互不重叠，确认搜库B绝对搜不到
+        库A的东西（哪怕BM25那一路单独命中了也不该泄漏进最终结果）。"""
+        vault2 = self.tmp / "vault2"
+        vault2.mkdir()
+        (vault2 / "other.md").write_text(
+            "# 完全不相关的内容\n\n插件 架构 这两个词特意也塞进来，试图从词法层面泄漏。",
+            encoding="utf-8",
+        )
+        self.lib_mgr.store.add_library("other-lib", "另一个库", str(vault2))
+
+        self.pipeline.index_library("test-lib")
+        self.pipeline.index_library("other-lib")
+
+        results = self.pipeline.search("test-lib", "插件 架构", top_k=10)
+        paths = [r.path for r in results]
+        self.assertNotIn("other.md", paths)
+        self.assertIn("plugin-notes.md", paths)
+
     def test_reindex_after_disabling_gui_style_optional_plugin_still_works(self):
         """插件之间真的没有硬编码依赖——即使不装/不启用任何 gui_panel 类
         插件（Phase 1 目前还没有这类插件），核心检索链路完全不受影响，
         对应 docs/ROADMAP.md Phase 1 验收标准"关掉任意一个非必需插件，
-        核心+MCP 仍能正常工作"。这里用"从未启用过 GUI 插件"这个既成事实
-        本身来体现，不需要额外反向禁用步骤。"""
-        self.assertNotIn("official-gui-shell", self.runtime.plugins)
+        核心+MCP 仍能正常工作"。scan() 会发现 plugins/ 目录下的全部插件
+        （包括 official-gui-shell），但这里的 REQUIRED_PLUGINS 列表从不
+        加载/启用它——只检查"没被启用"，不是"没被发现"，这两件事不一样。"""
+        gui_plugin = self.runtime.plugins.get("official-gui-shell")
+        self.assertIsNotNone(gui_plugin, "gui-shell应该能被scan()发现")
+        self.assertNotEqual(gui_plugin.state.value, "enabled")
         report = self.pipeline.index_library("test-lib")
         self.assertEqual(report.succeeded, 2)
 

@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<title>RAG REDO</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #262b36;
+    --text: #e6e8ee;
+    --muted: #8b92a3;
+    --accent: #5b8cff;
+    --accent-dim: #2c3b66;
+    --danger: #e5636b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
+  }
+  #sidebar {
+    width: 260px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    padding: 16px;
+    gap: 12px;
+  }
+  #sidebar h1 { font-size: 15px; margin: 0 0 4px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  #library-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; flex: 1; overflow-y: auto; }
+  #library-list li {
+    padding: 8px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--muted);
+    border: 1px solid transparent;
+  }
+  #library-list li:hover { background: #1e2230; }
+  #library-list li.active { background: var(--accent-dim); color: var(--text); border-color: var(--accent); }
+  #library-list li .path { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 11px; color: var(--muted); }
+  input[type=text] {
+    background: #0d0f13;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  input[type=text]:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button.secondary { background: #232837; color: var(--text); }
+  button:disabled { opacity: .5; cursor: default; }
+
+  #main { flex: 1; display: flex; flex-direction: column; padding: 24px 32px; overflow-y: auto; }
+  #search-row { display: flex; gap: 8px; margin-bottom: 8px; }
+  #search-row input { flex: 1; font-size: 15px; padding: 12px 14px; }
+  #status-line { font-size: 12px; color: var(--muted); min-height: 18px; margin-bottom: 16px; }
+  #status-line.error { color: var(--danger); }
+
+  #results { display: flex; flex-direction: column; gap: 10px; }
+  .result-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .result-card .meta { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .result-card .confidence { font-variant-numeric: tabular-nums; }
+  .result-card .text { font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+
+  #empty-state { color: var(--muted); font-size: 13px; margin-top: 40px; text-align: center; }
+</style>
+</head>
+<body>
+  <div id="sidebar">
+    <h1>库</h1>
+    <ul id="library-list"></ul>
+    <div class="field">
+      <label>新建库：名称</label>
+      <input type="text" id="new-lib-name" placeholder="比如：工作笔记" />
+    </div>
+    <div class="field">
+      <label>新建库：路径</label>
+      <input type="text" id="new-lib-path" placeholder="/path/to/vault" />
+    </div>
+    <button class="secondary" id="add-lib-btn">+ 新建库</button>
+    <button class="secondary" id="reindex-btn">重建当前库索引</button>
+  </div>
+  <div id="main">
+    <div id="search-row">
+      <input type="text" id="search-input" placeholder="搜索当前库…" />
+      <button id="search-btn">搜索</button>
+    </div>
+    <div id="status-line"></div>
+    <div id="results"></div>
+    <div id="empty-state">选一个库，然后搜点什么。</div>
+  </div>
+
+<script>
+const state = { libraries: [], activeLibraryId: null };
+
+function api() { return window.pywebview.api; }
+
+function setStatus(text, isError) {
+  const el = document.getElementById("status-line");
+  el.textContent = text || "";
+  el.className = isError ? "error" : "";
+}
+
+async function refreshLibraries() {
+  state.libraries = await api().list_libraries();
+  const list = document.getElementById("library-list");
+  list.innerHTML = "";
+  for (const lib of state.libraries) {
+    const li = document.createElement("li");
+    li.className = lib.library_id === state.activeLibraryId ? "active" : "";
+    li.innerHTML = `${lib.name}<span class="path">${lib.root_path}</span>`;
+    li.onclick = () => { state.activeLibraryId = lib.library_id; refreshLibraries(); };
+    list.appendChild(li);
+  }
+  if (state.activeLibraryId === null && state.libraries.length > 0) {
+    state.activeLibraryId = state.libraries[0].library_id;
+    refreshLibraries();
+  }
+}
+
+async function addLibrary() {
+  const name = document.getElementById("new-lib-name").value.trim();
+  const path = document.getElementById("new-lib-path").value.trim();
+  if (!name || !path) { setStatus("名称和路径都要填", true); return; }
+  const libraryId = name.toLowerCase().replace(/[^a-z0-9]+/g, "-") + "-" + Date.now().toString(36);
+  const result = await api().add_library(libraryId, name, path);
+  if (!result.ok) { setStatus("新建库失败：" + result.error, true); return; }
+  document.getElementById("new-lib-name").value = "";
+  document.getElementById("new-lib-path").value = "";
+  setStatus("已新建库：" + name, false);
+  await refreshLibraries();
+}
+
+async function reindexActive() {
+  if (!state.activeLibraryId) { setStatus("先选一个库", true); return; }
+  setStatus("正在建索引…", false);
+  const result = await api().reindex_library(state.activeLibraryId);
+  if (!result.ok) { setStatus("建索引失败：" + result.error, true); return; }
+  setStatus(`建索引完成：成功 ${result.succeeded} 个，失败 ${result.failed} 个`, result.failed > 0);
+}
+
+async function runSearch() {
+  const query = document.getElementById("search-input").value.trim();
+  if (!state.activeLibraryId) { setStatus("先选一个库", true); return; }
+  if (!query) { return; }
+  setStatus("搜索中…", false);
+  const result = await api().search(state.activeLibraryId, query, 10);
+  const resultsEl = document.getElementById("results");
+  const emptyEl = document.getElementById("empty-state");
+  resultsEl.innerHTML = "";
+  if (!result.ok) { setStatus("搜索失败：" + result.error, true); emptyEl.style.display = "block"; return; }
+  setStatus(`找到 ${result.results.length} 条结果`, false);
+  if (result.results.length === 0) {
+    emptyEl.textContent = "没搜到相关内容。";
+    emptyEl.style.display = "block";
+    return;
+  }
+  emptyEl.style.display = "none";
+  for (const r of result.results) {
+    const card = document.createElement("div");
+    card.className = "result-card";
+    card.innerHTML = `
+      <div class="meta">
+        <span>${r.path}${r.heading ? " · " + r.heading : ""}</span>
+        <span class="confidence">置信度 ${(r.confidence * 100).toFixed(0)}%</span>
+      </div>
+      <div class="text"></div>`;
+    card.querySelector(".text").textContent = r.text;
+    resultsEl.appendChild(card);
+  }
+}
+
+document.getElementById("add-lib-btn").onclick = addLibrary;
+document.getElementById("reindex-btn").onclick = reindexActive;
+document.getElementById("search-btn").onclick = runSearch;
+document.getElementById("search-input").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
+
+window.addEventListener("pywebviewready", refreshLibraries);
+</script>
+</body>
+</html>
