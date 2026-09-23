@@ -57,7 +57,7 @@ python3 -m venv .venv
 }
 ```
 
-接好后 AI 就能用这些工具：`search_knowledge`（文字混合检索）/ `navigate_knowledge`（PDF页级视觉导航，独立的"第二检索系统"，不参与前者的融合排序）/ `list_libraries` / `reindex_knowledge` / `export_library` / `import_library` / `get_library_sample`+`propose_library_summary`+`apply_library_summary`（库摘要：帮 AI 在检索前先判断"这个库值不值得查"，用户手写的简介受写权限门禁保护，AI 不能未经确认就覆盖）。
+接好后 AI 就能用这些工具：`search_knowledge`（文字混合检索，支持多库并查/exclude反选/folder子目录过滤，libraries 留空默认查全部库）/ `navigate_knowledge`（PDF页级视觉导航，独立的"第二检索系统"，不参与前者的融合排序）/ `list_libraries` / `reindex_knowledge` / `export_library` / `import_library` / `get_library_sample`+`propose_library_summary`+`apply_library_summary`（库摘要：帮 AI 在检索前先判断"这个库值不值得查"，用户手写的简介受写权限门禁保护，AI 不能未经确认就覆盖）。
 
 跑测试（不需要装 torch/sentence-transformers/qwen-vl-utils——测试全程注入假模型，见 [docs/LESSONS.md](docs/LESSONS.md)）：
 

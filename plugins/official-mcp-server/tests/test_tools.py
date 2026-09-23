@@ -174,7 +174,7 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertEqual(report["failed"], 0)
 
         search_result = await self.server.call_tool(
-            "search_knowledge", {"query": "插件 架构", "library_id": "test-lib"}
+            "search_knowledge", {"query": "插件 架构", "libraries": "test-lib"}
         )
         self.assertFalse(search_result.is_error)
         payload = search_result.structured_content
@@ -182,6 +182,7 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         hits = payload["results"]
         self.assertGreater(len(hits), 0)
         self.assertEqual(hits[0]["path"], "notes.md")
+        self.assertEqual(hits[0]["library_id"], "test-lib")
         self.assertIn("confidence", hits[0])
 
     async def test_reindex_then_navigate_knowledge_tool(self):
@@ -229,8 +230,31 @@ class TestMcpTools(TestMcpToolsAsyncBase):
 
     async def test_search_knowledge_default_top_k(self):
         await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
-        result = await self.server.call_tool("search_knowledge", {"query": "插件", "library_id": "test-lib"})
+        result = await self.server.call_tool("search_knowledge", {"query": "插件", "libraries": "test-lib"})
         self.assertFalse(result.is_error)
+
+    async def test_search_knowledge_empty_libraries_defaults_to_all(self):
+        """libraries 留空=全部已注册库，对齐 obsidian-rag 选库语法——不
+        传 libraries 字段应该等价于传 "" 或 "all"，不该报错也不该只搜
+        某一个库。"""
+        await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+        result = await self.server.call_tool("search_knowledge", {"query": "插件 架构"})
+        self.assertFalse(result.is_error)
+        payload = result.structured_content
+        self.assertTrue(payload["ok"])
+        self.assertGreater(len(payload["results"]), 0)
+
+    async def test_search_knowledge_include_body_false_omits_text(self):
+        await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+        result = await self.server.call_tool(
+            "search_knowledge", {"query": "插件 架构", "libraries": "test-lib", "include_body": False}
+        )
+        payload = result.structured_content
+        self.assertTrue(payload["ok"])
+        self.assertGreater(len(payload["results"]), 0)
+        for hit in payload["results"]:
+            self.assertNotIn("text", hit)
+            self.assertIn("path", hit)
 
     async def test_unknown_library_id_reports_error_not_crash(self):
         """实测过：MCP SDK 2.2.0 的工具函数如果裸抛异常，call_tool() 会
@@ -239,9 +263,21 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         Python 便捷方法本身不做）。所以 search_knowledge 自己必须显式
         try/except，绝不能指望 SDK 兜底——这条断言就是钉住这一点：调用
         本身要能正常返回（不抛异常），且结果里明确标 ok=False。"""
-        result = await self.server.call_tool("search_knowledge", {"query": "x", "library_id": "no-such-lib"})
+        result = await self.server.call_tool("search_knowledge", {"query": "x", "libraries": "no-such-lib"})
         self.assertFalse(result.is_error)
         self.assertFalse(result.structured_content["ok"])
+
+    async def test_search_knowledge_exclude_removes_library_from_results(self):
+        """exclude 反选：单库场景下 exclude 掉那唯一一个库，最终范围为空，
+        对齐 official-library-manager::resolve_libraries 的报错语义。"""
+        await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+        result = await self.server.call_tool(
+            "search_knowledge", {"query": "插件 架构", "libraries": "test-lib", "exclude": "test-lib"}
+        )
+        self.assertFalse(result.is_error)
+        payload = result.structured_content
+        self.assertFalse(payload["ok"])
+        self.assertIn("error", payload)
         self.assertIn("error", result.structured_content)
 
     async def test_tools_are_discoverable_with_schema(self):
@@ -263,11 +299,14 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         )
         search_tool = next(t for t in tools if t.name == "search_knowledge")
         self.assertIn("query", search_tool.input_schema["properties"])
-        self.assertIn("library_id", search_tool.input_schema["properties"])
+        self.assertIn("libraries", search_tool.input_schema["properties"])
+        self.assertIn("exclude", search_tool.input_schema["properties"])
+        self.assertIn("folder", search_tool.input_schema["properties"])
+        self.assertIn("include_body", search_tool.input_schema["properties"])
 
     async def test_export_then_import_library_round_trips_search_results(self):
         await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
-        before = await self.server.call_tool("search_knowledge", {"query": "插件 架构", "library_id": "test-lib"})
+        before = await self.server.call_tool("search_knowledge", {"query": "插件 架构", "libraries": "test-lib"})
         self.assertFalse(before.is_error)
 
         export_result = await self.server.call_tool("export_library", {"library_id": "test-lib"})
@@ -290,7 +329,7 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertEqual(import_payload["library_id"], "test-lib-restored")
 
         after = await self.server.call_tool(
-            "search_knowledge", {"query": "插件 架构", "library_id": "test-lib-restored"}
+            "search_knowledge", {"query": "插件 架构", "libraries": "test-lib-restored"}
         )
         self.assertFalse(after.is_error)
         self.assertEqual(

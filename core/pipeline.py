@@ -24,6 +24,39 @@ class PipelineError(RuntimeError):
     调用方（GUI/CLI/MCP）应该展示成"请先启用 XX 插件"而不是笼统报错。"""
 
 
+def _chunk_library(chunk_id: str) -> str:
+    """chunk_id 约定 f"{library_id}:{path}:{chunk_index}"（见
+    core/contracts.py::Chunk 的字段注释）——library_id 是第一个冒号之前
+    的部分，纯字符串切分，不用额外查一次数据库就能知道一个 chunk 属于
+    哪个库，多库检索合并结果时用得上。"""
+    return chunk_id.split(":", 1)[0]
+
+
+def _chunk_path(chunk_id: str) -> str:
+    """同 `_chunk_library`，取中间的 path 段——掐头（library_id，第一个
+    冒号前）去尾（chunk_index，最后一个冒号后），中间剩下的原样就是
+    path，哪怕 path 本身含冒号（POSIX 文件名理论上合法，Windows 不合法）
+    也不会切错，对齐 obsidian-rag/retriever.py::_chunk_file 同样的"从
+    chunk_id 直接切出文件路径，不用多查一次"思路。"""
+    return chunk_id.split(":", 1)[1].rsplit(":", 1)[0]
+
+
+def _norm_folder(folder: str) -> str:
+    """规范化 folder 参数：去首尾空白与首尾斜杠，反斜杠统一成正斜杠——
+    对齐 obsidian-rag/retriever.py::_norm_folder。"""
+    return folder.strip().replace("\\", "/").strip("/").strip()
+
+
+def _in_folder(path: str, folder: str) -> bool:
+    """path 是否落在 folder 目录下（或就是 folder 本身，单文件范围）。
+    前缀+边界校验：folder="AI" 只匹配 "AI/..."，不匹配 "AIML/..."——对齐
+    obsidian-rag/retriever.py::_in_folder，folder 为空时不过滤（全部
+    命中）。"""
+    if not folder:
+        return True
+    return path == folder or path.startswith(folder + "/")
+
+
 @dataclass
 class IndexFileReport:
     path: str
@@ -171,15 +204,46 @@ class Pipeline:
 
     # ---- 查询态 --------------------------------------------------------
 
-    def search(self, library_id: str, query: str, top_k: int = 10) -> list[SearchResult]:
+    def search(
+        self,
+        libraries: str,
+        query: str,
+        *,
+        top_k: int = 10,
+        exclude: str = "",
+        folder: str = "",
+    ) -> list[SearchResult]:
+        """混合检索：词法 BM25 + 向量 + 每库 RRF 融合 → 跨库候选池 → 全局
+        重排 → 装配 SearchResult。
+
+        `libraries` 是 obsidian-rag/retriever.py::hybrid_search 同名参数
+        的选库语法（见 official-library-manager 插件的 `resolve_libraries`
+        方法，唯一权威实现）——单库名、逗号分隔多库、空字符串=全部库、
+        "all"=全部库都合法；`exclude` 做减法；单库场景下传法和旧签名
+        完全兼容（一个库名本身就是"逗号分隔列表"里只有一项的特例）。
+
+        跨库排序对齐 obsidian-rag 的"每库先融合、候选池跨库合并、重排器
+        统一精排"思路：每个库各自跑 词法+向量→RRF，取本库前 `top_k*2`
+        名放进跨库候选池；重排器对整个候选池统一打分，全局 top_k 才是
+        最终结果——不是"每库各出 top_k 再简单拼接"，那样会让强相关库的
+        第 (k+1) 名被弱相关库的第 1 名挤掉候选池之外都不会发生（因为
+        candidate_pool/池化阈值是按库给的，不是按最终名次早早截断）。
+
+        `folder` 过滤在 RRF 融合之前就作用于每库的词法/向量候选列表——
+        对齐 obsidian-rag 在 dense/BM25 两路各自过滤 folder 再融合的
+        顺序，不是等重排完了再筛，那样候选池会被跟目标目录无关的结果
+        提前占满。
+
+        置信度不做"这一批结果内部 min-max 归一化"——直接把重排器给出的
+        校准概率（BAAI/bge-reranker-v2-m3 通过 sentence-transformers
+        CrossEncoder 默认自带 Sigmoid 激活，`reranker.rerank` 拿到的已经
+        是"该块与查询相关的概率"，0.5=无法判断）钳位到 [0,1] 直接用——
+        对齐 obsidian-rag 明确记录过的教训（问题54）：置信度必须和排序
+        同源、必须是跨查询可比的"真分尺度"，批内归一化会让"整批其实都
+        弱相关"的一批结果里排第一的那条被人为拉到接近1.0，误导下游判断。
+        """
         lib_mgr = self._singleton("library_manager")
-        if lib_mgr.store.get(library_id) is None:
-            # 不校验的话，Chroma 的 get_or_create_collection 会给一个不存在
-            # 的 library_id 静默造一个空 collection、BM25 那一路对未知库也
-            # 只是返回空列表——两边都不报错，最终结果是"安安静静地搜到0条"，
-            # 用户/调用方没法区分"这个库真的没有相关内容"和"library_id 打
-            # 错了"。宁可现在就报清楚，不要在查询态悄悄放过一个打错的id。
-            raise KeyError(f"未知库: {library_id}")
+        entries = lib_mgr.resolve_libraries(libraries, exclude)  # 未知库名 ValueError，见该方法说明
 
         lexical = self._singleton("lexical_index")
         embedder = self._singleton("embedder")
@@ -187,19 +251,32 @@ class Pipeline:
         fusion = self._singleton("fusion")
         reranker = self._singleton("reranker")
 
+        folder_norm = _norm_folder(folder)
         candidate_pool = top_k * 3
-        lexical_hits = lexical.search(library_id, query, top_k=candidate_pool)
         (query_vector,) = embedder.embed_texts([query])
-        vector_hits = vector_store.query(library_id, list(query_vector), top_k=candidate_pool)
 
-        lexical_ranked = [chunk_id for chunk_id, _ in lexical_hits]
-        vector_ranked = [chunk_id for chunk_id, _ in vector_hits]
-        fused = fusion.fuse([lexical_ranked, vector_ranked])
-        fused_ids = [chunk_id for chunk_id, _ in fused][: top_k * 2]
-        if not fused_ids:
+        pool_ids: list[str] = []
+        for cfg in entries:
+            library_id = cfg.library_id
+            lexical_hits = lexical.search(library_id, query, top_k=candidate_pool)
+            vector_hits = vector_store.query(library_id, list(query_vector), top_k=candidate_pool)
+            lexical_ranked = [cid for cid, _ in lexical_hits if _in_folder(_chunk_path(cid), folder_norm)]
+            vector_ranked = [cid for cid, _ in vector_hits if _in_folder(_chunk_path(cid), folder_norm)]
+            fused = fusion.fuse([lexical_ranked, vector_ranked])
+            pool_ids.extend(chunk_id for chunk_id, _ in fused[: top_k * 2])
+        if not pool_ids:
             return []
 
-        records = vector_store.get_by_ids(library_id, fused_ids)
+        # chunk_id 全局唯一且自带 library_id（见 _chunk_library），按库分组
+        # 批量取记录——vector_store.get_by_ids 是单库作用域的 API，不能跨库
+        # 一次问完，但也不需要为每个 chunk_id 单独查一次。
+        by_library: dict[str, list[str]] = {}
+        for chunk_id in pool_ids:
+            by_library.setdefault(_chunk_library(chunk_id), []).append(chunk_id)
+        records: dict[str, dict] = {}
+        for library_id, ids in by_library.items():
+            records.update(vector_store.get_by_ids(library_id, ids))
+
         # 喂给重排器的文本前面带上标题面包屑——重排器只看纯段落正文的话，
         # 少了"这段话出自哪个标题/章节"这个人类读者天然会用到的判断依据，
         # 内容主题相近的几篇笔记之间更容易被判混（真实用 demo-vault 里
@@ -207,7 +284,7 @@ class Pipeline:
         # 返回给调用方的 SearchResult.text 仍然是不带前缀的原始正文——
         # 这个拼接只是重排器的输入，不改变展示内容。
         rerank_input = []
-        for chunk_id in fused_ids:
+        for chunk_id in pool_ids:
             record = records.get(chunk_id)
             if record is None or not record["document"]:
                 continue
@@ -220,10 +297,6 @@ class Pipeline:
         if not reranked:
             return []
 
-        scores = [score for _, score in reranked]
-        lo, hi = min(scores), max(scores)
-        span = (hi - lo) or 1.0
-
         results: list[SearchResult] = []
         for chunk_id, score in reranked:
             record = records[chunk_id]
@@ -231,11 +304,11 @@ class Pipeline:
             results.append(
                 SearchResult(
                     chunk_id=chunk_id,
-                    library_id=library_id,
+                    library_id=_chunk_library(chunk_id),
                     path=meta.get("path", ""),
                     heading_breadcrumb=meta.get("heading_breadcrumb", ""),
                     text=record["document"],
-                    confidence=(score - lo) / span,
+                    confidence=max(0.0, min(1.0, float(score))),
                 )
             )
         return results

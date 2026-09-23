@@ -13,6 +13,7 @@ for p in (_REPO_ROOT, _PLUGIN_DIR):
         sys.path.insert(0, str(p))
 
 from official_library_manager.config import LibraryConfigStore  # noqa: E402
+from official_library_manager.plugin import LibraryManagerPlugin  # noqa: E402
 
 
 class TestLibraryConfigStore(unittest.TestCase):
@@ -85,6 +86,58 @@ class TestLibraryConfigStore(unittest.TestCase):
         store.add_library("lib1", "我的库", "/vaults/lib1")
         store.remove_library("lib1")
         self.assertEqual(store.list_libraries(), [])
+
+
+class TestResolveLibraries(unittest.TestCase):
+    """`LibraryManagerPlugin.resolve_libraries` 是多库检索选库语法的唯一
+    权威实现（对齐 obsidian-rag/library.py::resolve_entries），这里直接
+    测这个方法本身——不需要走完整 PluginRuntime/Pipeline，`resolve_libraries`
+    只碰 `self.store`，直接赋值即可，比端到端测试更聚焦。跨库检索的真实
+    端到端行为（真的搜到两个库的内容）在 tests/test_pipeline_e2e.py。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.plugin = LibraryManagerPlugin()
+        self.plugin.store = LibraryConfigStore(self.tmp / "libraries.json")
+        self.plugin.store.add_library("lib-a", "库A", "/vaults/a")
+        self.plugin.store.add_library("lib-b", "库B", "/vaults/b")
+        self.plugin.store.add_library("lib-c", "库C", "/vaults/c")
+
+    def test_empty_libraries_returns_all(self):
+        result = self.plugin.resolve_libraries("")
+        self.assertEqual({c.library_id for c in result}, {"lib-a", "lib-b", "lib-c"})
+
+    def test_all_keyword_case_insensitive_returns_all(self):
+        result = self.plugin.resolve_libraries("ALL")
+        self.assertEqual({c.library_id for c in result}, {"lib-a", "lib-b", "lib-c"})
+
+    def test_comma_separated_list_preserves_order_and_dedups(self):
+        result = self.plugin.resolve_libraries("lib-b,lib-a,lib-b")
+        self.assertEqual([c.library_id for c in result], ["lib-b", "lib-a"])
+
+    def test_exclude_subtracts_from_selection(self):
+        result = self.plugin.resolve_libraries("all", exclude="lib-b")
+        self.assertEqual({c.library_id for c in result}, {"lib-a", "lib-c"})
+
+    def test_unknown_library_name_raises_and_lists_available(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.plugin.resolve_libraries("lib-a,no-such-lib")
+        message = str(ctx.exception)
+        self.assertIn("no-such-lib", message)
+        self.assertIn("lib-a", message)
+        self.assertIn("lib-b", message)
+        self.assertIn("lib-c", message)
+
+    def test_exclude_everything_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            self.plugin.resolve_libraries("lib-a", exclude="lib-a")
+
+    def test_no_registered_libraries_raises_value_error(self):
+        empty_plugin = LibraryManagerPlugin()
+        empty_plugin.store = LibraryConfigStore(self.tmp / "empty.json")
+        with self.assertRaises(ValueError):
+            empty_plugin.resolve_libraries("")
 
 
 if __name__ == "__main__":

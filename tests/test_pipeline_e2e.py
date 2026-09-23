@@ -220,6 +220,86 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         self.assertNotIn("other.md", paths)
         self.assertIn("plugin-notes.md", paths)
 
+    def test_multi_library_search_pools_results_across_libraries(self):
+        """真正的多库并查——不是"每库各搜一遍简单拼接"，而是每库先融合、
+        候选池跨库合并、重排器统一精排给出全局排序（见
+        core/pipeline.py::search 的说明），对齐 obsidian-rag/retriever.py
+        ::hybrid_search 的"libraries='A,B' 多库并查"语义。用两个内容不
+        重叠的库、查一个只在其中一个库里出现的词，确认结果真的来自两个
+        不同的 library_id（而不是只搜了第一个库）。"""
+        vault2 = self.tmp / "vault2"
+        vault2.mkdir()
+        (vault2 / "other.md").write_text(
+            "# 另一个库的笔记\n\n这篇也讲插件 架构，但是是完全不同的一篇。",
+            encoding="utf-8",
+        )
+        self.lib_mgr.store.add_library("other-lib", "另一个库", str(vault2))
+        self.pipeline.index_library("test-lib")
+        self.pipeline.index_library("other-lib")
+
+        results = self.pipeline.search("test-lib,other-lib", "插件 架构", top_k=10)
+        library_ids = {r.library_id for r in results}
+        self.assertEqual(library_ids, {"test-lib", "other-lib"})
+        paths = {r.path for r in results}
+        self.assertIn("plugin-notes.md", paths)
+        self.assertIn("other.md", paths)
+
+    def test_multi_library_search_empty_libraries_defaults_to_all(self):
+        """libraries 留空="全部已注册库"——对齐 obsidian-rag 在没有配置
+        default_libraries 时的最终回退行为（rag-redo 目前没有通用配置
+        存储，直接以全部库为默认，见 resolve_libraries 的说明）。"""
+        vault2 = self.tmp / "vault2"
+        vault2.mkdir()
+        (vault2 / "other.md").write_text("# 另一个库\n\n插件 架构 也出现在这里。", encoding="utf-8")
+        self.lib_mgr.store.add_library("other-lib", "另一个库", str(vault2))
+        self.pipeline.index_library("test-lib")
+        self.pipeline.index_library("other-lib")
+
+        results = self.pipeline.search("", "插件 架构", top_k=10)
+        self.assertEqual({r.library_id for r in results}, {"test-lib", "other-lib"})
+
+        all_results = self.pipeline.search("all", "插件 架构", top_k=10)
+        self.assertEqual({r.library_id for r in all_results}, {"test-lib", "other-lib"})
+
+    def test_multi_library_search_exclude_removes_library_from_pool(self):
+        vault2 = self.tmp / "vault2"
+        vault2.mkdir()
+        (vault2 / "other.md").write_text("# 另一个库\n\n插件 架构 也出现在这里。", encoding="utf-8")
+        self.lib_mgr.store.add_library("other-lib", "另一个库", str(vault2))
+        self.pipeline.index_library("test-lib")
+        self.pipeline.index_library("other-lib")
+
+        results = self.pipeline.search("all", "插件 架构", top_k=10, exclude="other-lib")
+        self.assertEqual({r.library_id for r in results}, {"test-lib"})
+
+    def test_search_unknown_library_name_raises_value_error_listing_available(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.pipeline.search("no-such-lib", "随便什么查询")
+        self.assertIn("test-lib", str(ctx.exception))
+
+    def test_search_exclude_everything_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            self.pipeline.search("test-lib", "随便什么查询", exclude="test-lib")
+
+    def test_search_folder_filter_scopes_to_subdirectory(self):
+        """folder 按库内子目录过滤——须是完整目录名，"docs" 匹配
+        "docs/x.md" 不匹配 "docs2/x.md"，对齐 obsidian-rag/retriever.py
+        ::_in_folder 的前缀+边界规则。"""
+        (self.vault / "docs").mkdir()
+        (self.vault / "docs" / "inside.md").write_text(
+            "# docs内的笔记\n\n插件 架构 相关内容。", encoding="utf-8"
+        )
+        (self.vault / "docs2").mkdir()
+        (self.vault / "docs2" / "outside.md").write_text(
+            "# docs2的笔记（不该被docs前缀误匹配）\n\n插件 架构 相关内容。", encoding="utf-8"
+        )
+        self.pipeline.index_library("test-lib")
+
+        results = self.pipeline.search("test-lib", "插件 架构", top_k=10, folder="docs")
+        paths = {r.path for r in results}
+        self.assertIn("docs/inside.md", paths)
+        self.assertNotIn("docs2/outside.md", paths)
+
     def test_reindex_after_disabling_gui_style_optional_plugin_still_works(self):
         """插件之间真的没有硬编码依赖——即使不装/不启用任何 gui_panel 类
         插件（Phase 1 目前还没有这类插件），核心检索链路完全不受影响，

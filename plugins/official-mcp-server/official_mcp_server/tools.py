@@ -14,12 +14,36 @@ from core.pipeline import Pipeline
 
 def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
     @server.tool()
-    def search_knowledge(query: str, library_id: str, top_k: int = 5) -> dict[str, Any]:
-        """在指定库里做混合检索（词法 BM25 + 向量 + RRF 融合 + 重排），返回最相关的片段。
+    def search_knowledge(
+        query: str,
+        top_k: int = 5,
+        libraries: str = "",
+        exclude: str = "",
+        folder: str = "",
+        include_body: bool = True,
+    ) -> dict[str, Any]:
+        """语义搜索知识库（混合检索：向量语义 + 关键词 + 重排），返回最相关的片段。
+
+        库选择（先调 list_libraries 查看可用库名，对齐 obsidian-rag/
+        retriever.py::hybrid_search 的选库语法）：libraries 为空="全部已
+        注册库"；"all"=全部库；"A,B"=多库并查（跨库统一重排，不是简单
+        拼接——见 core/pipeline.py::search 的说明）；exclude="B"=全部库
+        排除B（反选）；最终范围=(libraries非空?libraries:全部库)−exclude，
+        未知库名会报错并列出可用库。folder 可按库内子目录过滤（须是完整
+        目录名，比如"docs"能匹配"docs/x.md"但不匹配"docs2/x.md"）。
+
+        置信度是重排器给出的、跨查询可比的校准概率（0~1，0.5=无法判断，
+        <0.30弱相关/0.30~0.75中相关/≥0.75高相关）——不是"这一批结果内部
+        排出来的相对名次"，同一次查询内分数越高越相关，但不同查询之间的
+        分数不能直接比较优劣。
+
+        include_body=False 时只返回来源清单（路径/标题/库id，无正文），
+        用于两阶段检索：先低成本枚举全量候选，再对命中少数用 read_document
+        精读——省去把大段无关正文传回来的token开销。
 
         实测过：MCP SDK（本项目锁定版本 2.2.0）的工具函数里裸抛异常
-        （比如 library_id 打错触发的 KeyError）不会被自动折叠成一个干净
-        的 is_error 结果——会原样往上炸。AI agent 调用这类工具时打错参数
+        （比如库名打错触发的 ValueError）不会被自动折叠成一个干净的
+        is_error 结果——会原样往上炸。AI agent 调用这类工具时打错参数
         是完全正常会发生的事，不能让它变成服务端异常，所以这里显式
         try/except，把"库不存在"这类可预期的失败折叠成 {"ok": False,
         "error": ...} 返回，绝不裸抛（同 official-gui-shell 的 Api 类
@@ -28,20 +52,24 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
 
         Args:
             query: 查询文本
-            library_id: 要搜索的库的 id（用 list_libraries 查看有哪些库）
             top_k: 最多返回几条结果
+            libraries: 库范围，逗号分隔的库id列表，空="全部库"，"all"=全部库
+            exclude: 要排除的库id，逗号分隔
+            folder: 按库内子目录过滤，留空=不过滤
+            include_body: False 时只返回来源清单不含正文
         """
         try:
-            results = pipeline.search(library_id, query, top_k=top_k)
+            results = pipeline.search(libraries, query, top_k=top_k, exclude=exclude, folder=folder)
         except Exception as exc:  # noqa: BLE001 - 见上方 docstring
             return {"ok": False, "error": str(exc)}
         return {
             "ok": True,
             "results": [
                 {
+                    "library_id": r.library_id,
                     "path": r.path,
                     "heading": r.heading_breadcrumb,
-                    "text": r.text,
+                    **({"text": r.text} if include_body else {}),
                     "confidence": round(r.confidence, 3),
                 }
                 for r in results

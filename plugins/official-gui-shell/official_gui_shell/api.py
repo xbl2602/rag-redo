@@ -52,17 +52,36 @@ class Api:
             ],
         }
 
-    def search(self, library_id: str, query: str, top_k: int = 10) -> dict[str, Any]:
+    def search(
+        self,
+        libraries: str,
+        query: str,
+        top_k: int = 10,
+        *,
+        exclude: str = "",
+        folder: str = "",
+    ) -> dict[str, Any]:
+        """`libraries` 支持 core/pipeline.py::search 的多库选库语法（单库名/
+        逗号分隔多库/空="全部库"/"all"）——参数位置保持和旧的单库
+        `library_id` 参数一致（第一个位置参数），前端目前仍然只传当前选中
+        的单个库id（见 assets/index.html 的 `state.activeLibraryId`），这
+        本身就是"逗号分隔列表里只有一项"的合法特例，不需要改调用方也能
+        直接享受到多库能力已经在编排层就绪这件事。**真正的多库勾选UI**
+        （对齐 obsidian-rag GUI 的库复选树，`checked=None`→全部库/
+        `checked=集合`→白名单并查）**还没做**，是一处如实记录的、刻意
+        分阶段的简化——底层能力已经完整，缺的只是前端一个新的复选框
+        树控件，不影响这个方法本身的正确性。"""
         if not query.strip():
             return {"ok": True, "results": []}
         try:
-            results = self._pipeline.search(library_id, query, top_k=top_k)
+            results = self._pipeline.search(libraries, query, top_k=top_k, exclude=exclude, folder=folder)
         except Exception as exc:  # noqa: BLE001 - 见模块 docstring
             return {"ok": False, "error": str(exc)}
         return {
             "ok": True,
             "results": [
                 {
+                    "library_id": r.library_id,
                     "path": r.path,
                     "heading": r.heading_breadcrumb,
                     "text": r.text,

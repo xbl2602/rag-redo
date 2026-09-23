@@ -59,7 +59,7 @@ Or connect it to an MCP-capable AI tool (Claude Code, opencode, etc.) by pointin
 }
 ```
 
-Once connected, the AI gets these tools: `search_knowledge` (hybrid text search) / `navigate_knowledge` (PDF page-level visual navigation — an independent "second retrieval system" that never participates in the fusion ranking of the former) / `list_libraries` / `reindex_knowledge` / `export_library` / `import_library` / `get_library_sample` + `propose_library_summary` + `apply_library_summary` (library summaries: helps the AI judge "is this library worth searching?" before it dives in; user-authored summaries are protected by the write-gate — the AI cannot overwrite them without explicit confirmation).
+Once connected, the AI gets these tools: `search_knowledge` (hybrid text search, with multi-library search / exclude / folder-scoped filtering — `libraries` defaults to all registered libraries when left blank) / `navigate_knowledge` (PDF page-level visual navigation — an independent "second retrieval system" that never participates in the fusion ranking of the former) / `list_libraries` / `reindex_knowledge` / `export_library` / `import_library` / `get_library_sample` + `propose_library_summary` + `apply_library_summary` (library summaries: helps the AI judge "is this library worth searching?" before it dives in; user-authored summaries are protected by the write-gate — the AI cannot overwrite them without explicit confirmation).
 
 Run the tests (no need to install torch/sentence-transformers/qwen-vl-utils — the whole suite runs against injected fake models, see [docs/LESSONS.md](docs/LESSONS.md)):
 
