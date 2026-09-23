@@ -20,7 +20,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).parent
+#: 打包后（PyInstaller）跑的是冻结的 exe，__file__ 指向的是打包器内部
+#: 临时/内嵌路径，不是发行目录——这时候必须以 exe 自己的位置为准，理由
+#: 同 gui_main.py 里的同名判断：plugins/ 必须是发行目录里一个真实、用户
+#: 能自己增删的文件夹，不能被打包进冻结产物内部。
+if getattr(sys, "frozen", False):
+    REPO_ROOT = Path(sys.executable).parent
+else:
+    REPO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(REPO_ROOT))
 for _plugin_dir in (REPO_ROOT / "plugins").glob("*"):
     if _plugin_dir.is_dir():

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -124,7 +125,7 @@ api_version = ">=0.1,<0.2"
 [runtime]
 kind = "subprocess_service"
 entry = "{module_name}:{class_name}"
-command = ["{sys.executable}", "server.py", "--port", "{{port}}"]
+command = [{json.dumps(sys.executable)}, "server.py", "--port", "{{port}}"]
 health_check = "http://127.0.0.1:{{port}}/health"
 
 [permissions]
@@ -279,6 +280,27 @@ class TestPluginRuntimeLifecycle(unittest.TestCase):
         rt.scan()  # 不传 state_file 时纯内存运行，不该报错
 
 
+def _process_is_gone(pid: int) -> bool:
+    """跨平台的"这个 pid 是不是真的没了"检查。POSIX 上 os.kill(pid, 0)
+    不发信号只探测进程是否存在，进程不在时抛 ProcessLookupError；Windows
+    没有这个信号语义，os.kill 在那边会直接抛 OSError（WinError 87），不能
+    用同一段代码判断，得走 Win32 OpenProcess API 才是真的问操作系统。"""
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return True
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
 class TestSubprocessServicePluginLifecycle(unittest.TestCase):
     """真实验证 subprocess_service 这条运行时路径：on_enable 真的拉起
     子进程、方法调用真的经过本机HTTP走到子进程、on_disable 真的把子进程
@@ -303,6 +325,19 @@ class TestSubprocessServicePluginLifecycle(unittest.TestCase):
         self.rt = PluginRuntime(self.plugins_dir, state_file=self.tmp / "data" / "plugins_state.json")
         self.rt.scan()
 
+    def tearDown(self) -> None:
+        # 兜底清掉这个类里任何测试方法真的拉起来但没自己 disable 掉的
+        # 子进程——在真实 Windows 机器上跑测试时发现过
+        # test_enable_starts_real_subprocess_and_call_round_trips 忘记
+        # disable，每跑一次就在系统里留下一个真的游离 server.py 子进程
+        # （架构红线6"不产生游离进程"，测试代码自己也不能违反，且这种
+        # 泄漏在一次性沙盒环境里几乎不可见，只有在持久化的真实机器上才
+        # 会累积暴露）。
+        for plugin_id in ("t-sub", "t-sub-broken"):
+            plugin = self.rt.plugins.get(plugin_id)
+            if plugin is not None and plugin.state == PluginState.ENABLED:
+                self.rt.disable(plugin_id)
+
     def test_enable_starts_real_subprocess_and_call_round_trips(self):
         self.rt.load("t-sub")
         self.assertEqual(self.rt.plugins["t-sub"].state, PluginState.LOADED)
@@ -322,8 +357,7 @@ class TestSubprocessServicePluginLifecycle(unittest.TestCase):
 
         self.rt.disable("t-sub")
         self.assertEqual(self.rt.plugins["t-sub"].state, PluginState.DISABLED)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(pid, 0)
+        self.assertTrue(_process_is_gone(pid))
 
     def test_broken_subprocess_command_marks_plugin_failed_not_crash(self):
         _make_plugin_dir = self.plugins_dir / "t-sub-broken"
@@ -334,8 +368,8 @@ class TestSubprocessServicePluginLifecycle(unittest.TestCase):
         toml_path = _make_plugin_dir / "plugin.toml"
         content = toml_path.read_text(encoding="utf-8")
         content = content.replace(
-            f'command = ["{sys.executable}", "server.py", "--port", "{{port}}"]',
-            'command = ["python3", "-c", "import sys; sys.exit(1)"]',
+            f'command = [{json.dumps(sys.executable)}, "server.py", "--port", "{{port}}"]',
+            f'command = [{json.dumps(sys.executable)}, "-c", "import sys; sys.exit(1)"]',
         )
         toml_path.write_text(content, encoding="utf-8")
 

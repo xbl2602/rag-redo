@@ -42,6 +42,11 @@ def extract(library_id: str, path: str, root: Path) -> ExtractedDocument:
         # UnicodeDecodeError，只会把 BOM 悄悄留在结果字符串开头，那样"失败
         # 才回退"的逻辑永远不会被触发，BOM 会一路带进索引污染检索。
         text = data.decode("utf-8-sig")
+        # Windows 上 Obsidian/记事本等编辑器写出来的 .md 大概率是 \r\n
+        # 换行——内容哈希用的是解码前的原始字节（不受影响），但 text 要
+        # 统一成 \n，不然切块按行切分时每行末尾都带一个看不见的 \r，且
+        # 同一篇笔记在 Windows/Linux 之间换行符不同会被误判成内容变了。
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
     except UnicodeDecodeError as exc:
         return ExtractedDocument(
             library_id=library_id,

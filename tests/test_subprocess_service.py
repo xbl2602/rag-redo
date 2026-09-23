@@ -52,6 +52,27 @@ srv.serve_forever()
 _EXITS_IMMEDIATELY = "import sys; sys.stderr.write('boom\\n'); sys.exit(1)"
 
 
+def _process_is_gone(pid: int) -> bool:
+    """跨平台的"这个 pid 是不是真的没了"检查，理由同 test_runtime.py 里
+    同名函数——POSIX 的 os.kill(pid, 0) 信号-0 探测语义在 Windows 上不
+    成立（直接抛 OSError 而不是 ProcessLookupError），得走 Win32
+    OpenProcess API。"""
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return True
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
 class TestSubprocessServiceHandle(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -92,8 +113,7 @@ class TestSubprocessServiceHandle(unittest.TestCase):
         self.assertFalse(handle.is_alive)
         # 不只是我们自己的 Popen 对象说"没了"——真的问操作系统这个 pid 还在不在，
         # 对应架构红线6"不产生游离进程"，这是这条红线唯一靠得住的验证方式。
-        with self.assertRaises(ProcessLookupError):
-            os.kill(pid, 0)
+        self.assertTrue(_process_is_gone(pid))
 
     def test_stop_is_idempotent(self):
         handle = self._make_handle()

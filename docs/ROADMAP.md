@@ -10,7 +10,7 @@
 2. **给 `official-ocr-mineru-local` 接真实模型（Phase 2）**——当前子进程里 `_real_ocr()` 是懒导入+清楚报错的占位，`RAG_REDO_FAKE_OCR=1` 才是测试走的路径，没有装、也没有下载任何真实OCR依赖/权重（这是本轮明确的约束：沙盒虚拟机空间有限）。真机器/有空间的环境上可以：①选定具体依赖（README 里占位写的是 `mineru`，需要确认实际包名/安装方式）；②在 `_real_ocr()` 里接真实调用；③同时把 `env_bootstrap` 的真正执行逻辑补上（见第3条），不要让重依赖悄悄装进核心 `.venv`。
 3. **实现 `env_bootstrap` 的真正执行（Phase 2 遗留）**——`plugin.toml` 的 `env_bootstrap` 字段核心从来没有真正跑过；`core/subprocess_service.py` 的 `resolve_plugin_python()` 目前永远会退化成用核心自己的解释器。只要还没有插件需要真实重依赖，这个简化不算错，但接第2条之前必须先把这个补上。
 4. **Phase 3 剩余两项**——库 AI 摘要（`official-library-summary`，需要先设计 `llm_provider` 扩展点+有序回退链，AGENTS.md"插件规则"一节已经写了设计意图）、Agent 写权限门禁通用化（`core/write_gate.py` 机制已实现，但还没有任何插件真的调用它触发）。
-5. **Phase 4：Windows 安装包**——完全没做，必须在真实 Windows 环境上构建验证（PyInstaller/Nuitka + Inno Setup），这个 Linux 沙盒做不了，也不该在这里写投机性的打包脚本。
+5. **Phase 4：Windows 安装包**——PyInstaller 打包这一半已经在真实 Windows 11 机器上做完并验证过（见下方 Phase 4 状态段落），免安装 onedir 产物能跑；**还没做的是 Inno Setup 安装包包装本身**（开始菜单快捷方式/卸载入口）+ 在一台"没装过任何开发工具"的干净 Windows 机器上验证打包产物能跑（目前只在打包机器本机验证过）+ 安装/卸载前后系统关键位置无残留的实测。
 
 ## Phase 0 — 插件运行时骨架（无 RAG 功能）
 
@@ -37,7 +37,7 @@
 
 **验收标准与当前完成情况**：
 - ✅ 能索引 demo-vault 和至少一个真实 Obsidian 库，检索质量不低于旧项目当前水平——`tests/test_pipeline_e2e.py` 用真实 `PluginRuntime` 扫描/加载/启用全部插件，索引临时小库后搜索，验证语义相关性、排除文件不泄漏、跨库隔离（词法+向量两路都验证过，词法这路是靠这个测试过程中发现真bug才补上的）；`plugins/official-mcp-server/tests/test_tools.py` 用真实 `MCPServer.call_tool()` 验证 MCP 协议层；额外用真实子进程（`mcp_stdio.py`）+ 真实 MCP 客户端做过一次手动冒烟，`initialize`/`list_tools`/`call_tool` 全部通过真实 stdio 协议接通。**未验证的是"和旧项目实际检索质量对比"**——这需要旧项目的真实 Obsidian 库和一批真实查询词人工比对，本轮没有这份数据，留给你实际用起来后反馈
-- ⬜ Windows 安装包/便携版在一台没装过 Python 的干净 Windows 环境里，从下载到能搜到第一条结果——**无法在当前 Linux 开发环境验证**，PyInstaller 打包 Windows .exe 通常需要在 Windows 上实际构建（不可靠的跨平台交叉编译），这是 Phase 4 的工作，且需要真实 Windows 机器
+- 🟡 Windows 安装包/便携版在一台没装过 Python 的干净 Windows 环境里，从下载到能搜到第一条结果——**PyInstaller 打包本身已经在真实 Windows 11 机器上做完并验证过**（onedir 产物真实弹窗渲染、真实 MCP 子进程通信，见 Phase 4 状态段落），但还没有"Inno Setup 安装包包装"+"在一台没装过任何开发工具的干净机器上验证打包产物"这两步，所以还不能勾满
 - ✅ Linux 开发环境下等价的源码安装方式能跑通同样的功能——当前所有开发/测试都在 Linux 完成，`core/`+14个官方插件+`mcp_stdio.py`+`gui_main.py` 全部在 Linux venv 里真实跑通
 - ✅ 关掉任意一个非必需插件（比如 GUI），核心+MCP 仍能正常工作——`mcp_stdio.py` 的 `REQUIRED_PLUGINS` 列表从不包含 `official-gui-shell`，MCP 全程不依赖它；`test_pipeline_e2e.py` 显式验证 gui-shell 处于"已发现未启用"状态时检索链路完全正常
 - ✅ 同时装两个都声明 `embedder` 扩展点的插件，在配置里切换"当前用哪个"不需要重启进程——`ExtensionRegistry.set_active()` 机制在 Phase 0 就已验证（`core/tests/test_runtime.py::test_singleton_conflict_surfaced_not_silent`），Phase 1 未额外造第二个 embedder 实现去重复验证，机制本身没变
@@ -70,11 +70,17 @@
 
 ## Phase 4 — 打包收尾与文档定稿
 
-- Windows 安装包（PyInstaller/Nuitka + Inno Setup）+ 免安装便携版，同一套打包脚本产出两种产物
-- 在一台干净 Windows 虚拟机上验证安装/卸载前后系统关键位置（注册表、全局 PATH、系统 Python 环境）无残留变化，坐实 AGENTS.md 架构红线7"不污染主机环境"不是口号
-- README.md 补全真实安装步骤+截图，README.en.md 英文镜像同步
-- [docs/legacy/](legacy/) 归档内容与 [docs/LESSONS.md](LESSONS.md) 精炼版交叉核对不遗漏关键教训
-- 全量回归测试纪律对齐旧项目（隔离测试环境、假 HTTP 注入、隐藏测试库模式）
+**状态（2026-09-23，真实 Windows 11 机器上做的，不是 Linux 沙盒里假设的）**：
+
+- ✅ **换机器验证**：项目此前只在 Linux 沙盒里开发过，第一次在真实 Windows 11 机器上重建 `.venv`、装轻量依赖、跑 `tests/run.py`——过程中真实发现并修了4个此前从没在真机上暴露过的 Windows 兼容性 bug：①测试构造合成插件时把 `sys.executable`（Windows 路径带反斜杠）直接拼进 TOML 字符串，触发 TOML 转义解析错误；② `os.kill(pid, 0)` 探测进程存活的 POSIX 惯用法在 Windows 上不成立（抛 `OSError` 不是 `ProcessLookupError`），改用 Win32 `OpenProcess` 判断；③ `official-extractor-text` 读文件不做换行符归一化，Windows 上 `\r\n` 原样带进检索文本；④ `tests/run.py` 打印中文用例名时，非真实控制台（管道/重定向）下 stdout 编码退化成系统码页，`UnicodeEncodeError` 崩溃，改成显式 `reconfigure(encoding="utf-8")`。同时发现一个更严重的问题：`tests/test_runtime.py` 里一个测试真的启动子进程做真实验证，却没有对应的 `tearDown` 兜底清理——在一次性沙盒环境里这个坑完全不可见（进程随容器一起没了），只有在持久化的真实机器上跑几次测试后才会看到系统里堆积出真的游离 `server.py` 进程，已修（架构红线6"不产生游离进程"对测试代码自己同样适用）。全部 27 个测试套件（255+ 用例）修完后在真实 Windows 上稳定全绿。
+- ✅ **GUI/MCP 两个入口在真实 Windows 上跑通**：`gui_main.py` 真的用 pywebview 弹出窗口、加载 Edge WebView2 后端、渲染出库管理/搜索界面（截图验证过内容不是空白/报错页）；`mcp_stdio.py` 真的被当子进程 Popen 起来，用真实 JSON-RPC over stdio 做过 `initialize`/`tools/list`/`tools/call`，5个工具（search_knowledge/list_libraries/reindex_knowledge/export_library/import_library）全部正常响应——这两项此前在 Linux 沙盒里从未被真实验证过（GUI 只在 WebKit2GTK 上测过，MCP 只测过协议层不测过真实 Windows 进程拉起）。
+- ✅ **PyInstaller 打包**：`installer/build_windows.py` 把两个入口各自冻结成 onedir 产物，`plugins/` 保持成产物旁边一个真实可编辑文件夹（不打包进冻结产物内部，理由见脚本 docstring）。真实验证过两个冻结产物都能独立跑（不需要系统装 Python）：GUI 弹窗渲染和直接跑源码时截图比对一致，MCP 走真实子进程+JSON-RPC 全部正常。过程中发现插件化架构给打包带来的真实复杂度：PyInstaller 的静态依赖分析看不到插件运行时才动态 import 的第三方库（比如 `official-extractor-docx` 的 `docx`），必须显式点名收集，不能指望自动发现——细节见脚本 docstring 和 [installer/README.md](../installer/README.md)。
+- ⬜ **Inno Setup 安装包包装**——还没做，目前只有免安装 onedir 产物，没有开始菜单快捷方式/卸载入口这套包装
+- ⬜ **在一台没装过任何开发工具的干净 Windows 机器上验证打包产物**——目前只在打包机器本机验证过，这是比"本机能跑冻结产物"更严格的最终验收场景
+- ⬜ 安装/卸载前后系统关键位置（注册表、全局 PATH、系统 Python 环境）无残留变化的实测——onedir 产物本身不写这些东西，但要等 Inno Setup 那层做完才能真正验收
+- ⬜ README.md 补全真实安装步骤+截图，README.en.md 英文镜像同步
+- ⬜ [docs/legacy/](legacy/) 归档内容与 [docs/LESSONS.md](LESSONS.md) 精炼版交叉核对不遗漏关键教训
+- ⬜ 全量回归测试纪律对齐旧项目（隔离测试环境、假 HTTP 注入、隐藏测试库模式）——这条本身已经在做（见上面"换机器验证"），但还没有系统性地对照旧项目纪律逐条过一遍
 
 ## 开放问题（需要你审阅确认）
 

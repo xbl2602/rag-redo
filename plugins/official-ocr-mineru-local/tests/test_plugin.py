@@ -21,6 +21,27 @@ sys.path.insert(0, str(REPO_ROOT))
 from core.runtime import PluginRuntime, PluginState  # noqa: E402
 
 
+def _process_is_gone(pid: int) -> bool:
+    """跨平台的"这个 pid 是不是真的没了"检查，理由同
+    tests/test_runtime.py 里同名函数——POSIX 的 os.kill(pid, 0) 信号-0
+    探测语义在 Windows 上不成立（直接抛 OSError 而不是
+    ProcessLookupError），得走 Win32 OpenProcess API。"""
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return True
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
 class TestMineruLocalOcrPlugin(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -75,8 +96,7 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
         pid = self.instance._handle._process.pid  # noqa: SLF001 - 直接问操作系统这个pid还在不在
         self.rt.disable("official-ocr-mineru-local")
         self.assertIsNone(self.rt.resource_arbiter.holder_of("gpu:0"))
-        with self.assertRaises(ProcessLookupError):
-            os.kill(pid, 0)
+        self.assertTrue(_process_is_gone(pid))
 
     def test_extract_after_disable_folds_to_failure_not_crash(self):
         self.rt.disable("official-ocr-mineru-local")

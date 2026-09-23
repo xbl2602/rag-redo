@@ -10,7 +10,7 @@
 
 Phase 1（文字检索 MVP）核心链路已实现并有真实测试覆盖（200+ 用例）：13 个官方插件（多格式提取、切块、库管理、BM25 词法检索、BGE-M3 向量化、Chroma 向量库、RRF 融合、重排、MCP 工具、GUI 壳、近似去重）+ 编排层 + Agent 写权限门禁。详见 [docs/ROADMAP.md](docs/ROADMAP.md) 的逐项完成情况。
 
-**还没做的**：Windows 安装包（Phase 4，需要真实 Windows 环境构建，当前开发环境是 Linux）；视觉/OCR 类插件（Phase 2，需要真实 API Key 或大模型下载，当前环境未配置）。
+**还没做的**：Windows 安装包的 Inno Setup 包装（PyInstaller 打包本身已经在真实 Windows 11 机器上做完并验证过，见 [installer/README.md](installer/README.md)，但还没有开始菜单快捷方式/卸载入口，也没在干净机器上验证过）；视觉/OCR 类插件（Phase 2，需要真实 API Key 或大模型下载，当前环境未配置）。
 
 架构设计文档：
 

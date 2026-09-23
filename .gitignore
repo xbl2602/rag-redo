@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 data/
 
+# Windows 打包产物（installer/build_windows.py 的输出），不是源码
+build/
+dist/
+*.spec
+
 # subprocess_service 插件自带的独立依赖环境
 plugins/*/.venv/
 plugins/*/env/

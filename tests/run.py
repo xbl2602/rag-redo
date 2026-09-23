@@ -22,6 +22,14 @@ TESTS_DIR = Path(__file__).parent
 sys.path.insert(0, str(TESTS_DIR))
 sys.path.insert(0, str(REPO_ROOT))
 
+# Windows 下用管道/文件重定向运行时（不是真实控制台），stdout/stderr 的
+# 编码会退化成系统区域码页（比如 cp1252），print() 里的中文用例名直接
+# UnicodeEncodeError 崩掉——这里统一重编码成 utf-8，真实在这台 Windows
+# 机器上复现过这个崩溃才加的，不是猜的。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 CORE_SUITES = [
     "test_manifest",
     "test_registry",
