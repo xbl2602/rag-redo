@@ -13,6 +13,35 @@
 5. ~~Phase 3 剩余两项（库 AI 摘要 + Agent 写权限门禁通用化）~~——**已完成（2026-09-23）**，见下方 Phase 3 状态段落。新发现一项未跟踪的功能缺口：调查过程中确认旧项目 `retriever.py::hyde_generate`（查询侧 HyDE 增强，让 LLM 为查询生成一段假设答案文档再去检索）是和库摘要**平行、独立**的功能，用同一协议但不同的配置端点（`hyde_llm_url`/`hyde_llm_model` vs `library_summary_llm_url`/`library_summary_llm_model`）——这次没有实现（ROADMAP此前从未把它列为独立追踪项，只在 FEATURE_TRIAGE.md 的库摘要那一行里以"HyDE式"三个字带过，容易被误读成同一个功能），如实记录为一个新发现的、还没做的功能，不是遗漏了已知计划项。
 6. ~~Phase 4：Inno Setup 安装包包装~~——**已完成（2026-09-23，真实编译+真实装卸全流程验证过）**，见下方 Phase 4 状态段落。**还没做的是在一台"没装过任何开发工具"的干净 Windows 机器上验证打包产物**（目前只在打包机器本机验证过完整装卸循环）+ 给冻结产物打包独立便携Python让 `official-visual-wemm`/`official-ocr-mineru-local` 在打包版本里也能真正可用（见上面第3/4条）+ 打包体积优化（当前约1GB/exe，根因也是WEMM验证重依赖临时装在核心venv里）。
 7. ~~多库并查检索选择+folder过滤+置信度真分尺度~~——**已完成（2026-09-23）**：对照 obsidian-rag/retriever.py::hybrid_search 逐项核对 `search_knowledge` 时发现的真实缺口（此前 ROADMAP 从未把这单独列为追踪项，不是遗漏了已知计划，是这轮对照审计才发现），见下方 Phase 1 状态段落。
+8. **⚠ 全面功能审计（2026-09-23）发现的新缺口，均未实现，按下方分类排序**——操作者要求"确保所有功能都完整复刻"后，逐个对照 obsidian-rag `server.py`（16个MCP工具 vs rag-redo当前9个）、`config.py`（CFG约60个配置项）、`singleton.py`、`guiweb/graph_data.py`+`semantic.py` 做的系统性核对，发现的缺口比此前任何一次审计都大，如实列出、不预设优先级由操作者定夺。详见下方"2026-09-23 全面功能审计"独立小节。
+
+## 2026-09-23 全面功能审计——已发现、尚未实现的缺口
+
+> 操作者要求"检查decision log/相关文档核对功能是否完整复刻"后的系统性核对结果。方法：`grep "@server.tool()"` 拿到 obsidian-rag 全部16个MCP工具的权威清单，逐个核对 rag-redo 当前实现；同时通读 `config.py` 全部 CFG 默认值、`singleton.py`、`guiweb/graph_data.py`+`semantic.py`。**这些都是这次才发现的真实缺口，不是已知计划里遗漏的执行细节**——此前的 FEATURE_TRIAGE.md 表格粒度停在"插件级"，从没有逐个核对过 MCP 工具级别和 CFG 配置项级别，这次审计把粒度下钻到了那两层。
+
+**A类——底层能力已存在，只差 MCP 封装（低工作量）**：
+- `find_duplicates`：`official-dedup` 插件的 `DedupPlugin.find_duplicate_groups(library_id)` 已实现且有测试，但从未注册成 MCP 工具——AI 现在完全无法触发近似去重诊断。
+- `wemm_status`：`official-visual-wemm` 子进程的 `/health` 探测已存在（`_handle.is_alive`/health_check），但没有对外的 MCP 只读诊断工具，用户/AI 没法直接问"WEMM 到底能不能用"。
+
+**B类——需要新写逻辑，但能直接复用已有基础设施（中等工作量）**：
+- `get_selection`/`propose_selection_changes`/`apply_selection_changes`：obsidian-rag 里 AI 可以经 MCP **提议**库内文件级勾选变更（纳入/排除某文件/目录），用户确认后生效——rag-redo 的 `official-library-manager` 已经有底层写方法 `LibraryConfigStore.set_selection()`，也已经有通用的 `core/write_gate.py` 两段式确认服务（`official-library-summary` 已经证明了这个模式能跑），但从没有人把两者接起来给 AI 用。AI 现在只能"读"库的勾选状态（`resolve_included_files`），不能"提议改"。
+- 置信度分档标注（"低置信度，仅供参考"）：`search_knowledge` 的工具描述里写了 <0.30/0.30~0.75/≥0.75 三档的**说明文字**，但没有像 obsidian-rag 那样真的在低置信度结果上**附加标注**——AI 拿到的是裸数字，得自己套文档里的阈值判断，obsidian-rag 是直接标好的。
+- 同篇结果封顶/截断（`max_chunks_per_file`/`truncate_mark`/`return_chunk_limit`）：obsidian-rag 的正文模式会给"同一篇笔记最多出现几块"设上限、超长块会截断并标注"完整内容见源文件"——rag-redo 现在对同一篇文章命中再多块也照单全收，也没有单块长度上限。
+- `small_to_big`（命中小块回填父节全文）：obsidian-rag 默认开启，小块检索保证召回精度，但展示时回填到父章节，兼顾"检索准"和"读起来有上下文"两头；rag-redo 目前只有小块，没有父子层级关系，也没有回填逻辑——这个需要 `official-chunker` 先建立父子块的关联关系，`search()` 命中后再查父块，两处都要动。
+- 进程单例守卫（`singleton.py`）：obsidian-rag 用非阻塞文件锁保证同一时刻只有一个 MCP server 实例在跑——原因是真实观测到过 opencode 等 MCP 客户端在启动时误拉起两个实例，导致模型/索引写锁双份常驻。rag-redo 的 `mcp_stdio.py` 完全没有这层防护，理论上同样会中招（架构红线6"不产生游离进程"这条本来管的是"自己启动的子进程"，这个是"自己这个主进程被重复拉起"，是同一个问题家族的另一种表现形式，此前没人往这个角度想过）。
+
+**C类——全新功能，需要真正的新设计（工作量最大，多数会碰 `core/`，按红线4需要先确认再动）**：
+- `note_relations`（双链关系查询）+ **通用配置存储的缺失是很多小缺口的共同根因**：rag-redo 目前**完全没有** Obsidian `[[wikilink]]` 解析能力——不只是 MCP 工具缺，是从提取阶段开始就没有"这篇笔记链接到谁"这件事的任何记录。这是一块新的、独立的能力（解析+存储+查询三层都要新建），graph 视图（下一条）也依赖它。
+- `index_status`（索引进度查询）+ **后台索引**：obsidian-rag 的重建索引是后台线程执行、带心跳+卡死检测，MCP 立即返回、AI 用 `index_status` 轮询进度。rag-redo 的 `index_library()` 是**同步阻塞调用**——大库重建索引时 MCP 这次调用会一直卡着直到全部做完，没有进度可看，AI 客户端也可能等超时。这个不是"锦上添花"的功能，是真实的可用性风险（`docs/LESSONS.md` 这次审计前刚补的"长时间任务需要心跳/进度通道"那条教训，一直没有真正被应用到索引这个最需要它的地方）。
+- `read_document`（读某文档的完整提取正文）：rag-redo 的 `ExtractedDocument.text` 只在 `index_library()` 内部一闪而过（提取完立刻切块，切块完就丢），从不落盘/缓存，所以现在**没有任何办法**在索引之后再问"这篇文章完整提取出来是什么样"——.md/.txt 还能退化成直接重读源文件，但 pdf/docx 需要重新跑一遍提取（本机OCR的话代价很高）才能回答，需要先决定"要不要做一层提取结果缓存"这个设计问题。
+- 自适应建议系统（`advice.py` 思路）：`core/contracts.py::SearchResult.advice` 字段从 Phase 1 就写了占位注释"继承旧项目 advice.py 的思路，Phase 3 落地"，但至今没有任何代码往这个字段塞过东西——obsidian-rag 会根据这一批结果的形态自动给 AI 提示（"多条高置信命中→调大top_k"/"命中含非笔记库→传libraries过滤"等），rag-redo 目前这个字段恒为空元组，功能占位了三个 Phase 都没有真正落地。
+- Graph 视图（`guiweb/graph_data.py`+`semantic.py`）：全库双链关系图+可选语义相似度边，纯 GUI 侧新面板，依赖上面的 `note_relations`/wikilink 能力打底，rag-redo 现在完全没有对应面板（Phase 1 GUI 范围里从没提过这个面板，不是被砍掉，是压根没被列进候选清单）。
+- **通用插件配置存储**：这是本轮审计里最值得单独点名的一条——`core/context.py::PluginContext` 目前只有 `data_dir`，没有任何"用户可调、可持久化的设置"入口。obsidian-rag 的 `config.py` 有约60个 CFG 项（RRF双路权重、`rerank_candidates`池大小、`default_libraries`、`cuda_cooldown_seconds`、`confidence_warn_threshold`、`mineru_python` 覆盖路径等），这次审计里至少6处独立缺口（RRF权重写死、`default_libraries`没法配、`mineru_python`只能靠环境变量硬覆盖没有GUI入口……）根子都在"没有这层"。值得作为一个独立的核心服务先设计清楚（大概率是新的核心组件，不是插件——两个已有核心服务`resource_arbiter`/`write_gate`都不懂具体配置项的含义，这个也该一样是"通用键值存储+插件各自声明自己关心哪些键"），再回头把上面几条一次性接进去，而不是每个缺口各自发明一套"环境变量兜底"。
+
+**D类——大概率不在"核心RAG能力"范围内，如实列出但不建议优先**：
+- `tools/check_notes.py`（笔记命名规范扫描）：这是原作者个人笔记组织习惯（MOC-前缀/frontmatter title等硬规则）绑定的一次性 CLI 工具，不是通用 RAG 能力，是否移植取决于操作者自己的笔记习惯是否也遵循同一套规范，不是"功能对齐"意义上的缺口。
+
+以上均为如实记录、未开始实现——本轮只做了审计和记录，没有擅自开始动工（C类多数会改 `core/`，按架构红线4先汇报等操作者定夺优先级）。
 
 ## Phase 0 — 插件运行时骨架（无 RAG 功能）
 
