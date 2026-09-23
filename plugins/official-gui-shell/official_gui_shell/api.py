@@ -72,6 +72,26 @@ class Api:
             ],
         }
 
+    def navigate(self, library_id: str, query: str, top_k: int = 5) -> dict[str, Any]:
+        """页级视觉导航——独立于 search() 的"第二检索系统"，见
+        core/pipeline.py::navigate() 的说明。返回的每条结果只有 PDF 路径+
+        页码+相似度分数，不返回图片本身（这个类不做任何缩略图渲染，同
+        调查到的旧项目 obsidian-rag 行为：GUI 只展示状态/结果列表，不做
+        页面图片预览，见 docs/ROADMAP.md TODO 第1条的调查结论）。"""
+        if not query.strip():
+            return {"ok": True, "results": []}
+        try:
+            hits = self._pipeline.navigate(library_id, query, top_k=top_k)
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "results": [
+                {"path": h.path, "abs_path": h.abs_path, "page": h.page_index + 1, "score": h.score}
+                for h in hits
+            ],
+        }
+
     def export_library(self, library_id: str, dest_path: str) -> dict[str, Any]:
         """把一个库导出成归档文件，写到 dest_path（用户在前端填的目标路径，
         比如"把这个库搬到另一台电脑"场景下先导出到U盘/网盘同步目录）。文件

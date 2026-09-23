@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .contracts import ExtractedDocument, SearchResult
+from .contracts import ExtractedDocument, PageHit, SearchResult
 from .runtime import PluginRuntime
 
 
@@ -108,11 +108,14 @@ class Pipeline:
         vector_store = self._singleton("vector_store")
 
         report = IndexReport(library_id=library_id)
+        pdf_paths: list[str] = []  # 供后面 visual_index 后置阶段复用，不再问 library_manager 第二遍
         for path, included, reason in lib_mgr.resolve_included_files(library_id):
             file_report = IndexFileReport(path=path, included=included, reason=reason)
             report.files.append(file_report)
             if not included:
                 continue
+            if path.lower().endswith(".pdf"):
+                pdf_paths.append(path)
 
             doc = self._extract(library_id, path, root)
             if doc.text is None:
@@ -150,6 +153,19 @@ class Pipeline:
             # 都必须支持持久化——见 docs/PLUGIN_SPEC.md 对 Phase 1 阶段
             # "先把官方实现做对、通用契约留给后续显现真实需求"的说明。
             lexical.save(library_id)
+
+        # 页级视觉索引（visual_index，比如 official-visual-wemm）作为独立
+        # 后置阶段自动跟随——镜像旧项目 index.py 的 _wemm_auto_phase：每次
+        # 文字索引跑完自动同步页级视觉索引，和上面文字那条流水线彻底独立
+        # （不影响 report、不影响主链路成功/失败判定）。这里不包一层
+        # try/except——按架构红线4的同一条纪律，"绝不抛异常、失败自己折叠"
+        # 是 visual_index 插件自己的契约（同 extractor 绝不抛异常），不是
+        # 编排层兜底出来的，编排层只负责按顺序调用。没装/没启用任何
+        # visual_index 插件时这里是零开销空循环，见 docs/ROADMAP.md TODO
+        # 第1条的调查结论。
+        for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
+            visual = self._plugin(plugin_id)
+            visual.index_library(library_id, root, pdf_paths)
 
         return report
 
@@ -223,6 +239,27 @@ class Pipeline:
                 )
             )
         return results
+
+    # ---- 页级视觉导航（独立于 search() 的"第二检索系统"）-------------------
+
+    def navigate(self, library_id: str, query: str, top_k: int = 5) -> list[PageHit]:
+        """页级视觉导航——调查过旧项目 obsidian-rag 的 navigate_knowledge/
+        wemm_retriever.py 后确认：这不是 search() 的变体，是完全独立的
+        检索面，从不与 BM25+向量+RRF 那条融合排序发生任何关系（不混向量
+        空间、不混分数），见 core/contracts.py::PageHit 的说明。
+
+        多个 visual_index 插件同时启用时，各自给出各自的排序结果按提供者
+        id 顺序拼接——不同视觉模型的相似度量纲不可比，不做跨提供者的分数
+        排序合并（这本身也是"绝不混向量空间"原则的自然延伸）。"""
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+
+        hits: list[PageHit] = []
+        for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
+            visual = self._plugin(plugin_id)
+            hits.extend(visual.navigate(library_id, query, top_k=top_k))
+        return hits
 
     # ---- 导入导出 --------------------------------------------------------
     #

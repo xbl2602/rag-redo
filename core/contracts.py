@@ -129,3 +129,25 @@ class SearchResult:
     text: str
     confidence: float  # 0~1，展示层按此分档（强/中/弱相关）
     advice: tuple[str, ...] = ()  # 自适应建议，继承旧项目 advice.py 的思路，Phase 3 落地
+
+
+# ---- 页级视觉导航（visual_index 扩展点，比如 official-visual-wemm）--------
+
+
+@dataclass(frozen=True)
+class PageHit:
+    """页级视觉检索（"第二检索系统"）的一条结果——一整页 PDF 图对应一条，
+    不是文字 chunk。
+
+    调查了旧项目 obsidian-rag 的 WEMM 实际实现后确认：这条检索路径**从来
+    不参与** core/pipeline.py::search() 的 BM25+向量+RRF 融合排序，是完全
+    独立、单独调用的"第二检索系统"（旧项目 navigate_knowledge 与
+    search_knowledge 彻底分离，绝不混向量空间/绝不混分数——见
+    docs/ROADMAP.md TODO 第1条的调查结论）。所以 PageHit 和 SearchResult
+    刻意是两个互不相通的类型，不是同一个类型的可选字段。"""
+
+    library_id: str
+    path: str  # PDF 相对库根目录的路径
+    abs_path: str  # 这台机器上的绝对路径，方便调用方直接打开看图
+    page_index: int  # 0-based 页码
+    score: float  # 相似度分数，量纲与 SearchResult.confidence 不同，不能混用/换算/比较

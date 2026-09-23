@@ -49,6 +49,44 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         }
 
     @server.tool()
+    def navigate_knowledge(query: str, library_id: str, top_k: int = 5) -> dict[str, Any]:
+        """页级视觉导航——独立于 search_knowledge 的"第二套检索"，把 PDF
+        每一页渲染成图直接"看图"匹配，不依赖文字提取/OCR，扫描件、图表、
+        公式密集的页面也能按页定位。用法建议：先用 search_knowledge 找
+        文字线索，遇到"要看图/表格/扫描页"的情况再调这个工具按页定位到
+        具体 PDF+页码，自己去看 abs_path 指向的原文件（本工具不返回图片
+        本身）。
+
+        调查过旧项目 obsidian-rag 的 navigate_knowledge/wemm_retriever.py
+        后确认：这条检索路径从来不与 search_knowledge 的 BM25+向量+RRF
+        融合排序发生任何关系（不混向量空间、不混分数），所以这里的
+        confidence/score 量纲和 search_knowledge 的 confidence 不可比，
+        不要拿两边的分数互相排序。异常处理策略同 search_knowledge：绝不
+        裸抛，折叠成 {"ok": False, "error": ...}。
+
+        Args:
+            query: 查询文本
+            library_id: 要搜索的库的 id（用 list_libraries 查看有哪些库）
+            top_k: 最多返回几条结果
+        """
+        try:
+            hits = pipeline.navigate(library_id, query, top_k=top_k)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "results": [
+                {
+                    "path": h.path,
+                    "abs_path": h.abs_path,
+                    "page": h.page_index + 1,  # 对外展示用1-based页码，符合人类阅读习惯
+                    "score": h.score,
+                }
+                for h in hits
+            ],
+        }
+
+    @server.tool()
     def list_libraries() -> list[dict]:
         """列出所有已注册的库及其基本信息。"""
         return [

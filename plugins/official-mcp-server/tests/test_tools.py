@@ -6,11 +6,14 @@ tests/test_pipeline_e2e.py 覆盖过，这里的重点是 MCP 这一层薄封装
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+import pymupdf
 
 _PLUGIN_DIR = Path(__file__).parent.parent
 _REPO_ROOT = _PLUGIN_DIR.parent.parent
@@ -37,6 +40,7 @@ REQUIRED_PLUGINS = [
     "official-fusion-rrf",
     "official-reranker",
     "official-import-export",
+    "official-visual-wemm",
 ]
 
 
@@ -59,6 +63,10 @@ class TestMcpToolsAsyncBase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+        self._wemm_env_backup = os.environ.get("RAG_REDO_FAKE_WEMM")
+        os.environ["RAG_REDO_FAKE_WEMM"] = "1"
+        self.addCleanup(self._restore_wemm_env)
 
         vault = self.tmp / "vault"
         vault.mkdir()
@@ -97,6 +105,27 @@ class TestMcpToolsAsyncBase(unittest.IsolatedAsyncioTestCase):
         mcp_plugin = McpServerPlugin()
         mcp_plugin.register_tools(self.server, self.pipeline, lib_mgr)
 
+    async def asyncTearDown(self) -> None:
+        # 真实在 Windows 上踩过的坑：这个类此前完全没有 tearDown，之前
+        # REQUIRED_PLUGINS 里全是 in_process 插件，没人管禁用与否都不会
+        # 留下真实痕迹；加了 official-visual-wemm（真实 subprocess_service）
+        # 之后就不一样了——这个类每个测试方法都在 asyncSetUp 里新建一个
+        # PluginRuntime 真的拉起一个子进程，如果不在这里对称地 disable
+        # 掉，每跑一次这个文件（10个测试方法）就在系统里留下10个真的游离
+        # 子进程，这是真机器上跑测试真实抓到的坑（架构红线6"不产生游离
+        # 进程"对测试代码自己同样适用，同 tests/test_runtime.py 里同类
+        # 修复的教训）。
+        for plugin_id in reversed(REQUIRED_PLUGINS):
+            state = self.runtime.plugins.get(plugin_id)
+            if state is not None and state.state.value == "enabled":
+                self.runtime.disable(plugin_id)
+
+    def _restore_wemm_env(self) -> None:
+        if self._wemm_env_backup is None:
+            os.environ.pop("RAG_REDO_FAKE_WEMM", None)
+        else:
+            os.environ["RAG_REDO_FAKE_WEMM"] = self._wemm_env_backup
+
 
 class TestMcpTools(TestMcpToolsAsyncBase):
     async def test_list_libraries_tool(self):
@@ -129,6 +158,49 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertEqual(hits[0]["path"], "notes.md")
         self.assertIn("confidence", hits[0])
 
+    async def test_reindex_then_navigate_knowledge_tool(self):
+        """真实走一遍 navigate_knowledge——不是 search_knowledge 的变体，
+        是完全独立的"第二检索系统"（页级视觉导航，见
+        core/contracts.py::PageHit 的说明），这里验证的是它作为 MCP 工具
+        能不能被正确发现/调用/返回结构化结果，业务逻辑（页向量对不对）
+        已经在 plugins/official-visual-wemm/tests/test_plugin.py 覆盖过。
+
+        用单独一个库（而不是共享 asyncSetUp 的 test-lib）——PDF 默认不在
+        库的 enabled_extensions 白名单里（official_library_manager 默认
+        只认 .md/.txt），把它加进共享库会连带影响其他测试对"succeeded/
+        failed 文件数"的断言，专门起一个库更干净。"""
+        pdf_vault = self.tmp / "pdf-vault"
+        pdf_vault.mkdir()
+        pdf_doc = pymupdf.open()
+        pdf_doc.new_page().insert_text((72, 72), "扫描页示例内容", fontsize=24)
+        pdf_doc.save(str(pdf_vault / "scan.pdf"))
+        pdf_doc.close()
+        self.lib_mgr.store.add_library("pdf-lib", "PDF库", str(pdf_vault))
+        self.lib_mgr.store.set_policy("pdf-lib", enabled_extensions=[".md", ".txt", ".pdf"])
+
+        reindex_result = await self.server.call_tool("reindex_knowledge", {"library_id": "pdf-lib"})
+        self.assertFalse(reindex_result.is_error)
+        self.assertTrue(reindex_result.structured_content["ok"])
+
+        navigate_result = await self.server.call_tool(
+            "navigate_knowledge", {"query": "随便什么查询", "library_id": "pdf-lib"}
+        )
+        self.assertFalse(navigate_result.is_error)
+        payload = navigate_result.structured_content
+        self.assertTrue(payload["ok"])
+        hits = payload["results"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["path"], "scan.pdf")
+        self.assertEqual(hits[0]["page"], 1)  # 对外1-based
+
+    async def test_navigate_knowledge_unknown_library_reports_error_not_crash(self):
+        result = await self.server.call_tool(
+            "navigate_knowledge", {"query": "x", "library_id": "no-such-lib"}
+        )
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+        self.assertIn("error", result.structured_content)
+
     async def test_search_knowledge_default_top_k(self):
         await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
         result = await self.server.call_tool("search_knowledge", {"query": "插件", "library_id": "test-lib"})
@@ -153,6 +225,7 @@ class TestMcpTools(TestMcpToolsAsyncBase):
             names,
             {
                 "search_knowledge",
+                "navigate_knowledge",
                 "list_libraries",
                 "reindex_knowledge",
                 "export_library",

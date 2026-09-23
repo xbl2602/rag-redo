@@ -1,0 +1,20 @@
+id = "official-visual-wemm"
+name = "WEMM 页级视觉导航"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+visual_index = "multi"
+
+[requires]
+
+[runtime]
+kind = "subprocess_service"
+entry = "official_visual_wemm.plugin:VisualWemmPlugin"
+command = ["{python}", "server.py", "--port", "{port}"]
+health_check = "http://127.0.0.1:{port}/health"
+
+[permissions]
+filesystem = ["vault_read"]
+network = false
+gpu = true

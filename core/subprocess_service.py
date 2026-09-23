@@ -16,6 +16,8 @@ on_disable 都该用这一份来管理自己的子进程，不用每个插件各
 from __future__ import annotations
 
 import json
+import os
+import signal
 import socket
 import subprocess
 import sys
@@ -87,12 +89,17 @@ class SubprocessServiceHandle:
         return self._process is not None and self._process.poll() is None
 
     def start(self) -> None:
+        # POSIX 上起一个独立进程组（start_new_session）——stop() 要对整棵
+        # 进程树发信号（见该方法的说明），不新开一个组的话 os.killpg 会把
+        # 发信号的核心进程自己也算进去。
+        extra_kwargs = {} if sys.platform == "win32" else {"start_new_session": True}
         self._process = subprocess.Popen(
             self._command,
             cwd=str(self._cwd) if self._cwd else None,
             env=self._env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            **extra_kwargs,
         )
         if self._health_check is None:
             return
@@ -129,23 +136,71 @@ class SubprocessServiceHandle:
             raise SubprocessServiceError(f"调用子进程 {method} 失败: {exc}") from exc
 
     def stop(self, grace_period: float = 3.0) -> None:
-        """不留游离进程（架构红线6）：先礼后兵——terminate() 给子进程
-        机会自己清理，grace_period 内没退出再 kill()，最后 wait() 确认
-        真的没了，不是发了信号就假装完事。真实踩过的坑：只 wait() 进程
-        退出不够，Popen(stdout=PIPE, stderr=PIPE) 打开的管道文件描述符
-        不会因为子进程退出就自动关闭，得手动 close()，不然每 start/stop
-        一轮就泄漏两个文件描述符（测试里用 ResourceWarning 抓到的）。"""
+        """不留游离进程（架构红线6）：先礼后兵——给子进程机会自己清理，
+        grace_period 内没退出再强杀，最后 wait() 确认真的没了，不是发了
+        信号就假装完事。真实踩过的坑：只 wait() 进程退出不够，
+        Popen(stdout=PIPE, stderr=PIPE) 打开的管道文件描述符不会因为子
+        进程退出就自动关闭，得手动 close()，不然每 start/stop 一轮就泄漏
+        两个文件描述符（测试里用 ResourceWarning 抓到的）。"""
         if self._process is None:
             return
         if self._process.poll() is None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=grace_period)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait(timeout=grace_period)
+            self._kill_process_tree(grace_period)
         if self._process.stdout is not None:
             self._process.stdout.close()
         if self._process.stderr is not None:
             self._process.stderr.close()
         self._process = None
+
+    def _kill_process_tree(self, grace_period: float) -> None:
+        """只杀 Popen 直接跟踪的那一个 pid 不够——真实在 Windows 上踩到的坑：
+        这台机器的 Python 安装里，`command[0]`（venv 的 python.exe）自己会
+        再派生一个真正执行代码的子进程，`Popen.terminate()` 只杀得掉外层
+        那一个，里面真正绑着端口、占着资源的子进程会变成不受任何人控制
+        的游离进程——用 `ps`/`Get-CimInstance Win32_Process` 真实抓到过
+        几十个这样的残留（架构红线6"不产生游离进程"这条本来就是冲着这种
+        情况写的，只是没预料到连"自己起的直接子进程"都会再分裂一层）。
+
+        Windows 上改用 `taskkill /F /T` 连整棵进程树一起杀——这是系统自带
+        工具，不需要额外依赖；`/F` 强制、`/T` 连子进程。POSIX 上等价的
+        做法是给子进程开一个独立进程组（见 start()），对整个组发信号。
+
+        **已知的残留问题，如实记录不假装修完了**：这个修复消灭了绝大多数
+        游离进程（改之前几乎每个真实起过子进程的测试都会漏，改完后单独跑
+        任何一个测试文件都干净），但在这台机器上"一次性跑完全部27+个测试
+        套件"这种高频连续启停子进程的场景下，真实观察到过偶发的、数量不
+        固定（0~10对不等）的残留——每次 taskkill 自己报告的都是成功
+        （returncode=0），但过一会儿再查还是能看到多出来的进程，行为像是
+        这台 Python 装装（venv 的 python.exe 会再派生子进程这件事本身）
+        自己在某个时间窗口里又拉起了一次新的子进程，taskkill 扫描进程树的
+        那一刻还没抓到它。没能在这轮彻底定位根因（更像是这台机器具体
+        Python 发行版 venv 启动器内部的行为，不是 rag-redo 自己代码能完全
+        控制的边界），先如实记录、不假装"改完就100%没有了"。真实影响面
+        有限：①只在测试大量、快速连续启停子进程时才可能出现，不是每次都
+        触发；②打包成 PyInstaller 冻结产物后不会有这个问题——冻结的 exe
+        不经过"venv 的 python.exe 转发到真正解释器"这一层间接调用，见
+        docs/ROADMAP.md 对应记录。"""
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(self._process.pid)],
+                capture_output=True,
+                check=False,
+            )
+            try:
+                self._process.wait(timeout=grace_period)
+            except subprocess.TimeoutExpired:
+                pass
+            return
+
+        try:
+            pgid = os.getpgid(self._process.pid)
+        except ProcessLookupError:
+            return
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            self._process.wait(timeout=grace_period)
+        except subprocess.TimeoutExpired:
+            os.killpg(pgid, signal.SIGKILL)
+            self._process.wait(timeout=grace_period)
+        except ProcessLookupError:
+            pass

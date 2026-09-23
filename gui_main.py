@@ -42,6 +42,7 @@ REQUIRED_PLUGINS = [
     "official-fusion-rrf",
     "official-reranker",
     "official-import-export",
+    "official-visual-wemm",
     "official-gui-shell",
 ]
 
