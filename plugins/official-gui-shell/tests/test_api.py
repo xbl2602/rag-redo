@@ -35,6 +35,7 @@ REQUIRED_PLUGINS = [
     "official-vector-store-chroma",
     "official-fusion-rrf",
     "official-reranker",
+    "official-import-export",
 ]
 
 
@@ -130,6 +131,36 @@ class TestApi(unittest.TestCase):
         result = self.api.search("lib1", "   ")
         self.assertTrue(result["ok"])
         self.assertEqual(result["results"], [])
+
+    def test_export_then_import_writes_real_file_and_restores_search(self):
+        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.reindex_library("lib1")
+        before = self.api.search("lib1", "插件 架构")
+
+        dest = str(self.tmp / "lib1.ragexport.zip")
+        export_result = self.api.export_library("lib1", dest)
+        self.assertTrue(export_result["ok"], export_result)
+        self.assertTrue(Path(dest).exists())
+
+        import_result = self.api.import_library(dest, "/new/machine/vault", "lib1-restored")
+        self.assertTrue(import_result["ok"], import_result)
+        self.assertEqual(import_result["library_id"], "lib1-restored")
+
+        after = self.api.search("lib1-restored", "插件 架构")
+        self.assertEqual(
+            [r["path"] for r in before["results"]],
+            [r["path"] for r in after["results"]],
+        )
+
+    def test_export_unknown_library_returns_error_not_exception(self):
+        result = self.api.export_library("no-such-lib", str(self.tmp / "out.zip"))
+        self.assertFalse(result["ok"])
+        self.assertIn("error", result)
+
+    def test_import_missing_file_returns_error_not_exception(self):
+        result = self.api.import_library(str(self.tmp / "does-not-exist.zip"), "/some/path")
+        self.assertFalse(result["ok"])
+        self.assertIn("error", result)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,17 @@
+id = "official-import-export"
+name = "库导入导出归档"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+archive_codec = "singleton"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_import_export.plugin:ImportExportPlugin"
+
+[permissions]
+network = false
+gpu = false

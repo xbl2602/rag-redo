@@ -104,6 +104,26 @@
     </div>
     <button class="secondary" id="add-lib-btn">+ 新建库</button>
     <button class="secondary" id="reindex-btn">重建当前库索引</button>
+
+    <h1>搬到另一台机器</h1>
+    <div class="field">
+      <label>导出当前库到文件</label>
+      <input type="text" id="export-dest" placeholder="/path/to/save/lib.ragexport.zip" />
+    </div>
+    <button class="secondary" id="export-btn">导出当前库</button>
+    <div class="field">
+      <label>从归档导入：归档文件路径</label>
+      <input type="text" id="import-archive" placeholder="/path/to/lib.ragexport.zip" />
+    </div>
+    <div class="field">
+      <label>导入：笔记文件在本机的目录</label>
+      <input type="text" id="import-root" placeholder="/path/to/vault" />
+    </div>
+    <div class="field">
+      <label>导入：新库的id（留空沿用原id）</label>
+      <input type="text" id="import-lib-id" placeholder="留空则沿用归档里的id" />
+    </div>
+    <button class="secondary" id="import-btn">导入为新库</button>
   </div>
   <div id="main">
     <div id="search-row">
@@ -195,8 +215,35 @@ async function runSearch() {
   }
 }
 
+async function exportActive() {
+  if (!state.activeLibraryId) { setStatus("先选一个库", true); return; }
+  const dest = document.getElementById("export-dest").value.trim();
+  if (!dest) { setStatus("先填导出目标路径", true); return; }
+  setStatus("正在导出…", false);
+  const result = await api().export_library(state.activeLibraryId, dest);
+  if (!result.ok) { setStatus("导出失败：" + result.error, true); return; }
+  setStatus("已导出到 " + dest, false);
+}
+
+async function importLibrary() {
+  const archivePath = document.getElementById("import-archive").value.trim();
+  const rootPath = document.getElementById("import-root").value.trim();
+  const libraryId = document.getElementById("import-lib-id").value.trim();
+  if (!archivePath || !rootPath) { setStatus("归档路径和笔记目录都要填", true); return; }
+  setStatus("正在导入…", false);
+  const result = await api().import_library(archivePath, rootPath, libraryId);
+  if (!result.ok) { setStatus("导入失败：" + result.error, true); return; }
+  setStatus("已导入为库：" + result.library_id, false);
+  document.getElementById("import-archive").value = "";
+  document.getElementById("import-root").value = "";
+  document.getElementById("import-lib-id").value = "";
+  await refreshLibraries();
+}
+
 document.getElementById("add-lib-btn").onclick = addLibrary;
 document.getElementById("reindex-btn").onclick = reindexActive;
+document.getElementById("export-btn").onclick = exportActive;
+document.getElementById("import-btn").onclick = importLibrary;
 document.getElementById("search-btn").onclick = runSearch;
 document.getElementById("search-input").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
 

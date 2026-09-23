@@ -36,6 +36,7 @@ OFFICIAL_PHASE1_PLUGINS = [
     "official-vector-store-chroma",
     "official-fusion-rrf",
     "official-reranker",
+    "official-import-export",
 ]
 
 
@@ -231,6 +232,84 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         self.assertNotEqual(gui_plugin.state.value, "enabled")
         report = self.pipeline.index_library("test-lib")
         self.assertEqual(report.succeeded, 2)
+
+
+class TestExportImportLibrary(TestEndToEndSearchPipeline):
+    """导出/导入是"把已建索引的库搬到另一台机器，不用重新跑一遍索引"的
+    能力——见 core/pipeline.py 的 export_library/import_library 模块内
+    注释。复用 TestEndToEndSearchPipeline 的 setUp（已经装好一个索引好
+    的 test-lib），不重新拼一遍 fixture。"""
+
+    def test_export_returns_real_zip_with_vectors_and_bm25(self):
+        import zipfile
+        from io import BytesIO
+
+        self.pipeline.index_library("test-lib")
+        data = self.pipeline.export_library("test-lib")
+        zf = zipfile.ZipFile(BytesIO(data))
+        self.assertEqual(set(zf.namelist()), {"manifest.json", "vectors.json", "bm25.json"})
+
+    def test_export_unknown_library_raises_keyerror(self):
+        with self.assertRaises(KeyError):
+            self.pipeline.export_library("no-such-library")
+
+    def test_import_creates_library_with_same_search_results(self):
+        """核心承诺：导入之后不重新索引，搜索质量应该和导出前完全一样——
+        这就是这个功能存在的理由，不是随便验证"能跑不报错"。"""
+        self.pipeline.index_library("test-lib")
+        before = self.pipeline.search("test-lib", "插件 架构", top_k=5)
+        self.assertTrue(before)
+
+        archive = self.pipeline.export_library("test-lib")
+        new_id = self.pipeline.import_library(archive, root_path="/new/machine/vault", library_id="test-lib-restored")
+        self.assertEqual(new_id, "test-lib-restored")
+
+        after = self.pipeline.search("test-lib-restored", "插件 架构", top_k=5)
+        self.assertEqual([r.path for r in before], [r.path for r in after])
+        self.assertEqual([r.text for r in before], [r.text for r in after])
+
+    def test_import_without_explicit_library_id_reuses_original(self):
+        self.pipeline.index_library("test-lib")
+        archive = self.pipeline.export_library("test-lib")
+        self.lib_mgr.store.remove_library("test-lib")
+
+        new_id = self.pipeline.import_library(archive, root_path="/new/machine/vault")
+        self.assertEqual(new_id, "test-lib")
+        self.assertIsNotNone(self.lib_mgr.store.get("test-lib"))
+
+    def test_import_carries_over_selection_and_policy(self):
+        self.lib_mgr.store.set_selection("test-lib", selection_out=["cooking.md"])
+        self.lib_mgr.store.set_policy("test-lib", new_file_default="exclude", enabled_extensions=[".md"])
+        self.pipeline.index_library("test-lib")
+        archive = self.pipeline.export_library("test-lib")
+
+        self.pipeline.import_library(archive, root_path="/new/machine/vault", library_id="test-lib-2")
+        cfg = self.lib_mgr.store.get("test-lib-2")
+        self.assertEqual(cfg.selection_out, ["cooking.md"])
+        self.assertEqual(cfg.new_file_default, "exclude")
+        self.assertEqual(cfg.enabled_extensions, [".md"])
+        self.assertEqual(cfg.root_path, "/new/machine/vault")
+
+    def test_import_rejects_existing_library_id(self):
+        self.pipeline.index_library("test-lib")
+        archive = self.pipeline.export_library("test-lib")
+        with self.assertRaises(ValueError):
+            self.pipeline.import_library(archive, root_path="/new/machine/vault", library_id="test-lib")
+
+    def test_import_survives_process_restart(self):
+        """导入进去的数据也得真的落盘，不是只活在导入那一次的内存里——
+        同 test_bm25_search_survives_process_restart 的精神，这里额外
+        确认"导入"这条路径本身也遵守同一条纪律，不是导出/导入两条路径
+        里只有一条测过持久化。"""
+        self.pipeline.index_library("test-lib")
+        archive = self.pipeline.export_library("test-lib")
+        self.pipeline.import_library(archive, root_path="/new/machine/vault", library_id="test-lib-restored")
+        before = self.pipeline.search("test-lib-restored", "插件 架构", top_k=5)
+
+        _restarted_runtime, restarted_pipeline = self._build_runtime()
+        after = restarted_pipeline.search("test-lib-restored", "插件 架构", top_k=5)
+        self.assertTrue(after)
+        self.assertEqual([r.path for r in before], [r.path for r in after])
 
 
 if __name__ == "__main__":

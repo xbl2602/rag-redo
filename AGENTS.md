@@ -11,7 +11,7 @@ Obsidian 笔记本地语义检索系统的完全重构：插件化架构，核�
 
 ## 当前状态
 
-**Phase 1（文字检索 MVP）核心链路已实现（2026-09-23）**：`core/` 两个核心组件 + Agent 写权限门禁全部落地；13 个官方插件（提取 md/txt/pdf文字层/docx、切块、库管理、BM25、BGE-M3、Chroma、RRF、重排、MCP 服务、GUI 壳、近似去重）+ `core/pipeline.py` 编排层，200+ 用例全绿（`tests/run.py`），另有真实子进程 MCP 协议冒烟、真实 pywebview 渲染冒烟、真实 demo-vault 索引验证。未完成：Phase 2（OCR/视觉插件，需要真实 API Key 或大模型下载，当前环境未配置）、Phase 4（Windows 安装包，需要真实 Windows 环境构建）。逐项完成情况见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**Phase 1（文字检索 MVP）核心链路已实现（2026-09-23）**：`core/` 两个核心组件 + Agent 写权限门禁全部落地；14 个官方插件（提取 md/txt/pdf文字层/docx、切块、库管理、BM25、BGE-M3、Chroma、RRF、重排、近似去重、MCP 服务、GUI 壳、导出/导入归档）+ `core/pipeline.py` 编排层，227 用例全绿（`tests/run.py`），另有真实子进程 MCP 协议冒烟、真实 pywebview 渲染冒烟、真实 demo-vault 索引验证。导出/导入（`official-import-export`）让一个库能带着已建索引搬到另一台机器，不需要重新跑一遍索引。未完成：Phase 2（OCR/视觉插件，需要真实 API Key 或大模型下载，当前环境未配置）、Phase 3 剩余项（库 AI 摘要、Agent 写权限门禁通用化）、Phase 4（Windows 安装包，需要真实 Windows 环境构建）。逐项完成情况见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 ## 核心哲学：五条约束
 

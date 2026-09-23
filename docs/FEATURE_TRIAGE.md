@@ -23,7 +23,7 @@
 | 库 AI 摘要(HyDE 式 LLM 调用) | `official-library-summary` | Phase 3 | in_process | 依赖 `llm_provider` 扩展点 |
 | GPU 显存仲裁 | 核心服务（不是插件） | Phase 2起随 subprocess_service 插件出现而启用 | — | 见 ARCHITECTURE.md 2.1节"资源仲裁器" |
 | Agent 写权限门禁(`selection_gate`/`summary_gate`) | 核心服务（不是插件） | Phase 0起可用，Phase 3实际被`library-manager`/`library-summary`插件使用 | — | 见 ARCHITECTURE.md 2.2节 |
-| 导出/导入(换电脑搬家) | `official-import-export` | Phase 3 | in_process | |
+| 导出/导入(换电脑搬家) | `official-import-export` | Phase 3 | in_process | ✅ 已实现——`archive_codec` 单例扩展点，只负责 zip 归档打包/解包，不知道 library_manager/lexical_index/vector_store 的存在；跨插件编排在 `core/pipeline.py` 的 `export_library`/`import_library`（同 `index_library`/`search` 的编排模式）。9+9 用例（插件自身归档格式测试 + Pipeline 端到端往返测试），另有 MCP 工具（`export_library`/`import_library`，base64 传输）和 GUI Api（真实文件读写）两条调用路径的回归测试 |
 | 旧 `libraries.json` 迁移脚本 | 一次性 CLI 工具，不常驻 | Phase 3 | — | ✅ 已实现（`tools/migrate_libraries_json.py`），字段映射对照旧项目 `library.py` 真实 schema 核对过，不迁移的字段（agent_formats/exclude_dirs等）在脚本 docstring 里逐条写清楚原因 |
 | MinHash+LSH 去重 | `official-dedup` | Phase 3 | in_process | ✅ 已实现，用 datasketch 库 |
 | Agent 写权限门禁 | 核心服务（`core/write_gate.py`） | Phase 0/3 | — | ✅ 已实现（提案号+确认码+TTL+一次性），尚未被任何插件实际调用触发——目前所有官方插件的写入都是"用户主动触发"（GUI点击/MCP工具调用），还没有"AI背着用户想改点什么"这种真正需要门禁拦一下的场景出现，见 docs/ROADMAP.md Phase 3 说明 |

@@ -12,6 +12,7 @@ GUI 是零侵入观察者（继承旧项目架构红线，见 AGENTS.md 架构�
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from core.pipeline import Pipeline
@@ -70,3 +71,30 @@ class Api:
                 for r in results
             ],
         }
+
+    def export_library(self, library_id: str, dest_path: str) -> dict[str, Any]:
+        """把一个库导出成归档文件，写到 dest_path（用户在前端填的目标路径，
+        比如"把这个库搬到另一台电脑"场景下先导出到U盘/网盘同步目录）。文件
+        I/O 直接在这里做，不是又新起一个插件——GUI Api 本来就是"把 Pipeline
+        能力包装成本地操作"的薄封装层，见模块 docstring，写文件到用户指定
+        的本地路径属于这一层该做的事，不属于 core.pipeline（那里只产出/消费
+        bytes，不知道"文件"这个概念，见 core/pipeline.py 的 export_library
+        注释）。"""
+        try:
+            archive_bytes = self._pipeline.export_library(library_id)
+            Path(dest_path).write_bytes(archive_bytes)
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
+
+    def import_library(self, archive_path: str, root_path: str, library_id: str = "") -> dict[str, Any]:
+        """从 export_library 写出的归档文件恢复一个库。library_id 留空
+        （前端不填这个字段）则沿用归档里记录的原始 library_id。"""
+        try:
+            archive_bytes = Path(archive_path).read_bytes()
+            new_id = self._pipeline.import_library(
+                archive_bytes, root_path=root_path, library_id=library_id or None
+            )
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "library_id": new_id}

@@ -45,6 +45,7 @@ REQUIRED_PLUGINS = [
     "official-vector-store-chroma",
     "official-fusion-rrf",
     "official-reranker",
+    "official-import-export",
     "official-mcp-server",
 ]
 

@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 from core.pipeline import Pipeline
@@ -88,3 +89,47 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
                 if f.included and not f.extracted
             ],
         }
+
+    @server.tool()
+    def export_library(library_id: str) -> dict[str, Any]:
+        """导出一个库的完整已建索引数据（配置+向量+BM25状态）为可移植归档，
+        base64 编码后返回——调用方把它存成一个 .zip 文件，就能把这个库搬到
+        另一台机器，用 import_library 恢复，不需要重新跑一遍索引。
+
+        异常处理策略同 search_knowledge/reindex_knowledge：绝不裸抛，折叠
+        成 {"ok": False, "error": ...}。
+
+        Args:
+            library_id: 要导出的库的 id
+        """
+        try:
+            archive_bytes = pipeline.export_library(library_id)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "library_id": library_id,
+            "archive_base64": base64.b64encode(archive_bytes).decode("ascii"),
+        }
+
+    @server.tool()
+    def import_library(archive_base64: str, root_path: str, library_id: str = "") -> dict[str, Any]:
+        """从 export_library 产出的归档恢复一个库，不重新索引。
+
+        root_path 必填——归档里不带原始机器上的路径（那个路径在新机器上
+        通常没有意义），必须显式告诉这台机器"这些笔记文件现在在哪"，见
+        core/pipeline.py 的 import_library 说明。library_id 留空（默认值
+        ""）则沿用归档里记录的原始 library_id；如果目标 id 已经存在，会
+        报错而不是覆盖——需要覆盖的话，先手动删除旧库。
+
+        Args:
+            archive_base64: export_library 返回的 archive_base64 字段内容
+            root_path: 这些笔记文件在这台机器上的真实目录路径
+            library_id: 恢复出的库用哪个 id；留空则沿用归档里的原始 id
+        """
+        try:
+            archive_bytes = base64.b64decode(archive_base64)
+            new_id = pipeline.import_library(archive_bytes, root_path=root_path, library_id=library_id or None)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "library_id": new_id}

@@ -36,6 +36,7 @@ REQUIRED_PLUGINS = [
     "official-vector-store-chroma",
     "official-fusion-rrf",
     "official-reranker",
+    "official-import-export",
 ]
 
 
@@ -148,10 +149,71 @@ class TestMcpTools(TestMcpToolsAsyncBase):
     async def test_tools_are_discoverable_with_schema(self):
         tools = await self.server.list_tools()
         names = {t.name for t in tools}
-        self.assertEqual(names, {"search_knowledge", "list_libraries", "reindex_knowledge"})
+        self.assertEqual(
+            names,
+            {
+                "search_knowledge",
+                "list_libraries",
+                "reindex_knowledge",
+                "export_library",
+                "import_library",
+            },
+        )
         search_tool = next(t for t in tools if t.name == "search_knowledge")
         self.assertIn("query", search_tool.input_schema["properties"])
         self.assertIn("library_id", search_tool.input_schema["properties"])
+
+    async def test_export_then_import_library_round_trips_search_results(self):
+        await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+        before = await self.server.call_tool("search_knowledge", {"query": "插件 架构", "library_id": "test-lib"})
+        self.assertFalse(before.is_error)
+
+        export_result = await self.server.call_tool("export_library", {"library_id": "test-lib"})
+        self.assertFalse(export_result.is_error)
+        export_payload = export_result.structured_content
+        self.assertTrue(export_payload["ok"])
+        self.assertIn("archive_base64", export_payload)
+
+        import_result = await self.server.call_tool(
+            "import_library",
+            {
+                "archive_base64": export_payload["archive_base64"],
+                "root_path": "/new/machine/vault",
+                "library_id": "test-lib-restored",
+            },
+        )
+        self.assertFalse(import_result.is_error)
+        import_payload = import_result.structured_content
+        self.assertTrue(import_payload["ok"])
+        self.assertEqual(import_payload["library_id"], "test-lib-restored")
+
+        after = await self.server.call_tool(
+            "search_knowledge", {"query": "插件 架构", "library_id": "test-lib-restored"}
+        )
+        self.assertFalse(after.is_error)
+        self.assertEqual(
+            [r["path"] for r in before.structured_content["results"]],
+            [r["path"] for r in after.structured_content["results"]],
+        )
+
+    async def test_export_unknown_library_reports_error_not_crash(self):
+        result = await self.server.call_tool("export_library", {"library_id": "no-such-lib"})
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+
+    async def test_import_rejects_existing_library_id(self):
+        await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+        export_result = await self.server.call_tool("export_library", {"library_id": "test-lib"})
+        result = await self.server.call_tool(
+            "import_library",
+            {
+                "archive_base64": export_result.structured_content["archive_base64"],
+                "root_path": "/new/machine/vault",
+                "library_id": "test-lib",
+            },
+        )
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
 
 
 if __name__ == "__main__":

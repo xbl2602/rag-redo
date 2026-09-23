@@ -68,7 +68,7 @@ RAG REDO 是 obsidian-rag 项目的完全重构，不复用旧项目的代码或
 | `llm_provider` | 多值 | HyDE、库摘要生成用的 LLM 调用 |
 | `gui_panel` | 多值 | 库管理、检索结果、设置页、全库关系图…… |
 | `mcp_tool_provider` | 多值 | 现有 9 个 MCP 工具，每个可拆给对应插件自己注册 |
-| `import_export` | 多值 | 换电脑搬家的导出/导入 |
+| `archive_codec` | 单例 | 换电脑搬家的导出/导入归档格式编解码（`official-import-export`）；实现落地时改成单例——归档格式在任一时刻只应该有一种在用，不是像 `extractor:*`/`dedup` 那样多个实现各管一段、都参与聚合。真正跨 library_manager/lexical_index/vector_store 三个插件收集/写回数据的编排在 `core/pipeline.py` 的 `export_library`/`import_library`，和 `index_library`/`search` 同一种模式，这个扩展点本身只管"字典 <-> zip 字节"这一步编解码 |
 
 不是插件、而是核心提供的**服务**（区别见第 2.2 节）：Agent 写权限门禁、资源仲裁。
 
