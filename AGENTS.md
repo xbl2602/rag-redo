@@ -11,7 +11,7 @@ Obsidian 笔记本地语义检索系统的完全重构：插件化架构，核�
 
 ## 当前状态
 
-**规划阶段**（2026-09-22 建仓）。核心代码尚未开始写。
+**Phase 1（文字检索 MVP）核心链路已实现（2026-09-23）**：`core/` 两个核心组件 + Agent 写权限门禁全部落地；13 个官方插件（提取 md/txt/pdf文字层/docx、切块、库管理、BM25、BGE-M3、Chroma、RRF、重排、MCP 服务、GUI 壳、近似去重）+ `core/pipeline.py` 编排层，200+ 用例全绿（`tests/run.py`），另有真实子进程 MCP 协议冒烟、真实 pywebview 渲染冒烟、真实 demo-vault 索引验证。未完成：Phase 2（OCR/视觉插件，需要真实 API Key 或大模型下载，当前环境未配置）、Phase 4（Windows 安装包，需要真实 Windows 环境构建）。逐项完成情况见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 ## 核心哲学：五条约束
 
@@ -97,7 +97,10 @@ Obsidian 笔记本地语义检索系统的完全重构：插件化架构，核�
 ## 环境
 
 - Windows 为主战场，深度适配是硬性要求；Linux 用于开发（venv/pip 即可，不要求打包）
-- 具体命令待 Phase 0 代码落地后补充（目前仓库没有可运行代码）
+- 依赖分两层：`jieba chromadb pymupdf4llm python-docx pywebview mcp datasketch` 是轻量依赖；`torch sentence-transformers`（懒加载，见 official-embedder-bge-m3/official-reranker 两个插件的模块 docstring）体积大，只有真的要跑通真实检索（而不是跑测试）才需要装
+- `.venv/bin/python tests/run.py`——全量测试，不需要装 torch/sentence-transformers（全程注入假模型）
+- `.venv/bin/python gui_main.py`——打开桌面界面；`.venv/bin/python mcp_stdio.py`——启动 MCP stdio 服务（给 AI 工具接）
+- `.venv/bin/python tools/migrate_libraries_json.py <旧libraries.json路径> --dry-run`——旧项目库配置迁移预览
 
 ## 提交与文档
 

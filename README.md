@@ -1,6 +1,6 @@
 # RAG REDO
 
-> Obsidian 笔记本地语义检索系统的完全重构版本。**当前是规划阶段，还没有可运行的软件**——如果你是来找安装教程的，还早，见下面"现状"。
+> Obsidian 笔记本地语义检索系统的完全重构版本。**核心检索链路已经能跑通**（Linux 开发环境下验证过，Windows 安装包还没做，见下面"现状"）。
 
 ## 这是什么
 
@@ -8,14 +8,57 @@
 
 ## 现状
 
-规划阶段，正在按 [docs/ROADMAP.md](docs/ROADMAP.md) 的 Phase 0 推进（插件运行时骨架）。架构设计文档已完成，欢迎阅读：
+Phase 1（文字检索 MVP）核心链路已实现并有真实测试覆盖（200+ 用例）：13 个官方插件（多格式提取、切块、库管理、BM25 词法检索、BGE-M3 向量化、Chroma 向量库、RRF 融合、重排、MCP 工具、GUI 壳、近似去重）+ 编排层 + Agent 写权限门禁。详见 [docs/ROADMAP.md](docs/ROADMAP.md) 的逐项完成情况。
+
+**还没做的**：Windows 安装包（Phase 4，需要真实 Windows 环境构建，当前开发环境是 Linux）；视觉/OCR 类插件（Phase 2，需要真实 API Key 或大模型下载，当前环境未配置）。
+
+架构设计文档：
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) —— 架构总览
 - [docs/DATA_FLOW.md](docs/DATA_FLOW.md) —— 数据流规则
 - [docs/PLUGIN_SPEC.md](docs/PLUGIN_SPEC.md) —— 插件规范
-- [docs/ROADMAP.md](docs/ROADMAP.md) —— 分阶段路线图
-- [docs/FEATURE_TRIAGE.md](docs/FEATURE_TRIAGE.md) —— 旧项目能力去留提案
+- [docs/ROADMAP.md](docs/ROADMAP.md) —— 分阶段路线图与完成情况
+- [docs/FEATURE_TRIAGE.md](docs/FEATURE_TRIAGE.md) —— 旧项目能力去留与迁移状态
 - [docs/LESSONS.md](docs/LESSONS.md) —— 旧项目架构教训精炼版
+
+## 现在就能试（Linux / 源码方式）
+
+Windows 安装包还没做好，目前只有源码+虚拟环境这条路径，且是在 Linux 上验证过的（Windows 下命令等价，把 `.venv/bin/` 换成 `.venv\Scripts\`）：
+
+```bash
+git clone <this-repo> rag-redo
+cd rag-redo
+python3 -m venv .venv
+.venv/bin/pip install jieba chromadb pymupdf4llm python-docx pywebview mcp datasketch
+# 下面这行是真正做检索/重排的模型依赖，体积较大（CPU版本约几百MB到1GB），
+# 首次用某个库检索时还会自动下载 BGE-M3 + 重排模型权重（几个GB，只需一次）：
+.venv/bin/pip install torch sentence-transformers --index-url https://download.pytorch.org/whl/cpu
+```
+
+打开图形界面（自带 [demo-vault/](demo-vault/) 可以直接拿来试，点"新建库"填个名字和 `demo-vault` 的绝对路径，再点"重建当前库索引"，然后搜"插件 架构"之类的词）：
+
+```bash
+.venv/bin/python gui_main.py
+```
+
+或者接入支持 MCP 的 AI 工具（Claude Code / opencode 等），把下面这段配置指向 `mcp_stdio.py`：
+
+```json
+{
+  "type": "stdio",
+  "command": "/path/to/rag-redo/.venv/bin/python",
+  "args": ["mcp_stdio.py"],
+  "cwd": "/path/to/rag-redo"
+}
+```
+
+接好后 AI 就能用 `search_knowledge` / `list_libraries` / `reindex_knowledge` 三个工具。
+
+跑测试（不需要装 torch/sentence-transformers——测试全程注入假模型，见 [docs/LESSONS.md](docs/LESSONS.md)）：
+
+```bash
+.venv/bin/python tests/run.py
+```
 
 ## 目标（做完之后应该是什么样）
 
