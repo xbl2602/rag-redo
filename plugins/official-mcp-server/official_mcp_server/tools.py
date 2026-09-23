@@ -115,6 +115,23 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         }
 
     @server.tool()
+    def wemm_status() -> dict[str, Any]:
+        """WEMM 页级视觉导航状态诊断（对齐 obsidian-rag 的 `wemm_status`
+        工具）：子进程是否存活、各库已建的页级索引规模（几个PDF、几页
+        向量）——用这个一眼确认"WEMM 到底能不能用"，不用靠猜。只读，
+        不会拉起子进程、不会加载模型。
+
+        `official-visual-wemm` 插件未启用时 `providers` 为空字典，不是
+        错误——同 `navigate_knowledge` 未装该插件时"空结果不是失败"的
+        语义一致。
+        """
+        try:
+            status = pipeline.visual_status()
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "providers": status}
+
+    @server.tool()
     def list_libraries() -> list[dict]:
         """列出所有已注册的库及其基本信息，含每个库的简介（导航/澄清性质
         的一段话，帮你在真正检索/通读全文之前先判断"这个库值不值得往这

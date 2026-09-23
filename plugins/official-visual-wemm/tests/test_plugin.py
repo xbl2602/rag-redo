@@ -122,6 +122,27 @@ class TestVisualWemmPlugin(unittest.TestCase):
             self.assertTrue(hit.abs_path.endswith("doc.pdf"))
             self.assertIsInstance(hit.score, float)
 
+    def test_status_reports_subprocess_alive_and_page_counts(self):
+        """对齐 obsidian-rag 的 wemm_status 诊断工具——2026-09-23 全面
+        功能审计发现的缺口，见 tools.py::wemm_status。"""
+        self.instance.index_library("lib1", self.vault, ["doc.pdf"])
+        status = self.instance.status()
+        self.assertTrue(status["enabled"])
+        self.assertTrue(status["subprocess_alive"])
+        self.assertEqual(status["libraries"], {"lib1": {"page_count": 2, "pdf_count": 1}})
+
+    def test_status_before_any_indexing_has_no_libraries(self):
+        status = self.instance.status()
+        self.assertEqual(status["libraries"], {})
+
+    def test_status_does_not_start_subprocess(self):
+        """只读诊断不该有副作用——禁用后子进程已经不在了，status() 不该
+        把它重新拉起来（对齐 obsidian-rag"只读，不启动服务"的承诺）。"""
+        self.rt.disable("official-visual-wemm")
+        status = self.instance.status()
+        self.assertFalse(status["subprocess_alive"])
+        self.assertFalse(status["enabled"])
+
     def test_navigate_on_library_with_no_pdf_index_returns_empty_not_error(self):
         # 从没调用过 index_library，对应 collection 压根不存在——不该报错，
         # 应该折叠成空结果（同 wemm_retriever.py "页库不存在只记错误不阻断"

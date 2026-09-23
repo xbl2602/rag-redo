@@ -220,6 +220,14 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertEqual(hits[0]["path"], "scan.pdf")
         self.assertEqual(hits[0]["page"], 1)  # 对外1-based
 
+        status_result = await self.server.call_tool("wemm_status", {})
+        self.assertFalse(status_result.is_error)
+        status_payload = status_result.structured_content
+        self.assertTrue(status_payload["ok"])
+        wemm_status = status_payload["providers"]["official-visual-wemm"]
+        self.assertTrue(wemm_status["subprocess_alive"])
+        self.assertEqual(wemm_status["libraries"]["pdf-lib"], {"page_count": 1, "pdf_count": 1})
+
     async def test_navigate_knowledge_unknown_library_reports_error_not_crash(self):
         result = await self.server.call_tool(
             "navigate_knowledge", {"query": "x", "library_id": "no-such-lib"}
@@ -295,6 +303,7 @@ class TestMcpTools(TestMcpToolsAsyncBase):
                 "get_library_sample",
                 "propose_library_summary",
                 "apply_library_summary",
+                "wemm_status",
             },
         )
         search_tool = next(t for t in tools if t.name == "search_knowledge")

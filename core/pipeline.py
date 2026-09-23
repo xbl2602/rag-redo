@@ -344,6 +344,23 @@ class Pipeline:
             hits.extend(visual.navigate(library_id, query, top_k=top_k))
         return hits
 
+    def visual_status(self) -> dict:
+        """页级视觉导航（`visual_index` 扩展点）的只读诊断——遍历全部
+        已启用的提供者（目前只有 `official-visual-wemm` 一个），按
+        plugin_id 汇总各自的 `status()`。对齐 obsidian-rag 的
+        `wemm_status` MCP 工具，2026-09-23 全面功能审计发现的缺口。
+        没有任何 `visual_index` 插件启用时返回空字典——同 `navigate()`
+        的"没装就是空结果不是错误"语义，不强制要求提供者实现
+        `status()`（`hasattr` 判断，同 `index_library()` 对
+        `lexical.save` 的处理方式，`visual_index` 目前也没有强制的接口
+        契约）。"""
+        result: dict[str, dict] = {}
+        for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
+            visual = self._plugin(plugin_id)
+            if hasattr(visual, "status"):
+                result[plugin_id] = visual.status()
+        return result
+
     # ---- 库摘要（library_summary/llm_provider 扩展点，Phase 3）-----------
     #
     # 采样是 vector_store 的事、生成是 llm_provider 的事、存储+写权限门禁

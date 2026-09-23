@@ -215,6 +215,38 @@ class VisualWemmPlugin:
 
         self._logger.info("WEMM页级索引完成：库=%s，%d页", library_id, indexed_pages)
 
+    # ---- 只读诊断 ----------------------------------------------------------
+
+    def status(self) -> dict:
+        """WEMM 页级视觉导航状态——对齐 obsidian-rag 的 `wemm_status` MCP
+        工具："建没建、生效没生效"，用户/AI 一眼能确认，不用靠猜。只读，
+        不拉起子进程、不加载模型（同 obsidian-rag 该工具"只读，不启动
+        服务、不加载模型"的承诺——用 `self._handle` 的现有快照判断存活，
+        不调用 `_ensure_alive()`）。
+
+        **一处简化，如实记录**：obsidian-rag 的 `wemm_status` 还会报告
+        "当前索引的 PDF 里有哪些失败（未渲染成功）"——rag-redo 的
+        `index_library()` 目前是全量重跑、不持久化每个文件的成败历史
+        （同"不做增量索引"的已知简化），这里只能报告"现在 Chroma 里有
+        多少页/多少个PDF的向量"这个当前状态，报不出"上一轮谁失败了"，
+        如需要这个信息应看 `reindex_knowledge` 那次调用自己返回的
+        failures 清单（当次可见，不持久化跨调用查询）。"""
+        alive = self._handle is not None and self._handle.is_alive
+        libraries: dict[str, dict] = {}
+        if self._client is not None:
+            for coll in self._client.list_collections():
+                if not coll.name.startswith("visual_"):
+                    continue
+                library_id = coll.name[len("visual_"):]
+                metadatas = coll.get(include=["metadatas"])["metadatas"] or []
+                pdf_paths = {m["path"] for m in metadatas if m and m.get("path")}
+                libraries[library_id] = {"page_count": len(metadatas), "pdf_count": len(pdf_paths)}
+        return {
+            "enabled": self._enabled,
+            "subprocess_alive": alive,
+            "libraries": libraries,
+        }
+
     # ---- 查询态 ----------------------------------------------------------
 
     def navigate(self, library_id: str, query: str, top_k: int = 5) -> list[PageHit]:
