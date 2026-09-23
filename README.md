@@ -10,7 +10,9 @@
 
 Phase 1（文字检索 MVP）核心链路已实现并有真实测试覆盖（350+ 用例）：19 个官方插件（多格式提取、切块、库管理、BM25 词法检索、BGE-M3 向量化、Chroma 向量库、RRF 融合、重排、MCP 工具、GUI 壳、近似去重、导出/导入、MinerU云端/本机OCR、WEMM页级视觉导航、库摘要、OpenAI兼容LLM Provider）+ 编排层 + Agent 写权限门禁。`official-visual-wemm`（页级视觉导航，独立于文字检索的"第二检索系统"，MCP 工具 `navigate_knowledge`）已经在真实 Windows 机器上完整实现并用真实 `tencent/WeMM-Embedding-2B` 模型验证过语义效果；GPU/显存精细生命周期管理（空闲卸载/自退出/主动驱逐/检索侧优先抢占）已按旧项目真实行为补齐。库摘要功能（帮 AI 在检索前先判断"这个库值不值得查"，用户手写的简介受 Agent 写权限门禁保护）已完整实现。详见 [docs/ROADMAP.md](docs/ROADMAP.md) 的逐项完成情况。
 
-**还没做的**：Windows 安装包已经能真实装/卸（Inno Setup 打包，`/CURRENTUSER` 免管理员权限，装/卸真实验证过开始菜单快捷方式+注册表项干净、用户数据卸载后保留，见 [installer/README.md](installer/README.md)），但还没在一台"没装过开发工具"的干净机器上验证过（只在打包机器本机验证过），且当前打包产物里 `official-visual-wemm` 暂时不可用（冻结产物缺一个能跑 env_bootstrap 的独立解释器，已知限制）；`official-ocr-mineru-local` 还没接真实 OCR 模型（当前是可运行但用假结果的骨架）；查询侧 HyDE 增强（旧项目里和库摘要平行独立的功能，这次调查库摘要时确认还没做）。
+`official-ocr-mineru-local`（本机 PDF OCR）已经接了真实 MinerU 模型——探测复用本机已装好的 `uv tool install mineru[all]` 工具环境（不重新下载权重），真实识别过中英文混排扫描件。
+
+**还没做的**：Windows 安装包已经能真实装/卸（Inno Setup 打包，`/CURRENTUSER` 免管理员权限，装/卸真实验证过开始菜单快捷方式+注册表项干净、用户数据卸载后保留，见 [installer/README.md](installer/README.md)），但还没在一台"没装过开发工具"的干净机器上验证过（只在打包机器本机验证过），且当前打包产物里 `official-visual-wemm`/`official-ocr-mineru-local` 暂时不可用（冻结产物缺一个能跑 env_bootstrap/探测外部工具环境的独立解释器，已知限制）；查询侧 HyDE 增强（旧项目里和库摘要平行独立的功能，这次调查库摘要时确认还没做）。
 
 架构设计文档：
 

@@ -62,6 +62,7 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
             self.rt.plugins["official-ocr-mineru-local"].error,
         )
         self.instance = self.rt.plugins["official-ocr-mineru-local"].instance
+        self.plugin_module = sys.modules[type(self.instance).__module__]
         self.addCleanup(lambda: self.rt.disable("official-ocr-mineru-local"))
 
     def _restore_env(self) -> None:
@@ -103,6 +104,66 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
         doc = self.instance.extract("lib1", "whatever.pdf", self.tmp)
         self.assertIsNone(doc.text)
         self.assertIn("未运行", doc.failure_reason)
+
+    def test_mineru_local_timeout_scales_with_pages(self):
+        f = self.plugin_module._mineru_local_timeout
+        self.assertEqual(f(None), 300.0)
+        self.assertEqual(f(0), 300.0)
+        self.assertEqual(f(1), 330.0)
+        self.assertEqual(f(200), 300.0 + 30.0 * 200)
+
+    def test_resolve_mineru_python_short_circuits_to_core_interpreter_when_faking(self):
+        # RAG_REDO_FAKE_OCR=1 已经在 setUp 里设了——不管有没有装真实 MinerU
+        # 工具环境，都不该去探测/要求它，测试机器不该被强制装几个GB的依赖。
+        self.assertEqual(self.plugin_module._resolve_mineru_python(), sys.executable)
+
+
+class TestResolveMineruPythonWithoutFaking(unittest.TestCase):
+    """不经过 PluginRuntime，直接测 `_resolve_mineru_python` 在非测试模式下
+    的探测/覆盖逻辑——真实按 obsidian-rag/gpu_arbiter.py 同名函数的探测
+    路径走一遍，不是纸面设计审查。"""
+
+    def setUp(self) -> None:
+        plugin_dir = REPO_ROOT / "plugins" / "official-ocr-mineru-local"
+        if str(plugin_dir) not in sys.path:
+            sys.path.insert(0, str(plugin_dir))
+        import official_ocr_mineru_local.plugin as ocr_plugin_module  # noqa: PLC0415
+
+        self.mod = ocr_plugin_module
+        self._fake_backup = os.environ.pop("RAG_REDO_FAKE_OCR", None)
+        self._override_backup = os.environ.pop("RAG_REDO_MINERU_PYTHON", None)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self) -> None:
+        if self._fake_backup is not None:
+            os.environ["RAG_REDO_FAKE_OCR"] = self._fake_backup
+        if self._override_backup is not None:
+            os.environ["RAG_REDO_MINERU_PYTHON"] = self._override_backup
+
+    def test_explicit_env_override_wins_when_file_exists(self):
+        fd, path = tempfile.mkstemp(suffix=".exe")
+        os.close(fd)
+        fake_python = Path(path)
+        self.addCleanup(lambda: fake_python.unlink(missing_ok=True))
+        os.environ["RAG_REDO_MINERU_PYTHON"] = str(fake_python)
+        self.assertEqual(self.mod._resolve_mineru_python(), str(fake_python))
+
+    def test_nonexistent_override_falls_through_to_autodetect(self):
+        missing = Path(tempfile.gettempdir()) / "rag-redo-test-does-not-exist" / "python.exe"
+        os.environ["RAG_REDO_MINERU_PYTHON"] = str(missing)
+        result = self.mod._resolve_mineru_python()
+        # 探测不到就该是 None（本机真装了 MinerU 时会探测到真实路径，两种
+        # 结果都合法——这里只断言"不是那个不存在的覆盖路径"）。
+        self.assertNotEqual(result, str(missing))
+
+    def test_autodetect_finds_uv_tool_install_when_present(self):
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            self.skipTest("非 Windows 或 APPDATA 未设置，跳过 uv tool 落点探测")
+        expected = Path(appdata) / "uv" / "tools" / "mineru" / "Scripts" / "python.exe"
+        if not expected.is_file():
+            self.skipTest("本机未安装 MinerU tool 环境（uv tool install mineru），跳过")
+        self.assertEqual(self.mod._resolve_mineru_python(), str(expected))
 
 
 if __name__ == "__main__":

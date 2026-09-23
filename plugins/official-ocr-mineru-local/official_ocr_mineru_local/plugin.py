@@ -1,54 +1,116 @@
 """official-ocr-mineru-local 插件：真正的重依赖/模型跑在独立子进程里
-（server.py），这个类本身很薄，只负责三件事：
+（server.py），这个类本身很薄，只负责四件事：
 ①向 GPU 资源仲裁器申请一个名额（这是"名额"层面的协商，不是真实GPU
 硬件探测——探测发生在真正调用真实模型那一刻，见
 core/resource_arbiter.py 模块docstring"探测失败fail-open"）；
-②用 core.subprocess_service 启动/终止自己声明的子进程；
-③把 extract() 转发成对子进程的本机HTTP调用。
+②解析出能跑子进程的 MinerU 解释器路径（见 `_resolve_mineru_python`）；
+③用 core.subprocess_service 启动/终止自己声明的子进程；
+④把 extract() 转发成对子进程的本机HTTP调用。
 
-**这个沙盒环境刻意不下载真实OCR模型**：用户明确要求——虚拟机磁盘空间
-有限，且插件架构本身就该是"模型无关"的，具体模型选型/权重下载应该在
-用户真正启用这个插件、真正需要本机OCR能力时才发生，不该为了验证"这个
-插件的架构能不能跑起来"就强绑一个真实模型下载（同
-official-embedder-bge-m3/official-reranker"真实依赖懒加载、测试注入假
-实现"的纪律，这里的"重依赖"从模型权重换成了整个OCR子进程）。
-server.py 里真正调用模型的分支懒导入，没装就折叠成清楚的失败原因；
-测试用 RAG_REDO_FAKE_OCR=1 环境变量注入确定性假OCR结果，验证的是"子
-进程真的启动了、本机HTTP协议真的通了、chain-try 真的把内容喂进主链路
-了"，不是"真的识别对了文字"——后者要等真机器（有GPU/磁盘空间的用户
-环境）装好真实依赖后验证。
+**MinerU 解释器是"检测复用外部工具环境"，不是 env_bootstrap 建独立venv
+（2026-09-23 真机接入真实模型时的架构决策，按 obsidian-rag/gpu_arbiter.py
+`_resolve_mineru_python` 真实行为照做）**：MinerU 官方发行的是一个独立
+命令行工具（`uv tool install --python 3.12 -U "mineru[all]"`），装的时候
+自带一整套 torch/transformers 环境，用户很可能已经在别处（比如旧项目
+obsidian-rag，或者单纯早前就自己装过）装过一份——这里的策略是"探测已有
+安装、直接复用"，不是像 official-visual-wemm 那样用 env_bootstrap 每个
+插件建一份隔离 venv 重新 pip install 一遍。原因：MinerU 的模型权重+
+torch 依赖体积以GB计，重复安装既浪费磁盘又会触发没必要的重新下载
+（用户明确反馈过"已经有本地MinerU了，不要重复下载"）；而 uv tool 是
+MinerU 官方文档推荐的标准安装方式，落点路径是可预测的既定规范，值得
+专门探测，不需要每个插件都发明一套"帮用户装环境"的逻辑。
 
-**已知的、刻意的简化**：`env_bootstrap`（首次启用时拉起独立venv）尚未
-被核心真正执行——`resolve_plugin_python()` 找不到约定路径下的独立venv
-时会退化用核心自己的解释器，见 core/subprocess_service.py 该函数的
-docstring。对于这个只用标准库的参考实现，这个简化本身没有问题；一旦
-真的要接入需要重依赖的真实OCR模型，`env_bootstrap` 的执行逻辑必须先
-落地。
+**这个参考实现此前刻意不下载真实OCR模型**（虚拟机磁盘空间有限阶段的
+过渡状态，2026-09-23 已因用户本机已具备完整 MinerU 环境而结束）：
+server.py 里真正调用模型的分支仍然懒导入，找不到依赖时折叠成清楚的
+失败原因；`RAG_REDO_FAKE_OCR=1` 环境变量继续存在，供测试/无GPU机器用
+——验证"子进程真的启动了、本机HTTP协议真的通了、chain-try 真的把内容
+喂进主链路了"，不需要真机器/真模型（同 official-embedder-bge-m3/
+official-reranker"真实依赖懒加载、测试注入假实现"的纪律）。
 
-**GPU 资源仲裁（2026-09-23 补齐，和 official-visual-wemm 是同一套协议）**：
-和 official-visual-wemm 处于同一优先级层级——两者都是"按需占用"的
+**GPU 资源仲裁（和 official-visual-wemm 是同一套协议）**：和
+official-visual-wemm 处于同一优先级层级——两者都是"按需占用"的
 subprocess_service GPU 消费者，谁刚需要谁能把对方挤开（`preempt_equal`，
 对应旧项目 WEMM/MinerU 互相抢占显存的真实行为）；`on_preempt` 回调只
 请求子进程"软驱逐"（`/evict`），不整个杀掉子进程；`_ensure_alive()` 在
-真正调用前按需重新拉起（子进程接入真实模型后会有空闲自退出机制，见
-server.py TODO 说明，这里先把协议对称打通）。
+真正调用前按需重新拉起。
+
+**单文件超时随页数缩放（对齐 obsidian-rag/extractors.py::_mineru_local_
+timeout）**：300s + 30s×页数（200页封顶约105min，pipeline GPU 尚无基准
+数据，这是防卡死的 backstop 不是性能承诺）——页数在核心解释器这一侧
+（这里，用 pymupdf，本来就是 official-extractor-pdf-text 的既有依赖）先
+数一遍算出这次调用该给多长的HTTP超时，server.py 那一侧对同一份文件会
+独立再数一遍页数（用于它自己的页数上限把关），两次数页各司其职，不是
+重复劳动——对齐 obsidian-rag caller 端预先算超时、server 端独立把关
+上限的既有分工。
 """
 from __future__ import annotations
 
 import hashlib
+import os
+import sys
 from pathlib import Path
 
 from core.contracts import ExtractedDocument
-from core.subprocess_service import SubprocessServiceError, SubprocessServiceHandle, resolve_plugin_python
+from core.subprocess_service import SubprocessServiceError, SubprocessServiceHandle
 
 EXTRACTOR_VERSION = "0.1.0"
 PLUGIN_ID = "official-ocr-mineru-local"
 GPU_RESOURCE_ID = "gpu:0"
 GPU_PRIORITY = 10  # 和 official-visual-wemm 同一层级，互相抢占（preempt_equal）
+_MINERU_INSTALL_HINT = 'uv tool install --python 3.12 -U "mineru[all]"'
 
 
 def _content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _resolve_mineru_python(explicit: str | None = None) -> str | None:
+    """MinerU tool 环境的 python.exe。测试/无GPU机器（RAG_REDO_FAKE_OCR）
+    直接用核心自己的解释器——不需要真装 MinerU，server.py 的假OCR分支
+    只用标准库；`RAG_REDO_MINERU_PYTHON` 环境变量显式覆盖优先（对齐
+    official-llm-openai-compatible 用环境变量做可覆盖配置的既有先例，
+    rag-redo 目前还没有通用的插件设置存储，见 core/context.py）；否则按
+    `uv tool install` 的标准落点探测（对齐 obsidian-rag/gpu_arbiter.py
+    `_resolve_mineru_python` 的探测路径），都找不到返回 None，调用方负责
+    报出清楚的安装提示，不是静默退化用不认识 mineru 包的核心解释器。"""
+    if os.environ.get("RAG_REDO_FAKE_OCR"):
+        return sys.executable
+    override = explicit or os.environ.get("RAG_REDO_MINERU_PYTHON")
+    if override and Path(override).is_file():
+        return str(override)
+    candidates: list[Path] = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.append(Path(appdata) / "uv" / "tools" / "mineru" / "Scripts" / "python.exe")
+    home = Path.home()
+    candidates.append(home / ".local" / "share" / "uv" / "tools" / "mineru" / "bin" / "python")
+    candidates.append(home / ".local" / "share" / "uv" / "tools" / "mineru" / "Scripts" / "python.exe")
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _count_pages(full_path: Path) -> "int | None":
+    try:
+        import pymupdf
+
+        doc = pymupdf.open(full_path)
+        try:
+            return int(doc.page_count)
+        finally:
+            doc.close()
+    except Exception:
+        return None
+
+
+def _mineru_local_timeout(pages) -> float:
+    try:
+        n = int(pages or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return 300.0 + 30.0 * max(0, n)
 
 
 class MineruLocalOcrPlugin:
@@ -59,7 +121,6 @@ class MineruLocalOcrPlugin:
         self._plugin_dir: Path | None = None
         self._runtime_health_check: str | None = None
         self._runtime_command: tuple[str, ...] | None = None
-        self._runtime_env_bootstrap: str | None = None
 
     def on_load(self, ctx):
         self._logger = ctx.logger
@@ -73,7 +134,6 @@ class MineruLocalOcrPlugin:
         self._plugin_dir = Path(__file__).parent
         self._runtime_health_check = ctx.runtime.health_check
         self._runtime_command = ctx.runtime.command
-        self._runtime_env_bootstrap = ctx.runtime.env_bootstrap
         self._enabled = True
         self._start_handle()
 
@@ -88,11 +148,17 @@ class MineruLocalOcrPlugin:
 
     def _start_handle(self) -> None:
         assert self._plugin_dir is not None and self._runtime_command is not None
-        python = resolve_plugin_python(self._plugin_dir, env_bootstrap=self._runtime_env_bootstrap, logger=self._logger)
+        python = _resolve_mineru_python()
+        if python is None:
+            raise SubprocessServiceError(
+                f"找不到 MinerU tool 环境的 Python（RAG_REDO_MINERU_PYTHON 未配且自动探测失败）："
+                f"请先跑 {_MINERU_INSTALL_HINT} 装好本机 MinerU，或设置 RAG_REDO_MINERU_PYTHON "
+                "指向已有安装的 python.exe"
+            )
         command = tuple(arg.replace("{python}", python) for arg in self._runtime_command)
         self._handle = SubprocessServiceHandle(command, health_check=self._runtime_health_check, cwd=self._plugin_dir)
         self._handle.start()
-        self._logger.info("MinerU本机OCR子进程已启动（端口=%d）", self._handle.port)
+        self._logger.info("MinerU本机OCR子进程已启动（端口=%d，解释器=%s）", self._handle.port, python)
 
     def _stop_handle(self) -> None:
         if self._handle is not None:
@@ -133,8 +199,12 @@ class MineruLocalOcrPlugin:
             return self._fail(library_id, path, f"读取失败: {type(exc).__name__}: {exc}")
         content_hash = _content_hash(data)
 
+        # 客户端这一侧的HTTP超时要覆盖住 server.py 那一侧的单文件处理预算
+        # （300s+30s×页数）再加60s网络余量，否则大文件会在还没解析完时就被
+        # 这一跳掐断——对齐 obsidian-rag/extractors.py 的 caller 端算超时。
+        timeout = _mineru_local_timeout(_count_pages(full_path)) + 60.0
         try:
-            result = self._handle.call("extract", {"path": path, "root": str(root)}, timeout=120.0)
+            result = self._handle.call("extract", {"path": path, "root": str(root)}, timeout=timeout)
         except SubprocessServiceError as exc:
             return self._fail(library_id, path, f"本机OCR调用失败: {exc}", content_hash)
 
