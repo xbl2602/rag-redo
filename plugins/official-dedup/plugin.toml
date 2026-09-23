@@ -1,0 +1,17 @@
+id = "official-dedup"
+name = "近似重复检测"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+dedup = "multi"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_dedup.plugin:DedupPlugin"
+
+[permissions]
+network = false
+gpu = false
