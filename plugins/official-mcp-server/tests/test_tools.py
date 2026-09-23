@@ -48,7 +48,9 @@ class _FakeEncoder:
 
 class _FakeReranker:
     def score(self, query, texts):
-        terms = [t for t in query if t.strip()]
+        # query.split()，不是逐字符遍历——见 tests/test_demo_vault.py 的
+        # 同类注释，逐字符统计在更长的真实文本上容易被噪声干扰。
+        terms = query.split()
         return [sum(text.count(term) for term in terms) for text in texts]
 
 

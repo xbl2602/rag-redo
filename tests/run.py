@@ -30,6 +30,7 @@ CORE_SUITES = [
     "test_write_gate",
     "test_runtime",
     "test_pipeline_e2e",
+    "test_demo_vault",
 ]
 
 

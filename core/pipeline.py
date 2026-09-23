@@ -184,11 +184,20 @@ class Pipeline:
             return []
 
         records = vector_store.get_by_ids(library_id, fused_ids)
-        rerank_input = [
-            (chunk_id, records[chunk_id]["document"])
-            for chunk_id in fused_ids
-            if chunk_id in records and records[chunk_id]["document"]
-        ]
+        # 喂给重排器的文本前面带上标题面包屑——重排器只看纯段落正文的话，
+        # 少了"这段话出自哪个标题/章节"这个人类读者天然会用到的判断依据，
+        # 内容主题相近的几篇笔记之间更容易被判混（真实用 demo-vault 里
+        # 四篇主题相关的笔记测才暴露出来，小合成语料没有这个区分度）。
+        # 返回给调用方的 SearchResult.text 仍然是不带前缀的原始正文——
+        # 这个拼接只是重排器的输入，不改变展示内容。
+        rerank_input = []
+        for chunk_id in fused_ids:
+            record = records.get(chunk_id)
+            if record is None or not record["document"]:
+                continue
+            heading = (record["metadata"] or {}).get("heading_breadcrumb", "")
+            prefixed = f"{heading}\n{record['document']}" if heading and heading != "(无标题)" else record["document"]
+            rerank_input.append((chunk_id, prefixed))
         if not rerank_input:
             return []
         reranked = reranker.rerank(query, rerank_input, top_k=top_k)

@@ -52,7 +52,10 @@ class _DeterministicFakeEncoder:
 
 class _DeterministicFakeReranker:
     def score(self, query: str, texts: list[str]) -> list[float]:
-        query_terms = [t for t in query if t.strip()]
+        # query.split() 按空白切词，不要写成 [t for t in query]——那是逐
+        # 字符遍历，在内容更长/更真实的语料里容易被无关字符噪声干扰
+        # （demo-vault 那份测试真实踩到过，见 tests/test_demo_vault.py）。
+        query_terms = query.split()
         return [sum(text.count(term) for term in query_terms) for text in texts]
 
 
