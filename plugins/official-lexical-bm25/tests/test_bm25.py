@@ -134,6 +134,17 @@ class TestBM25IndexPersistence(unittest.TestCase):
         results = loaded.search("插件")
         self.assertEqual(results[0][0], "d2")
 
+    def test_to_dict_from_dict_round_trip(self):
+        """export_import 插件走这两个方法（不经过文件），确认内存里
+        直接来回转换也保真，不是只测过'写文件再读文件'这一条路径。"""
+        idx = BM25Index(k1=1.8, b=0.6)
+        idx.add("d1", "插件系统的架构设计")
+        restored = BM25Index.from_dict(idx.to_dict())
+        self.assertEqual(restored.k1, 1.8)
+        self.assertEqual(restored.b, 0.6)
+        self.assertEqual(restored.doc_count, 1)
+        self.assertEqual(restored.search("插件系统")[0][0], "d1")
+
 
 if __name__ == "__main__":
     unittest.main()

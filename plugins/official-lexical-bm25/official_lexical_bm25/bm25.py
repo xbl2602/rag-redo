@@ -110,20 +110,37 @@ class BM25Index:
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
         return ranked[:top_k]
 
-    def save(self, path: Path) -> None:
-        """落盘：只存 doc_lengths + doc_tokens_cache，_postings 是它俩的
-        倒排索引视图，加载时重新推导即可，不用重复存一份容易和原数据
-        对不上的冗余状态。用 JSON 不用 pickle——这份数据完全是简单类型
-        （字符串/整数的字典），JSON 够用且没有反序列化任意代码执行的
-        隐患，没有理由为了省几行代码换一个有安全面的格式。"""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
+    def to_dict(self) -> dict:
+        """只存 doc_lengths + doc_tokens_cache，_postings 是它俩的倒排
+        索引视图，重建时重新推导即可，不用重复存一份容易和原数据对不上
+        的冗余状态。返回值是纯 JSON 兼容类型（字符串/数字的字典），供
+        save() 落盘，也供 official-import-export 插件直接拿去打包进
+        导出归档，不需要先写一个临时文件再读回来。"""
+        return {
             "k1": self.k1,
             "b": self.b,
-            "doc_lengths": self._doc_lengths,
+            "doc_lengths": dict(self._doc_lengths),
             "doc_tokens_cache": {doc_id: dict(counts) for doc_id, counts in self._doc_tokens_cache.items()},
         }
-        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "BM25Index":
+        idx = cls(k1=data.get("k1", 1.5), b=data.get("b", 0.75))
+        idx._doc_lengths = dict(data.get("doc_lengths", {}))
+        idx._doc_tokens_cache = {
+            doc_id: Counter(counts) for doc_id, counts in data.get("doc_tokens_cache", {}).items()
+        }
+        for doc_id, counts in idx._doc_tokens_cache.items():
+            for term, freq in counts.items():
+                idx._postings[term].append(_Posting(doc_id=doc_id, term_freq=freq))
+        return idx
+
+    def save(self, path: Path) -> None:
+        """用 JSON 不用 pickle——这份数据完全是简单类型，JSON 够用且没有
+        反序列化任意代码执行的隐患，没有理由为了省几行代码换一个有安全
+        面的格式。"""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_dict(), ensure_ascii=False), encoding="utf-8")
 
     @classmethod
     def load(cls, path: Path) -> "BM25Index":
@@ -137,12 +154,4 @@ class BM25Index:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return cls()
-        idx = cls(k1=data.get("k1", 1.5), b=data.get("b", 0.75))
-        idx._doc_lengths = dict(data.get("doc_lengths", {}))
-        idx._doc_tokens_cache = {
-            doc_id: Counter(counts) for doc_id, counts in data.get("doc_tokens_cache", {}).items()
-        }
-        for doc_id, counts in idx._doc_tokens_cache.items():
-            for term, freq in counts.items():
-                idx._postings[term].append(_Posting(doc_id=doc_id, term_freq=freq))
-        return idx
+        return cls.from_dict(data)

@@ -1,10 +1,12 @@
 """单测注入假 reranker，不碰真实模型——理由同 official-embedder-bge-m3
-的测试文件。"""
+的测试文件（含"为什么用 mock.patch.dict 而不是依赖开发机没装依赖"的
+真实踩坑记录，这里不重复展开）。"""
 from __future__ import annotations
 
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 _PLUGIN_DIR = Path(__file__).parent.parent
 _REPO_ROOT = _PLUGIN_DIR.parent.parent
@@ -49,8 +51,9 @@ class TestRealRerankerLazyLoading(unittest.TestCase):
 
     def test_score_without_dependency_raises_clear_import_error(self):
         reranker = _RealReranker()
-        with self.assertRaises(ModuleNotFoundError):
-            reranker.score("q", ["a", "b"])
+        with patch.dict(sys.modules, {"sentence_transformers": None}):
+            with self.assertRaises(ImportError):
+                reranker.score("q", ["a", "b"])
 
 
 if __name__ == "__main__":

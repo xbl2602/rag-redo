@@ -70,3 +70,15 @@ class LexicalBM25Plugin:
         必要的 I/O 开销，攒到这一批全部处理完再写一次。"""
         if self.indexes is not None and library_id in self.indexes:
             self.indexes[library_id].save(self._path_for(library_id))
+
+    def export_state(self, library_id: str) -> dict:
+        """给 official-import-export 插件用：拿这个库的 BM25 索引状态
+        （纯 JSON 兼容字典），打包进导出归档，不用先落盘再读文件。"""
+        return self._index_for(library_id).to_dict()
+
+    def import_state(self, library_id: str, data: dict) -> None:
+        """从导出归档恢复这个库的 BM25 索引状态，并立刻落盘（恢复完的
+        状态不该只活在内存里，否则马上重启又得重新导入一遍）。"""
+        assert self.indexes is not None
+        self.indexes[library_id] = BM25Index.from_dict(data)
+        self.save(library_id)

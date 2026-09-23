@@ -51,6 +51,23 @@ class ChromaVectorStore:
             for chunk_id, doc, meta in zip(result["ids"], result["documents"], result["metadatas"])
         }
 
+    def get_all(self, library_id: str) -> dict[str, dict]:
+        """取这个库 collection 里的全部记录（含向量）——给
+        official-import-export 插件导出用。Chroma 的 get() 不传 ids/where
+        过滤条件就是官方支持的"整表读出"用法，不是非正式的偏门用法。
+        故意不走"直接打包 Chroma 的底层 sqlite 文件"这条路——那样导出
+        文件的格式会和 Chroma 具体版本的内部存储细节绑死，Chroma 升级
+        换了内部格式，旧导出包可能读不出来；走公开 API 读出记录、用我们
+        自己定义的格式重新打包，格式自己说了算，不随第三方库实现细节
+        变化。"""
+        result = self._collection(library_id).get(include=["documents", "metadatas", "embeddings"])
+        return {
+            chunk_id: {"document": doc, "metadata": meta, "embedding": list(vec)}
+            for chunk_id, doc, meta, vec in zip(
+                result["ids"], result["documents"], result["metadatas"], result["embeddings"]
+            )
+        }
+
     def delete(self, library_id: str, chunk_ids: list[str]) -> None:
         if not chunk_ids:
             return

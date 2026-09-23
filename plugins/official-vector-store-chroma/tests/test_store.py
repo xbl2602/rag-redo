@@ -88,6 +88,28 @@ class TestChromaVectorStore(unittest.TestCase):
         self.assertIn("c1", records)
         self.assertNotIn("does-not-exist", records)
 
+    def test_get_all_returns_every_record_with_embeddings(self):
+        self.store.upsert(
+            "lib1",
+            ["c1", "c2"],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            documents=["文本一", "文本二"],
+            metadatas=[{"path": "a.md"}, {"path": "b.md"}],
+        )
+        records = self.store.get_all("lib1")
+        self.assertEqual(set(records), {"c1", "c2"})
+        self.assertEqual(records["c1"]["document"], "文本一")
+        self.assertEqual(records["c1"]["embedding"], [1.0, 0.0, 0.0])
+
+    def test_get_all_empty_collection_returns_empty_dict(self):
+        self.assertEqual(self.store.get_all("lib1"), {})
+
+    def test_get_all_only_returns_requested_library(self):
+        self.store.upsert("lib1", ["c1"], [[1.0, 0.0, 0.0]], documents=["文本一"])
+        self.store.upsert("lib2", ["c2"], [[0.0, 1.0, 0.0]], documents=["文本二"])
+        records = self.store.get_all("lib1")
+        self.assertEqual(set(records), {"c1"})
+
 
 if __name__ == "__main__":
     unittest.main()

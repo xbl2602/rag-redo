@@ -40,6 +40,10 @@ class ChromaVectorStorePlugin:
         assert self.store is not None
         return self.store.get_by_ids(library_id, chunk_ids)
 
+    def get_all(self, library_id: str) -> dict[str, dict]:
+        assert self.store is not None
+        return self.store.get_all(library_id)
+
     def query(self, library_id: str, query_vector: list[float], top_k: int = 10) -> list[tuple[str, float]]:
         assert self.store is not None
         return self.store.query(library_id, query_vector, top_k=top_k)
