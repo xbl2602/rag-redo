@@ -2,6 +2,16 @@
 
 > 分阶段验收标准，风格延续旧项目 `GOAL.md` 的 C1/C2/C3 硬指标（可执行的检查方式+预期输出，不是"大概做完了"这种自评）。每个 Phase 开始前，具体验收命令会随实现细化补齐——这里先定"做什么、判断做完的标准是什么"。
 
+## TODO（下一步，按优先级）
+
+> 换机器/换环境接着做时先看这一节——每条都能在下面对应 Phase 的"状态"段落里找到更详细的背景，这里只列"要做什么、卡点是什么"。
+
+1. **`official-visual-wemm`（Phase 2）**——未开始。这是一个会影响共享契约的设计决策，不是照抄OCR插件模式的体力活：需要新的 `visual_index` 扩展点、页面渲染（`pymupdf` 已有，不需要新依赖）、以及 `core/pipeline.py` 的 `search()` 融合逻辑接入第三路排名。核心问题——`core/contracts.py` 的 `SearchResult` 要不要为"页面级命中"单独建一个类型（当前是chunk级）？这会影响 GUI/MCP 两个消费方，动手前建议先过一遍再定。
+2. **给 `official-ocr-mineru-local` 接真实模型（Phase 2）**——当前子进程里 `_real_ocr()` 是懒导入+清楚报错的占位，`RAG_REDO_FAKE_OCR=1` 才是测试走的路径，没有装、也没有下载任何真实OCR依赖/权重（这是本轮明确的约束：沙盒虚拟机空间有限）。真机器/有空间的环境上可以：①选定具体依赖（README 里占位写的是 `mineru`，需要确认实际包名/安装方式）；②在 `_real_ocr()` 里接真实调用；③同时把 `env_bootstrap` 的真正执行逻辑补上（见第3条），不要让重依赖悄悄装进核心 `.venv`。
+3. **实现 `env_bootstrap` 的真正执行（Phase 2 遗留）**——`plugin.toml` 的 `env_bootstrap` 字段核心从来没有真正跑过；`core/subprocess_service.py` 的 `resolve_plugin_python()` 目前永远会退化成用核心自己的解释器。只要还没有插件需要真实重依赖，这个简化不算错，但接第2条之前必须先把这个补上。
+4. **Phase 3 剩余两项**——库 AI 摘要（`official-library-summary`，需要先设计 `llm_provider` 扩展点+有序回退链，AGENTS.md"插件规则"一节已经写了设计意图）、Agent 写权限门禁通用化（`core/write_gate.py` 机制已实现，但还没有任何插件真的调用它触发）。
+5. **Phase 4：Windows 安装包**——完全没做，必须在真实 Windows 环境上构建验证（PyInstaller/Nuitka + Inno Setup），这个 Linux 沙盒做不了，也不该在这里写投机性的打包脚本。
+
 ## Phase 0 — 插件运行时骨架（无 RAG 功能）
 
 **状态：已实现并验证（2026-09-22）。** 代码在 `core/`（manifest/registry/datastore/resource_arbiter/runtime/cli），示例插件在 `examples/`，测试在 `tests/`（45 用例，`.venv/bin/python tests/run.py` 全绿）。实现过程中在真实跑通 CLI 演示时发现并修了一个真实设计缺陷：扩展点的单例/多值判定最初写死在核心的一份固定名单里，导致插件自己发明的新扩展点名字永远不会被判定为单例、冲突检测形同虚设——这违反了"核心不该预先知道每个可能出现的扩展点名字"的原则。改成由声明扩展点的插件自己在 manifest 里说明基数（`provides.<point> = "singleton" | "multi"`），两个插件声明不一致时保守按 singleton 处理。
