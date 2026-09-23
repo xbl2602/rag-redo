@@ -24,7 +24,9 @@
 | GPU 显存仲裁 | 核心服务（不是插件） | Phase 2起随 subprocess_service 插件出现而启用 | — | 见 ARCHITECTURE.md 2.1节"资源仲裁器" |
 | Agent 写权限门禁(`selection_gate`/`summary_gate`) | 核心服务（不是插件） | Phase 0起可用，Phase 3实际被`library-manager`/`library-summary`插件使用 | — | 见 ARCHITECTURE.md 2.2节 |
 | 导出/导入(换电脑搬家) | `official-import-export` | Phase 3 | in_process | |
-| 旧 `libraries.json` 迁移脚本 | 一次性 CLI 工具，不常驻 | Phase 3 | — | 已确认要做 |
+| 旧 `libraries.json` 迁移脚本 | 一次性 CLI 工具，不常驻 | Phase 3 | — | ✅ 已实现（`tools/migrate_libraries_json.py`），字段映射对照旧项目 `library.py` 真实 schema 核对过，不迁移的字段（agent_formats/exclude_dirs等）在脚本 docstring 里逐条写清楚原因 |
+| MinHash+LSH 去重 | `official-dedup` | Phase 3 | in_process | ✅ 已实现，用 datasketch 库 |
+| Agent 写权限门禁 | 核心服务（`core/write_gate.py`） | Phase 0/3 | — | ✅ 已实现（提案号+确认码+TTL+一次性），尚未被任何插件实际调用触发——目前所有官方插件的写入都是"用户主动触发"（GUI点击/MCP工具调用），还没有"AI背着用户想改点什么"这种真正需要门禁拦一下的场景出现，见 docs/ROADMAP.md Phase 3 说明 |
 | Flet 经典 GUI | **已确认：不迁移** | — | — | 和 guiweb 功能重复、维护负担已确认不值得——操作者已同意直接砍掉。新架构下 `gui_panel` 扩展点本身就支持替换整个 GUI，想要 Flet 体验的话可以有人做成一个独立的 `gui_panel` 实现，但不作为官方维护对象 |
 
 **仍待确认的1处判断**：Agent 写权限门禁+GPU 仲裁定为"核心服务"而非"插件"（见 [ROADMAP.md](ROADMAP.md)"开放问题"）。WEMM 官方插件、Flet 不迁移两处已在 2026-09-22 确认。

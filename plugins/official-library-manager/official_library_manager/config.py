@@ -77,6 +77,28 @@ class LibraryConfigStore:
         self._save()
         return cfg
 
+    def set_policy(
+        self,
+        library_id: str,
+        *,
+        new_file_default: str | None = None,
+        enabled_extensions: list[str] | None = None,
+    ) -> LibraryConfig:
+        """改"新文件默认策略"/"启用格式列表"——这两项在 `add_library` 时
+        只能取字段默认值，之前没有任何公开方法能在创建后改它们（GUI 设置
+        面板、tools/migrate_libraries_json.py 都需要这个能力，不是只服务
+        迁移脚本一个调用方，所以做成正式的公开方法，不是迁移脚本专用的
+        私有旁路）。"""
+        cfg = self._libraries.get(library_id)
+        if cfg is None:
+            raise KeyError(f"未知库: {library_id}")
+        if new_file_default is not None:
+            cfg.new_file_default = new_file_default
+        if enabled_extensions is not None:
+            cfg.enabled_extensions = enabled_extensions
+        self._save()
+        return cfg
+
     def remove_library(self, library_id: str) -> None:
         self._libraries.pop(library_id, None)
         self._save()

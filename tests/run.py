@@ -1,12 +1,13 @@
 """统一测试入口，风格对齐旧 obsidian-rag 项目 tests/run.py：单进程跑完全部
 套件，打印"结果：N/M 套通过"。见 ../AGENTS.md 测试纪律一节。
 
-覆盖两类测试：
-- 核心测试（本目录下的 test_*.py，测 core/ 里的两个核心组件）
+覆盖三类测试：
+- 核心测试（本目录下的 test_*.py，测 core/ 里的核心组件）
 - 插件测试（plugins/*/tests/test_*.py，随插件自己走——每个插件自带测试，
   方便将来独立分发时测试也跟着走，不用依赖仓库中心 tests/ 目录）
-每个插件的测试模块用它自己的完整相对路径生成唯一模块名，避免"两个插件都
-有一个 test_plugin.py"这种同名冲突。
+- 工具脚本测试（tools/tests/test_*.py，比如迁移脚本）
+每个测试模块用它自己的完整相对路径生成唯一模块名，避免"两处都有一个
+test_config.py"这种同名冲突。
 """
 from __future__ import annotations
 
@@ -32,11 +33,15 @@ CORE_SUITES = [
 ]
 
 
-def _discover_plugin_test_files() -> list[Path]:
+def _discover_extra_test_files() -> list[Path]:
+    found: list[Path] = []
     plugins_dir = REPO_ROOT / "plugins"
-    if not plugins_dir.exists():
-        return []
-    return sorted(plugins_dir.glob("*/tests/test_*.py"))
+    if plugins_dir.exists():
+        found.extend(plugins_dir.glob("*/tests/test_*.py"))
+    tools_tests_dir = REPO_ROOT / "tools" / "tests"
+    if tools_tests_dir.exists():
+        found.extend(tools_tests_dir.glob("test_*.py"))
+    return sorted(found)
 
 
 def _load_module_from_path(path: Path):
@@ -67,7 +72,7 @@ def main() -> int:
         total_ok += 1 if ok else 0
         print(f"{'PASS' if ok else 'FAIL'} core/{name} ({result.testsRun} 用例, {elapsed:.2f}s)")
 
-    for path in _discover_plugin_test_files():
+    for path in _discover_extra_test_files():
         label = str(path.relative_to(REPO_ROOT))
         total += 1
         module = _load_module_from_path(path)

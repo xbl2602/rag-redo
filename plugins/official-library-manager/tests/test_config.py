@@ -53,6 +53,28 @@ class TestLibraryConfigStore(unittest.TestCase):
         with self.assertRaises(KeyError):
             store.set_selection("nope", selection_in=["a.md"])
 
+    def test_set_policy_persists(self):
+        store = LibraryConfigStore(self.path)
+        store.add_library("lib1", "我的库", "/vaults/lib1")
+        store.set_policy("lib1", new_file_default="exclude", enabled_extensions=[".pdf", ".docx"])
+        store2 = LibraryConfigStore(self.path)
+        cfg = store2.get("lib1")
+        self.assertEqual(cfg.new_file_default, "exclude")
+        self.assertEqual(cfg.enabled_extensions, [".pdf", ".docx"])
+
+    def test_set_policy_partial_update_leaves_other_field_untouched(self):
+        store = LibraryConfigStore(self.path)
+        store.add_library("lib1", "我的库", "/vaults/lib1")
+        store.set_policy("lib1", new_file_default="exclude")
+        cfg = store.get("lib1")
+        self.assertEqual(cfg.new_file_default, "exclude")
+        self.assertEqual(cfg.enabled_extensions, [".md", ".txt"])  # 默认值没被动过
+
+    def test_set_policy_unknown_library_raises(self):
+        store = LibraryConfigStore(self.path)
+        with self.assertRaises(KeyError):
+            store.set_policy("nope", new_file_default="exclude")
+
     def test_corrupted_file_degrades_to_empty_not_crash(self):
         self.path.write_text("{not valid json", encoding="utf-8")
         store = LibraryConfigStore(self.path)
