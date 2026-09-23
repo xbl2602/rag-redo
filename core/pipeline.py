@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .contracts import ExtractedDocument, PageHit, SearchResult
+from .contracts import ExtractedDocument, LibrarySummary, PageHit, SampledChunk, SearchResult
 from .runtime import PluginRuntime
 
 
@@ -260,6 +260,83 @@ class Pipeline:
             visual = self._plugin(plugin_id)
             hits.extend(visual.navigate(library_id, query, top_k=top_k))
         return hits
+
+    # ---- 库摘要（library_summary/llm_provider 扩展点，Phase 3）-----------
+    #
+    # 采样是 vector_store 的事、生成是 llm_provider 的事、存储+写权限门禁
+    # 是 library_summary 的事——三方互不知道彼此存在，真正的协调只在这里
+    # 发生（架构红线1），和 index_library()/export_library() 是同一种
+    # "只有编排层知道跨插件顺序"的模式。两条真实调用路径（对齐调查到的
+    # obsidian-rag 行为）：①MCP对话里的agent自己用 sample_library() 拿到
+    # 的片段写简介、调 propose_library_summary() 提交，不需要
+    # generate_library_summary()（省一次LLM调用）；②GUI"刷新简介"按钮
+    # 没有对话中的agent代笔，走 generate_library_summary() 真的调一次
+    # 配置好的 llm_provider，见 official-library-summary 插件模块 docstring。
+
+    def get_library_summary(self, library_id: str) -> LibrarySummary:
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+        return self._singleton("library_summary").get(library_id)
+
+    def sample_library(self, library_id: str, k: int = 20) -> list[SampledChunk]:
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+        vector_store = self._singleton("vector_store")
+        if not hasattr(vector_store, "sample"):
+            raise PipelineError("当前 vector_store 实现不支持采样（缺少 sample）")
+        return vector_store.sample(library_id, k=k)
+
+    def propose_library_summary(self, library_id: str, text: str) -> dict:
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+        return self._singleton("library_summary").propose(library_id, text)
+
+    def set_library_summary_direct(self, library_id: str, text: str, *, source: str = "user") -> dict:
+        """无条件写入，不经过写权限门禁——给"人类直接操作"这条路径用
+        （GUI 手写编辑 / GUI"刷新简介"按钮），见 official-library-summary
+        插件 plugin.py::set_direct 的说明。"""
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+        return self._singleton("library_summary").set_direct(library_id, text, source=source)
+
+    def apply_library_summary(self, library_id: str, proposal_id: str, confirmation_code: str) -> dict:
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+        return self._singleton("library_summary").apply(library_id, proposal_id, confirmation_code)
+
+    def generate_library_summary(self, library_id: str, k: int = 20) -> tuple[str, str]:
+        """采样 + 拼prompt + 依次尝试 llm_provider 链（按插件id字母序，
+        同 `_extract()` 链式尝试 extractor:pdf 的既定模式），直到某个
+        provider 真的产出非空结果为止。返回 (生成的文本, 使用的provider
+        插件id)。**不落盘**——落盘是调用方决定要不要走
+        propose_library_summary() 的事，这里只负责"编排跨插件生成流程"。
+        """
+        lib_mgr = self._singleton("library_manager")
+        cfg = lib_mgr.store.get(library_id)
+        if cfg is None:
+            raise KeyError(f"未知库: {library_id}")
+
+        samples = self.sample_library(library_id, k=k)
+        if not samples:
+            raise PipelineError(f"库 {library_id} 尚未建索引或索引为空，无法生成简介（先调用 index_library 建好索引再重试）")
+
+        summary_plugin = self._singleton("library_summary")
+        system, user = summary_plugin.build_prompt(cfg.name, samples)
+
+        provider_ids = sorted(self.runtime.registry.providers_of("llm_provider"))
+        if not provider_ids:
+            raise PipelineError("没有已启用的 llm_provider 插件")
+        for plugin_id in provider_ids:
+            provider = self._plugin(plugin_id)
+            text = provider.complete(system, user)
+            if text:
+                return summary_plugin.finalize_text(text), plugin_id
+        raise PipelineError("所有 llm_provider 均未能生成简介（服务不可用或返回为空，检查本地/云端LLM服务是否在线）")
 
     # ---- 导入导出 --------------------------------------------------------
     #

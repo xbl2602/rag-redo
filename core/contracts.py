@@ -151,3 +151,34 @@ class PageHit:
     abs_path: str  # 这台机器上的绝对路径，方便调用方直接打开看图
     page_index: int  # 0-based 页码
     score: float  # 相似度分数，量纲与 SearchResult.confidence 不同，不能混用/换算/比较
+
+
+# ---- 库摘要（library_summary/llm_provider 扩展点，Phase 3）---------------
+
+
+@dataclass(frozen=True)
+class SampledChunk:
+    """从某库已建索引的向量空间里用最远点采样挑出的一个代表性片段，供
+    official-library-summary 概括主题用——按 obsidian-rag 的
+    library_summary.py::sample_representative_chunks 真实行为移植（"库里
+    每个块索引时已经过 embedder 编码存进向量库，是免费的副产品，不需要
+    也不该为了写一段简介重新读全文"）。和 SearchResult/PageHit 一样是
+    独立类型，不相通：采样不是检索，没有 query，没有排序意义上的分数。"""
+
+    path: str
+    heading: str
+    text: str
+
+
+@dataclass(frozen=True)
+class LibrarySummary:
+    """一个库当前的简介状态——official-library-summary 插件的存储对外
+    暴露的唯一读出形状，对齐旧项目 library.py::get_library_summary 的
+    字段（source 的三态含义见该插件模块 docstring）。"""
+
+    library_id: str
+    text: str
+    source: str  # "none"（从未生成）| "ai"（AI生成，可被覆盖）| "user"（用户手写，覆盖需走写权限门禁）
+    updated_at: float | None
+    fingerprint: str | None  # 生成时的内容指纹，用于判断"库内容可能已变化，简介或已过时"
+    model: str | None  # 生成时用的 llm_provider 插件 id，source != "ai" 时为 None

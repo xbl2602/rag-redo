@@ -1,0 +1,17 @@
+id = "official-llm-openai-compatible"
+name = "OpenAI兼容LLM Provider"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+llm_provider = "multi"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_llm_openai_compatible.plugin:OpenAiCompatibleLlmPlugin"
+
+[permissions]
+network = true
+gpu = false

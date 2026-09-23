@@ -43,6 +43,8 @@ REQUIRED_PLUGINS = [
     "official-reranker",
     "official-import-export",
     "official-visual-wemm",
+    "official-library-summary",
+    "official-llm-openai-compatible",
     "official-gui-shell",
 ]
 

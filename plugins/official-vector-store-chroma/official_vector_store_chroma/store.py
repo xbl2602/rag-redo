@@ -88,3 +88,62 @@ class ChromaVectorStore:
 
     def count(self, library_id: str) -> int:
         return self._collection(library_id).count()
+
+    def sample(self, library_id: str, k: int = 20) -> list[dict]:
+        """最远点采样（farthest-point sampling）：从库的全部块向量里选 k
+        个语义上分散的代表块，供 official-library-summary 概括库内容用——
+        直接复用索引时 embedder 已经算好的向量，免费的副产品，不需要也
+        不该为了写一段简介重新读一遍全文（对齐旧项目
+        library_summary.py::sample_representative_chunks 的算法和理由，
+        见该函数 docstring）。确定性、不需要迭代收敛；纯 Python 实现，
+        不为此新增 numpy 依赖——k 通常是十几到二十，向量维度几百到一千，
+        规模上完全跑得动，没必要为了这一处引入新的重量依赖。
+        """
+        coll = self._collection(library_id)
+        n = coll.count()
+        if n == 0:
+            return []
+        result = coll.get(include=["documents", "metadatas", "embeddings"])
+        docs = result.get("documents")
+        metas = result.get("metadatas")
+        embs = result.get("embeddings")
+        # 注意：embeddings 可能是 numpy 数组（较新版本 Chroma）——绝不能对
+        # 可能是数组的值用 `or`/`not` 做真值判断（"the truth value of an
+        # array with more than one element is ambiguous"），一律用
+        # `is None`/`len()` 判空，这是旧项目 library_summary.py 真实踩过
+        # 写进注释的坑，照抄这条纪律。
+        if docs is None or len(docs) == 0 or embs is None or len(embs) == 0:
+            return []
+        if metas is None:
+            metas = [{}] * len(docs)
+        k = min(k, len(docs))
+        if k <= 0:
+            return []
+        vecs = [list(v) for v in embs]
+
+        def _dist2(a: list[float], b: list[float]) -> float:
+            return sum((x - y) ** 2 for x, y in zip(a, b))
+
+        chosen = [0]
+        dists = [_dist2(vecs[0], v) for v in vecs]
+        while len(chosen) < k:
+            nxt = max(range(len(vecs)), key=lambda i: dists[i])
+            if nxt in chosen:  # 全部重合的退化情形（比如全部向量相同），提前收手
+                break
+            chosen.append(nxt)
+            for i, v in enumerate(vecs):
+                d = _dist2(vecs[nxt], v)
+                if d < dists[i]:
+                    dists[i] = d
+
+        rows = []
+        for i in chosen:
+            meta = metas[i] or {}
+            rows.append(
+                {
+                    "path": meta.get("path", ""),
+                    "heading": meta.get("heading_breadcrumb", ""),
+                    "text": (docs[i] or "")[:400],
+                }
+            )
+        return rows

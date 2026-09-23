@@ -110,6 +110,50 @@ class TestChromaVectorStore(unittest.TestCase):
         records = self.store.get_all("lib1")
         self.assertEqual(set(records), {"c1"})
 
+    def test_sample_empty_collection_returns_empty_list(self):
+        self.assertEqual(self.store.sample("lib1"), [])
+
+    def test_sample_returns_at_most_k_rows(self):
+        self.store.upsert(
+            "lib1",
+            ["c1", "c2", "c3"],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            documents=["文本一", "文本二", "文本三"],
+        )
+        rows = self.store.sample("lib1", k=2)
+        self.assertEqual(len(rows), 2)
+
+    def test_sample_covers_semantically_spread_points_not_duplicates(self):
+        """最远点采样应该挑出彼此分散的点，不是恰好挑到一堆重复/相邻的——
+        三个正交方向各放一个块，k=3 应该三个都选中（互相最远）。"""
+        self.store.upsert(
+            "lib1",
+            ["c1", "c2", "c3"],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            documents=["讲天文", "讲地理", "讲历史"],
+            metadatas=[{"path": "a.md"}, {"path": "b.md"}, {"path": "c.md"}],
+        )
+        rows = self.store.sample("lib1", k=3)
+        self.assertEqual({r["path"] for r in rows}, {"a.md", "b.md", "c.md"})
+
+    def test_sample_degenerate_all_identical_vectors_does_not_crash(self):
+        """全部向量重合的退化情形（比如库只有一份内容被切成很多相同的块）
+        应该提前收手，不抛异常、不死循环。"""
+        self.store.upsert(
+            "lib1",
+            ["c1", "c2", "c3"],
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            documents=["同一段文本"] * 3,
+        )
+        rows = self.store.sample("lib1", k=5)
+        self.assertGreaterEqual(len(rows), 1)
+        self.assertLessEqual(len(rows), 3)
+
+    def test_sample_truncates_long_text_to_400_chars(self):
+        self.store.upsert("lib1", ["c1"], [[1.0, 0.0, 0.0]], documents=["字" * 1000])
+        rows = self.store.sample("lib1", k=1)
+        self.assertEqual(len(rows[0]["text"]), 400)
+
 
 if __name__ == "__main__":
     unittest.main()

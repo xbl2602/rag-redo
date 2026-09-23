@@ -36,6 +36,8 @@ REQUIRED_PLUGINS = [
     "official-fusion-rrf",
     "official-reranker",
     "official-import-export",
+    "official-library-summary",
+    "official-llm-openai-compatible",
 ]
 
 
@@ -52,6 +54,16 @@ class _FakeReranker:
         # 同类注释，逐字符统计在更长的真实文本上容易被噪声干扰。
         terms = query.split()
         return [sum(text.count(term) for term in terms) for text in texts]
+
+
+class _FakeLlmClient:
+    def __init__(self, response: str = "这是一个关于插件架构的知识库。") -> None:
+        self.response = response
+        self.calls: list[dict] = []
+
+    def complete(self, system, user, **kwargs):
+        self.calls.append({"system": system, "user": user})
+        return self.response
 
 
 class TestApi(unittest.TestCase):
@@ -81,6 +93,13 @@ class TestApi(unittest.TestCase):
         from official_reranker.rerank import RerankerEngine
 
         self.runtime.plugins["official-reranker"].instance.engine = RerankerEngine(reranker=_FakeReranker())
+
+        from official_llm_openai_compatible.llm import OpenAiCompatibleClient
+
+        self.fake_llm = _FakeLlmClient()
+        self.runtime.plugins["official-llm-openai-compatible"].instance._client = OpenAiCompatibleClient(  # noqa: SLF001
+            http_client=self.fake_llm
+        )
 
         lib_mgr = self.runtime.plugins["official-library-manager"].instance
         self.pipeline = Pipeline(self.runtime)
@@ -161,6 +180,58 @@ class TestApi(unittest.TestCase):
         result = self.api.import_library(str(self.tmp / "does-not-exist.zip"), "/some/path")
         self.assertFalse(result["ok"])
         self.assertIn("error", result)
+
+    def test_get_library_summary_blank_by_default(self):
+        self.api.add_library("lib1", "测试库", str(self.vault))
+        result = self.api.get_library_summary("lib1")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["text"], "")
+        self.assertEqual(result["source"], "none")
+
+    def test_set_library_summary_writes_directly_without_gate(self):
+        """用户在 GUI 手写简介：无条件生效，不需要写权限门禁确认——
+        即使覆盖的是用户自己之前写的内容也一样（用户改自己的东西不需要
+        向自己确认）。"""
+        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.set_library_summary("lib1", "第一版手写简介")
+        result = self.api.set_library_summary("lib1", "第二版手写简介")
+        self.assertTrue(result["ok"])
+        summary = self.api.get_library_summary("lib1")
+        self.assertEqual(summary["text"], "第二版手写简介")
+        self.assertEqual(summary["source"], "user")
+
+    def test_refresh_library_summary_calls_llm_and_writes_directly(self):
+        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.reindex_library("lib1")
+        result = self.api.refresh_library_summary("lib1")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["text"], self.fake_llm.response)
+        self.assertEqual(result["provider"], "official-llm-openai-compatible")
+        summary = self.api.get_library_summary("lib1")
+        self.assertEqual(summary["source"], "ai")
+
+    def test_refresh_library_summary_needs_confirm_when_user_authored_and_not_forced(self):
+        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.reindex_library("lib1")
+        self.api.set_library_summary("lib1", "用户手写的简介")
+        result = self.api.refresh_library_summary("lib1")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result.get("needs_confirm"))
+        # 没有真的生成/覆盖——用户手写内容原封不动
+        self.assertEqual(self.api.get_library_summary("lib1")["text"], "用户手写的简介")
+
+    def test_refresh_library_summary_force_overwrites_user_authored(self):
+        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.reindex_library("lib1")
+        self.api.set_library_summary("lib1", "用户手写的简介")
+        result = self.api.refresh_library_summary("lib1", force=True)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.api.get_library_summary("lib1")["text"], self.fake_llm.response)
+
+    def test_refresh_library_summary_on_unindexed_library_returns_error(self):
+        self.api.add_library("lib1", "测试库", str(self.vault))
+        result = self.api.refresh_library_summary("lib1")
+        self.assertFalse(result["ok"])
 
 
 if __name__ == "__main__":

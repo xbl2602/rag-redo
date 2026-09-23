@@ -1,6 +1,8 @@
 """official-vector-store-chroma 插件：生命周期钩子的薄封装，真实逻辑在 store.py。"""
 from __future__ import annotations
 
+from core.contracts import SampledChunk
+
 from .store import ChromaVectorStore
 
 
@@ -47,3 +49,7 @@ class ChromaVectorStorePlugin:
     def query(self, library_id: str, query_vector: list[float], top_k: int = 10) -> list[tuple[str, float]]:
         assert self.store is not None
         return self.store.query(library_id, query_vector, top_k=top_k)
+
+    def sample(self, library_id: str, k: int = 20) -> list[SampledChunk]:
+        assert self.store is not None
+        return [SampledChunk(path=r["path"], heading=r["heading"], text=r["text"]) for r in self.store.sample(library_id, k=k)]

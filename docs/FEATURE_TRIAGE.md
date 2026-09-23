@@ -20,13 +20,13 @@
 | MinerU 本机 OCR | `official-ocr-mineru-local` | Phase 2 | subprocess_service | ✅ 已实现（真实子进程+本机HTTP+GPU资源租约协商），刻意不下载真实模型/未接入 env_bootstrap，见 ROADMAP.md Phase 2 状态；独立 py3.12/uv 环境的真正引导仍待做 |
 | WEMM 页级视觉检索 | `official-visual-wemm` | Phase 2 | subprocess_service | **已确认：官方独立插件**，不降级为社区插件。复杂度最高的一项，Phase 2 单独评估工作量 |
 | MinHash+LSH 去重 | `official-dedup` | Phase 3 | in_process | |
-| 库 AI 摘要(HyDE 式 LLM 调用) | `official-library-summary` | Phase 3 | in_process | 依赖 `llm_provider` 扩展点 |
+| 库 AI 摘要 | `official-library-summary` | Phase 3 | in_process | ✅ 已实现——最远点采样复用索引已有向量，AI生成随便覆盖/用户手写需走写权限门禁，依赖 `llm_provider` 扩展点（`official-llm-openai-compatible`，`multi`基数链式尝试）。注：表头原写"HyDE式LLM调用"容易误读成包含查询侧HyDE增强——调查后确认HyDE（`retriever.py::hyde_generate`）是旧项目里平行独立的另一功能，同协议不同配置端点，这次没有实现，见 ROADMAP.md TODO |
 | GPU 显存仲裁 | 核心服务（不是插件） | Phase 2起随 subprocess_service 插件出现而启用 | — | 见 ARCHITECTURE.md 2.1节"资源仲裁器" |
 | Agent 写权限门禁(`selection_gate`/`summary_gate`) | 核心服务（不是插件） | Phase 0起可用，Phase 3实际被`library-manager`/`library-summary`插件使用 | — | 见 ARCHITECTURE.md 2.2节 |
 | 导出/导入(换电脑搬家) | `official-import-export` | Phase 3 | in_process | ✅ 已实现——`archive_codec` 单例扩展点，只负责 zip 归档打包/解包，不知道 library_manager/lexical_index/vector_store 的存在；跨插件编排在 `core/pipeline.py` 的 `export_library`/`import_library`（同 `index_library`/`search` 的编排模式）。9+9 用例（插件自身归档格式测试 + Pipeline 端到端往返测试），另有 MCP 工具（`export_library`/`import_library`，base64 传输）和 GUI Api（真实文件读写）两条调用路径的回归测试 |
 | 旧 `libraries.json` 迁移脚本 | 一次性 CLI 工具，不常驻 | Phase 3 | — | ✅ 已实现（`tools/migrate_libraries_json.py`），字段映射对照旧项目 `library.py` 真实 schema 核对过，不迁移的字段（agent_formats/exclude_dirs等）在脚本 docstring 里逐条写清楚原因 |
 | MinHash+LSH 去重 | `official-dedup` | Phase 3 | in_process | ✅ 已实现，用 datasketch 库 |
-| Agent 写权限门禁 | 核心服务（`core/write_gate.py`） | Phase 0/3 | — | ✅ 已实现（提案号+确认码+TTL+一次性），尚未被任何插件实际调用触发——目前所有官方插件的写入都是"用户主动触发"（GUI点击/MCP工具调用），还没有"AI背着用户想改点什么"这种真正需要门禁拦一下的场景出现，见 docs/ROADMAP.md Phase 3 说明 |
+| Agent 写权限门禁 | 核心服务（`core/write_gate.py`） | Phase 0/3 | — | ✅ 已实现（提案号+确认码+TTL+一次性），✅ 已被真实调用（2026-09-23）——`official-library-summary` 是第一个真实调用方：AI经MCP对话想覆盖用户手写的库简介时走 propose/apply 两段式确认，端到端验证过完整链路，见 docs/ROADMAP.md Phase 3 说明 |
 | Flet 经典 GUI | **已确认：不迁移** | — | — | 和 guiweb 功能重复、维护负担已确认不值得——操作者已同意直接砍掉。新架构下 `gui_panel` 扩展点本身就支持替换整个 GUI，想要 Flet 体验的话可以有人做成一个独立的 `gui_panel` 实现，但不作为官方维护对象 |
 
 **仍待确认的1处判断**：Agent 写权限门禁+GPU 仲裁定为"核心服务"而非"插件"（见 [ROADMAP.md](ROADMAP.md)"开放问题"）。WEMM 官方插件、Flet 不迁移两处已在 2026-09-22 确认。

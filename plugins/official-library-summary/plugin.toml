@@ -1,0 +1,17 @@
+id = "official-library-summary"
+name = "库摘要"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+library_summary = "singleton"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_library_summary.plugin:LibrarySummaryPlugin"
+
+[permissions]
+network = false
+gpu = false

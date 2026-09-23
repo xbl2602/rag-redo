@@ -88,11 +88,30 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
 
     @server.tool()
     def list_libraries() -> list[dict]:
-        """列出所有已注册的库及其基本信息。"""
-        return [
-            {"library_id": cfg.library_id, "name": cfg.name, "root_path": cfg.root_path}
-            for cfg in lib_mgr.store.list_libraries()
-        ]
+        """列出所有已注册的库及其基本信息，含每个库的简介（导航/澄清性质
+        的一段话，帮你在真正检索/通读全文之前先判断"这个库值不值得往这
+        查"——不是检索结果的替代品）。没有简介的库不代表没内容，只是还
+        没生成过；如果用户明确要求，先调用 get_library_sample 采样，自己
+        写一段，再用 propose_library_summary 提交。
+
+        library_summary 是可选插件——关掉它之后 list_libraries 仍应正常
+        工作，只是每条结果的 summary 字段一律是 None（同 AGENTS.md"关掉
+        任意一个非必需插件，核心+MCP仍能正常工作"这条既有验收标准，不能
+        因为新增了库摘要功能就让这条退化）。
+        """
+        summary_available = pipeline.runtime.registry.active_of("library_summary") is not None
+        rows = []
+        for cfg in lib_mgr.store.list_libraries():
+            summary_text = pipeline.get_library_summary(cfg.library_id).text if summary_available else ""
+            rows.append(
+                {
+                    "library_id": cfg.library_id,
+                    "name": cfg.name,
+                    "root_path": cfg.root_path,
+                    "summary": summary_text or None,
+                }
+            )
+        return rows
 
     @server.tool()
     def reindex_knowledge(library_id: str) -> dict[str, Any]:
@@ -171,3 +190,91 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "library_id": new_id}
+
+    # -----------------------------------------------------------------
+    # 库简介（Phase 3）：导航/澄清性质的一段话，帮你在真正检索/通读全文
+    # 之前先判断"这个库值不值得往这查"。生成绝不自动触发——只能由用户在
+    # GUI 点"刷新简介"，或在对话里向你明确提出请求后，你才调用下面这两个
+    # 写入工具。覆盖保护复用核心 write_gate 两段式确认（数据面在
+    # official-library-summary 插件）：库简介若是用户手写的，你想改写
+    # 必须先 propose 拿到确认码、讲给用户听、得到明确同意后才能 apply；
+    # 库简介若从没被人手写过，propose 会直接生效。
+    # -----------------------------------------------------------------
+
+    @server.tool()
+    def get_library_sample(library_id: str, k: int = 20) -> dict[str, Any]:
+        """只读：从某库已建索引的内容里采样出一批有代表性的片段（最远点
+        采样，覆盖库内语义空间的分散区域），供你自己组织语言写一段库简介。
+
+        ⚠ 仅在用户明确要求你生成/更新某库的简介时才调用本工具——不要在
+        检索问答过程中顺手调用，那不是本工具的用途。
+
+        看完采样后写简介必须遵守（这不是建议，是硬约束）——必须同时做到
+        ①②两件事，只写主题范围而不给判断依据、或反过来，都不合格：
+        ① 先一两句给总体定位（这库大致是什么性质/服务于什么），再概括
+          库内主要覆盖哪几类主题或板块（口语化提及即可，不要用编号/项目
+          符号罗列成清单）；
+        ② 接着明确写清楚"适合来这库查什么类型的问题"、以及"大概率查不到
+          什么"（正反两面都要有）——直接服务于"值不值得往这查"这个决策，
+          而不是把主题范围甩给对方自己去猜；
+        ③ 禁止逐字摘抄下面给的片段原文，必须用你自己的话概括转写；
+        ④ 不点名任何一篇具体笔记的细节，只讲库整体范围；
+        ⑤ 100~300 字，一段话，不用 markdown、不分点、不用标题；
+        ⑥ 写好后调用 propose_library_summary(library_id, text) 提交，
+          不要自己把文本回复给用户就结束——那样不会真正写入。
+
+        Args:
+            library_id: 要采样的库的 id
+            k: 采样代表片段数
+        """
+        try:
+            samples = pipeline.sample_library(library_id, k=k)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        if not samples:
+            return {"ok": False, "error": f"库「{library_id}」尚未建索引或索引为空，无法采样。先调用 reindex_knowledge 建好索引再重试。"}
+        return {
+            "ok": True,
+            "samples": [{"path": s.path, "heading": s.heading, "text": s.text} for s in samples],
+        }
+
+    @server.tool()
+    def propose_library_summary(library_id: str, text: str) -> dict[str, Any]:
+        """提交一段库简介（100~300 字，导航/澄清性质，见 get_library_sample
+        的写作约束）。
+
+        行为分两种情况，你不用自己判断走哪条——本工具会自动处理：
+        - 该库简介此前是空白或由 AI 生成的：直接写入生效，返回确认信息
+          （applied=True）。
+        - 该库简介是用户手写的：不会直接覆盖，而是生成一份待确认提案
+          （applied=False，含 proposal_id + 6 位数字确认码），你必须把
+          新简介完整展示给用户，得到用户明确同意后，携带提案号与确认码
+          调用 apply_library_summary 才会真正生效。未经用户同意就调用
+          apply 是严重违规。
+
+        Args:
+            library_id: 要更新简介的库的 id
+            text: 新的简介文本
+        """
+        try:
+            result = pipeline.propose_library_summary(library_id, text)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return result
+
+    @server.tool()
+    def apply_library_summary(library_id: str, proposal_id: str, confirmation_code: str) -> dict[str, Any]:
+        """应用已获用户确认的库简介覆盖提案。只有 propose_library_summary
+        返回的提案号 + 用户看到的确认码二者匹配、且未过期（10 分钟）时才
+        会生效——这是硬编码门禁，无任何配置可绕过。
+
+        Args:
+            library_id: 目标库的 id
+            proposal_id: propose_library_summary 返回的提案号
+            confirmation_code: 用户确认后提供的 6 位数字确认码
+        """
+        try:
+            result = pipeline.apply_library_summary(library_id, proposal_id, confirmation_code)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return result

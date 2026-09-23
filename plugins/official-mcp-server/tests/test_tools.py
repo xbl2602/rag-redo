@@ -41,6 +41,8 @@ REQUIRED_PLUGINS = [
     "official-reranker",
     "official-import-export",
     "official-visual-wemm",
+    "official-library-summary",
+    "official-llm-openai-compatible",
 ]
 
 
@@ -57,6 +59,14 @@ class _FakeReranker:
         # 同类注释，逐字符统计在更长的真实文本上容易被噪声干扰。
         terms = query.split()
         return [sum(text.count(term) for term in terms) for text in texts]
+
+
+class _FakeLlmClient:
+    def __init__(self, response: str = "这是一个讲插件架构的个人知识库简介。") -> None:
+        self.response = response
+
+    def complete(self, system, user, **kwargs):
+        return self.response
 
 
 class TestMcpToolsAsyncBase(unittest.IsolatedAsyncioTestCase):
@@ -99,6 +109,13 @@ class TestMcpToolsAsyncBase(unittest.IsolatedAsyncioTestCase):
         from official_reranker.rerank import RerankerEngine
 
         self.runtime.plugins["official-reranker"].instance.engine = RerankerEngine(reranker=_FakeReranker())
+
+        from official_llm_openai_compatible.llm import OpenAiCompatibleClient
+
+        self.fake_llm = _FakeLlmClient()
+        self.runtime.plugins["official-llm-openai-compatible"].instance._client = OpenAiCompatibleClient(  # noqa: SLF001
+            http_client=self.fake_llm
+        )
 
         lib_mgr = self.runtime.plugins["official-library-manager"].instance
         lib_mgr.store.add_library("test-lib", "测试库", str(vault))
@@ -239,6 +256,9 @@ class TestMcpTools(TestMcpToolsAsyncBase):
                 "reindex_knowledge",
                 "export_library",
                 "import_library",
+                "get_library_sample",
+                "propose_library_summary",
+                "apply_library_summary",
             },
         )
         search_tool = next(t for t in tools if t.name == "search_knowledge")
@@ -294,6 +314,82 @@ class TestMcpTools(TestMcpToolsAsyncBase):
                 "library_id": "test-lib",
             },
         )
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+
+    async def test_list_libraries_includes_summary_field(self):
+        result = await self.server.call_tool("list_libraries", {})
+        libs = result.structured_content["result"]
+        self.assertIn("summary", libs[0])
+        self.assertIsNone(libs[0]["summary"])  # 还没生成过
+
+    async def test_get_library_sample_then_propose_then_apply_roundtrip(self):
+        await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+
+        sample_result = await self.server.call_tool("get_library_sample", {"library_id": "test-lib"})
+        self.assertFalse(sample_result.is_error)
+        sample_payload = sample_result.structured_content
+        self.assertTrue(sample_payload["ok"])
+        self.assertTrue(sample_payload["samples"])
+        self.assertEqual(sample_payload["samples"][0]["path"], "notes.md")
+
+        propose_result = await self.server.call_tool(
+            "propose_library_summary", {"library_id": "test-lib", "text": "一段AI写的库简介"}
+        )
+        self.assertFalse(propose_result.is_error)
+        propose_payload = propose_result.structured_content
+        self.assertTrue(propose_payload["ok"])
+        self.assertTrue(propose_payload["applied"])  # 此前是空白态，直接生效不需要确认
+
+        list_result = await self.server.call_tool("list_libraries", {})
+        libs = list_result.structured_content["result"]
+        self.assertEqual(libs[0]["summary"], "一段AI写的库简介")
+
+    async def test_propose_over_user_authored_summary_requires_apply_confirmation(self):
+        await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+        summary_plugin = self.runtime.plugins["official-library-summary"].instance
+        summary_plugin._store.set("test-lib", "用户手写的简介", source="user")  # noqa: SLF001
+
+        propose_result = await self.server.call_tool(
+            "propose_library_summary", {"library_id": "test-lib", "text": "AI想覆盖的新简介"}
+        )
+        propose_payload = propose_result.structured_content
+        self.assertFalse(propose_payload["applied"])
+        self.assertIn("proposal_id", propose_payload)
+        self.assertIn("confirmation_code", propose_payload)
+
+        apply_result = await self.server.call_tool(
+            "apply_library_summary",
+            {
+                "library_id": "test-lib",
+                "proposal_id": propose_payload["proposal_id"],
+                "confirmation_code": propose_payload["confirmation_code"],
+            },
+        )
+        self.assertFalse(apply_result.is_error)
+        self.assertTrue(apply_result.structured_content["ok"])
+
+        list_result = await self.server.call_tool("list_libraries", {})
+        self.assertEqual(list_result.structured_content["result"][0]["summary"], "AI想覆盖的新简介")
+
+    async def test_apply_library_summary_wrong_code_reports_error_not_crash(self):
+        await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+        summary_plugin = self.runtime.plugins["official-library-summary"].instance
+        summary_plugin._store.set("test-lib", "用户手写的简介", source="user")  # noqa: SLF001
+        propose_result = await self.server.call_tool(
+            "propose_library_summary", {"library_id": "test-lib", "text": "新简介"}
+        )
+        proposal_id = propose_result.structured_content["proposal_id"]
+
+        apply_result = await self.server.call_tool(
+            "apply_library_summary",
+            {"library_id": "test-lib", "proposal_id": proposal_id, "confirmation_code": "000000"},
+        )
+        self.assertFalse(apply_result.is_error)
+        self.assertFalse(apply_result.structured_content["ok"])
+
+    async def test_get_library_sample_unindexed_library_reports_error_not_crash(self):
+        result = await self.server.call_tool("get_library_sample", {"library_id": "test-lib"})
         self.assertFalse(result.is_error)
         self.assertFalse(result.structured_content["ok"])
 

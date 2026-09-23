@@ -396,5 +396,126 @@ class TestOcrChainTryFallback(unittest.TestCase):
         self.assertIn("fake-ocr", results[0].text)
 
 
+class _FakeLlmHttpClient:
+    """给 official-llm-openai-compatible 用的假客户端——不碰真实网络，
+    验证的是"pipeline 真的把采样片段拼进了prompt、真的按provider链式
+    尝试调用、真的把结果传回给库摘要插件写盘"这条编排逻辑本身，不是
+    "LLM 写得好不好"。"""
+
+    def __init__(self, response: str = "这是一个关于插件架构和厨房食谱的个人知识库，适合查询系统设计与家常菜做法。") -> None:
+        self.response = response
+        self.calls: list[dict] = []
+
+    def complete(self, system, user, **kwargs):
+        self.calls.append({"system": system, "user": user})
+        return self.response
+
+
+class TestLibrarySummaryPipeline(unittest.TestCase):
+    """证明 Phase 3 的库摘要设计真的接进了主管道，不是插件单测自证自话：
+    vector_store.sample() 真的从索引好的库里采样、llm_provider 链式尝试
+    真的被调用、official-library-summary 的写权限门禁真的挡住了对用户
+    手写简介的覆盖——采样/chunker/BM25/Chroma/Pipeline.search 全部是真
+    代码，只有"调用真实云端/本地LLM"这一步注入假客户端（同
+    official-embedder-bge-m3 假编码器的理由：不为了验证编排逻辑对不对
+    就强绑一次真实网络调用）。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        (self.vault / "plugin-notes.md").write_text(
+            "# 插件架构笔记\n\n这篇笔记讲插件系统的架构设计，核心只有两个组件。",
+            encoding="utf-8",
+        )
+        (self.vault / "cooking.md").write_text(
+            "# 厨房笔记\n\n这篇笔记记录了几个食谱，包括家常菜做法。",
+            encoding="utf-8",
+        )
+
+        self.data_dir = self.tmp / "data"
+        self.runtime = PluginRuntime(
+            REPO_ROOT / "plugins",
+            state_file=self.tmp / "plugins_state.json",
+            data_dir=self.data_dir,
+        )
+        self.runtime.scan()
+        plugin_ids = OFFICIAL_PHASE1_PLUGINS + ["official-library-summary", "official-llm-openai-compatible"]
+        for plugin_id in plugin_ids:
+            self.runtime.load(plugin_id)
+            self.runtime.enable(plugin_id)
+            state = self.runtime.plugins[plugin_id]
+            self.assertEqual(state.state, PluginState.ENABLED, f"{plugin_id}: {state.error}")
+
+        from official_embedder_bge_m3.embed import BGEM3Embedder
+
+        self.runtime.plugins["official-embedder-bge-m3"].instance.embedder = BGEM3Embedder(encoder=_DeterministicFakeEncoder())
+        from official_reranker.rerank import RerankerEngine
+
+        self.runtime.plugins["official-reranker"].instance.engine = RerankerEngine(reranker=_DeterministicFakeReranker())
+
+        from official_llm_openai_compatible.llm import OpenAiCompatibleClient
+
+        self.fake_llm = _FakeLlmHttpClient()
+        self.runtime.plugins["official-llm-openai-compatible"].instance._client = OpenAiCompatibleClient(  # noqa: SLF001
+            http_client=self.fake_llm
+        )
+
+        self.pipeline = Pipeline(self.runtime)
+        self.lib_mgr = self.runtime.plugins["official-library-manager"].instance
+        self.lib_mgr.store.add_library("test-lib", "测试库", str(self.vault))
+        self.pipeline.index_library("test-lib")
+
+    def test_sample_library_returns_representative_chunks_from_real_index(self):
+        samples = self.pipeline.sample_library("test-lib", k=5)
+        self.assertTrue(samples)
+        paths = {s.path for s in samples}
+        self.assertEqual(paths, {"plugin-notes.md", "cooking.md"})
+
+    def test_sample_library_unknown_library_raises_keyerror(self):
+        with self.assertRaises(KeyError):
+            self.pipeline.sample_library("no-such-lib")
+
+    def test_generate_library_summary_calls_llm_provider_chain_and_returns_text(self):
+        text, provider_id = self.pipeline.generate_library_summary("test-lib")
+        self.assertEqual(provider_id, "official-llm-openai-compatible")
+        self.assertEqual(text, self.fake_llm.response)
+        self.assertEqual(len(self.fake_llm.calls), 1)
+        # prompt 里应该真的带上了采样到的文件名，不是空壳调用
+        self.assertTrue(any(name in self.fake_llm.calls[0]["user"] for name in ("plugin-notes.md", "cooking.md")))
+
+    def test_generate_library_summary_on_unindexed_library_raises_clear_error(self):
+        self.lib_mgr.store.add_library("empty-lib", "空库", str(self.tmp / "empty"))
+        (self.tmp / "empty").mkdir()
+        with self.assertRaises(Exception):
+            self.pipeline.generate_library_summary("empty-lib")
+
+    def test_propose_then_apply_full_roundtrip_via_pipeline(self):
+        result = self.pipeline.propose_library_summary("test-lib", "一段AI生成的简介")
+        self.assertTrue(result["applied"])
+        summary = self.pipeline.get_library_summary("test-lib")
+        self.assertEqual(summary.text, "一段AI生成的简介")
+        self.assertEqual(summary.source, "ai")
+
+    def test_propose_over_user_summary_requires_gate_confirmation(self):
+        """完整端到端验证写权限门禁真的挡住了 AI 覆盖用户手写内容——
+        这是 core/write_gate.py 第一次被真实插件+真实Pipeline调用链路
+        验证过，不只是插件自己的单元测试。"""
+        summary_plugin = self.runtime.plugins["official-library-summary"].instance
+        summary_plugin._store.set("test-lib", "用户手写的简介", source="user")  # noqa: SLF001
+
+        propose_result = self.pipeline.propose_library_summary("test-lib", "AI想覆盖的新简介")
+        self.assertFalse(propose_result["applied"])
+        self.assertEqual(self.pipeline.get_library_summary("test-lib").text, "用户手写的简介")
+
+        apply_result = self.pipeline.apply_library_summary(
+            "test-lib", propose_result["proposal_id"], propose_result["confirmation_code"]
+        )
+        self.assertTrue(apply_result["ok"])
+        self.assertEqual(self.pipeline.get_library_summary("test-lib").text, "AI想覆盖的新简介")
+
+
 if __name__ == "__main__":
     unittest.main()

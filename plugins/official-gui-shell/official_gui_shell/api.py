@@ -107,6 +107,49 @@ class Api:
             return {"ok": False, "error": str(exc)}
         return {"ok": True}
 
+    def get_library_summary(self, library_id: str) -> dict[str, Any]:
+        try:
+            summary = self._pipeline.get_library_summary(library_id)
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "text": summary.text, "source": summary.source, "model": summary.model}
+
+    def set_library_summary(self, library_id: str, text: str) -> dict[str, Any]:
+        """用户在 GUI 直接手写/编辑简介：无条件生效，不经过写权限门禁——
+        门禁只保护"AI 经 MCP 对话想覆盖用户已写内容"这一种场景，用户改
+        自己的东西不需要向自己确认（同调查到的旧项目 guiweb/bridge.py::
+        set_library_summary 行为）。"""
+        try:
+            return self._pipeline.set_library_summary_direct(library_id, text, source="user")
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+
+    def refresh_library_summary(self, library_id: str, force: bool = False) -> dict[str, Any]:
+        """"刷新简介"：真的调一次配置好的 llm_provider 生成新简介，直接
+        写入（不经过写权限门禁——GUI 点按钮本身就是明确的人类操作，同
+        set_library_summary）。
+
+        当前简介若是用户手写的且 force=False，不生成也不覆盖，返回
+        `needs_confirm=True` 让前端二次确认后带 force=True 重试（同调查
+        到的旧项目 guiweb/bridge.py::_run_summary_refresh_batch 的"先探测
+        再问要不要覆盖"逻辑）。
+
+        **已知的简化**：旧项目这一步是后台线程+前端轮询（本地思考型模型
+        一次生成可能要几十秒到几分钟，同步等待会让弹层"卡住"）——rag-redo
+        的 GUI Api 层目前完全没有"后台任务+轮询"基础设施，这里简化成
+        同步阻塞调用，是刻意的简化，不是假装做了异步，调用方（前端）
+        目前需要自己接受这次调用可能较慢。"""
+        try:
+            current = self._pipeline.get_library_summary(library_id)
+            if current.source == "user" and not force:
+                return {"ok": False, "needs_confirm": True}
+            text, provider_id = self._pipeline.generate_library_summary(library_id)
+            result = self._pipeline.set_library_summary_direct(library_id, text, source="ai")
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+        result["provider"] = provider_id
+        return result
+
     def import_library(self, archive_path: str, root_path: str, library_id: str = "") -> dict[str, Any]:
         """从 export_library 写出的归档文件恢复一个库。library_id 留空
         （前端不填这个字段）则沿用归档里记录的原始 library_id。"""
