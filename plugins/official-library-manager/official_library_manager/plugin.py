@@ -15,9 +15,11 @@ from .selection import collect_included_files
 class LibraryManagerPlugin:
     def __init__(self) -> None:
         self.store: LibraryConfigStore | None = None
+        self._settings = None
 
     def on_load(self, ctx):
         self.store = LibraryConfigStore(ctx.data_dir / "libraries.json")
+        self._settings = ctx.settings
         ctx.logger.info("library-manager 已加载，%d 个库", len(self.store.list_libraries()))
 
     def on_enable(self, ctx):
@@ -28,25 +30,27 @@ class LibraryManagerPlugin:
 
     def on_unload(self, ctx):
         self.store = None
+        self._settings = None
 
     def resolve_libraries(self, libraries: str = "", exclude: str = "") -> list[LibraryConfig]:
         """按"白名单减法"解析出这次检索该覆盖哪些库——对齐 obsidian-rag/
         library.py::resolve_entries 的多库选择语义（旧项目 GUI 的库勾选树、
         `search_knowledge` MCP 工具的 `libraries`/`exclude` 参数最终都调
-        这一个函数）：`libraries` 为空 = 全部已注册库；`"all"` 显式等同于
-        空；`"A,B"` 按逗号切开多库并查（去重但保留顺序）；`exclude` 做
-        减法，在 `libraries` 解析结果之上再排除；两边出现未知库id直接
-        报错并把全部可用库名列出来，不静默忽略打错的名字。
+        这一个函数）：`libraries` 为空 = 先查 `default_libraries` 设置
+        （见下），配置也是空才回退全部已注册库；`"all"` 显式等同于"忽略
+        default_libraries、就是要全部库"；`"A,B"` 按逗号切开多库并查
+        （去重但保留顺序）；`exclude` 做减法，在解析结果之上再排除；
+        两边出现未知库id直接报错并把全部可用库名列出来，不静默忽略
+        打错的名字。
 
-        **一处已知的、如实记录的简化**：obsidian-rag 在 `libraries` 为空时
-        还会先查一层全局配置 `default_libraries`（用户可以设定"新增库/
-        非笔记库默认不参与检索"），配置也是空才最终回退全部库；rag-redo
-        目前还没有通用的插件配置存储（见 core/context.py 的 PluginContext
-        字段，没有 settings/config 这类入口），所以这里直接以"全部库"
-        作为唯一默认——这是"暂无配置存储基建"的简化，不是"多库选择"这个
-        能力本身缺角；default_libraries 这类可配置默认值等通用配置存储
-        落地后可以在这里追加一层，不影响调用方已经在用的 libraries/
-        exclude 语义。
+        **`default_libraries` 设置（2026-09-23 接入 core/settings.py 通用
+        设置存储后补齐，此前是已知的、如实记录的简化）**：对齐
+        obsidian-rag/config.py 的 `default_libraries` 项——用户可以设定
+        "新增库/非笔记库默认不参与检索"，`libraries` 参数留空时优先用这份
+        默认范围，而不是不由分说地查全部库；配置里的库id如果已经被删除，
+        静默跳过（不算入未知库名报错），配置项全部失效或本来就没配才
+        回退全部库——同 obsidian-rag `resolve_entries` 的"默认库全部失效
+        →回退全部库（旧行为）"语义。
         """
         assert self.store is not None
         entries = self.store.list_libraries()
@@ -58,7 +62,10 @@ class LibraryManagerPlugin:
             if names and names[0].lower() == "all":
                 names = list(by_id)
         else:
-            names = list(by_id)
+            defaults = self._settings.get("default_libraries", []) if self._settings is not None else []
+            names = [n for n in defaults if n in by_id]
+            if not names:
+                names = list(by_id)
         ex = [n.strip() for n in exclude.split(",") if n.strip()]
         unknown = sorted({n for n in names + ex if n not in by_id})
         if unknown:

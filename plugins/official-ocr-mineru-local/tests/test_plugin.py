@@ -165,6 +165,34 @@ class TestResolveMineruPythonWithoutFaking(unittest.TestCase):
             self.skipTest("本机未安装 MinerU tool 环境（uv tool install mineru），跳过")
         self.assertEqual(self.mod._resolve_mineru_python(), str(expected))
 
+    def test_settings_mineru_python_used_when_no_explicit_or_env_override(self):
+        """对齐 obsidian-rag/config.py 的 mineru_python 设置项（2026-09-23
+        接入 core/settings.py 通用设置存储后补齐）——没有更高优先级的
+        显式参数/环境变量覆盖时，读设置里存的解释器路径。"""
+        from core.settings import SettingsStore
+
+        fd, path = tempfile.mkstemp(suffix=".exe")
+        os.close(fd)
+        fake_python = Path(path)
+        self.addCleanup(lambda: fake_python.unlink(missing_ok=True))
+        settings = SettingsStore(Path(tempfile.mkdtemp()) / "settings.json")
+        settings.set("mineru_python", str(fake_python))
+        self.assertEqual(self.mod._resolve_mineru_python(settings=settings), str(fake_python))
+
+    def test_env_var_override_wins_over_settings(self):
+        from core.settings import SettingsStore
+
+        fd1, settings_path = tempfile.mkstemp(suffix=".exe")
+        os.close(fd1)
+        fd2, env_path = tempfile.mkstemp(suffix=".exe")
+        os.close(fd2)
+        self.addCleanup(lambda: Path(settings_path).unlink(missing_ok=True))
+        self.addCleanup(lambda: Path(env_path).unlink(missing_ok=True))
+        settings = SettingsStore(Path(tempfile.mkdtemp()) / "settings.json")
+        settings.set("mineru_python", settings_path)
+        os.environ["RAG_REDO_MINERU_PYTHON"] = env_path
+        self.assertEqual(self.mod._resolve_mineru_python(settings=settings), env_path)
+
 
 if __name__ == "__main__":
     unittest.main()

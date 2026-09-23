@@ -18,6 +18,10 @@ from .contracts import ExtractedDocument, LibrarySummary, PageHit, SampledChunk,
 from .runtime import PluginRuntime
 
 
+DEFAULT_FUSION_DENSE_WEIGHT = 1.0  # RRF 融合里"向量语义"这一路的权重，对齐 obsidian-rag/config.py 同名默认值
+DEFAULT_FUSION_BM25_WEIGHT = 1.0  # RRF 融合里"BM25关键词"这一路的权重，同上
+
+
 class PipelineError(RuntimeError):
     """编排层缺少必要的已启用插件时抛出——这不是插件自己的失败折叠范畴
     （那是数据层面的"这个文件没收"），是"根本没法开始跑"的配置错误，
@@ -254,6 +258,12 @@ class Pipeline:
         folder_norm = _norm_folder(folder)
         candidate_pool = top_k * 3
         (query_vector,) = embedder.embed_texts([query])
+        # RRF 两路权重可调（core/settings.py 通用设置存储，2026-09-23 全面
+        # 功能审计发现此前是死值——对齐 obsidian-rag/config.py 的
+        # fusion_dense_weight/fusion_bm25_weight，调大 dense 偏语义、调大
+        # bm25 偏关键词；没配过就是等权 1.0/1.0，经典无权重 RRF）。
+        dense_weight = self.runtime.settings.get("fusion_dense_weight", DEFAULT_FUSION_DENSE_WEIGHT)
+        bm25_weight = self.runtime.settings.get("fusion_bm25_weight", DEFAULT_FUSION_BM25_WEIGHT)
 
         pool_ids: list[str] = []
         for cfg in entries:
@@ -262,7 +272,7 @@ class Pipeline:
             vector_hits = vector_store.query(library_id, list(query_vector), top_k=candidate_pool)
             lexical_ranked = [cid for cid, _ in lexical_hits if _in_folder(_chunk_path(cid), folder_norm)]
             vector_ranked = [cid for cid, _ in vector_hits if _in_folder(_chunk_path(cid), folder_norm)]
-            fused = fusion.fuse([lexical_ranked, vector_ranked])
+            fused = fusion.fuse([lexical_ranked, vector_ranked], weights=[bm25_weight, dense_weight])
             pool_ids.extend(chunk_id for chunk_id, _ in fused[: top_k * 2])
         if not pool_ids:
             return []

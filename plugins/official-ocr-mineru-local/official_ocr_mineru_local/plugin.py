@@ -65,18 +65,22 @@ def _content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _resolve_mineru_python(explicit: str | None = None) -> str | None:
+def _resolve_mineru_python(explicit: str | None = None, settings=None) -> str | None:
     """MinerU tool 环境的 python.exe。测试/无GPU机器（RAG_REDO_FAKE_OCR）
     直接用核心自己的解释器——不需要真装 MinerU，server.py 的假OCR分支
-    只用标准库；`RAG_REDO_MINERU_PYTHON` 环境变量显式覆盖优先（对齐
-    official-llm-openai-compatible 用环境变量做可覆盖配置的既有先例，
-    rag-redo 目前还没有通用的插件设置存储，见 core/context.py）；否则按
-    `uv tool install` 的标准落点探测（对齐 obsidian-rag/gpu_arbiter.py
-    `_resolve_mineru_python` 的探测路径），都找不到返回 None，调用方负责
-    报出清楚的安装提示，不是静默退化用不认识 mineru 包的核心解释器。"""
+    只用标准库。覆盖优先级：显式参数 > `RAG_REDO_MINERU_PYTHON` 环境变量
+    （一次性/CI场景用，不持久化）> `mineru_python` 设置项（2026-09-23接入
+    core/settings.py 通用设置存储后补齐，对齐 obsidian-rag/config.py 的
+    `mineru_python` 项——GUI/设置面板可持久化改，不用每次都设环境变量）
+    > 按 `uv tool install` 的标准落点自动探测（对齐
+    obsidian-rag/gpu_arbiter.py `_resolve_mineru_python` 的探测路径），
+    都找不到返回 None，调用方负责报出清楚的安装提示，不是静默退化用不
+    认识 mineru 包的核心解释器。"""
     if os.environ.get("RAG_REDO_FAKE_OCR"):
         return sys.executable
     override = explicit or os.environ.get("RAG_REDO_MINERU_PYTHON")
+    if not override and settings is not None:
+        override = settings.get("mineru_python", "") or None
     if override and Path(override).is_file():
         return str(override)
     candidates: list[Path] = []
@@ -121,9 +125,11 @@ class MineruLocalOcrPlugin:
         self._plugin_dir: Path | None = None
         self._runtime_health_check: str | None = None
         self._runtime_command: tuple[str, ...] | None = None
+        self._settings = None
 
     def on_load(self, ctx):
         self._logger = ctx.logger
+        self._settings = ctx.settings
         ctx.logger.info("MinerU本机OCR已加载")
 
     def on_enable(self, ctx):
@@ -148,12 +154,12 @@ class MineruLocalOcrPlugin:
 
     def _start_handle(self) -> None:
         assert self._plugin_dir is not None and self._runtime_command is not None
-        python = _resolve_mineru_python()
+        python = _resolve_mineru_python(settings=self._settings)
         if python is None:
             raise SubprocessServiceError(
-                f"找不到 MinerU tool 环境的 Python（RAG_REDO_MINERU_PYTHON 未配且自动探测失败）："
-                f"请先跑 {_MINERU_INSTALL_HINT} 装好本机 MinerU，或设置 RAG_REDO_MINERU_PYTHON "
-                "指向已有安装的 python.exe"
+                f"找不到 MinerU tool 环境的 Python（mineru_python 设置项/RAG_REDO_MINERU_PYTHON "
+                f"环境变量均未配且自动探测失败）：请先跑 {_MINERU_INSTALL_HINT} 装好本机 MinerU，"
+                "或设置 mineru_python 指向已有安装的 python.exe"
             )
         command = tuple(arg.replace("{python}", python) for arg in self._runtime_command)
         self._handle = SubprocessServiceHandle(command, health_check=self._runtime_health_check, cwd=self._plugin_dir)

@@ -13,7 +13,7 @@
 5. ~~Phase 3 剩余两项（库 AI 摘要 + Agent 写权限门禁通用化）~~——**已完成（2026-09-23）**，见下方 Phase 3 状态段落。新发现一项未跟踪的功能缺口：调查过程中确认旧项目 `retriever.py::hyde_generate`（查询侧 HyDE 增强，让 LLM 为查询生成一段假设答案文档再去检索）是和库摘要**平行、独立**的功能，用同一协议但不同的配置端点（`hyde_llm_url`/`hyde_llm_model` vs `library_summary_llm_url`/`library_summary_llm_model`）——这次没有实现（ROADMAP此前从未把它列为独立追踪项，只在 FEATURE_TRIAGE.md 的库摘要那一行里以"HyDE式"三个字带过，容易被误读成同一个功能），如实记录为一个新发现的、还没做的功能，不是遗漏了已知计划项。
 6. ~~Phase 4：Inno Setup 安装包包装~~——**已完成（2026-09-23，真实编译+真实装卸全流程验证过）**，见下方 Phase 4 状态段落。**还没做的是在一台"没装过任何开发工具"的干净 Windows 机器上验证打包产物**（目前只在打包机器本机验证过完整装卸循环）+ 给冻结产物打包独立便携Python让 `official-visual-wemm`/`official-ocr-mineru-local` 在打包版本里也能真正可用（见上面第3/4条）+ 打包体积优化（当前约1GB/exe，根因也是WEMM验证重依赖临时装在核心venv里）。
 7. ~~多库并查检索选择+folder过滤+置信度真分尺度~~——**已完成（2026-09-23）**：对照 obsidian-rag/retriever.py::hybrid_search 逐项核对 `search_knowledge` 时发现的真实缺口（此前 ROADMAP 从未把这单独列为追踪项，不是遗漏了已知计划，是这轮对照审计才发现），见下方 Phase 1 状态段落。
-8. **⚠ 全面功能审计（2026-09-23）发现的新缺口，均未实现，按下方分类排序**——操作者要求"确保所有功能都完整复刻"后，逐个对照 obsidian-rag `server.py`（16个MCP工具 vs rag-redo当前9个）、`config.py`（CFG约60个配置项）、`singleton.py`、`guiweb/graph_data.py`+`semantic.py` 做的系统性核对，发现的缺口比此前任何一次审计都大，如实列出、不预设优先级由操作者定夺。详见下方"2026-09-23 全面功能审计"独立小节。
+8. **⚠ 全面功能审计（2026-09-23）发现的新缺口，按下方分类排序**——操作者要求"确保所有功能都完整复刻"后，逐个对照 obsidian-rag `server.py`（16个MCP工具 vs rag-redo当前9个）、`config.py`（CFG约60个配置项）、`singleton.py`、`guiweb/graph_data.py`+`semantic.py` 做的系统性核对，发现的缺口比此前任何一次审计都大，如实列出。操作者定夺先做C类里点名的"通用插件配置存储"——~~已完成~~，见下方独立小节末尾；其余项仍未开始，优先级待续定夺。
 
 ## 2026-09-23 全面功能审计——已发现、尚未实现的缺口
 
@@ -42,6 +42,8 @@
 - `tools/check_notes.py`（笔记命名规范扫描）：这是原作者个人笔记组织习惯（MOC-前缀/frontmatter title等硬规则）绑定的一次性 CLI 工具，不是通用 RAG 能力，是否移植取决于操作者自己的笔记习惯是否也遵循同一套规范，不是"功能对齐"意义上的缺口。
 
 以上均为如实记录、未开始实现——本轮只做了审计和记录，没有擅自开始动工（C类多数会改 `core/`，按架构红线4先汇报等操作者定夺优先级）。
+
+**操作者定夺：先做通用插件配置存储（2026-09-23 已完成）**——C类里点名的"最高杠杆"一项。新增 `core/settings.py::SettingsStore`（核心服务，不是插件）：具名键值对持久化到 `data_dir/settings.json`，`get(key, default)` 按调用方传入的 `default` 类型校验磁盘值（类型不符回退默认值+警告，不静默接受错误类型，对齐 obsidian-rag/config.py::`_coerce` 的教训）；不预先声明全局 DEFAULTS——每个调用方在自己的 `get()` 调用点传自己的默认值，这本身就是"这个设置项属于谁"的权威声明，符合插件互相独立的架构原则，不是照抄 obsidian-rag 单一 `CFG` 字典的做法。`core/context.py::PluginContext` 新增 `settings` 字段，`core/runtime.py` 构造并注入。真实接入三处此前审计发现的独立缺口证明不是只搭了空壳基建：①`official-library-manager::resolve_libraries` 的 `default_libraries`（对齐 obsidian-rag 同名配置项，`libraries` 参数留空时先查这个、配置全部失效才回退全部库）；②`core/pipeline.py::search` 的 RRF 两路权重 `fusion_dense_weight`/`fusion_bm25_weight`（此前写死1.0/1.0，用记录调用参数的假 `fuse()` 替身验证真的传下去了，不是纸面改了签名）；③`official-ocr-mineru-local` 的 `mineru_python` 覆盖路径（新增设置项优先级层，在已有的 `RAG_REDO_MINERU_PYTHON` 环境变量和自动探测之间）。`official-gui-shell::Api` 新增 `get_settings()`/`set_setting()`/`unset_setting()` 三个通用方法（真正的图形化设置面板还没做，同多库检索那次的"底层能力先完整、面板UI刻意分阶段"简化）。真机用真实BGE-M3+reranker验证过：`default_libraries` 真的把空 `libraries` 参数收窄到指定库，权重设置真的改变了融合调用参数且不影响重排器的最终精排质量。新增46个用例（`core/test_settings.py` 12个 + 各接入点的直测+e2e验证），34/34测试套件全绿。
 
 ## Phase 0 — 插件运行时骨架（无 RAG 功能）
 

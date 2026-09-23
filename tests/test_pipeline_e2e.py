@@ -220,6 +220,48 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         self.assertNotIn("other.md", paths)
         self.assertIn("plugin-notes.md", paths)
 
+    def test_search_reads_fusion_weights_from_settings(self):
+        """RRF 两路权重可调（2026-09-23 全面功能审计发现的缺口，接入
+        core/settings.py 通用设置存储后补齐）——对齐 obsidian-rag/config.py
+        的 fusion_dense_weight/fusion_bm25_weight，用一个记录调用参数的
+        假 fuse() 替身验证 search() 真的把设置里的值传下去了，不是纸面
+        改了签名没真的接线。"""
+        fusion_instance = self.runtime.plugins["official-fusion-rrf"].instance
+        calls = []
+        original_fuse = fusion_instance.fuse
+
+        def _spy_fuse(ranked_lists, weights=None):
+            calls.append(weights)
+            return original_fuse(ranked_lists, weights=weights)
+
+        fusion_instance.fuse = _spy_fuse
+        self.addCleanup(lambda: setattr(fusion_instance, "fuse", original_fuse))
+
+        self.runtime.settings.set("fusion_dense_weight", 2.5)
+        self.runtime.settings.set("fusion_bm25_weight", 0.5)
+        self.pipeline.search("test-lib", "插件 架构", top_k=5)
+
+        self.assertTrue(calls, "fuse() 应该至少被调用一次")
+        for weights in calls:
+            self.assertEqual(weights, [0.5, 2.5])  # [bm25权重, dense权重]，和 [lexical, vector] 顺序对齐
+
+    def test_search_fusion_weights_default_to_equal_when_unset(self):
+        fusion_instance = self.runtime.plugins["official-fusion-rrf"].instance
+        calls = []
+        original_fuse = fusion_instance.fuse
+
+        def _spy_fuse(ranked_lists, weights=None):
+            calls.append(weights)
+            return original_fuse(ranked_lists, weights=weights)
+
+        fusion_instance.fuse = _spy_fuse
+        self.addCleanup(lambda: setattr(fusion_instance, "fuse", original_fuse))
+
+        self.pipeline.search("test-lib", "插件 架构", top_k=5)
+        self.assertTrue(calls)
+        for weights in calls:
+            self.assertEqual(weights, [1.0, 1.0])
+
     def test_multi_library_search_pools_results_across_libraries(self):
         """真正的多库并查——不是"每库各搜一遍简单拼接"，而是每库先融合、
         候选池跨库合并、重排器统一精排给出全局排序（见

@@ -233,6 +233,31 @@ class TestApi(unittest.TestCase):
         result = self.api.refresh_library_summary("lib1")
         self.assertFalse(result["ok"])
 
+    def test_get_settings_starts_empty(self):
+        self.assertEqual(self.api.get_settings(), {})
+
+    def test_set_setting_then_get_settings_round_trips(self):
+        result = self.api.set_setting("fusion_dense_weight", 2.0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.api.get_settings(), {"fusion_dense_weight": 2.0})
+
+    def test_set_setting_takes_effect_immediately_without_restart(self):
+        """对齐架构红线8"切换实现是配置层面操作，不需要重启"——写了设置
+        之后不重建 Api/Pipeline，直接再查一次就该看到新值。"""
+        self.api.set_setting("default_libraries", ["lib1"])
+        self.assertEqual(self.api._pipeline.runtime.settings.get("default_libraries", []), ["lib1"])
+
+    def test_unset_setting_restores_default_on_next_read(self):
+        self.api.set_setting("k", "v")
+        result = self.api.unset_setting("k")
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.api.get_settings(), {})
+        self.assertEqual(self.api._pipeline.runtime.settings.get("k", "default"), "default")
+
+    def test_unset_setting_missing_key_is_ok_not_error(self):
+        result = self.api.unset_setting("never-set")
+        self.assertTrue(result["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

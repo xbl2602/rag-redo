@@ -12,6 +12,7 @@ for p in (_REPO_ROOT, _PLUGIN_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
+from core.settings import SettingsStore  # noqa: E402
 from official_library_manager.config import LibraryConfigStore  # noqa: E402
 from official_library_manager.plugin import LibraryManagerPlugin  # noqa: E402
 
@@ -103,6 +104,7 @@ class TestResolveLibraries(unittest.TestCase):
         self.plugin.store.add_library("lib-a", "库A", "/vaults/a")
         self.plugin.store.add_library("lib-b", "库B", "/vaults/b")
         self.plugin.store.add_library("lib-c", "库C", "/vaults/c")
+        self.plugin._settings = SettingsStore(self.tmp / "settings.json")
 
     def test_empty_libraries_returns_all(self):
         result = self.plugin.resolve_libraries("")
@@ -138,6 +140,35 @@ class TestResolveLibraries(unittest.TestCase):
         empty_plugin.store = LibraryConfigStore(self.tmp / "empty.json")
         with self.assertRaises(ValueError):
             empty_plugin.resolve_libraries("")
+
+    def test_empty_libraries_uses_default_libraries_setting_when_configured(self):
+        """对齐 obsidian-rag/config.py 的 default_libraries：libraries 留空
+        时优先用这份设置里的范围，而不是不由分说查全部库。"""
+        self.plugin._settings.set("default_libraries", ["lib-a", "lib-c"])
+        result = self.plugin.resolve_libraries("")
+        self.assertEqual({c.library_id for c in result}, {"lib-a", "lib-c"})
+
+    def test_all_keyword_ignores_default_libraries_setting(self):
+        self.plugin._settings.set("default_libraries", ["lib-a"])
+        result = self.plugin.resolve_libraries("all")
+        self.assertEqual({c.library_id for c in result}, {"lib-a", "lib-b", "lib-c"})
+
+    def test_default_libraries_with_deleted_library_silently_skips_it(self):
+        self.plugin._settings.set("default_libraries", ["lib-a", "no-longer-exists"])
+        result = self.plugin.resolve_libraries("")
+        self.assertEqual({c.library_id for c in result}, {"lib-a"})
+
+    def test_default_libraries_all_invalid_falls_back_to_all(self):
+        """对齐 obsidian-rag resolve_entries："默认库全部失效→回退全部库
+        （旧行为）"——不是报错，是安静地退回"全部库"这个更宽松的默认。"""
+        self.plugin._settings.set("default_libraries", ["no-longer-exists"])
+        result = self.plugin.resolve_libraries("")
+        self.assertEqual({c.library_id for c in result}, {"lib-a", "lib-b", "lib-c"})
+
+    def test_explicit_libraries_param_overrides_default_libraries_setting(self):
+        self.plugin._settings.set("default_libraries", ["lib-a"])
+        result = self.plugin.resolve_libraries("lib-b")
+        self.assertEqual({c.library_id for c in result}, {"lib-b"})
 
 
 if __name__ == "__main__":

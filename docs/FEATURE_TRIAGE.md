@@ -30,4 +30,6 @@
 | Agent 写权限门禁 | 核心服务（`core/write_gate.py`） | Phase 0/3 | — | ✅ 已实现（提案号+确认码+TTL+一次性），✅ 已被真实调用（2026-09-23）——`official-library-summary` 是第一个真实调用方：AI经MCP对话想覆盖用户手写的库简介时走 propose/apply 两段式确认，端到端验证过完整链路，见 docs/ROADMAP.md Phase 3 说明 |
 | Flet 经典 GUI | **已确认：不迁移** | — | — | 和 guiweb 功能重复、维护负担已确认不值得——操作者已同意直接砍掉。新架构下 `gui_panel` 扩展点本身就支持替换整个 GUI，想要 Flet 体验的话可以有人做成一个独立的 `gui_panel` 实现，但不作为官方维护对象 |
 
+| 通用插件配置存储 | 核心服务（`core/settings.py::SettingsStore`） | Phase 1（2026-09-23 补） | — | ✅ 已实现——2026-09-23 全面功能审计点名的"最高杠杆"缺口：此前 `PluginContext` 只有 `data_dir`，没有任何用户可调、可持久化的设置入口，RRF权重/`default_libraries`/`mineru_python`覆盖路径等至少6处独立缺口根子都在这。不照抄 obsidian-rag 单一全局 `CFG` 字典的做法——只提供通用的"具名键值对持久化+按default类型校验"能力，不预先声明全局默认值清单，每个设置项的归属/默认值由调用方自己在 `get(key, default)` 调用点声明，符合插件互相独立的架构原则。已真实接入三处消费者（`resolve_libraries`的`default_libraries`/RRF两路权重/`mineru_python`覆盖），`official-gui-shell::Api` 新增通用读写方法，真正的图形化设置面板还没做（同多库检索那次的"底层能力先完整、UI刻意分阶段"简化）。详见 ROADMAP.md 全面功能审计小节 |
+
 **仍待确认的1处判断**：Agent 写权限门禁+GPU 仲裁定为"核心服务"而非"插件"（见 [ROADMAP.md](ROADMAP.md)"开放问题"）。WEMM 官方插件、Flet 不迁移两处已在 2026-09-22 确认。

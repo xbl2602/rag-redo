@@ -180,3 +180,40 @@ class Api:
         except Exception as exc:  # noqa: BLE001 - 见模块 docstring
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "library_id": new_id}
+
+    def get_settings(self) -> dict[str, Any]:
+        """列出当前已持久化的全部设置项（`core/settings.py` 通用设置
+        存储，2026-09-23 全面功能审计后补齐，对齐 obsidian-rag GUI 的
+        Config 编辑面板）。只列出"已经被显式设过值"的键——每个设置项的
+        默认值分散在各自的插件/`core/pipeline.py` 里（架构原则"同一件事
+        只能在一处定义"，这个类不该、也不知道去重复维护一份全局默认值
+        清单），前端展示"未设置"的项时应该显示"（使用默认值）"而不是
+        编个假默认值出来。
+
+        **已知的简化**：目前没有把"这个键是什么意思、合法取值范围是什么"
+        这类元信息暴露出来——obsidian-rag 的 config.json 模板把这些写成
+        行内注释，rag-redo 这一层现在只是裸的键值对，前端要做成可用的
+        设置面板还需要自己维护一份"键名→中文说明"的映射，这块还没做。"""
+        return self._pipeline.runtime.settings.all()
+
+    def set_setting(self, key: str, value: Any) -> dict[str, Any]:
+        """写一个设置项，立即持久化、对后续调用立即生效（不需要重启——
+        `core/pipeline.py::search()` 等每次调用都现读 `ctx.settings`，
+        不是进程启动时缓存一份快照，同架构红线8"切换实现是配置层面操作，
+        不需要重启"的精神）。这个方法本身不校验 `value` 的类型/合法性——
+        校验发生在真正读取它的那一处（`SettingsStore.get()` 按调用方传的
+        default 类型核对，见该类 docstring），这里收到什么就存什么。"""
+        try:
+            self._pipeline.runtime.settings.set(key, value)
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
+
+    def unset_setting(self, key: str) -> dict[str, Any]:
+        """删掉一个设置项，恢复成"未设置"（后续读取会拿回调用方自己的
+        默认值）——"恢复默认值"按钮用得上。"""
+        try:
+            self._pipeline.runtime.settings.unset(key)
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
