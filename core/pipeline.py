@@ -13,8 +13,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
-from .contracts import ExtractedDocument, LibrarySummary, PageHit, SampledChunk, SearchResult
+from .contracts import DocumentContent, ExtractedDocument, LibrarySummary, PageHit, SampledChunk, SearchResult
+from .extract_cache import ExtractCache
+from .index_progress import IndexProgressTracker
 from .runtime import PluginRuntime
 
 
@@ -88,6 +91,12 @@ class IndexReport:
 class Pipeline:
     def __init__(self, runtime: PluginRuntime) -> None:
         self.runtime = runtime
+        # 提取结果缓存（core/extract_cache.py，2026-09-23 补齐）——只有
+        # 编排层自己用（read_document/find_duplicates/index_library），
+        # 插件不需要访问，所以不放进 PluginContext，直接归 Pipeline 自己
+        # 持有，同"谁需要就给谁配、不无谓扩大插件可见接口"的原则。
+        self._extract_cache = ExtractCache(runtime.data_dir / "extracted")
+        self._index_progress = IndexProgressTracker(runtime.data_dir / "index_progress")
 
     # ---- 插件解析 --------------------------------------------------------
 
@@ -132,7 +141,18 @@ class Pipeline:
 
     # ---- 索引态 --------------------------------------------------------
 
-    def index_library(self, library_id: str) -> IndexReport:
+    def index_library(
+        self,
+        library_id: str,
+        *,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> IndexReport:
+        """`progress_callback(files_done, files_total, current_path)` 可选
+        ——每处理完一个（在检索范围内的）文件调一次，供
+        `core/index_progress.py::IndexProgressTracker` 在后台执行时上报
+        进度（2026-09-23 补，见该模块 docstring）。不传就是原有的纯同步
+        调用，行为完全不变——GUI/测试目前都是这样直接调用，不强制迁移
+        到后台执行那条路径。"""
         lib_mgr = self._singleton("library_manager")
         cfg = lib_mgr.store.get(library_id)
         if cfg is None:
@@ -144,9 +164,19 @@ class Pipeline:
         lexical = self._singleton("lexical_index")
         vector_store = self._singleton("vector_store")
 
+        # 整库重跑前先清空提取结果缓存——见 core/extract_cache.py 模块
+        # docstring："被删除/排除出检索范围的文件不该在缓存里留下陈旧
+        # 正文"。索引本来就是全量重跑（不做增量），缓存跟着同一个节奏
+        # 清空重建，不需要单独的失效判断。
+        self._extract_cache.clear_library(library_id)
+
         report = IndexReport(library_id=library_id)
         pdf_paths: list[str] = []  # 供后面 visual_index 后置阶段复用，不再问 library_manager 第二遍
-        for path, included, reason in lib_mgr.resolve_included_files(library_id):
+        included_files = lib_mgr.resolve_included_files(library_id)
+        files_total = len(included_files)
+        for files_done, (path, included, reason) in enumerate(included_files, start=1):
+            if progress_callback is not None:
+                progress_callback(files_done, files_total, path)
             file_report = IndexFileReport(path=path, included=included, reason=reason)
             report.files.append(file_report)
             if not included:
@@ -158,6 +188,10 @@ class Pipeline:
             if doc.text is None:
                 file_report.extract_failure = doc.failure_reason
                 continue
+            # 提取成功就落一份缓存——read_document/find_duplicates 靠这份
+            # 缓存工作，不需要索引之后再重新跑一遍提取（尤其是OCR，重新
+            # 跑代价很高）。见 core/extract_cache.py 模块 docstring。
+            self._extract_cache.write(library_id, path, doc.text)
 
             chunks = chunker.chunk(doc)
             if not chunks:
@@ -205,6 +239,36 @@ class Pipeline:
             visual.index_library(library_id, root, pdf_paths)
 
         return report
+
+    def start_index_library(self, library_id: str) -> tuple[bool, str]:
+        """后台重建索引——对齐 obsidian-rag 的 `reindex_knowledge`"后台
+        执行、立即返回"语义（2026-09-23 全面功能审计发现的缺口，见
+        `core/index_progress.py` 模块 docstring）。真正的索引逻辑还是
+        `index_library()`，这里只是把它丢进一个后台线程、定期上报进度。
+
+        返回 `(started, message)`——`started=False` 时是"这个库已经有一
+        个索引任务在跑"，不是错误，调用方（MCP工具）应该把 message 原样
+        转达，不是折叠成失败。库不存在时提前校验一次并直接抛
+        `KeyError`（不进后台线程才发现——那样错误要等一轮心跳超时才能
+        被用户看到，对"打错库名"这种立刻能判断的错误没有意义）。
+        """
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+
+        def _run(progress_callback):
+            return self.index_library(library_id, progress_callback=progress_callback)
+
+        return self._index_progress.start(library_id, _run)
+
+    def index_status(self, library_id: str) -> dict | None:
+        """查询索引进度——对齐 obsidian-rag 的 `index_status` 工具。返回
+        `None` 表示这个库从没跑过（后台）索引，调用方自己决定怎么展示
+        "从没跑过"和"跑过但已完成/失败"的区别。"""
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+        return self._index_progress.status(library_id)
 
     # ---- 查询态 --------------------------------------------------------
 
@@ -359,6 +423,78 @@ class Pipeline:
             visual = self._plugin(plugin_id)
             if hasattr(visual, "status"):
                 result[plugin_id] = visual.status()
+        return result
+
+    def read_document(self, library_id: str, path: str) -> DocumentContent:
+        """读取某文档的完整正文——对齐 obsidian-rag 的 `read_document`
+        MCP 工具（2026-09-23 全面功能审计发现的缺口）：检索命中后想通读
+        全文时用，不是 search() 的替代品，没有 query/confidence。
+
+        `.md`/`.txt` 直接重读源文件（拿到当前最新内容，比任何缓存都准）；
+        其余格式（pdf/docx 等需要真正"提取"的格式）读上一次
+        `index_library()` 写入的提取结果缓存（`core/extract_cache.py`）
+        ——不在这里现场重新提取，尤其本机OCR代价很高，"精读一篇已经索引
+        过的文档"不该悄悄触发一次重扫描，对齐 obsidian-rag"绝不后台
+        触发扫描件OCR或云端调用"的承诺。缓存里没有就说明这个文件还没有
+        被成功索引过，报错提示先建索引，不是静默返回空。
+
+        被排除出检索范围的文件拒绝读取（对齐 obsidian-rag 问题44的教训：
+        "被用户显式排除的文件对 RAG 系统完全不存在，Agent 不可访问"）。
+        """
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+
+        matches = [f for f in lib_mgr.resolve_included_files(library_id) if f[0] == path]
+        if not matches:
+            raise KeyError(f"库「{library_id}」里找不到文件: {path!r}")
+        _, included, reason = matches[0]
+        if not included:
+            raise ValueError(f"「{path}」已被排除出检索范围（{reason}），拒绝读取")
+
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        if ext in ("md", "txt", "markdown"):
+            cfg = lib_mgr.store.get(library_id)
+            full_path = Path(cfg.root_path) / path
+            try:
+                text = full_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                raise ValueError(f"读取源文件失败: {type(exc).__name__}: {exc}") from exc
+            return DocumentContent(library_id=library_id, path=path, text=text, source="源文件直读")
+
+        cached = self._extract_cache.read(library_id, path)
+        if cached is None:
+            raise ValueError(f"「{path}」还没有被成功索引过，先调用 index_library 建好索引再重试")
+        return DocumentContent(library_id=library_id, path=path, text=cached, source="提取缓存")
+
+    def find_duplicates(self, library_id: str, *, threshold: float = 0.7) -> dict[str, list[list[str]]]:
+        """近似重复检测（只读建议，绝不自动删/移动文件）——对齐
+        obsidian-rag 的 `find_duplicates` MCP 工具（2026-09-23 全面功能
+        审计发现的缺口）：找出库内"内容几乎相同"的重复文档（同一课件多份
+        拷贝、文档转出的多个副本），比较的是"上一次成功索引时的提取正文"
+        （`core/extract_cache.py`），不产生新向量、不改索引、不触发重新
+        提取。
+
+        `dedup` 是多值扩展点（同 `visual_index`）——遍历全部已启用的
+        提供者，各自独立现算一遍，按 plugin_id 汇总返回，不做跨提供者
+        合并（不同去重算法给出的分组语义上互相独立，同 `navigate()`
+        "不同视觉模型不混叠"的原则）。没有被成功索引过的文件不参与比较
+        （同 obsidian-rag"未提取的文件跳过"的做法）。
+        """
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+
+        texts: dict[str, str] = {}
+        for path in self._extract_cache.list_relative_paths(library_id):
+            text = self._extract_cache.read(library_id, path)
+            if text is not None:
+                texts[path] = text
+
+        result: dict[str, list[list[str]]] = {}
+        for plugin_id in sorted(self.runtime.registry.providers_of("dedup")):
+            dedup_plugin = self._plugin(plugin_id)
+            result[plugin_id] = dedup_plugin.find_duplicates_in_texts(texts, threshold=threshold)
         return result
 
     # ---- 库摘要（library_summary/llm_provider 扩展点，Phase 3）-----------

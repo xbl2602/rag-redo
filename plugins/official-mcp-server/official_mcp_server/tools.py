@@ -132,6 +132,51 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         return {"ok": True, "providers": status}
 
     @server.tool()
+    def read_document(library_id: str, path: str) -> dict[str, Any]:
+        """读取某文档的完整正文（对齐 obsidian-rag 的 `read_document` 工具）：
+        检索命中后想通读全文时用，不是 search_knowledge 的替代品——没有
+        query，没有 confidence，正文不截断不封顶。
+
+        `.md`/`.txt` 直接现读源文件；pdf/docx 等需要提取的格式读上一次
+        `reindex_knowledge` 索引时留下的提取结果，不会现场重新提取（尤其
+        本机OCR代价很高，精读一篇已索引文档不该悄悄触发一次重扫描）——
+        如果这个文件还没被成功索引过，会明确报错提示先 reindex_knowledge。
+        已被用户排除出检索范围的文件拒绝读取（那类文件对整个 RAG 流程
+        "不存在"，同其他工具的排除语义一致）。
+
+        Args:
+            library_id: 文档所在库的 id（用 list_libraries 查看有哪些库）
+            path: 库内相对路径（用 search_knowledge 的来源行/list_libraries 确认）
+        """
+        try:
+            doc = pipeline.read_document(library_id, path)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "path": doc.path, "text": doc.text, "source": doc.source, "chars": len(doc.text)}
+
+    @server.tool()
+    def find_duplicates(library_id: str, threshold: float = 0.7) -> dict[str, Any]:
+        """近似重复文档检测（只读建议，绝不删除/移动文件）——对齐
+        obsidian-rag 的 `find_duplicates` 工具：找出库内"内容几乎相同"
+        的重复文档（同一课件多份拷贝、同一文档转出的多个副本），返回
+        重复组，由你决定是否清理/合并，避免检索反复命中同一段内容。
+
+        比较的是提取出的文字内容（文本级 MinHash+LSH，不是语义相似度），
+        只统计已经被成功索引过的文件——还没索引过的文件不参与比较，
+        先 reindex_knowledge 建好索引再调用本工具才有意义。
+
+        Args:
+            library_id: 要检测的库的 id
+            threshold: 相似度阈值（0~1，默认0.7），越高越严格，只有真正
+                       "近乎逐字重复"的才会被分进同一组
+        """
+        try:
+            groups_by_provider = pipeline.find_duplicates(library_id, threshold=threshold)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "groups": groups_by_provider}
+
+    @server.tool()
     def list_libraries() -> list[dict]:
         """列出所有已注册的库及其基本信息，含每个库的简介（导航/澄清性质
         的一段话，帮你在真正检索/通读全文之前先判断"这个库值不值得往这

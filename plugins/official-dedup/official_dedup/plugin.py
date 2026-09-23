@@ -42,3 +42,17 @@ class DedupPlugin:
         if self.indexes is None or library_id not in self.indexes:
             return []
         return self.indexes[library_id].find_duplicate_groups()
+
+    def find_duplicates_in_texts(self, texts: dict[str, str], *, threshold: float = 0.7) -> list[list[str]]:
+        """对给定的一批 (doc_id → 正文) **现场计算**近似重复分组，用完
+        即弃的临时 `DedupIndex`，完全不碰 `add_document`/`find_duplicate_
+        groups` 那条常驻索引路径——两者互不干扰。对齐 obsidian-rag
+        `find_duplicates` MCP 工具"只读建议、按需现算、不产生向量、不改
+        索引"的语义（见该工具 docstring）：调用方（`core/pipeline.py`）
+        从提取结果缓存里现读整批文档正文传进来，这个插件只负责"给一批
+        文本、告诉我哪些近似重复"这一件事，不关心文本从哪来、也不负责
+        缓存/持久化它们。"""
+        index = DedupIndex(threshold=threshold)
+        for doc_id, text in texts.items():
+            index.add(doc_id, text)
+        return index.find_duplicate_groups()

@@ -182,3 +182,16 @@ class LibrarySummary:
     updated_at: float | None
     fingerprint: str | None  # 生成时的内容指纹，用于判断"库内容可能已变化，简介或已过时"
     model: str | None  # 生成时用的 llm_provider 插件 id，source != "ai" 时为 None
+
+
+@dataclass(frozen=True)
+class DocumentContent:
+    """`Pipeline.read_document` 的返回形状——对齐 obsidian-rag 的
+    `read_document` MCP 工具：读某文档的完整正文，用于检索命中后精读，
+    不是检索结果的一部分（没有 confidence/query，和 SearchResult 不
+    相通）。"""
+
+    library_id: str
+    path: str
+    text: str
+    source: str  # "源文件直读"（.md/.txt 现读）| "提取缓存"（pdf/docx 等，来自上一次索引的提取结果）

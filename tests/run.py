@@ -39,6 +39,8 @@ CORE_SUITES = [
     "test_gpu_arbiter",
     "test_write_gate",
     "test_settings",
+    "test_extract_cache",
+    "test_index_progress",
     "test_runtime",
     "test_subprocess_service",
     "test_pipeline_e2e",

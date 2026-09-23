@@ -41,6 +41,7 @@ REQUIRED_PLUGINS = [
     "official-reranker",
     "official-import-export",
     "official-visual-wemm",
+    "official-dedup",
     "official-library-summary",
     "official-llm-openai-compatible",
 ]
@@ -185,6 +186,61 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertEqual(hits[0]["library_id"], "test-lib")
         self.assertIn("confidence", hits[0])
 
+    async def test_read_document_tool_reads_source_file_for_md(self):
+        await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+        result = await self.server.call_tool("read_document", {"library_id": "test-lib", "path": "notes.md"})
+        self.assertFalse(result.is_error)
+        payload = result.structured_content
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["source"], "源文件直读")
+        self.assertIn("插件系统的架构设计", payload["text"])
+
+    async def test_read_document_tool_unknown_path_reports_error(self):
+        await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+        result = await self.server.call_tool(
+            "read_document", {"library_id": "test-lib", "path": "does-not-exist.md"}
+        )
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+
+    async def test_read_document_tool_before_indexing_reports_error(self):
+        result = await self.server.call_tool("read_document", {"library_id": "test-lib", "path": "notes.md"})
+        self.assertFalse(result.is_error)
+        # 还没建过索引：.md 直读源文件不需要索引也能成功——这条断言的是
+        # "还没index过的文件依然能读到源文件内容"，因为.md/.txt走的是
+        # 现读源文件而不是提取缓存这条路径。
+        self.assertTrue(result.structured_content["ok"])
+
+    async def test_find_duplicates_tool_detects_near_duplicate_files(self):
+        vault = self.tmp / "vault"
+        (vault / "notes-copy.md").write_text(
+            "# 插件架构（副本）\n\n这篇笔记讲插件系统的架构设计，一字不改的近似重复。",
+            encoding="utf-8",
+        )
+        (vault / "notes.md").write_text(
+            "# 插件架构\n\n这篇笔记讲插件系统的架构设计，一字不改的近似重复。", encoding="utf-8"
+        )
+        await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+
+        result = await self.server.call_tool("find_duplicates", {"library_id": "test-lib"})
+        self.assertFalse(result.is_error)
+        payload = result.structured_content
+        self.assertTrue(payload["ok"])
+        groups = payload["groups"]["official-dedup"]
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(set(groups[0]), {"notes.md", "notes-copy.md"})
+
+    async def test_find_duplicates_tool_no_duplicates_returns_empty_groups(self):
+        await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+        result = await self.server.call_tool("find_duplicates", {"library_id": "test-lib"})
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content["groups"]["official-dedup"], [])
+
+    async def test_find_duplicates_tool_unknown_library_reports_error(self):
+        result = await self.server.call_tool("find_duplicates", {"library_id": "no-such-lib"})
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+
     async def test_reindex_then_navigate_knowledge_tool(self):
         """真实走一遍 navigate_knowledge——不是 search_knowledge 的变体，
         是完全独立的"第二检索系统"（页级视觉导航，见
@@ -304,6 +360,8 @@ class TestMcpTools(TestMcpToolsAsyncBase):
                 "propose_library_summary",
                 "apply_library_summary",
                 "wemm_status",
+                "read_document",
+                "find_duplicates",
             },
         )
         search_tool = next(t for t in tools if t.name == "search_knowledge")
