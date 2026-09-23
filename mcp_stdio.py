@@ -17,6 +17,7 @@ official-* 插件里，这个文件只是"胶水"，对应 docs/PLUGIN_SPEC.md �
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -29,6 +30,14 @@ if getattr(sys, "frozen", False):
 else:
     REPO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(REPO_ROOT))
+
+#: 数据目录：理由和 GUI/MCP 共享同一份数据的说明，见 gui_main.py 里同名
+#: 常量的注释——这里不重复展开，两个入口必须保持完全一致的解析逻辑
+#: （同一份数据只能有一处权威路径判定，DATA_FLOW.md 规则4的体现）。
+if getattr(sys, "frozen", False):
+    DATA_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "RAG-Redo" / "data"
+else:
+    DATA_ROOT = REPO_ROOT / "data"
 for _plugin_dir in (REPO_ROOT / "plugins").glob("*"):
     if _plugin_dir.is_dir():
         sys.path.insert(0, str(_plugin_dir))
@@ -63,8 +72,8 @@ REQUIRED_PLUGINS = [
 def build_runtime() -> PluginRuntime:
     runtime = PluginRuntime(
         REPO_ROOT / "plugins",
-        state_file=REPO_ROOT / "data" / "plugins_state.json",
-        data_dir=REPO_ROOT / "data",
+        state_file=DATA_ROOT / "plugins_state.json",
+        data_dir=DATA_ROOT,
     )
     runtime.scan()
     for plugin_id in REQUIRED_PLUGINS:

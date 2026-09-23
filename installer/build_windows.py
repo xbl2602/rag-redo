@@ -17,6 +17,22 @@ AGENTS.md"这个项目不是什么"一节的约束（v1 插件发现只扫描本
    点名的这几个包对应的是当前 Phase 1 官方插件集实际用到的第三方库
    （chromadb/mcp/pymupdf4llm/pymupdf/docx/jieba）——以后官方插件集
    加新依赖，这里要跟着补一项，不会自动生效。
+
+   **这条对本项目自己的 `core` 包同样成立，不只是第三方库**（2026-09-23
+   真机安装+真实MCP协议调用时抓到的真实bug）：`core/gpu_arbiter.py`/
+   `core/subprocess_service.py` 只被插件代码动态import（比如
+   `official-embedder-bge-m3` 的 `from core import gpu_arbiter`、
+   `official-visual-wemm` 的 `from core.subprocess_service import ...`），
+   从来不被 `core/pipeline.py`/`core/runtime.py` 自己的模块内部相互
+   import——PyInstaller 从 gui_main.py/mcp_stdio.py 的 `from core.pipeline
+   import Pipeline` 出发做静态分析，顺着 core 包内部真实的 import 关系
+   传递收集，根本不知道"某个插件运行时会来 import 这另外两个模块"，
+   实测结果是打出来的冻结产物里 `core/` 包缺了这两个文件，插件在冻结
+   环境里加载时报 `ImportError: cannot import name 'gpu_arbiter'`/
+   `ModuleNotFoundError: No module named 'core.subprocess_service'`——
+   和插件专属第三方依赖是同一类问题，同一个修法：`--collect-submodules
+   core` 把整个 core 包的全部子模块无条件收进去，不管 PyInstaller 自己
+   的静态分析能不能追踪到谁在用它们。
 2. **`__file__` 在冻结后不指向发行目录**，gui_main.py/mcp_stdio.py 已经
    各自加了 `sys.frozen` 判断，改用 `Path(sys.executable).parent`；这份
    脚本只管打包，不需要再处理这件事。
@@ -36,6 +52,10 @@ REPO_ROOT = Path(__file__).parent.parent
 #: 第1点。改官方插件集时同步维护这份清单。
 COLLECT_ALL = ["chromadb", "mcp", "pymupdf4llm", "docx"]
 COLLECT_DATA = ["jieba", "pymupdf"]
+#: core 包自己的子模块也会被插件动态 import（见模块 docstring 第1点的
+#: 真实踩坑记录）——不是数据文件，只需要子模块本身都被收进去，用
+#: --collect-submodules，不需要 --collect-all 那种连带数据文件的版本。
+COLLECT_SUBMODULES = ["core"]
 
 TARGETS = [
     ("rag-redo-gui", "gui_main.py", "--windowed"),
@@ -57,6 +77,8 @@ def _build_one(name: str, entry: str, windowed_flag: str) -> Path:
         cmd += ["--collect-data", pkg]
     for pkg in COLLECT_ALL:
         cmd += ["--collect-all", pkg]
+    for pkg in COLLECT_SUBMODULES:
+        cmd += ["--collect-submodules", pkg]
     cmd.append(str(REPO_ROOT / entry))
 
     subprocess.run(cmd, cwd=REPO_ROOT, check=True)

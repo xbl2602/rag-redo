@@ -46,7 +46,30 @@ def _run_env_bootstrap(plugin_dir: Path, env_bootstrap: str, *, timeout: float, 
     下来"。约定脚本是一个 `.py` 文件（不是 `.sh`/`.bat`）——Windows 优先
     是硬性要求（AGENTS.md 五条约束第5条），一份纯 Python 脚本不需要用户
     机器上有 bash/WSL 才能跑，用核心自己已经在跑的这个解释器执行就行，
-    不需要额外引入 shell 依赖。"""
+    不需要额外引入 shell 依赖。
+
+    **`sys.executable` 在 PyInstaller 冻结产物里不是通用解释器**（2026-
+    09-23 真机打包安装后真实调用时踩到的严重坑，不是猜的）：源码/开发
+    环境下 `sys.executable` 是 `.venv/Scripts/python.exe`，接受任意脚本
+    路径当参数、老老实实执行；冻结产物里 `sys.executable` 是冻结 exe
+    自己（比如 `rag-redo-mcp.exe`），这个 exe 的入口是写死的
+    `mcp_stdio.py::main()`，不认识"把 env_bootstrap.py 当脚本参数执行"
+    这种用法——真实观察到的后果是它直接忽略参数、把自己当成一个全新的
+    MCP 服务实例重新跑起来，而这个新实例的 `on_enable` 又会再触发一次
+    同样的 env_bootstrap 尝试，指数级递归拉起自己，几分钟内真实堆出了
+    四十多个 `rag-redo-mcp.exe` 进程——这正是架构红线6"不产生游离进程"
+    要死死防住的场景，只是这次是被"能启动子进程"这个能力本身触发的自我
+    复制，不是"启动了忘记收"。所以这里显式拒绝在冻结环境下尝试执行
+    ——宁可插件启用失败、报错清楚，也不能让 fail-open 的退化路径变成
+    自我复制的进程炸弹。真正的修复（给冻结产物打包一份独立的、能当脚本
+    解释器用的便携 Python）是后续工作，还没做，见 docs/ROADMAP.md。"""
+    if getattr(sys, "frozen", False):
+        raise EnvBootstrapError(
+            "当前是 PyInstaller 冻结产物，没有可以用来跑 env_bootstrap 脚本的独立解释器"
+            "（sys.executable 是这个冻结 exe 自己，不是通用 Python，直接拿它当解释器用"
+            "会导致 exe 把自己重新拉起——已知问题，见 core/subprocess_service.py 本函数"
+            "docstring，真正的修复需要给冻结产物打包一份独立便携 Python，还没做）"
+        )
     script = plugin_dir / env_bootstrap
     if not script.is_file():
         raise EnvBootstrapError(f"env_bootstrap 脚本缺失: {script}")
@@ -97,7 +120,20 @@ def resolve_plugin_python(
     （同 `RAG_REDO_FAKE_OCR`/`RAG_REDO_FAKE_WEMM` 这两个已有先例同一条
     纪律）。设了这个变量时，即使插件声明了 env_bootstrap 也直接跳过，
     按"没声明"处理——测试本来就该走假实现（子进程内部的 FAKE_* 变量），
-    不需要真的建出一个装好 torch 的独立环境。"""
+    不需要真的建出一个装好 torch 的独立环境。
+
+    **冻结产物（PyInstaller）里"退化用核心解释器"这条路必须直接拒绝，
+    不能真退化**（2026-09-23 真机打包安装后真实调用时抓到的严重bug，
+    完整原因见 `_run_env_bootstrap` 的 docstring）：源码/开发环境下
+    `sys.executable` 是能接受任意脚本参数的通用解释器，"退化用它"是
+    安全的 fail-open；冻结产物里 `sys.executable` 是冻结 exe 自己，
+    `command = ["{python}", "server.py", ...]` 一旦真的替换成冻结exe
+    自己的路径，Popen 出来的不是子进程该跑的 server.py，是把整个应用
+    自己重新拉起一份——递归下去就是指数级自我复制的进程炸弹（真实观测
+    到几分钟内四十多个游离进程），这正是架构红线6要死死防住的场景。
+    所以这里改成显式抛出 `SubprocessServiceError`，插件启用失败、原因
+    清楚地折叠进插件状态（core/runtime.py::enable() 已有的统一折叠
+    机制），绝不允许在冻结环境下静默产出一个会自我复制的错误命令。"""
     venv_python = _venv_python_path(plugin_dir / ".venv")
     if venv_python.exists():
         return str(venv_python)
@@ -108,11 +144,17 @@ def resolve_plugin_python(
         try:
             _run_env_bootstrap(plugin_dir, env_bootstrap, timeout=bootstrap_timeout, logger=log)
         except EnvBootstrapError as exc:
-            log.warning("插件 %s 的 env_bootstrap 未能建出独立环境，退化用核心解释器：%s", plugin_dir.name, exc)
+            log.warning("插件 %s 的 env_bootstrap 未能建出独立环境：%s", plugin_dir.name, exc)
         else:
             if venv_python.exists():
                 return str(venv_python)
-            log.warning("插件 %s 的 env_bootstrap 跑完了但没有在约定路径生成解释器，退化用核心解释器", plugin_dir.name)
+            log.warning("插件 %s 的 env_bootstrap 跑完了但没有在约定路径生成解释器", plugin_dir.name)
+    if getattr(sys, "frozen", False):
+        raise SubprocessServiceError(
+            f"插件 {plugin_dir.name} 没有自己的独立环境，且当前是冻结产物——"
+            "不能退化用核心解释器（那会导致应用自我复制，见 resolve_plugin_python 的 docstring）。"
+            "这个插件在当前打包版本里暂时不可用，需要 env_bootstrap 真正成功建出独立环境才行。"
+        )
     return sys.executable
 
 

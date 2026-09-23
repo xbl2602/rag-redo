@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -263,6 +264,47 @@ class TestResolvePluginPythonEnvBootstrap(unittest.TestCase):
         result = resolve_plugin_python(self.tmp, env_bootstrap="env_bootstrap.py", logger=logger, bootstrap_timeout=30.0)
         self.assertEqual(result, sys.executable)
         self.assertTrue(logger.warnings)
+
+    def test_frozen_build_raises_instead_of_falling_back_to_sys_executable(self):
+        """严重bug回归测试（2026-09-23 真机打包安装后真实调用时抓到）：
+        `sys.executable` 在 PyInstaller 冻结产物里是冻结exe自己，不是
+        通用解释器——把它当 command 里的 "{python}" 用会让 exe 把自己
+        重新拉起，递归下去是指数级自我复制的进程炸弹（真实观测到几分钟
+        内四十多个游离进程）。冻结环境下找不到插件专属venv必须直接
+        报错，绝不能静默退化返回 sys.executable。"""
+        from core.subprocess_service import SubprocessServiceError, resolve_plugin_python
+
+        with patch.object(sys, "frozen", True, create=True):
+            with self.assertRaises(SubprocessServiceError):
+                resolve_plugin_python(self.tmp)
+
+    def test_frozen_build_with_existing_venv_still_works_normally(self):
+        """冻结环境下如果插件专属venv已经真的建好了（之前手动跑过一次
+        env_bootstrap，或者未来打包了便携python自动建好的），照常返回，
+        不受这条新增的拒绝逻辑影响——这条只挡"没有真实独立环境、企图
+        静默退化"这一种情况。"""
+        from core.subprocess_service import resolve_plugin_python
+
+        venv_python = self._venv_python_path()
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("fake interpreter", encoding="utf-8")
+        with patch.object(sys, "frozen", True, create=True):
+            result = resolve_plugin_python(self.tmp)
+        self.assertEqual(result, str(venv_python))
+
+    def test_frozen_build_env_bootstrap_refuses_to_run_and_folds_to_clear_error(self):
+        """冻结环境下 env_bootstrap 脚本本身也不该被尝试执行——同样是
+        `sys.executable` 不是通用解释器这条坑，即使脚本文件真实存在也
+        不该去跑，直接折叠成清楚的失败原因。"""
+        from core.subprocess_service import SubprocessServiceError, resolve_plugin_python
+
+        script = self.tmp / "env_bootstrap.py"
+        script.write_text("pass\n", encoding="utf-8")
+        logger = _FakeLogger()
+        with patch.object(sys, "frozen", True, create=True):
+            with self.assertRaises(SubprocessServiceError):
+                resolve_plugin_python(self.tmp, env_bootstrap="env_bootstrap.py", logger=logger, bootstrap_timeout=30.0)
+        self.assertTrue(any("冻结" in msg for msg in logger.warnings))
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 CORE_SUITES = [
     "test_manifest",
+    "test_plugin_manifests_sane",
     "test_registry",
     "test_datastore",
     "test_resource_arbiter",

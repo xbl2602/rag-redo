@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -21,6 +22,21 @@ if getattr(sys, "frozen", False):
 else:
     REPO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(REPO_ROOT))
+
+#: 数据目录：开发/源码运行时和 REPO_ROOT 同级（不变，现有测试/工作流依赖
+#: 这一点）；打包安装后改用 %LOCALAPPDATA%（Windows 标准的"这个应用自己
+#: 的用户数据"位置）而不是 exe 自己的安装目录——Inno Setup 卸载时只删
+#: 安装目录本身，不该连带把用户已经建好的索引库也删掉（同 AGENTS.md
+#: "所有数据落在 data/ 目录下，不写到用户机器上其他共享位置"这条约束
+#: 并不冲突：LOCALAPPDATA 下这个应用专属的子目录本质上仍然是"这个应用
+#: 自己的目录"，只是选了一个"卸载程序体不会动"的稳定位置，不是散落到
+#: 别处共享目录）。GUI 和 MCP 两个冻结产物各自安装在不同文件夹（见
+#: installer/rag-redo.iss），但都会指向这同一个 DATA_ROOT，这样两边
+#: 操作的是同一批库，不是各自维护一份互不相通的数据。
+if getattr(sys, "frozen", False):
+    DATA_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "RAG-Redo" / "data"
+else:
+    DATA_ROOT = REPO_ROOT / "data"
 for _plugin_dir in (REPO_ROOT / "plugins").glob("*"):
     if _plugin_dir.is_dir():
         sys.path.insert(0, str(_plugin_dir))
@@ -52,8 +68,8 @@ REQUIRED_PLUGINS = [
 def build_runtime() -> PluginRuntime:
     runtime = PluginRuntime(
         REPO_ROOT / "plugins",
-        state_file=REPO_ROOT / "data" / "plugins_state.json",
-        data_dir=REPO_ROOT / "data",
+        state_file=DATA_ROOT / "plugins_state.json",
+        data_dir=DATA_ROOT,
     )
     runtime.scan()
     for plugin_id in REQUIRED_PLUGINS:
