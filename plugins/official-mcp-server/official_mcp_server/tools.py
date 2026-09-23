@@ -205,7 +205,19 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
 
     @server.tool()
     def reindex_knowledge(library_id: str) -> dict[str, Any]:
-        """重新索引指定的库。
+        """后台重建索引，立即返回（对齐 obsidian-rag 的 `reindex_knowledge`
+        "后台执行+立即返回"语义，2026-09-23 全面功能审计发现的缺口——
+        此前是完全同步阻塞，大库重建索引会让这次工具调用一直卡到全部
+        跑完才返回，AI 客户端也可能在这期间等到协议超时）。
+
+        真正想知道跑得怎么样——是不是还在跑、跑到第几个文件、有没有
+        卡死、最终成功/失败了几个文件——调 `index_status(library_id)`
+        轮询，本工具的返回值里没有这些信息（这是设计使然，不是遗漏：
+        任务这时候大概率还没跑完）。
+
+        同一个库同一时刻只允许一个后台索引任务：重复调用会返回
+        `started=False`，不是错误，也不会打断正在跑的那个任务——不同
+        库互不影响，可以同时各自跑一个。
 
         注：MCP SDK 对裸 `dict` 返回类型标注推不出结构化输出 schema
         （实测 `structured_content` 会是 None，只能从 content[0].text
@@ -222,20 +234,30 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
             library_id: 要重建索引的库的 id
         """
         try:
-            report = pipeline.index_library(library_id)
+            started, message = pipeline.start_index_library(library_id)
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
-        return {
-            "ok": True,
-            "library_id": library_id,
-            "succeeded": report.succeeded,
-            "failed": report.failed,
-            "failures": [
-                {"path": f.path, "reason": f.extract_failure}
-                for f in report.files
-                if f.included and not f.extracted
-            ],
-        }
+        return {"ok": True, "started": started, "message": message}
+
+    @server.tool()
+    def index_status(library_id: str) -> dict[str, Any]:
+        """查询后台索引进度（对齐 obsidian-rag 的 `index_status` 工具，
+        适配成按库查询——本项目的 reindex_knowledge 本来就是单库粒度，
+        不像 obsidian-rag 那样一次调用可能触及多个库）。配合
+        reindex_knowledge 轮询用：`status.stage` 是 running/done/failed，
+        `status.health` 是心跳/进度健康判定（healthy/stalled_no_heartbeat/
+        stalled_no_progress），从没跑过（本进程视角的）后台索引时
+        `status` 为 `None`（不是错误——调用方自己决定"从没跑过"要怎么
+        展示，同一般"查询不存在的资源返回空而不是报错"的约定）。
+
+        Args:
+            library_id: 要查询的库的 id
+        """
+        try:
+            status = pipeline.index_status(library_id)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "status": status}
 
     @server.tool()
     def export_library(library_id: str) -> dict[str, Any]:
