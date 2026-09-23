@@ -16,8 +16,8 @@
 | 多库/路径级勾选(`decide_included`) | `official-library-manager` | Phase 1 | in_process | 默认必装插件（不是核心，但安装包强制预置），检索建立在"库范围"之上 |
 | pywebview GUI 壳+基础面板 | `official-gui-shell` | Phase 1 | in_process | 只做壳+库管理/搜索/结果三个面板，其余面板随对应功能插件各自带 |
 | MCP 检索工具 | 随各功能插件自己注册 `mcp_tool_provider` | Phase 1起逐步 | — | 不集中在一个插件，谁提供功能谁注册对应工具 |
-| MinerU 云端 OCR | `official-ocr-mineru-cloud` | Phase 2 | subprocess_service（网络调用，隔离 API Key 相关代码） | |
-| MinerU 本机 OCR | `official-ocr-mineru-local` | Phase 2 | subprocess_service | 独立 py3.12/uv 环境，按需下载，不进核心 venv |
+| MinerU 云端 OCR | `official-ocr-mineru-cloud` | Phase 2 | **改成 in_process**（只是一次HTTP调用，没有需要独立环境隔离的重依赖，subprocess_service 是不必要的复杂度，见 ROADMAP.md Phase 2 状态） | ✅ 已实现，懒加载/可注入HTTP客户端（同 official-embedder-bge-m3 模式），9用例 |
+| MinerU 本机 OCR | `official-ocr-mineru-local` | Phase 2 | subprocess_service | ✅ 已实现（真实子进程+本机HTTP+GPU资源租约协商），刻意不下载真实模型/未接入 env_bootstrap，见 ROADMAP.md Phase 2 状态；独立 py3.12/uv 环境的真正引导仍待做 |
 | WEMM 页级视觉检索 | `official-visual-wemm` | Phase 2 | subprocess_service | **已确认：官方独立插件**，不降级为社区插件。复杂度最高的一项，Phase 2 单独评估工作量 |
 | MinHash+LSH 去重 | `official-dedup` | Phase 3 | in_process | |
 | 库 AI 摘要(HyDE 式 LLM 调用) | `official-library-summary` | Phase 3 | in_process | 依赖 `llm_provider` 扩展点 |

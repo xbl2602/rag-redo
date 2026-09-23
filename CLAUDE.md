@@ -11,7 +11,7 @@ Obsidian 笔记本地语义检索系统的完全重构：插件化架构，核�
 
 ## 当前状态
 
-**Phase 1（文字检索 MVP）核心链路已实现（2026-09-23）**：`core/` 两个核心组件 + Agent 写权限门禁全部落地；14 个官方插件（提取 md/txt/pdf文字层/docx、切块、库管理、BM25、BGE-M3、Chroma、RRF、重排、近似去重、MCP 服务、GUI 壳、导出/导入归档）+ `core/pipeline.py` 编排层，227 用例全绿（`tests/run.py`），另有真实子进程 MCP 协议冒烟、真实 pywebview 渲染冒烟、真实 demo-vault 索引验证。导出/导入（`official-import-export`）让一个库能带着已建索引搬到另一台机器，不需要重新跑一遍索引。未完成：Phase 2（OCR/视觉插件，需要真实 API Key 或大模型下载，当前环境未配置）、Phase 3 剩余项（库 AI 摘要、Agent 写权限门禁通用化）、Phase 4（Windows 安装包，需要真实 Windows 环境构建）。逐项完成情况见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+**Phase 1（文字检索 MVP）核心链路已实现（2026-09-23）**：`core/` 两个核心组件 + Agent 写权限门禁全部落地；16 个官方插件（提取 md/txt/pdf文字层/docx、切块、库管理、BM25、BGE-M3、Chroma、RRF、重排、近似去重、MCP 服务、GUI 壳、导出/导入归档、MinerU云端/本机OCR）+ `core/pipeline.py` 编排层，255 用例全绿（`tests/run.py`），另有真实子进程 MCP 协议冒烟、真实 pywebview 渲染冒烟、真实 demo-vault 索引验证。导出/导入（`official-import-export`）让一个库能带着已建索引搬到另一台机器，不需要重新跑一遍索引。**`core/subprocess_service.py` 已落地**（真实子进程生命周期管理：启动/health_check/本机HTTP调用/干净终止），`official-ocr-mineru-local` 是第一个真实跑通的 `subprocess_service` 插件——刻意不下载真实OCR模型（虚拟机磁盘空间有限，且插件架构本身就该模型无关，真实模型下载应该发生在用户真正启用这个插件时，不是验证架构时），子进程内部用环境变量注入确定性假结果测试，链路本身（进程/HTTP/GPU资源租约/三层extractor:pdf链式尝试）全部是真代码。未完成：`official-visual-wemm`（需要新的 `visual_index` 扩展点+`search()`融合逻辑接入第三路排名，是个影响 `SearchResult` 契约的设计决策，留待专门讨论）、Phase 3 剩余项（库 AI 摘要、Agent 写权限门禁通用化）、Phase 4（Windows 安装包，需要真实 Windows 环境构建）。逐项完成情况见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 ## 核心哲学：五条约束
 

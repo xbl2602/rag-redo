@@ -35,11 +35,15 @@ core = ">=0.1"
 
 [runtime]
 kind = "in_process"          # 或 "subprocess_service"
-entry = "official_embedder_bge_m3.plugin:Embedder"   # in_process: module:class
-# subprocess_service 额外字段：
-# command = ["uv", "run", "server.py"]
+entry = "official_embedder_bge_m3.plugin:Embedder"   # module:class——subprocess_service 也需要这个字段
+# subprocess_service 额外字段（entry 这时指向一个本地的薄转发类：on_enable
+# 用 core/subprocess_service.py 的 SubprocessServiceHandle 拉起下面这条
+# command、on_disable 收掉它，方法调用转发成对子进程的本机HTTP请求——真正
+# 跑重依赖/模型的是子进程，entry 指向的这个类本身很薄，不需要装任何重
+# 依赖。参考实现：plugins/official-ocr-mineru-local）：
+# command = ["{python}", "server.py", "--port", "{port}"]   # {port} 由核心自动分配空闲端口替换
 # health_check = "http://127.0.0.1:{port}/health"
-# env_bootstrap = "setup.sh"   # 首次启用时跑一次，负责拉起独立环境/下载权重
+# env_bootstrap = "setup.sh"   # 首次启用时跑一次，负责拉起独立环境/下载权重——尚未被核心真正执行，见 docs/ROADMAP.md Phase 2 状态
 
 [permissions]
 # 声明式，v1不做沙箱强制执行，只做展示——个人本机工具的信任模型是"你选择装什么"，不是"防着插件作恶"

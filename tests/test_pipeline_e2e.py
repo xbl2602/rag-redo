@@ -312,5 +312,89 @@ class TestExportImportLibrary(TestEndToEndSearchPipeline):
         self.assertEqual([r.path for r in before], [r.path for r in after])
 
 
+class TestOcrChainTryFallback(unittest.TestCase):
+    """证明 Phase 2 的 OCR chain-try 设计真的接进了主管道，不是插件单测
+    自证自话：一份没有文字层的"扫描版"PDF，先被 official-extractor-pdf-text
+    诚实地判定"scanned:no-text-layer"放弃，再被 official-ocr-mineru-cloud
+    尝试（真实客户端，没配 MINERU_API_KEY，真的会失败），最后被
+    official-ocr-mineru-local 接住（子进程+RAG_REDO_FAKE_OCR=1 注入的
+    确定性假结果）——三层链式尝试全部走真实代码，只有"识别出的文字内容"
+    是假的（因为沙盒环境刻意不下载真实OCR模型，见
+    official_ocr_mineru_local/plugin.py 模块docstring），链路本身、
+    core/pipeline.py 的 provider 链式尝试逻辑、chunker/BM25/Chroma/
+    Pipeline.search 全部是真代码。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+        self._fake_ocr_env_backup = os.environ.get("RAG_REDO_FAKE_OCR")
+        os.environ["RAG_REDO_FAKE_OCR"] = "1"
+        self._api_key_backup = os.environ.pop("MINERU_API_KEY", None)
+        self.addCleanup(self._restore_env)
+
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        import pymupdf
+
+        doc = pymupdf.open()
+        doc.new_page()  # 完全空白，没有文字层——逼 extractor-pdf-text 认输
+        doc.save(str(self.vault / "scanned-contract.pdf"))
+        doc.close()
+
+        self.data_dir = self.tmp / "data"
+        self.runtime = PluginRuntime(
+            REPO_ROOT / "plugins",
+            state_file=self.tmp / "plugins_state.json",
+            data_dir=self.data_dir,
+        )
+        self.runtime.scan()
+        plugin_ids = OFFICIAL_PHASE1_PLUGINS + ["official-ocr-mineru-cloud", "official-ocr-mineru-local"]
+        for plugin_id in plugin_ids:
+            self.runtime.load(plugin_id)
+            self.runtime.enable(plugin_id)
+            state = self.runtime.plugins[plugin_id]
+            self.assertEqual(state.state, PluginState.ENABLED, f"{plugin_id}: {state.error}")
+        self.addCleanup(lambda: self.runtime.disable("official-ocr-mineru-local"))
+
+        from official_embedder_bge_m3.embed import BGEM3Embedder
+
+        self.runtime.plugins["official-embedder-bge-m3"].instance.embedder = BGEM3Embedder(
+            encoder=_DeterministicFakeEncoder()
+        )
+        from official_reranker.rerank import RerankerEngine
+
+        self.runtime.plugins["official-reranker"].instance.engine = RerankerEngine(reranker=_DeterministicFakeReranker())
+
+        self.pipeline = Pipeline(self.runtime)
+        self.lib_mgr = self.runtime.plugins["official-library-manager"].instance
+        self.lib_mgr.store.add_library("scan-lib", "扫描件库", str(self.vault))
+        # library-manager 的默认启用格式是 [.md, .txt]（见
+        # official_library_manager/config.py），不包含 .pdf——PDF 检索
+        # 场景要显式打开，这是库层面的选择，不是extractor/OCR这一侧该
+        # 关心的事。
+        self.lib_mgr.store.set_policy("scan-lib", enabled_extensions=[".md", ".txt", ".pdf"])
+
+    def _restore_env(self) -> None:
+        if self._fake_ocr_env_backup is None:
+            os.environ.pop("RAG_REDO_FAKE_OCR", None)
+        else:
+            os.environ["RAG_REDO_FAKE_OCR"] = self._fake_ocr_env_backup
+        if self._api_key_backup is not None:
+            os.environ["MINERU_API_KEY"] = self._api_key_backup
+
+    def test_scanned_pdf_falls_through_to_local_ocr_and_gets_indexed(self):
+        report = self.pipeline.index_library("scan-lib")
+        self.assertEqual(report.succeeded, 1, f"扫描版PDF应该经OCR链式尝试后索引成功: {report.files}")
+        self.assertEqual(report.failed, 0)
+        self.assertGreater(report.files[0].chunk_count, 0)
+
+    def test_ocr_recovered_content_is_actually_searchable(self):
+        self.pipeline.index_library("scan-lib")
+        results = self.pipeline.search("scan-lib", "fake-ocr scanned-contract", top_k=5)
+        self.assertTrue(results, "OCR恢复出的内容应该能被搜到，不是索引了但实际检索不到的死数据")
+        self.assertIn("fake-ocr", results[0].text)
+
+
 if __name__ == "__main__":
     unittest.main()

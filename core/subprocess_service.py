@@ -18,10 +18,34 @@ from __future__ import annotations
 import json
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+
+def resolve_plugin_python(plugin_dir: Path) -> str:
+    """subprocess_service 插件应该用自己 env_bootstrap 建出来的独立解释器
+    跑子进程，不是核心的 `.venv`——两者必须互相隔离（架构红线7"不碰系统/
+    其他环境"的插件间版本）。按约定路径找：
+    `<plugin_dir>/.venv/bin/python`（POSIX）或
+    `<plugin_dir>/.venv/Scripts/python.exe`（Windows）。
+
+    **已知的、刻意的简化**：`env_bootstrap` 声明字段目前还没有被核心真正
+    执行过（见 docs/ROADMAP.md Phase 2 状态说明），约定路径下大概率找不到
+    独立 venv——这时退化成用核心自己的解释器，不是假装这件事已经解决了。
+    对于当前用纯标准库、不需要任何重依赖的 subprocess_service 参考实现
+    （official-ocr-mineru-local）来说这个退化本身没有问题；一旦真的需要
+    安装重依赖（比如真实 OCR 模型），`env_bootstrap` 的执行逻辑必须先落地，
+    不能让插件在没有真正独立环境的情况下悄悄把重依赖装进核心 venv。"""
+    posix_python = plugin_dir / ".venv" / "bin" / "python"
+    if posix_python.exists():
+        return str(posix_python)
+    windows_python = plugin_dir / ".venv" / "Scripts" / "python.exe"
+    if windows_python.exists():
+        return str(windows_python)
+    return sys.executable
 
 
 class SubprocessServiceError(Exception):

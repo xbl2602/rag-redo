@@ -1,0 +1,20 @@
+id = "official-ocr-mineru-local"
+name = "MinerU 本机 OCR"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+"extractor:pdf" = "multi"
+
+[requires]
+
+[runtime]
+kind = "subprocess_service"
+entry = "official_ocr_mineru_local.plugin:MineruLocalOcrPlugin"
+command = ["{python}", "server.py", "--port", "{port}"]
+health_check = "http://127.0.0.1:{port}/health"
+
+[permissions]
+filesystem = ["vault_read"]
+network = false
+gpu = true

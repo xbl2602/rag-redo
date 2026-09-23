@@ -37,12 +37,15 @@
 
 ## Phase 2 — 视觉与 OCR 插件
 
-**目标**：MinerU 云端 OCR、MinerU 本机 OCR、WEMM 页级视觉检索，各自独立成 `subprocess_service` 插件。
+**目标**：MinerU 云端 OCR、MinerU 本机 OCR、WEMM 页级视觉检索，各自独立成插件。
 
-**验收标准**：
-- 三者分别能独立安装/卸载，卸载后不影响 Phase 1 的文字检索
-- GPU 仲裁在 WEMM 和文字检索之间的抢占策略，行为对齐旧项目 `gpu_arbiter.py` 已验证的时间线（懒加载、空闲卸载、检索优先抢占、探测失败 fail-open）
-- MinerU 本机 OCR 的独立 py 环境引导过程不污染核心 venv（可验证：核心 venv 的依赖列表里不出现 MinerU 专属的包）
+**状态（2026-09-23）**：
+- ✅ **`core/subprocess_service.py` 落地**——之前 `core/runtime.py` 对 `subprocess_service` 插件直接 `raise NotImplementedError`（占位），现在真的实现了：`SubprocessServiceHandle` 负责启动声明的 `command`、轮询 `health_check`、本机HTTP调用方法、干净终止子进程（真实验证：`os.kill(pid, 0)` 确认进程真的没了）。自动分配空闲端口，避免多个 `subprocess_service` 插件抢端口。`in_process`/`subprocess_service` 现在走同一条 `_instantiate()` 路径，区别只在于 `entry` 指向的本地类是否用这个工具拉起子进程。8 用例，另有 `tests/test_runtime.py` 3 个真实走完整 `PluginRuntime` 生命周期的用例
+- ✅ **`official-ocr-mineru-cloud`**（**改成 `in_process`，不是最初设想的 `subprocess_service`**——只是一次HTTP调用，没有需要独立环境隔离的重依赖，`subprocess_service` 反而是不必要的复杂度；`懒加载/可注入HTTP客户端`模式同 `official-embedder-bge-m3`，单测全程注入假客户端，不碰真实网络/API Key）。9 用例
+- ✅ **`official-ocr-mineru-local`**（真实 `subprocess_service`：GPU资源仲裁租约协商 + 真实子进程 + 本机HTTP，`extractor:pdf` 多值扩展点，和 `official-extractor-pdf-text`/`official-ocr-mineru-cloud` 三层链式尝试——文字层→云端OCR→本机OCR，插件id字母序决定尝试顺序，不需要额外编排逻辑）。**刻意不下载真实OCR模型**（虚拟机磁盘空间有限，且插件架构本身就该是"模型无关"的——具体模型选型/权重下载应该在用户真正启用这个插件时才发生，不该为了验证插件架构本身而强绑真实下载，同 `official-embedder-bge-m3`/`official-reranker` 的懒加载纪律）；子进程内部用 `RAG_REDO_FAKE_OCR` 环境变量注入确定性假结果，测试验证的是"子进程+HTTP+chain-try链路通不通"，不是"识别准不准"。6 用例，另有 `tests/test_pipeline_e2e.py::TestOcrChainTryFallback` 2 个用例真实走完整三层链式尝试+索引+搜索
+- ⬜ **`official-visual-wemm`**——未开始。和 OCR 不同，WEMM 是页级*视觉*检索，需要新的 `visual_index` 扩展点、新的页面渲染步骤（`pymupdf` 已有，不需要新依赖）、以及 `core/pipeline.py` 的 `search()` 融合逻辑接入第三路排名（当前只融合 lexical+vector 两路）——这涉及 `core/contracts.py` 的 `SearchResult` 契约要不要为"页面级命中"（而不是当前的chunk级命中）单独建一个类型，是个会影响所有 `SearchResult` 消费方（GUI/MCP）的真实设计决策，值得先和操作者过一遍再动手，不是照抄 OCR 的模式就能顺手做完的小事
+- ⬜ **GPU 仲裁在 WEMM 和文字检索之间的抢占策略**——`official-ocr-mineru-local` 已经演示了"申请/释放一个具名资源租约"的最小可用集成，完整的"检索优先抢占 WEMM"时序验证要等 WEMM 落地后一起做
+- ⬜ **MinerU 本机 OCR 的独立 py 环境引导（`env_bootstrap`）**——`plugin.toml` 的 `env_bootstrap` 字段核心还没有真正执行过；`core/subprocess_service.py` 的 `resolve_plugin_python()` 会在找不到插件专属 venv 时退化用核心自己的解释器，对当前"只用标准库、没有真实重依赖"的参考实现没有问题，但真的要接入需要重依赖的真实模型之前，这一步必须先落地——不能让插件在没有真正独立环境的情况下把重依赖悄悄装进核心 venv
 
 ## Phase 3 — 治理与体验类插件
 
