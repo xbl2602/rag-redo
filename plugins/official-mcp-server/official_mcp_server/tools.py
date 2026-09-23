@@ -343,6 +343,28 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         return {"ok": True, "status": status}
 
     @server.tool()
+    def index_failures(library_id: str) -> dict[str, Any]:
+        """索引失败溯源（只读诊断，对齐 obsidian-rag 的 `index_failures`
+        工具）：列出最近一次 reindex_knowledge 跑完后，库内"没转成/没
+        索引上"的文件及原因——解决"什么文件转不到、为什么"，你看一眼就
+        知道哪份文档没进库、卡在哪。只读，绝不触发重新索引或模型加载。
+
+        简化说明：rag-redo 每次都是全量重跑（不做增量索引），本工具因此
+        不判断"下一轮会不会自动重试"——反正下一轮本来就会重新试一遍全部
+        文件，这个问题在 rag-redo 里不成立，见 core/index_failures.py
+        模块 docstring。库存在但从没索引过时 `failures` 为 `None`
+        （不是错误）；`failures` 为空列表则表示上次全部成功。
+
+        Args:
+            library_id: 要查询的库的 id
+        """
+        try:
+            result = pipeline.index_failures(library_id)
+        except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "result": result}
+
+    @server.tool()
     def export_library(library_id: str) -> dict[str, Any]:
         """导出一个库的完整已建索引数据（配置+向量+BM25状态）为可移植归档，
         base64 编码后返回——调用方把它存成一个 .zip 文件，就能把这个库搬到

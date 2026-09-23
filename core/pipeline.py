@@ -17,6 +17,7 @@ from typing import Callable
 
 from .contracts import DocumentContent, ExtractedDocument, LibrarySummary, PageHit, SampledChunk, SearchResult
 from .extract_cache import ExtractCache
+from .index_failures import IndexFailuresStore
 from .index_progress import IndexProgressTracker
 from .note_relations import NoteRelationsStore, extract_wikilink_targets
 from .runtime import PluginRuntime
@@ -99,6 +100,7 @@ class Pipeline:
         self._extract_cache = ExtractCache(runtime.data_dir / "extracted")
         self._index_progress = IndexProgressTracker(runtime.data_dir / "index_progress")
         self._note_relations = NoteRelationsStore(runtime.data_dir / "note_relations")
+        self._index_failures = IndexFailuresStore(runtime.data_dir / "index_failures")
 
     # ---- 插件解析 --------------------------------------------------------
 
@@ -248,7 +250,30 @@ class Pipeline:
         # 增量、全量重跑"的节奏一致，见 core/note_relations.py 模块 docstring。
         self._note_relations.write_library(library_id, links_by_path)
 
+        # 索引失败溯源诊断数据同样整库覆盖写一次——见 core/index_failures.py
+        # 模块 docstring，两条同步/后台调用路径都走这里，不需要调用方
+        # 自己再另外持久化一份。
+        self._index_failures.write_library(
+            library_id,
+            succeeded=report.succeeded,
+            failures=[
+                {"path": f.path, "reason": f.extract_failure}
+                for f in report.files
+                if f.included and not f.extracted
+            ],
+        )
+
         return report
+
+    def index_failures(self, library_id: str) -> dict | None:
+        """索引失败溯源（只读诊断，对齐 obsidian-rag 的 `index_failures`
+        工具——简化版，见 `core/index_failures.py` 模块 docstring）：列出
+        最近一次 `index_library()` 跑完后，库内"没转成/没索引上"的文件
+        及原因。库存在但从没索引过时返回 `None`（不是错误）。"""
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+        return self._index_failures.read(library_id)
 
     def note_relations(self, library_id: str, path: str) -> dict:
         """双链关系查询（对齐 obsidian-rag 的 `note_relations` 工具）：

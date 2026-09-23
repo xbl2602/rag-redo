@@ -489,6 +489,7 @@ class TestMcpTools(TestMcpToolsAsyncBase):
                 "list_libraries",
                 "reindex_knowledge",
                 "index_status",
+                "index_failures",
                 "export_library",
                 "import_library",
                 "get_library_sample",
@@ -665,6 +666,30 @@ class TestMcpTools(TestMcpToolsAsyncBase):
 
     async def test_index_status_unknown_library_reports_error(self):
         result = await self.server.call_tool("index_status", {"library_id": "no-such-lib"})
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+
+    async def test_index_failures_before_any_reindex_is_none(self):
+        result = await self.server.call_tool("index_failures", {"library_id": "test-lib"})
+        self.assertFalse(result.is_error)
+        payload = result.structured_content
+        self.assertTrue(payload["ok"])
+        self.assertIsNone(payload["result"])
+
+    async def test_index_failures_after_successful_reindex_reports_empty_failures(self):
+        """全部成功和从没跑过是两种不同的状态——全部成功后 failures 应该
+        是空列表，不是 None，同 core/index_failures.py 模块 docstring。"""
+        await self._reindex_and_wait("test-lib")
+        result = await self.server.call_tool("index_failures", {"library_id": "test-lib"})
+        self.assertFalse(result.is_error)
+        payload = result.structured_content
+        self.assertTrue(payload["ok"])
+        self.assertIsNotNone(payload["result"])
+        self.assertEqual(payload["result"]["succeeded"], 1)
+        self.assertEqual(payload["result"]["failures"], [])
+
+    async def test_index_failures_unknown_library_reports_error(self):
+        result = await self.server.call_tool("index_failures", {"library_id": "no-such-lib"})
         self.assertFalse(result.is_error)
         self.assertFalse(result.structured_content["ok"])
 
