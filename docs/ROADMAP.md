@@ -16,6 +16,34 @@
 8. ~~全面功能审计（2026-09-23）发现的新缺口~~——**核心行为契约已全部完成（2026-09-24）**，见下方独立小节及其后续段落"操作者 `/goal` 锁定"完成所有！"后续完成情况"。仍未完成的是本地 Windows 干净机安装验收、GUI 真实渲染冒烟和打包体积优化，不是行为契约缺口。
 9. ~~完整文件级增量索引~~——**已完成（2026-09-24）**：per-file manifest + 分段 generation + 精确阶段失效 + 原子发布 + 无重算 compaction，文字/BM25/提取缓存/WEMM 页库全部接入；MCP/GUI 同时支持增量和显式完整重建。
 
+## 2026-09-25 通宵行为对齐审计——报告核实与九项修复
+
+> 操作者提供了一份过时的调研报告并要求先核实时效性，再"继续未完成工作 + 检查已实现代码是否有简化"。方法：六个只读调研 agent 把报告的每条声明对照当前代码与旧项目生产代码逐条验证，然后按 AGENTS.md §8（先复现测试后实现、逐项全量回归、分项提交）执行。全程 45/45 套测试全绿（新增约 30 条用例）。工作区在报告写作后已被推送（报告里"79 个文件未提交/领先 24 提交"已过时），14 条 BC 契约当时已全部标 pass——但核实证明其中三条是虚标（见下）。
+
+**报告判断有误、实为与旧项目一致（不动）**：
+- **Graph 四项全部与旧项目同构**：未索引普通文件不显示（graph_data.py:89-105 同）、语义边基于文件名+路径而非正文（semantic.py:46 逐字相同）、O(N²)（graph_data.py:220-233 同阶）、MCP 无 Graph 工具（旧 server.py grep "graph" 零命中）。报告把"继承设计"当成了缺口。
+- **HyDE 自带 HTTP 客户端不是简化而是对齐**：旧项目没有 provider 抽象，`retriever.py:503-541` 的 hyde_generate 就是自带 urllib 客户端 + 独立 `hyde_llm_url/model/api_key` 配置端点；rag-redo 的 official-llm-openai-compatible 接口（`complete(system, user)`）也装不下 per-调用方端点。不做"统一到 Provider 层"。
+- **GUI 搜索无 freshness 与旧项目一致**：旧 GUI bridge.py:672 直调 hybrid_search 无 ensure_fresh，GUI/MCP 不对称是两代共有的行为。
+- **advisor exclude 建议错位**：事实成立但旧项目 advice.py:148-150 同错——经操作者拍板**修复而非复刻**（见下），已作为经确认的偏离登记 BC-08。
+
+**核实为真实偏离、已修复（各一条提交）**：
+1. **BC-02/03/04 虚标 pass 的三条数据安全缺口**（增量索引把"本轮看不到"一律当"确认删除"）：①库路径消失/目录扫空 → 新增 `library_freshness()` 报 missing/emptied，MCP 自动同步跳过并写入响应 notes、同步失败降级旧索引检索（对齐 index.py:1506-1529 + server.py:264-273/314-317；从未索引+空目录=收敛态不重建）；②deferred 不再落 `chunk_ids:[]` 记录——旧条目与旧块原样保留继续服务，词法旧块删除迁移到各确定丢弃点（对齐 index.py:2142-2148"不落终态、不动 meta"）；③撤销 Agent 授权改为冻结语义——保留条目与块、视觉 PDF 保留在有效页集合不重渲染（对齐 index.py:2058-2066 + wemm_indexer.py:190"其余冻结"）。
+2. **GUI 进程单例守卫**：gui_main.py 接 ProcessSingletonGuard（旧项目 gui/app.py:46-69 与 guiweb/app.py:46-87 两个 GUI 入口都有锁，此前只给 MCP 接了）；真实子进程接线测试 2 条。
+3. **原子写统一**：新增 core/atomic.py 权威实现（tmp+os.replace+Windows PermissionError 退避重试，临时名含 pid+线程id 防同目标并发互踩）——修 5 处裸 write 直写（settings.json/plugins_state.json/提取缓存/BM25索引/libraries.json——后者对齐旧 library.py:421-427 原子写；另 GUI 导出归档），并把 8 处各自复制的 tmp+replace 收敛到同一助手。
+4. **GUI 设置 secret 打码 + 键元信息**：get_settings 改 `{values, meta}` 打包返回（对齐 bridge.py:801-820），`*_api_key/*_token` 规则兜底 + SETTING_FIELD_META 中文说明（消除 api.py"设置键无说明"已知简化），前端 secret 键打码显示/编辑框切密码态（对齐 app.js:1640-1641）。
+5. **检索侧 GPU 收口**：移除 embed/rerank 加载路径的 wait_for_vram(900s) 盲等（返回值此前未检查；旧项目检索侧从不阻塞等待——`_vram_maybe_evict_wemm` 是主动驱逐检查，wait 语义只属于 WEMM/MinerU 服务端）；补齐 on_disable 归还 gpu:0 名额（rerank.py docstring 一直声称但从未实现）。
+6. **CUDA 冷却期状态机按旧项目原行为补齐**（消除 embed.py"单次降级永不切回"的已知简化）：新增 core/gpu_arbiter.CudaCooldownGate——冷却窗口（设置项 `cuda_cooldown_seconds` 默认300，对齐旧 config.py）内直接 CPU、到期毫秒级探测（64MB 分配）通过才切回、失败原因/device 健康落盘 device_state.json；embed/rerank 接入加载失败冷却+CPU重试一次、慢批检测（>30s 连续两批降级，对齐 encode_safe 的 WDDM 共享显存溢出检测）。
+7. **library-summary 指纹精确算法**：新增 `library_content_fingerprint()`——排序聚合全部已索引文件 path:content_hash 后 sha256 截16位（逐字对齐 library_summary.py:40-50；旧数据源 meta.hash 的等价物是 manifest 的 content_hash），消除"采样片段哈希代理"的已知简化；并补齐指纹传递链（MCP propose 对齐 server.py:508、GUI AI 刷新对齐 bridge.py:414 三元组、用户手写不带指纹对齐 bridge.py:356-365）——此前 is_stale 过时提示因无指纹而完全休眠。
+8. **DataStore issue_path 权限收口**：storage_handle 授权登记为唯一依据，未声明 data_write 的插件不再有申领持久化路径的通道（此前 handle 门禁可被直接绕过）；多插件共享 index_generations legacy 目录的刻意设计保持允许并写入文档。
+9. **文档/打包**：README.en.md 过时的 Inno Setup/打包不可用表述改为便携 ZIP 现状；core/subprocess_service.py docstring"便携 Python 还没做"滞后于代码的段落修正；便携包 README 补 MinerU 外部 uv tool 环境说明；build_windows.py 构建时生成 requirements-lock.txt（133 项锁定版本，"最小依赖清单"第一步）。
+
+**核实后决定顺延/登记的事项**：
+- **业务 CLI**（旧项目 index.py:2441 索引/library.py:700 库管理/import/export/dedup；rag-redo 只有插件管理 CLI）——操作者拍板低优先顺延，未动。
+- **runtime.py:281-283 的 sys.path 简化**（每插件导入隔离，防同名顶层模块冲突）——真实边界收紧涉及导入机制重构，登记待办未动。
+- **DataStore 深度封装**（handle 返回裸 Path、契约值 write/read 生产零调用、gui_main 直传 lib_mgr 实例给 GUI Api）——in_process 受信任插件定位下门禁已到合理边界；深度封装与 GUI 走契约通道是架构改进项，登记待办。
+- **干净机验收与便携包体积优化**——需要无开发工具的真实机器，无法无人值守执行，仍待操作者。
+- 全量高频连跑下 core/test_index_progress 的两条子进程计时用例偶发抖动（单跑稳定、昨夜起点提交同样偶发，属项目已知的高频连跑子进程残留问题家族，见 Phase 4 记录），已通过并发唯一临时名修复消除一个潜在干扰源。
+
 ## 2026-09-23 全面功能审计——已发现、尚未实现的缺口
 
 > 操作者要求"检查decision log/相关文档核对功能是否完整复刻"后的系统性核对结果。方法：`grep "@server.tool()"` 拿到 obsidian-rag 全部16个MCP工具的权威清单，逐个核对 rag-redo 当前实现；同时通读 `config.py` 全部 CFG 默认值、`singleton.py`、`guiweb/graph_data.py`+`semantic.py`。**这些都是这次才发现的真实缺口，不是已知计划里遗漏的执行细节**——此前的 FEATURE_TRIAGE.md 表格粒度停在"插件级"，从没有逐个核对过 MCP 工具级别和 CFG 配置项级别，这次审计把粒度下钻到了那两层。
