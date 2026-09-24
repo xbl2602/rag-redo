@@ -4,6 +4,17 @@ DataStore 同时提供跨插件契约值的权限收窄和按插件发放的 Sto
 存储插件只能拿到自己声明 data_write 后取得的 namespace/path，非存储插件
 不能直接取得应用数据根目录。规则见 ../AGENTS.md"两个核心组件"节、
 ../docs/DATA_FLOW.md 数据的读/写边界表。
+
+**权限校验的准确边界（如实记录）**：`issue_path` 要求 plugin_id 已通过
+`storage_handle(..., allowed=True)` 登记为 data_write 授权方——未声明
+data_write 的插件从此没有拿路径的通道（此前 issue_path 是公开方法，
+handle 的门禁防君子不防小人）。但对已授权的存储插件，DataStore 不校验
+"你申请的 namespace 是否属于你"：in_process 插件与核心共享进程，按
+AGENTS.md"受信任插件"的定位不宣称抵御恶意代码；且 legacy 命名空间存在
+多插件共享同一核心存储目录的真实用法（lexical-bm25/vector-store-chroma/
+visual-wemm 共享 index_generations 供 core.index_generation 的分段存储），
+全局碰撞检查会把这种刻意共享误伤成错误。这是信任模型内的门禁，不是
+安全沙箱。
 """
 from __future__ import annotations
 
@@ -66,8 +77,14 @@ class DataStore:
     root: Path | None = None
     _entries: dict[str, _Entry] = field(default_factory=dict)
     _issued: dict[tuple[str, str, str], Path] = field(default_factory=dict)
+    _granted: set[str] = field(default_factory=set)
 
     def storage_handle(self, plugin_id: str, *, allowed: bool) -> StorageHandle:
+        # allowed=真值登记进授权集合：issue_path 的权限校验以这份集合为
+        # 唯一依据——此前 issue_path 是公开方法，任何拿到 ctx.data_store 的
+        # 插件（哪怕没声明 data_write）都能直接绕过 handle 的门禁自领路径。
+        if allowed:
+            self._granted.add(plugin_id)
         return StorageHandle(self, plugin_id, allowed=allowed)
 
     def issue_path(
@@ -79,6 +96,11 @@ class DataStore:
     ) -> Path:
         if self.root is None:
             raise DataAccessError("DataStore 未配置持久化根目录")
+        if plugin_id not in self._granted:
+            raise DataAccessError(
+                f"{plugin_id} 未声明 data_write 权限，不能申领持久化路径"
+                "（持久化访问必须经由 ctx.storage 发放的 StorageHandle）"
+            )
         safe_name = Path(name)
         if safe_name.is_absolute() or any(part in {"", ".", ".."} for part in safe_name.parts):
             raise DataAccessError(f"无效的数据命名空间: {name!r}")

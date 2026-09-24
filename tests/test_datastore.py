@@ -67,6 +67,39 @@ class TestDataStore(unittest.TestCase):
                 root / "libraries.json",
             )
 
+    def test_issue_path_denies_plugin_without_data_write_grant(self):
+        """issue_path 的权限校验以 storage_handle 的授权登记为唯一依据——
+        未声明 data_write 的插件即使拿到 DataStore 本体，也没有申领持久化
+        路径的通道（此前是公开方法，handle 门禁可被直接绕过）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DataStore(Path(tmp))
+            store.storage_handle("plugin-no-write", allowed=False)
+            with self.assertRaises(DataAccessError):
+                store.issue_path("plugin-no-write", "state")
+            with self.assertRaises(DataAccessError):
+                store.issue_path("totally-unknown-plugin", "state")
+
+    def test_granted_storage_plugin_can_issue_its_own_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = DataStore(root)
+            handle = store.storage_handle("plugin-a", allowed=True)
+            self.assertEqual(handle.path("state"), root / "plugin_data" / "plugin-a" / "state")
+
+    def test_shared_legacy_namespace_stays_allowed_for_multiple_owners(self):
+        """多插件共享同一 legacy 目录是刻意设计（index_generations 分段存储
+        被 lexical-bm25/vector-store-chroma/visual-wemm 共用）——同路径不同
+        owner 的重复申领不得报错。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = DataStore(root)
+            for plugin_id in ("plugin-a", "plugin-b", "plugin-c"):
+                handle = store.storage_handle(plugin_id, allowed=True)
+                self.assertEqual(
+                    handle.directory("index_generations", legacy="index_generations"),
+                    root / "index_generations",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
