@@ -32,6 +32,8 @@ import json
 import urllib.parse
 from pathlib import Path
 
+from .atomic import atomic_write_text
+
 
 def _hash_for(rel_path: str) -> str:
     return hashlib.sha256(rel_path.encode("utf-8")).hexdigest()
@@ -80,8 +82,9 @@ class ExtractCache:
             return {}
 
     def _save_index(self, library_id: str, index: dict[str, str], generation: str | None = None) -> None:
-        self._index_path(library_id, generation).write_text(
-            json.dumps(index, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
+        atomic_write_text(
+            self._index_path(library_id, generation),
+            json.dumps(index, ensure_ascii=False, indent=2, sort_keys=True),
         )
 
     def write(
@@ -98,7 +101,8 @@ class ExtractCache:
             if route
             else self._text_path(library_id, rel_path, generation)
         )
-        target.write_text(text, encoding="utf-8")
+        # 原子写：read_document 读到的正文绝不能是断电留下的半截文本
+        atomic_write_text(target, text)
         index = self._load_index(library_id, generation)
         index[_hash_for(rel_path)] = rel_path
         self._save_index(library_id, index, generation)

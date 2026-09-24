@@ -15,6 +15,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from core.atomic import atomic_write_text
+
 
 @dataclass
 class LibraryConfig:
@@ -46,9 +48,10 @@ class LibraryConfigStore:
         return {lib_id: LibraryConfig(**data) for lib_id, data in raw.items()}
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # 原子写——对齐 obsidian-rag/library.py::save_registry（421-427）对
+        # libraries.json 的 tmp+replace 纪律：注册表写半截 = 全部库配置丢失。
         raw = {lib_id: asdict(cfg) for lib_id, cfg in self._libraries.items()}
-        self.path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(self.path, json.dumps(raw, ensure_ascii=False, indent=2))
 
     @staticmethod
     def _validate_identity(library_id: str, name: str, root_path: str) -> tuple[str, str, str]:

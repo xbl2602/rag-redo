@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import re
+
+from .atomic import atomic_write_text
 from pathlib import Path
 
 
@@ -66,17 +68,10 @@ class IndexGenerationStore:
             "history": [previous] if previous else [],
             "committed_pid": os.getpid(),
         }
-        tmp = path.with_suffix(f".{os.getpid()}.tmp")
         try:
-            self._root.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp, path)
+            atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
             return True
         except OSError:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
             return False
 
 
@@ -110,17 +105,10 @@ class IndexManifestStore:
         if not library_id or not generation or manifest.get("format_version") != INDEX_MANIFEST_VERSION:
             return False
         path = self._path_for(library_id, generation)
-        tmp = path.with_suffix(f".{os.getpid()}.tmp")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp, path)
+            atomic_write_text(path, json.dumps(manifest, ensure_ascii=False, indent=2))
             return True
         except OSError:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
             return False
 
     def list_generations(self, library_id: str) -> list[str]:

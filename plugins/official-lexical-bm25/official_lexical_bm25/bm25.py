@@ -15,6 +15,8 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from core.atomic import atomic_write_text
+
 import jieba
 
 INDEXER_VERSION = "0.1.0"
@@ -139,8 +141,8 @@ class BM25Index:
         """用 JSON 不用 pickle——这份数据完全是简单类型，JSON 够用且没有
         反序列化任意代码执行的隐患，没有理由为了省几行代码换一个有安全
         面的格式。"""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), ensure_ascii=False), encoding="utf-8")
+        # 原子写（core/atomic.py）：BM25 索引半截 = 词法检索路整体失效
+        atomic_write_text(path, json.dumps(self.to_dict(), ensure_ascii=False))
 
     @classmethod
     def load(cls, path: Path) -> "BM25Index":

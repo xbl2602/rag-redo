@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 
+from core.atomic import atomic_write_bytes, atomic_write_text
 from core.contracts import ExtractedDocument
 
 from .ocr import MineruCloudError, _RealHttpClient
@@ -68,10 +69,9 @@ class MineruCloudExtractor:
         if self._pending_path is None:
             return
         try:
-            self._pending_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self._pending_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(temporary, self._pending_path)
+            atomic_write_text(
+                self._pending_path, json.dumps(data, ensure_ascii=False, indent=2)
+            )
         except OSError:
             pass
 
@@ -104,9 +104,7 @@ class MineruCloudExtractor:
         try:
             self._sidecar_dir.mkdir(parents=True, exist_ok=True)
             path = self._sidecar_dir / f"{content_hash}.json"
-            temporary = path.with_suffix(".tmp")
-            temporary.write_bytes(sidecar)
-            os.replace(temporary, path)
+            atomic_write_bytes(path, sidecar)
         except OSError:
             pass
 
@@ -123,10 +121,7 @@ class MineruCloudExtractor:
         data["files"] = int(data.get("files", 0)) + 1
         data["pages"] = int(data.get("pages", 0)) + pages
         try:
-            self._quota_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self._quota_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-            os.replace(temporary, self._quota_path)
+            atomic_write_text(self._quota_path, json.dumps(data, ensure_ascii=False))
         except OSError:
             pass
 

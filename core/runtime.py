@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from .atomic import atomic_write_text
 from .context import PluginContext
 from .datastore import DataStore
 from .manifest import ManifestError, PluginManifest, load_manifest, validate_manifest
@@ -325,8 +326,8 @@ class PluginRuntime:
     def _save_state(self) -> None:
         if self.state_file is None:
             return
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(
+        # 原子写：plugins_state.json 半截会让重启后插件启用状态错乱
+        atomic_write_text(
+            self.state_file,
             json.dumps({"enabled": sorted(self._enabled_ids)}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
         )

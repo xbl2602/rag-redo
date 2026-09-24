@@ -15,6 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from core.atomic import atomic_write_bytes
 from core.pipeline import DEFAULT_CONFIDENCE_WARN_THRESHOLD, Pipeline, confidence_tier
 
 
@@ -254,7 +255,7 @@ class Api:
         注释）。"""
         try:
             archive_bytes = self._pipeline.export_library(library_id)
-            Path(dest_path).write_bytes(archive_bytes)
+            atomic_write_bytes(Path(dest_path), archive_bytes)
         except Exception as exc:  # noqa: BLE001 - 见模块 docstring
             return {"ok": False, "error": str(exc)}
         return {"ok": True}

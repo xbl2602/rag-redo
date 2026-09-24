@@ -19,8 +19,9 @@ index_library()` 跑完后产出的 `IndexReport` 本来就带着这些信息
 from __future__ import annotations
 
 import json
-import os
 import re
+
+from .atomic import atomic_write_text
 from pathlib import Path
 
 
@@ -44,13 +45,9 @@ class IndexFailuresStore:
     ) -> None:
         """把本轮有效文件清单的成功/失败汇总原子写入当前 generation。"""
         try:
-            self._root.mkdir(parents=True, exist_ok=True)
             target = self._path_for(library_id, generation)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = target.with_suffix(".tmp")
             data = {"succeeded": succeeded, "failures": failures}
-            tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp_path, target)
+            atomic_write_text(target, json.dumps(data, ensure_ascii=False, indent=2))
         except OSError:
             pass  # 诊断数据写盘失败不该让索引任务本身失败——fail-open，同其他核心服务的一贯原则
 

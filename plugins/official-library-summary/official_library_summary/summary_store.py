@@ -17,6 +17,8 @@ import json
 import time
 from pathlib import Path
 
+from core.atomic import atomic_write_text
+
 SUMMARY_MAX_CHARS = 300
 SUMMARY_SOURCES = ("none", "ai", "user")
 _BLANK = {"text": "", "source": "none", "updated_at": None, "fingerprint": None, "model": None}
@@ -37,9 +39,7 @@ class SummaryStore:
             return {}
 
     def _save(self, data: dict) -> None:
-        tmp = self._path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self._path)
+        atomic_write_text(self._path, json.dumps(data, ensure_ascii=False, indent=2))
 
     def get(self, library_id: str) -> dict:
         """读侧防御：从没写过/字段缺失/source 非法一律回退成空白态，绝不

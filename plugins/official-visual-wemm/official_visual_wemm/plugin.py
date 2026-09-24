@@ -46,11 +46,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
 from pathlib import Path
 
 import chromadb
 
+from core.atomic import atomic_write_text
 from core.contracts import PageHit, VisualPageState
 from core.index_generation import IndexGenerationStore
 from core.subprocess_service import SubprocessServiceError, SubprocessServiceHandle, resolve_plugin_python
@@ -210,13 +210,10 @@ class VisualWemmPlugin:
         if self._state_root is None:
             return
         path = self._state_path(library_id, generation)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(f".{os.getpid()}.tmp")
         try:
-            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp, path)
+            atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
         except OSError:
-            tmp.unlink(missing_ok=True)
+            pass
 
     @staticmethod
     def _fingerprint(path: Path) -> tuple[int, int, str]:

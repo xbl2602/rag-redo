@@ -23,6 +23,7 @@ from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Callable, Iterator
 
+from .atomic import atomic_write_text
 from .runtime import PluginRuntime, PluginState
 from .singleton import FileByteLock, pid_alive
 
@@ -90,26 +91,12 @@ class IndexStartResult:
 
 
 def _atomic_write_json(path: Path, data: object) -> bool:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    # 权威实现收敛到 core/atomic.py（tmp+os.replace+PermissionError 退避重试）
     try:
-        tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        for attempt in range(5):
-            try:
-                os.replace(tmp_path, path)
-                return True
-            except PermissionError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.01)
-        return False
+        atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+        return True
     except OSError:
         return False
-    finally:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def _read_json(path: Path) -> dict | None:

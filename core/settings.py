@@ -42,6 +42,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .atomic import atomic_write_text
+
 
 def _type_compatible(value: Any, default: Any) -> bool:
     if isinstance(default, bool):
@@ -120,11 +122,14 @@ class SettingsStore:
             return dict(self._values)
 
     def _save_locked(self) -> None:
+        # 原子写（tmp + os.replace，见 core/atomic.py）——GUI 与 MCP 两个
+        # 进程共享同一个 DATA_ROOT 下的 settings.json，写入中途被杀不能
+        # 留下半截 JSON 让下次启动全部设置丢失；对齐 obsidian-rag/library.py
+        # ::save_registry 对注册表文件的原子写纪律。
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(
+            atomic_write_text(
+                self._path,
                 json.dumps(self._values, ensure_ascii=False, indent=2, sort_keys=True),
-                encoding="utf-8",
             )
         except OSError as exc:
             self._logger.warning("设置写盘失败（本次改动只在内存生效，进程重启后会丢失）：%s", exc)
