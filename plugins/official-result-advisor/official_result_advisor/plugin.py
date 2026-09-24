@@ -118,9 +118,15 @@ class ResultAdvisorPlugin:
                 per_file[key] = per_file.get(key, 0) + 1
             (library, path), count = max(per_file.items(), key=lambda item: item[1])
             if count >= max(2, round(delivered * 0.6)):
+                # 经操作者确认的偏离（2026-09-25）：旧项目 advice.py:148-150
+                # 同一场景建议 `exclude="<文件路径>"`，但两边检索入口的 exclude
+                # 实际语义都是库 ID（library.resolve_entries 对未知名直接
+                # raise），AI 照做只会让整次检索报错——旧文案是继承的既有
+                # bug。改为指向可执行的 read_document 精读入口。
                 output.append(
-                    f"命中集中在《{_stem(path)}》（{count}/{delivered} 条）：想横向比较其它笔记，"
-                    f"可传 exclude=\"{path}\" 再搜一次，或把 top_k 调大。"
+                    f"命中集中在《{_stem(path)}》（{count}/{delivered} 条）："
+                    f"想精读这篇可调 read_document(library_id=\"{library}\", path=\"{path}\")，"
+                    "想横向比较其它笔记把 top_k 调大。"
                 )
 
         if len(output) < max_lines and any(_extension(result.path) in {"pdf", "docx"} for result in hits):

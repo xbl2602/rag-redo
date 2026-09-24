@@ -205,7 +205,7 @@
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_search_advice_uses_separate_response_channel",
         "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpToolsAsyncBase.test_search_knowledge_returns_separate_advice_channel"
       ],
-      "acceptance": "建议必须纯规则、零 I/O、同一输入同一输出、最多限定数量，并与结果本体使用不同通道。",
+      "acceptance": "建议必须纯规则、零 I/O、同一输入同一输出、最多限定数量，并与结果本体使用不同通道。【经操作者确认的偏离（2026-09-25）】\"单文件集中\"场景的建议文案改为指向 read_document 精读入口——旧项目 advice.py:148-150 建议 `exclude=\"<文件路径>\"`，但两边检索入口的 exclude 实际语义都是库 ID，照做整次检索报错（继承的既有 bug）；除此之外全部规则文案与旧项目逐字对齐。",
       "blocker": ""
     },
     {

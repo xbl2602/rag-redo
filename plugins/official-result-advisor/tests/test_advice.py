@@ -109,6 +109,25 @@ class TestResultAdvisorPlugin(unittest.TestCase):
         )
         self.assertTrue(any("top_k 调大" in line for line in advice))
 
+    def test_single_file_concentration_suggests_read_document_not_exclude(self):
+        """经操作者确认的偏离（2026-09-25）：旧项目 advice.py:148-150 在"单
+        文件集中"场景建议 `exclude="<文件路径>"`，但检索入口的 exclude 实际
+        语义是库 ID，照做整次检索直接报错（继承的既有 bug）。建议必须指向
+        可执行的入口，不得再把文件路径塞进 exclude。"""
+        advice = self._advise(
+            [
+                _result("c1", "docs/深度专题.md", 0.8),
+                _result("c2", "docs/深度专题.md", 0.7),
+                _result("c3", "其他笔记.md", 0.6),
+            ],
+            top_k=3,
+        )
+        concentrated = [line for line in advice if "命中集中" in line]
+        self.assertTrue(concentrated, advice)
+        self.assertIn("read_document", concentrated[0])
+        self.assertIn('library_id="notes"', concentrated[0])
+        self.assertNotIn('exclude="', concentrated[0])
+
     def test_backfill_list_and_document_rules(self):
         self.runtime.settings.set("advice_max_lines", 3)
         advice = self._advise(
