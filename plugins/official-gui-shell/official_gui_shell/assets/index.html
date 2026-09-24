@@ -608,6 +608,7 @@
 
 <script>
 const state = {
+  settingsMeta: {},
   libraries: [],
   activeLibraryId: null,
   selectedLibraryIds: new Set(),
@@ -781,12 +782,43 @@ async function refreshSummary() {
   }
 }
 
+// 设置面板：secret 键打码显示 + 编辑框切换密码态——对齐 obsidian-rag
+// guiweb/ui/app.js:1640-1641 按 secret 标志渲染 type="password" 的既有行为；
+// 键元信息（label/hint/secret）由 get_settings 一次带回（对齐 bridge.py::get_settings）。
+function settingIsSecret(key) {
+  const meta = (state.settingsMeta || {})[key];
+  if (meta) return !!meta.secret;
+  return /_(api_key|token)$/.test(key.toLowerCase());
+}
+
+function updateSettingsValueInputType() {
+  const key = document.getElementById("settings-key").value.trim();
+  document.getElementById("settings-value").type = settingIsSecret(key) ? "password" : "text";
+}
+
 async function refreshSettings() {
   const list = document.getElementById("settings-list");
   try {
     const result = await api().get_settings();
-    const entries = Object.entries(result || {}).sort(([left], [right]) => left.localeCompare(right));
-    list.textContent = entries.length ? entries.map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join("\\n") : "没有显式设置，使用各插件默认值";
+    state.settingsMeta = (result && result.meta) || {};
+    const values = (result && result.values) || {};
+    const knownKeys = Object.keys(state.settingsMeta).sort((left, right) => left.localeCompare(right));
+    const lines = [];
+    for (const key of knownKeys) {
+      const meta = state.settingsMeta[key] || {};
+      const label = meta.label && meta.label !== key ? `${key}（${meta.label}）` : key;
+      if (Object.prototype.hasOwnProperty.call(values, key)) {
+        const shown = meta.secret ? "******（已设置，需修改请重新输入）" : JSON.stringify(values[key]);
+        lines.push(`${label} = ${shown}${meta.hint ? "\n  " + meta.hint : ""}`);
+      } else if (meta.hint || (meta.label && meta.label !== key)) {
+        lines.push(`${label} = （未设置，使用默认值）${meta.hint ? "\n  " + meta.hint : ""}`);
+      }
+    }
+    for (const [key, value] of Object.entries(values).sort(([left], [right]) => left.localeCompare(right))) {
+      if (!state.settingsMeta[key]) lines.push(`${key} = ${settingIsSecret(key) ? "******（已设置，需修改请重新输入）" : JSON.stringify(value)}`);
+    }
+    list.textContent = lines.length ? lines.join("\n") : "没有显式设置，使用各插件默认值";
+    updateSettingsValueInputType();
   } catch (error) {
     list.textContent = readableError(error, "无法读取设置");
   }
@@ -2009,6 +2041,7 @@ document.getElementById("summary-refresh-btn").onclick = async () => {
   document.getElementById("summary-text").value = result && result.ok ? result.text || "" : "";
   setStatus(result && result.ok ? "摘要已生成" : readableError(result && result.error, "生成摘要失败"), !(result && result.ok));
 };
+document.getElementById("settings-key").addEventListener("input", updateSettingsValueInputType);
 document.getElementById("settings-save-btn").onclick = async () => {
   const key = document.getElementById("settings-key").value.trim();
   const raw = document.getElementById("settings-value").value;

@@ -19,6 +19,40 @@ from core.atomic import atomic_write_bytes
 from core.pipeline import DEFAULT_CONFIDENCE_WARN_THRESHOLD, Pipeline, confidence_tier
 
 
+#: 已知设置键的展示元信息——对齐 obsidian-rag/gui/config_editor.py 的
+#: FIELD_META（label/hint/secret），放在 GUI 插件层而不是 core/settings.py：
+#: "这个键在设置面板里怎么展示"是 GUI 的呈现关注点，设置存储本身只管
+#: 存取（同"设置项默认值由调用方声明"的分工）。未登记的键回退用键名
+#: 本身做 label；`*_api_key`/`*_token` 后缀按规则一律视为敏感（对齐
+#: config_editor.py:168/278 对 mineru_api_key/library_summary_llm_api_key
+#: 的 secret 标记），未来新增 key 类设置不需要记得回来登记。
+SETTING_FIELD_META: dict[str, dict[str, Any]] = {
+    "fusion_dense_weight": {"label": "RRF 向量语义路权重", "hint": "调大偏向语义检索；两路等权1.0/1.0为经典无权重RRF"},
+    "fusion_bm25_weight": {"label": "RRF BM25 关键词路权重", "hint": "调大偏向关键词检索"},
+    "default_libraries": {"label": "默认检索库", "hint": "检索的 libraries 参数留空时先收窄到这些库（库id列表）"},
+    "confidence_warn_threshold": {"label": "低置信度警示线", "hint": "低于此值的结果标注“仅供参考”（默认0.30）"},
+    "confidence_drop_threshold": {"label": "置信度骤降警示线", "hint": "0=关闭（沿用旧项目当前口径）"},
+    "max_chunks_per_file": {"label": "同篇结果封顶", "hint": "正文模式下同一文件最多交付几块（默认3）"},
+    "tbd_exclude_ratio": {"label": "占位符占比阈值", "hint": "正文被占位符占据超过此占比的文件记 tbd 终态跳过索引"},
+    "pdf_scan_backend": {"label": "扫描件 OCR 后端", "hint": "none=不OCR（混合PDF保持scanned终态）；mineru-cloud/mineru-local"},
+    "mineru_python": {"label": "MinerU 解释器覆盖路径", "hint": "留空则按 uv tool 标准落点自动探测本机已装环境"},
+    "hyde_enabled": {"label": "HyDE 查询增强开关", "hint": "默认关闭；开启后低置信查询会用 LLM 生成假设文档重查"},
+    "hyde_min_confidence": {"label": "HyDE 触发阈值", "hint": "首轮 top1 置信度低于此值才触发（默认0.5）"},
+    "hyde_llm_url": {"label": "HyDE LLM 端点", "hint": "OpenAI 兼容 chat/completions 地址"},
+    "hyde_llm_model": {"label": "HyDE LLM 模型", "hint": ""},
+    "hyde_llm_api_key": {"label": "HyDE LLM API Key", "secret": True, "hint": "敏感信息，不进任何日志"},
+    "hyde_llm_timeout_seconds": {"label": "HyDE 请求超时（秒）", "hint": ""},
+    "hyde_llm_max_tokens": {"label": "HyDE 生成上限（token）", "hint": ""},
+}
+
+
+def _setting_is_secret(key: str) -> bool:
+    lowered = key.lower()
+    return lowered.endswith(("_api_key", "_token")) or bool(
+        SETTING_FIELD_META.get(key, {}).get("secret")
+    )
+
+
 class Api:
     def __init__(self, pipeline: Pipeline, lib_mgr: Any) -> None:
         self._pipeline = pipeline
@@ -313,19 +347,23 @@ class Api:
         return {"ok": True, "library_id": new_id}
 
     def get_settings(self) -> dict[str, Any]:
-        """列出当前已持久化的全部设置项（`core/settings.py` 通用设置
-        存储，2026-09-23 全面功能审计后补齐，对齐 obsidian-rag GUI 的
-        Config 编辑面板）。只列出"已经被显式设过值"的键——每个设置项的
-        默认值分散在各自的插件/`core/pipeline.py` 里（架构原则"同一件事
-        只能在一处定义"，这个类不该、也不知道去重复维护一份全局默认值
-        清单），前端展示"未设置"的项时应该显示"（使用默认值）"而不是
-        编个假默认值出来。
-
-        **已知的简化**：目前没有把"这个键是什么意思、合法取值范围是什么"
-        这类元信息暴露出来——obsidian-rag 的 config.json 模板把这些写成
-        行内注释，rag-redo 这一层现在只是裸的键值对，前端要做成可用的
-        设置面板还需要自己维护一份"键名→中文说明"的映射，这块还没做。"""
-        return self._pipeline.runtime.settings.all()
+        """返回 `{"values": {...}, "meta": {key: {label, hint, secret}}}`——
+        对齐 obsidian-rag/guiweb/bridge.py::get_settings（801-820）一次把
+        当前值和字段元信息一起带回的设计：`values` 只含"已经被显式设过值"
+        的键（每个设置项的默认值分散在各自的插件/`core/pipeline.py` 里，
+        架构原则"同一件事只能在一处定义"，这里不重复维护默认值清单），
+        `meta` 覆盖全部已知键（含未设置的）供前端展示说明，`secret=True`
+        的键由前端按密码框渲染、列表里打码显示（真实值仍随 values 返回，
+        与旧项目一致——打码是展示层行为，不是接口层截断）。"""
+        values = self._pipeline.runtime.settings.all()
+        meta: dict[str, Any] = {}
+        for key in dict.fromkeys([*SETTING_FIELD_META, *values]):
+            entry = dict(SETTING_FIELD_META.get(key, {}))
+            entry.setdefault("label", key)
+            entry.setdefault("hint", "")
+            entry["secret"] = _setting_is_secret(key)
+            meta[key] = entry
+        return {"values": values, "meta": meta}
 
     def set_setting(self, key: str, value: Any) -> dict[str, Any]:
         """写一个设置项，立即持久化、对后续调用立即生效（不需要重启——

@@ -388,12 +388,14 @@ class TestApi(unittest.TestCase):
         self.assertFalse(result["ok"])
 
     def test_get_settings_starts_empty(self):
-        self.assertEqual(self.api.get_settings(), {})
+        result = self.api.get_settings()
+        self.assertEqual(result["values"], {})
+        self.assertIn("fusion_dense_weight", result["meta"])
 
     def test_set_setting_then_get_settings_round_trips(self):
         result = self.api.set_setting("fusion_dense_weight", 2.0)
         self.assertTrue(result["ok"])
-        self.assertEqual(self.api.get_settings(), {"fusion_dense_weight": 2.0})
+        self.assertEqual(self.api.get_settings()["values"], {"fusion_dense_weight": 2.0})
 
     def test_set_setting_takes_effect_immediately_without_restart(self):
         """对齐架构红线8"切换实现是配置层面操作，不需要重启"——写了设置
@@ -405,12 +407,26 @@ class TestApi(unittest.TestCase):
         self.api.set_setting("k", "v")
         result = self.api.unset_setting("k")
         self.assertTrue(result["ok"])
-        self.assertEqual(self.api.get_settings(), {})
+        self.assertEqual(self.api.get_settings()["values"], {})
         self.assertEqual(self.api._pipeline.runtime.settings.get("k", "default"), "default")
 
     def test_unset_setting_missing_key_is_ok_not_error(self):
         result = self.api.unset_setting("never-set")
         self.assertTrue(result["ok"])
+
+    def test_settings_meta_marks_api_keys_secret(self):
+        """对齐 obsidian-rag/gui/config_editor.py:168/278（secret 标志）与
+        guiweb/bridge.py:813（元信息随值一起返回）：API key 类设置必须带
+        secret=True 让前端按密码框渲染，且规则兜底覆盖未登记的 key 类新键。"""
+        self.api.set_setting("hyde_llm_api_key", "sk-something")
+        self.api.set_setting("custom_provider_token", "tok-something")
+        self.api.set_setting("fusion_dense_weight", 1.5)
+        meta = self.api.get_settings()["meta"]
+        self.assertTrue(meta["hyde_llm_api_key"]["secret"])
+        self.assertTrue(meta["custom_provider_token"]["secret"], "未登记的 *_token 键按规则兜底")
+        self.assertFalse(meta["fusion_dense_weight"]["secret"])
+        self.assertTrue(meta["hyde_llm_api_key"]["label"])
+        self.assertTrue(meta["fusion_dense_weight"]["hint"], "已知键必须带中文说明")
 
 
 if __name__ == "__main__":
