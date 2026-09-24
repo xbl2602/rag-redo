@@ -16,6 +16,6 @@ health_check = "http://127.0.0.1:{port}/health"
 env_bootstrap = "env_bootstrap.py"
 
 [permissions]
-filesystem = ["vault_read"]
+filesystem = ["vault_read", "data_write"]
 network = false
 gpu = true

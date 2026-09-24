@@ -46,6 +46,8 @@ class ExtractedDocument:
     extracted_by: str  # 插件 id，例如 "official-extractor-pdf-text"
     extractor_version: str
     content_hash: str  # 源文件内容指纹，供增量判断是否需要重新抽取
+    failure_state: str | None = None
+    capability_signature: str | None = None
 
     def __post_init__(self) -> None:
         if (self.text is None) == (self.failure_reason is None):
@@ -71,6 +73,8 @@ class Chunk:
     heading_breadcrumb: str  # 所在标题层级面包屑，方便检索结果展示来源
     chunked_by: str
     chunker_version: str
+    section_id: str = ""
+    section_text: str = ""
 
 
 # ---- 向量化 / 词法化阶段 ----------------------------------------------------
@@ -108,6 +112,13 @@ class SearchQuery:
 
 
 @dataclass(frozen=True)
+class QueryExpansion:
+    query: str
+    expanded_by: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class ScoredChunk:
     """检索/融合/重排各阶段共用的"一个块+一个分数"载体。score 的含义随
     stage 变化（lexical 分数 / 向量相似度 / RRF 融合分数 / 重排分数），
@@ -128,7 +139,86 @@ class SearchResult:
     heading_breadcrumb: str
     text: str
     confidence: float  # 0~1，展示层按此分档（强/中/弱相关）
-    advice: tuple[str, ...] = ()  # 自适应建议，继承旧项目 advice.py 的思路，Phase 3 落地
+    backfilled: bool = False
+    advice: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SearchAdviceInput:
+    results: tuple[SearchResult, ...]
+    query: str
+    mode: str
+    top_k: int
+    default_libraries: tuple[str, ...]
+    warn_threshold: float
+    strong_threshold: float
+
+
+@dataclass(frozen=True)
+class SearchResponse:
+    results: tuple[SearchResult, ...]
+    advice: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class VisualPageState:
+    library_id: str
+    path: str
+    provider_id: str
+    status: str
+    failure_reason: str | None
+    pages: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class GraphNode:
+    node_id: str
+    library_id: str
+    path: str
+    node_type: str
+    chunks: int = 0
+    updated_ns: int | None = None
+    failure_reason: str | None = None
+    theme: str = "general"
+    extraction_state: str = "none"
+    visual_state: str = "none"
+    page_number: int | None = None
+    page_count: int | None = None
+    is_hub: bool = False
+
+
+@dataclass(frozen=True)
+class GraphEdge:
+    source: str
+    target: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class GraphStats:
+    nodes: int
+    edges: int
+
+
+@dataclass(frozen=True)
+class GraphResponse:
+    nodes: tuple[GraphNode, ...]
+    edges: tuple[GraphEdge, ...]
+    library_ids: tuple[str, ...]
+    stats: GraphStats
+
+
+@dataclass(frozen=True)
+class SemanticGraphEdge:
+    source: str
+    target: str
+    similarity: float
+
+
+@dataclass(frozen=True)
+class SemanticGraphResponse:
+    edges: tuple[SemanticGraphEdge, ...]
+    error: str | None = None
 
 
 # ---- 页级视觉导航（visual_index 扩展点，比如 official-visual-wemm）--------

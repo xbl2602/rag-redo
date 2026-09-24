@@ -36,21 +36,36 @@ class Api:
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
 
-    def reindex_library(self, library_id: str) -> dict[str, Any]:
+    def reindex_library(self, library_id: str, full: bool = False) -> dict[str, Any]:
         try:
-            report = self._pipeline.index_library(library_id)
-        except (KeyError, Exception) as exc:  # noqa: BLE001 - 见模块 docstring
+            if full:
+                result = self._pipeline.start_index_library(library_id, source="gui", full=True)
+            else:
+                result = self._pipeline.start_index_library(library_id, source="gui")
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
             return {"ok": False, "error": str(exc)}
         return {
             "ok": True,
-            "succeeded": report.succeeded,
-            "failed": report.failed,
-            "failures": [
-                {"path": f.path, "reason": f.extract_failure}
-                for f in report.files
-                if f.included and not f.extracted
-            ],
+            "started": result.started,
+            "message": result.message,
+            "run_id": result.run_id,
+            "worker_pid": result.worker_pid,
+            "full": full,
         }
+
+    def index_status(self, library_id: str) -> dict[str, Any]:
+        try:
+            status = self._pipeline.index_status(library_id)
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "status": status}
+
+    def stop_index(self, library_id: str, run_id: str) -> dict[str, Any]:
+        try:
+            stopped, message = self._pipeline.stop_index_library(library_id, run_id)
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "stopped": stopped, "message": message}
 
     def search(
         self,
@@ -72,9 +87,16 @@ class Api:
         分阶段的简化——底层能力已经完整，缺的只是前端一个新的复选框
         树控件，不影响这个方法本身的正确性。"""
         if not query.strip():
-            return {"ok": True, "results": []}
+            return {"ok": True, "advice": [], "results": []}
         try:
-            results = self._pipeline.search(libraries, query, top_k=top_k, exclude=exclude, folder=folder)
+            response = self._pipeline.search_with_advice(
+                libraries,
+                query,
+                top_k=top_k,
+                exclude=exclude,
+                folder=folder,
+            )
+            results = response.results
         except Exception as exc:  # noqa: BLE001 - 见模块 docstring
             return {"ok": False, "error": str(exc)}
         warn_threshold = self._pipeline.runtime.settings.get(
@@ -82,18 +104,125 @@ class Api:
         )
         return {
             "ok": True,
+            "advice": list(response.advice),
             "results": [
                 {
                     "library_id": r.library_id,
                     "path": r.path,
                     "heading": r.heading_breadcrumb,
                     "text": r.text,
+                    "backfilled": r.backfilled,
                     "confidence": round(r.confidence, 3),
                     "confidence_tier": confidence_tier(r.confidence, warn_threshold),
                 }
                 for r in results
             ],
         }
+
+    def graph(self, libraries: str = "") -> dict[str, Any]:
+        try:
+            response = self._pipeline.graph(libraries or "all")
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+        nodes: list[dict[str, Any]] = []
+        for node in response.nodes:
+            item: dict[str, Any] = {
+                "id": node.node_id,
+                "lib": node.library_id,
+                "rel": node.path,
+                "type": node.node_type,
+                "chunks": node.chunks,
+                "updated": node.updated_ns / 1_000_000_000 if node.updated_ns is not None else None,
+                "fail_reason": node.failure_reason,
+                "theme": node.theme,
+                "pipeline": {
+                    "mineru": node.extraction_state,
+                    "wemm": node.visual_state,
+                },
+                "big": node.is_hub,
+            }
+            if node.page_number is not None:
+                item["page"] = node.page_number
+            if node.page_count is not None:
+                item["pages"] = node.page_count
+            nodes.append(item)
+        return {
+            "ok": True,
+            "nodes": nodes,
+            "edges": [
+                {"a": edge.source, "b": edge.target, "kind": edge.kind}
+                for edge in response.edges
+            ],
+            "libs": list(response.library_ids),
+            "stats": {
+                "nodes": response.stats.nodes,
+                "edges": response.stats.edges,
+            },
+        }
+
+    def open_source(self, library_id: str, path: str) -> dict[str, Any]:
+        try:
+            cfg = self._lib_mgr.store.get(library_id)
+            if cfg is None:
+                raise KeyError(f"未知库: {library_id}")
+            root = Path(cfg.root_path).resolve()
+            target = (root / path).resolve()
+            if root != target and root not in target.parents:
+                raise ValueError("源文件路径越出库目录")
+            if not target.is_file():
+                raise FileNotFoundError(str(target))
+            import os
+
+            opener = getattr(os, "startfile", None)
+            if callable(opener):
+                opener(str(target))
+            else:
+                return {"ok": True, "opened": False, "path": str(target)}
+            return {"ok": True, "opened": True, "path": str(target)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def graph_semantic_edges(
+        self,
+        libraries: str = "",
+        threshold: float = 0.62,
+    ) -> dict[str, Any]:
+        try:
+            response = self._pipeline.graph_semantic_edges(
+                libraries or "all",
+                threshold=threshold,
+            )
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "edges": [
+                {"a": edge.source, "b": edge.target, "sim": edge.similarity}
+                for edge in response.edges
+            ],
+            "error": response.error,
+        }
+
+    def index_failures(self, library_id: str) -> dict[str, Any]:
+        try:
+            failures = self._pipeline.index_failures(library_id)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "failures": (failures or {}).get("failures", [])}
+
+    def read_document(self, library_id: str, path: str) -> dict[str, Any]:
+        try:
+            document = self._pipeline.read_document(library_id, path)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "path": document.path, "text": document.text, "source": document.source}
+
+    def note_relations(self, library_id: str, path: str) -> dict[str, Any]:
+        try:
+            relations = self._pipeline.note_relations(library_id, path)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, **relations}
 
     def navigate(self, library_id: str, query: str, top_k: int = 5) -> dict[str, Any]:
         """页级视觉导航——独立于 search() 的"第二检索系统"，见
@@ -157,11 +286,8 @@ class Api:
         到的旧项目 guiweb/bridge.py::_run_summary_refresh_batch 的"先探测
         再问要不要覆盖"逻辑）。
 
-        **已知的简化**：旧项目这一步是后台线程+前端轮询（本地思考型模型
-        一次生成可能要几十秒到几分钟，同步等待会让弹层"卡住"）——rag-redo
-        的 GUI Api 层目前完全没有"后台任务+轮询"基础设施，这里简化成
-        同步阻塞调用，是刻意的简化，不是假装做了异步，调用方（前端）
-        目前需要自己接受这次调用可能较慢。"""
+        **已知的简化**：GUI 的后台任务+轮询目前只覆盖重建索引；摘要生成
+        本身仍是同步阻塞调用，调用方（前端）需要接受这次调用可能较慢。"""
         try:
             current = self._pipeline.get_library_summary(library_id)
             if current.source == "user" and not force:

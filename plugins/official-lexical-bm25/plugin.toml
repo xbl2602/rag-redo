@@ -13,5 +13,6 @@ kind = "in_process"
 entry = "official_lexical_bm25.plugin:LexicalBM25Plugin"
 
 [permissions]
+filesystem = ["data_write"]
 network = false
 gpu = false

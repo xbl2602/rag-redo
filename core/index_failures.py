@@ -14,14 +14,7 @@ index_library()` 跑完后产出的 `IndexReport` 本来就带着这些信息
 数据也该由编排层自己持久化，不是某个插件的职责，也不需要做成扩展点
 （没有"可插拔的失败诊断算法"这种需求）。
 
-**刻意的简化，如实记录**：obsidian-rag 的 `index_failures` 基于持久化
-的 per-file meta（`index_meta_*.json`），额外能判断"这条失败下一轮
-会不会自动重试"（对照当前 OCR 能力签名 `current_backend_sig()`）——
-这依赖它"增量索引、跳过内容没变的文件"的机制。rag-redo 目前每次
-`index_library()` 都是全量重跑（Phase 1 既定简化，见 `docs/ROADMAP.md`），
-不存在"这次失败下次会不会重试"的问题——反正下次全量重跑本来就会
-重新试一遍所有文件，这个问题在 rag-redo 里不成立，不是简化掉答不出来。
-这里只回答"上一次全量重跑后，谁没转成、为什么"，不做重试预测。
+**增量失败语义**：per-file manifest 记录终态、deferred、能力签名和输入指纹。稳定终态在输入与能力不变时跳过；内容或能力变化后重试。deferred 不进入终态清单，并在后续同步继续尝试；成功后清除失败状态。删除或排除的文件从当前 generation 的失败清单中消失。
 """
 from __future__ import annotations
 
@@ -35,17 +28,25 @@ class IndexFailuresStore:
     def __init__(self, root: Path) -> None:
         self._root = root
 
-    def _path_for(self, library_id: str) -> Path:
+    def _path_for(self, library_id: str, generation: str | None = None) -> Path:
         safe = re.sub(r"[^\w.-]", "_", library_id)
+        if generation:
+            return self._root / "generations" / safe / f"{generation}.json"
         return self._root / f"{safe}.json"
 
-    def write_library(self, library_id: str, *, succeeded: int, failures: list[dict]) -> None:
-        """整库覆盖写一次（不是逐文件增量写）——同索引本身"不做增量、
-        全量重跑"的节奏一致。`index_library()` 每次跑完（不管成功还是
-        部分失败）都应该调用一次，让这份诊断数据始终反映"最近一次"。"""
+    def write_library(
+        self,
+        library_id: str,
+        *,
+        succeeded: int,
+        failures: list[dict],
+        generation: str | None = None,
+    ) -> None:
+        """把本轮有效文件清单的成功/失败汇总原子写入当前 generation。"""
         try:
             self._root.mkdir(parents=True, exist_ok=True)
-            target = self._path_for(library_id)
+            target = self._path_for(library_id, generation)
+            target.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = target.with_suffix(".tmp")
             data = {"succeeded": succeeded, "failures": failures}
             tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -53,12 +54,18 @@ class IndexFailuresStore:
         except OSError:
             pass  # 诊断数据写盘失败不该让索引任务本身失败——fail-open，同其他核心服务的一贯原则
 
-    def read(self, library_id: str) -> dict | None:
+    def clear_generation(self, library_id: str, generation: str) -> None:
+        try:
+            self._path_for(library_id, generation).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def read(self, library_id: str, generation: str | None = None) -> dict | None:
         """返回 `{"succeeded": N, "failures": [{"path", "reason"}, ...]}`。
         库从没索引过（没有诊断数据文件）时返回 `None`——调用方自己决定
         怎么展示"从没跑过"和"跑过但全部成功"（`failures` 为空列表）的
         区别。"""
-        path = self._path_for(library_id)
+        path = self._path_for(library_id, generation)
         if not path.is_file():
             return None
         try:

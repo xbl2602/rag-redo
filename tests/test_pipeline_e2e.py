@@ -15,6 +15,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from docx import Document
 
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -22,6 +25,8 @@ for plugin_dir in (REPO_ROOT / "plugins").glob("*"):
     if plugin_dir.is_dir():
         sys.path.insert(0, str(plugin_dir))
 
+from core.contracts import ExtractedDocument, SearchResult
+from core.index_progress import IndexStartResult
 from core.pipeline import Pipeline, confidence_tier  # noqa: E402
 from core.runtime import PluginRuntime, PluginState  # noqa: E402
 
@@ -37,6 +42,8 @@ OFFICIAL_PHASE1_PLUGINS = [
     "official-fusion-rrf",
     "official-reranker",
     "official-import-export",
+    "official-query-enhancer-hyde",
+    "official-result-advisor",
 ]
 
 
@@ -58,6 +65,30 @@ class _DeterministicFakeReranker:
         # （demo-vault 那份测试真实踩到过，见 tests/test_demo_vault.py）。
         query_terms = query.split()
         return [sum(text.count(term) for term in query_terms) for text in texts]
+
+
+class _FakeHydeClient:
+    def __init__(self, response: str = "假设文档正文") -> None:
+        self.response = response
+        self.calls: list[dict] = []
+
+    def complete(self, prompt: str, **kwargs):
+        self.calls.append({"prompt": prompt, **kwargs})
+        return self.response
+
+
+class _FailingHydeClient:
+    def complete(self, prompt: str, **kwargs):
+        raise RuntimeError("LLM unavailable")
+
+
+class _PathRankedReranker:
+    def rerank(self, query, chunk_id_text_pairs, top_k=10):
+        long_chunks = [pair for pair in chunk_id_text_pairs if ":long.md:" in pair[0]]
+        other_chunks = [pair for pair in chunk_id_text_pairs if ":long.md:" not in pair[0]]
+        ranked = [(pair[0], 0.99 - index * 0.01) for index, pair in enumerate(long_chunks)]
+        ranked.extend((pair[0], 0.60 - index * 0.01) for index, pair in enumerate(other_chunks))
+        return sorted(ranked, key=lambda item: item[1], reverse=True)[:top_k]
 
 
 class TestConfidenceTier(unittest.TestCase):
@@ -99,6 +130,7 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
 
         self.data_dir = self.tmp / "data"
         self.runtime, self.pipeline = self._build_runtime()
+        self.addCleanup(self.runtime.close)
         self.lib_mgr = self.runtime.plugins["official-library-manager"].instance
         self.lib_mgr.store.add_library("test-lib", "测试库", str(self.vault))
 
@@ -156,6 +188,48 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         self.assertTrue((self.data_dir / "chroma").exists())
         self.assertFalse((REPO_ROOT / "data" / "libraries.json").exists())
 
+    def test_agent_format_allowlist_freezes_unapproved_docx_until_authorized(self):
+        document = Document()
+        document.add_paragraph("Agent binary authorization test content")
+        document.save(str(self.vault / "agent.docx"))
+        self.pipeline.index_library("test-lib", format_allowlist=(".md", ".txt"))
+        generation = self.pipeline._generations.active("test-lib")
+        manifest = self.pipeline._manifests.read("test-lib", generation)
+        assert manifest is not None
+        self.assertNotIn("agent.docx", manifest["files"])
+        self.pipeline.index_library(
+            "test-lib",
+            full=True,
+            format_allowlist=(".md", ".txt", ".docx"),
+        )
+        generation = self.pipeline._generations.active("test-lib")
+        manifest = self.pipeline._manifests.read("test-lib", generation)
+        assert manifest is not None
+        self.assertEqual(manifest["files"]["agent.docx"]["extractor_id"], "official-extractor-docx")
+        blocked = self.pipeline.search(
+            "test-lib",
+            "Agent binary authorization test content",
+            format_allowlist=(".md", ".txt"),
+        )
+        self.assertTrue(all(result.path != "agent.docx" for result in blocked))
+        allowed = self.pipeline.search(
+            "test-lib",
+            "Agent binary authorization test content",
+            format_allowlist=(".md", ".txt", ".docx"),
+        )
+        self.assertTrue(any(result.path == "agent.docx" for result in allowed))
+
+    def test_stale_libraries_detects_first_run_changes_additions_and_removals(self):
+        allowed = {"test-lib": (".md", ".txt")}
+        self.assertEqual(self.pipeline.stale_libraries("all", format_allowlist=allowed), ["test-lib"])
+        self.pipeline.index_library("test-lib", format_allowlist=(".md", ".txt"))
+        self.assertEqual(self.pipeline.stale_libraries("all", format_allowlist=allowed), [])
+        (self.vault / "new.md").write_text("# 新文件\n\n新增内容", encoding="utf-8")
+        self.assertEqual(self.pipeline.stale_libraries("all", format_allowlist=allowed), ["test-lib"])
+        self.pipeline.index_library("test-lib", format_allowlist=(".md", ".txt"))
+        (self.vault / "new.md").unlink()
+        self.assertEqual(self.pipeline.stale_libraries("all", format_allowlist=allowed), ["test-lib"])
+
     def test_index_then_search_finds_relevant_doc(self):
         report = self.pipeline.index_library("test-lib")
         self.assertEqual(report.succeeded, 2, f"应该两个文件都索引成功: {report.files}")
@@ -165,6 +239,287 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         self.assertGreater(len(results), 0)
         self.assertEqual(results[0].path, "plugin-notes.md")
         self.assertIn("插件", results[0].text)
+
+    def test_graph_reads_active_manifest_and_relations_without_loading_embedder(self):
+        (self.vault / "plugin-notes.md").write_text(
+            "# 插件架构笔记\n\n插件系统连接到 [[cooking]]。",
+            encoding="utf-8",
+        )
+        self.pipeline.index_library("test-lib")
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        with patch.object(embedder, "embed_texts", wraps=embedder.embed_texts) as embed_texts:
+            response = self.pipeline.graph("all")
+        embed_texts.assert_not_called()
+        self.assertEqual(response.library_ids, ("test-lib",))
+        self.assertEqual({node.path for node in response.nodes}, {"plugin-notes.md", "cooking.md"})
+        self.assertIn(
+            ("test-lib|cooking.md", "test-lib|plugin-notes.md", "link"),
+            {(edge.source, edge.target, edge.kind) for edge in response.edges},
+        )
+
+    def test_graph_semantic_edges_are_separate_and_use_existing_embedder(self):
+        (self.vault / "third.md").write_text("# 第三篇\n\n独立内容。", encoding="utf-8")
+        self.pipeline.index_library("test-lib")
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        with patch.object(
+            embedder,
+            "embed_texts",
+            return_value=[(1.0, 0.0), (0.99, 0.01), (0.0, 1.0)],
+        ) as embed_texts:
+            response = self.pipeline.graph_semantic_edges("all", threshold=0.9)
+        embed_texts.assert_called_once()
+        self.assertTrue(response.error is None)
+        self.assertTrue(any(edge.source != edge.target for edge in response.edges))
+
+    def test_graph_semantic_cache_invalidates_when_document_metadata_changes(self):
+        (self.vault / "third.md").write_text("# 第三篇\n\n独立内容。", encoding="utf-8")
+        self.pipeline.index_library("test-lib")
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        vectors = [(1.0, 0.0), (0.99, 0.01), (0.0, 1.0)]
+        with patch.object(embedder, "embed_texts", return_value=vectors) as embed_texts:
+            self.pipeline.graph_semantic_edges("all", threshold=0.9)
+            self.pipeline.graph_semantic_edges("all", threshold=0.9)
+            self.assertEqual(embed_texts.call_count, 1)
+            generation = self.pipeline._generations.active("test-lib")
+            manifest = self.pipeline._manifests.read("test-lib", generation)
+            assert manifest is not None
+            manifest["files"]["third.md"]["mtime_ns"] += 1
+            self.assertTrue(self.pipeline._manifests.write(manifest))
+            self.pipeline.graph_semantic_edges("all", threshold=0.9)
+        self.assertEqual(embed_texts.call_count, 2)
+
+    def test_index_progress_callback_reports_phases_and_completion_after_work(self):
+        events = []
+        report = self.pipeline.index_library("test-lib", progress_callback=events.append)
+
+        phases = []
+        for event in events:
+            if event.phase not in phases:
+                phases.append(event.phase)
+        self.assertEqual(
+            phases,
+            ["scanning", "extracting", "embedding", "writing", "file_complete", "visual", "finalizing"],
+        )
+
+        extracting = [event for event in events if event.phase == "extracting"]
+        self.assertEqual([event.files_done for event in extracting], [0, 1])
+        self.assertTrue(all(event.stall_grace_s == 300.0 for event in extracting))
+        self.assertTrue(all(event.chunks_total is None for event in events if event.phase != "visual" and event.phase != "finalizing"))
+
+        completed = [event for event in events if event.phase == "file_complete"]
+        self.assertEqual([event.files_done for event in completed], [1, 2])
+        expected_chunks = [report.files[0].chunk_count, sum(f.chunk_count for f in report.files)]
+        self.assertEqual([event.chunks_done for event in completed], expected_chunks)
+
+        embedding = [event for event in events if event.phase == "embedding"]
+        writing = [event for event in events if event.phase == "writing"]
+        self.assertTrue(all(event.stall_grace_s == 300.0 for event in embedding))
+        self.assertTrue(all(event.stall_grace_s == 180.0 for event in writing))
+
+        visual = next(event for event in events if event.phase == "visual")
+        self.assertEqual(visual.chunks_total, visual.chunks_done)
+        self.assertEqual(visual.stall_grace_s, 300.0)
+        finalizing = next(event for event in events if event.phase == "finalizing")
+        self.assertEqual(finalizing.chunks_total, finalizing.chunks_done)
+
+    def test_background_index_start_and_stop_api(self):
+        result = IndexStartResult(True, "started", "run-1", 123)
+        with patch.object(self.pipeline._index_progress, "start", return_value=result) as start_mock:
+            with patch.object(
+                self.pipeline._index_progress,
+                "stop",
+                return_value=(True, "cancelled"),
+            ) as stop_mock:
+                started, message = self.pipeline.start_index_library("test-lib", source="e2e")
+                stopped, stop_message = self.pipeline.stop_index_library("test-lib", result.run_id)
+        self.assertTrue(started)
+        self.assertEqual(message, "started")
+        self.assertTrue(stopped)
+        self.assertEqual(stop_message, "cancelled")
+        start_mock.assert_called_once_with("test-lib", "e2e")
+        stop_mock.assert_called_once_with("test-lib", result.run_id)
+
+    def test_search_advice_uses_separate_response_channel(self):
+        result = SearchResult("c1", "test-lib", "low.md", "低", "正文", 0.1)
+        with patch.object(self.pipeline, "_search_once", return_value=[result]):
+            response = self.pipeline.search_with_advice("test-lib", "低")
+        self.assertIsInstance(response.results, tuple)
+        self.assertTrue(response.advice)
+        self.assertLessEqual(len(response.advice), 2)
+        self.assertEqual(response.results[0].advice, ())
+
+    def test_hyde_disabled_uses_one_search(self):
+        first = [SearchResult("c1", "test-lib", "first.md", "first", "first", 0.2)]
+        enhancer = self.runtime.plugins["official-query-enhancer-hyde"].instance
+        enhancer._client = _FakeHydeClient()
+        with patch.object(self.pipeline, "_search_once", return_value=first) as search_mock:
+            results = self.pipeline.search("test-lib", "能力")
+        self.assertEqual(results, first)
+        self.assertEqual(search_mock.call_count, 1)
+        self.assertEqual(enhancer._client.calls, [])
+
+    def test_hyde_rechecks_and_keeps_strictly_higher_confidence(self):
+        self.runtime.settings.set("hyde_enabled", True)
+        self.runtime.settings.set("hyde_min_confidence", 0.5)
+        enhancer = self.runtime.plugins["official-query-enhancer-hyde"].instance
+        enhancer._client = _FakeHydeClient("假设文档正文")
+        first = [SearchResult("c1", "test-lib", "first.md", "first", "first", 0.2)]
+        second = [SearchResult("c2", "test-lib", "second.md", "second", "second", 0.8)]
+        with patch.object(self.pipeline, "_search_once", side_effect=[first, second]) as search_mock:
+            results = self.pipeline.search("test-lib", "能力")
+        self.assertEqual(results, second)
+        self.assertEqual(search_mock.call_count, 2)
+        self.assertEqual(search_mock.call_args_list[1].args[1], "假设文档正文")
+        self.assertEqual(len(enhancer._client.calls), 1)
+
+    def test_hyde_failure_or_worse_result_keeps_first(self):
+        self.runtime.settings.set("hyde_enabled", True)
+        enhancer = self.runtime.plugins["official-query-enhancer-hyde"].instance
+        first = [SearchResult("c1", "test-lib", "first.md", "first", "first", 0.4)]
+        enhancer._client = _FailingHydeClient()
+        with self.assertLogs(level="WARNING"):
+            with patch.object(self.pipeline, "_search_once", return_value=first) as search_mock:
+                self.assertEqual(self.pipeline.search("test-lib", "能力"), first)
+        self.assertEqual(search_mock.call_count, 1)
+
+        enhancer._client = _FakeHydeClient("更差的查询")
+        worse = [SearchResult("c2", "test-lib", "worse.md", "worse", "worse", 0.3)]
+        with patch.object(self.pipeline, "_search_once", side_effect=[first, worse]) as search_mock:
+            self.assertEqual(self.pipeline.search("test-lib", "能力"), first)
+        self.assertEqual(search_mock.call_count, 2)
+
+    def test_second_unchanged_index_reuses_extraction_and_embeddings(self):
+        self.pipeline.index_library("test-lib", generation_id="first")
+        manifest_before = self.pipeline._manifest("test-lib", "first")
+        extractor = self.runtime.plugins["official-extractor-text"].instance
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        with patch.object(extractor, "extract", wraps=extractor.extract) as extract_mock:
+            with patch.object(embedder, "embed_chunks", wraps=embedder.embed_chunks) as embed_mock:
+                report = self.pipeline.index_library("test-lib", generation_id="second")
+        self.assertEqual(extract_mock.call_count, 0)
+        self.assertEqual(embed_mock.call_count, 0)
+        self.assertEqual(report.unchanged, 2)
+        manifest_after = self.pipeline._manifest("test-lib", "second")
+        self.assertIsNotNone(manifest_before)
+        self.assertIsNotNone(manifest_after)
+        self.assertEqual(len(manifest_before["vector_segments"]), 1)
+        self.assertEqual(len(manifest_after["vector_segments"]), 1)
+        self.assertEqual(len(manifest_after["extract_segments"]), 1)
+        self.assertTrue(manifest_after["compacted"])
+        self.assertTrue(self.pipeline.search("test-lib", "插件 架构", top_k=5))
+
+    def test_changed_file_reembeds_only_that_file(self):
+        self.pipeline.index_library("test-lib", generation_id="first")
+        (self.vault / "plugin-notes.md").write_text(
+            "# 插件架构笔记\n\n新增内容只讨论厨房食谱。", encoding="utf-8"
+        )
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        with patch.object(embedder, "embed_chunks", wraps=embedder.embed_chunks) as embed_mock:
+            report = self.pipeline.index_library("test-lib", generation_id="second")
+        self.assertEqual(embed_mock.call_count, 1)
+        self.assertEqual(report.changed, 1)
+        self.assertEqual(report.unchanged, 1)
+        results = self.pipeline.search("test-lib", "厨房 食谱", top_k=5)
+        self.assertEqual(results[0].path, "plugin-notes.md")
+
+    def test_touch_without_content_change_reuses_embeddings(self):
+        self.pipeline.index_library("test-lib", generation_id="first")
+        path = self.vault / "plugin-notes.md"
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns + 1_000_000, stat.st_mtime_ns + 1_000_000))
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        with patch.object(embedder, "embed_chunks", wraps=embedder.embed_chunks) as embed_mock:
+            report = self.pipeline.index_library("test-lib", generation_id="second")
+        self.assertEqual(embed_mock.call_count, 0)
+        self.assertEqual(report.unchanged, 2)
+
+    def test_failed_file_is_retried_and_can_recover(self):
+        path = self.vault / "recover.md"
+        path.write_text("", encoding="utf-8")
+        first = self.pipeline.index_library("test-lib", generation_id="first")
+        failed = next(item for item in first.files if item.path == "recover.md")
+        self.assertFalse(failed.extracted)
+        self.assertEqual(first.failed, 1)
+        path.write_text("# 恢复成功\n\n插件 架构 已经可以检索。", encoding="utf-8")
+        second = self.pipeline.index_library("test-lib", generation_id="second")
+        retried = next(item for item in second.files if item.path == "recover.md")
+        self.assertTrue(retried.extracted)
+        self.assertEqual(second.retried, 1)
+        self.assertTrue(any(result.path == "recover.md" for result in self.pipeline.search("test-lib", "插件 架构")))
+
+    def test_embedder_signature_change_reembeds_all_without_reextracting(self):
+        self.pipeline.index_library("test-lib", generation_id="first")
+        manifest = self.pipeline._manifest("test-lib", "first")
+        manifest["signatures"]["embedder"] = [["official-embedder-bge-m3", "old"]]
+        self.assertTrue(self.pipeline._manifests.write(manifest))
+        extractor = self.runtime.plugins["official-extractor-text"].instance
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        with patch.object(extractor, "extract", wraps=extractor.extract) as extract_mock:
+            with patch.object(embedder, "embed_chunks", wraps=embedder.embed_chunks) as embed_mock:
+                report = self.pipeline.index_library("test-lib", generation_id="second")
+        self.assertEqual(extract_mock.call_count, 0)
+        self.assertEqual(embed_mock.call_count, 2)
+        self.assertEqual(report.changed, 2)
+        updated_manifest = self.pipeline._manifest("test-lib", "second")
+        self.assertIsNotNone(updated_manifest)
+        self.assertEqual(len(updated_manifest["vector_segments"]), 1)
+        self.assertTrue(updated_manifest["vector_segments"][0].startswith("second"))
+
+    def test_full_index_forces_unchanged_files_to_rebuild(self):
+        self.pipeline.index_library("test-lib", generation_id="first")
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        with patch.object(embedder, "embed_chunks", wraps=embedder.embed_chunks) as embed_mock:
+            report = self.pipeline.index_library("test-lib", generation_id="second", full=True)
+        self.assertEqual(embed_mock.call_count, 2)
+        self.assertEqual(report.unchanged, 0)
+        self.assertEqual(report.changed, 2)
+
+    def test_failed_generation_keeps_previous_searchable_index(self):
+        self.pipeline.index_library("test-lib", generation_id="good")
+        old_paths = {r.path for r in self.pipeline.search("test-lib", "插件 架构", top_k=10)}
+        (self.vault / "new.md").write_text("# 插件新增\n\n新一代插件索引。", encoding="utf-8")
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        with patch.object(embedder, "embed_chunks", side_effect=RuntimeError("generation failed")):
+            with self.assertRaisesRegex(RuntimeError, "generation failed"):
+                self.pipeline.index_library("test-lib", generation_id="bad")
+        self.assertEqual(self.pipeline._generations.active("test-lib"), "good")
+        current_paths = {r.path for r in self.pipeline.search("test-lib", "插件 架构", top_k=10)}
+        self.assertEqual(current_paths, old_paths)
+        self.assertNotIn("new.md", current_paths)
+
+    def test_successful_generation_drops_removed_files(self):
+        self.pipeline.index_library("test-lib", generation_id="first")
+        self.assertTrue(self.pipeline.search("test-lib", "厨房 食谱", top_k=10))
+        (self.vault / "cooking.md").unlink()
+        self.pipeline.index_library("test-lib", generation_id="second")
+        self.assertEqual(self.pipeline._generations.active("test-lib"), "second")
+        self.assertFalse(
+            any(r.path == "cooking.md" for r in self.pipeline.search("test-lib", "厨房 食谱", top_k=10))
+        )
+
+    def test_emptying_library_compacts_away_old_segments(self):
+        self.pipeline.index_library("test-lib", generation_id="first")
+        (self.vault / "plugin-notes.md").unlink()
+        (self.vault / "cooking.md").unlink()
+        report = self.pipeline.index_library("test-lib", generation_id="second")
+        manifest = self.pipeline._manifest("test-lib", "second")
+        self.assertEqual(report.removed, 2)
+        self.assertEqual(self.pipeline.search("test-lib", "插件 架构", top_k=10), [])
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest["vector_segments"], [])
+        self.assertEqual(manifest["extract_segments"], [])
+        self.assertTrue(manifest["compacted"])
+
+    def test_old_generation_is_cleaned_after_next_commit(self):
+        for generation in ("first", "second", "third"):
+            self.pipeline.index_library("test-lib", generation_id=generation)
+        self.assertEqual(self.pipeline._generations.active("test-lib"), "third")
+        self.assertEqual(self.pipeline._generations.history("test-lib"), ["second"])
+        self.assertFalse((self.data_dir / "extracted" / "test-lib" / "first").exists())
+        self.assertFalse((self.data_dir / "bm25" / "generations" / "test-lib" / "first.json").exists())
+        self.assertFalse(
+            (self.data_dir / "note_relations" / "generations" / "test-lib" / "first.json").exists()
+        )
 
     def test_search_different_query_finds_different_doc(self):
         self.pipeline.index_library("test-lib")
@@ -230,6 +585,59 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         results = self.pipeline.search("big-lib2", "插件", top_k=10)
         same_file_hits = [r for r in results if r.path == "big.md"]
         self.assertEqual(len(same_file_hits), 1)
+
+    def test_small_to_big_backfills_and_folds_parent_section(self):
+        parent_paragraphs = "\n\n".join(f"测试父节第{i}段，包含足够长且不会重复的工程内容。" + "细节" * 80 for i in range(8))
+        (self.vault / "long.md").write_text(f"# 长父节\n\n{parent_paragraphs}", encoding="utf-8")
+        (self.vault / "other.md").write_text("# 其它\n\n测试其它甲。\n\n## 其它乙\n\n测试其它乙。", encoding="utf-8")
+        self.runtime.plugins["official-reranker"].instance.engine = _PathRankedReranker()
+        self.pipeline.index_library("test-lib")
+        manifest = self.pipeline._manifest("test-lib", self.pipeline._generations.active("test-lib"))
+        section = manifest["files"]["long.md"]["sections"]["s0"]
+        self.assertGreater(section["chunk_count"], 1)
+        self.assertGreater(len(section["text"]), 300)
+        self.runtime.settings.set("max_chunks_per_file", 1)
+        results = self.pipeline.search("test-lib", "测试", top_k=4)
+        long_results = [result for result in results if result.path == "long.md"]
+        self.assertEqual(len(long_results), 1)
+        self.assertTrue(long_results[0].backfilled)
+        self.assertEqual(long_results[0].text, section["text"])
+        self.assertTrue(any(result.path == "other.md" for result in results))
+
+    def test_small_to_big_list_mode_keeps_small_chunks(self):
+        parent_paragraphs = "\n\n".join(f"测试父节第{i}段。" + "细节" * 80 for i in range(8))
+        (self.vault / "long.md").write_text(f"# 长父节\n\n{parent_paragraphs}", encoding="utf-8")
+        self.runtime.plugins["official-reranker"].instance.engine = _PathRankedReranker()
+        self.pipeline.index_library("test-lib")
+        self.runtime.settings.set("max_chunks_per_file", 1)
+        results = self.pipeline.search("test-lib", "测试", top_k=4, include_body=False)
+        long_results = [result for result in results if result.path == "long.md"]
+        self.assertEqual(len(results), 4)
+        self.assertGreaterEqual(len(long_results), 2)
+        self.assertTrue(all(not result.backfilled for result in results))
+
+    def test_small_to_big_does_not_backfill_single_chunk_section(self):
+        (self.vault / "long.md").write_text(
+            "# 长父节\n\n" + "测试单块父节。" + "细节" * 80,
+            encoding="utf-8",
+        )
+        self.runtime.plugins["official-reranker"].instance.engine = _PathRankedReranker()
+        self.pipeline.index_library("test-lib")
+        results = self.pipeline.search("test-lib", "测试", top_k=3)
+        long_results = [result for result in results if result.path == "long.md"]
+        self.assertTrue(long_results)
+        self.assertTrue(all(not result.backfilled for result in long_results))
+
+    def test_small_to_big_can_be_disabled(self):
+        parent_paragraphs = "\n\n".join(f"测试父节第{i}段。" + "细节" * 80 for i in range(8))
+        (self.vault / "long.md").write_text(f"# 长父节\n\n{parent_paragraphs}", encoding="utf-8")
+        self.runtime.plugins["official-reranker"].instance.engine = _PathRankedReranker()
+        self.pipeline.index_library("test-lib")
+        self.runtime.settings.set("small_to_big", False)
+        self.runtime.settings.set("max_chunks_per_file", 1)
+        results = self.pipeline.search("test-lib", "测试", top_k=3)
+        self.assertTrue(all(not result.backfilled for result in results))
+        self.assertLessEqual(sum(result.path == "long.md" for result in results), 1)
 
     def test_confidence_drop_threshold_filters_low_confidence_results(self):
         """置信度丢弃护栏默认关闭（0.0），显式调高后应该真的把低于阈值的
@@ -416,6 +824,26 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         report = self.pipeline.index_library("test-lib")
         self.assertEqual(report.succeeded, 2)
 
+    def test_empty_and_tbd_terminal_states_are_stable_until_content_changes(self):
+        (self.vault / "empty.md").write_text("   \n", encoding="utf-8")
+        (self.vault / "draft.md").write_text("[TBD]\nTODO —\n正文占位", encoding="utf-8")
+        first = self.pipeline.index_library("test-lib")
+        self.assertEqual(first.failed, 2)
+        states = {row.path: row.failure_state for row in first.files if row.failure_state}
+        self.assertEqual(states, {"empty.md": "empty", "draft.md": "tbd"})
+        extractor = self.runtime.plugins["official-extractor-text"].instance
+        with patch.object(extractor, "extract", side_effect=AssertionError("stable terminal re-extracted")):
+            second = self.pipeline.index_library("test-lib")
+        self.assertEqual(second.retried, 0)
+        (self.vault / "draft.md").write_text("# 完成稿\n\n正式内容", encoding="utf-8")
+        third = self.pipeline.index_library("test-lib")
+        self.assertEqual(third.failed, 1)
+        self.assertEqual(third.succeeded, 3)
+        self.assertEqual(
+            {row.path: row.failure_state for row in third.files if row.failure_state},
+            {"empty.md": "empty"},
+        )
+
 
 class TestExportImportLibrary(TestEndToEndSearchPipeline):
     """导出/导入是"把已建索引的库搬到另一台机器，不用重新跑一遍索引"的
@@ -430,7 +858,18 @@ class TestExportImportLibrary(TestEndToEndSearchPipeline):
         self.pipeline.index_library("test-lib")
         data = self.pipeline.export_library("test-lib")
         zf = zipfile.ZipFile(BytesIO(data))
-        self.assertEqual(set(zf.namelist()), {"manifest.json", "vectors.json", "bm25.json"})
+        self.assertEqual(
+            set(zf.namelist()),
+            {
+                "manifest.json",
+                "vectors.json",
+                "bm25.json",
+                "index.json",
+                "extracted.json",
+                "relations.json",
+                "failures.json",
+            },
+        )
 
     def test_export_unknown_library_raises_keyerror(self):
         with self.assertRaises(KeyError):
@@ -450,6 +889,28 @@ class TestExportImportLibrary(TestEndToEndSearchPipeline):
         after = self.pipeline.search("test-lib-restored", "插件 架构", top_k=5)
         self.assertEqual([r.path for r in before], [r.path for r in after])
         self.assertEqual([r.text for r in before], [r.text for r in after])
+        imported_manifest = self.pipeline._manifest(
+            "test-lib-restored", self.pipeline._generations.active("test-lib-restored")
+        )
+        imported_ids = [
+            chunk_id
+            for record in imported_manifest["files"].values()
+            for chunk_id in record.get("chunk_ids", [])
+        ]
+        self.assertTrue(imported_ids)
+        self.assertTrue(all(chunk_id.startswith("test-lib-restored:") for chunk_id in imported_ids))
+
+    def test_import_preserves_terminal_failure_diagnostics(self):
+        (self.vault / "empty.md").write_text("", encoding="utf-8")
+        self.pipeline.index_library("test-lib")
+        archive = self.pipeline.export_library("test-lib")
+        self.pipeline.import_library(archive, root_path=str(self.vault), library_id="restored-failures")
+        manifest = self.pipeline._manifest(
+            "restored-failures", self.pipeline._generations.active("restored-failures")
+        )
+        self.assertEqual(manifest["files"]["empty.md"]["status"], "terminal")
+        self.assertEqual(manifest["files"]["empty.md"]["failure_state"], "empty")
+        self.assertEqual(self.pipeline.index_failures("restored-failures")["failures"][0]["path"], "empty.md")
 
     def test_import_without_explicit_library_id_reuses_original(self):
         self.pipeline.index_library("test-lib")
@@ -462,7 +923,15 @@ class TestExportImportLibrary(TestEndToEndSearchPipeline):
 
     def test_import_carries_over_selection_and_policy(self):
         self.lib_mgr.store.set_selection("test-lib", selection_out=["cooking.md"])
-        self.lib_mgr.store.set_policy("test-lib", new_file_default="exclude", enabled_extensions=[".md"])
+        self.lib_mgr.store.set_policy(
+            "test-lib",
+            new_file_default="exclude",
+            enabled_extensions=[".md"],
+            exclude_dirs=["private"],
+            exclude_files=["secret.txt"],
+            exclude_patterns=["*.tmp"],
+        )
+        self.lib_mgr.store.set_agent_formats("test-lib", [".pdf", ".docx"])
         self.pipeline.index_library("test-lib")
         archive = self.pipeline.export_library("test-lib")
 
@@ -471,6 +940,10 @@ class TestExportImportLibrary(TestEndToEndSearchPipeline):
         self.assertEqual(cfg.selection_out, ["cooking.md"])
         self.assertEqual(cfg.new_file_default, "exclude")
         self.assertEqual(cfg.enabled_extensions, [".md"])
+        self.assertEqual(cfg.exclude_dirs, ["private"])
+        self.assertEqual(cfg.exclude_files, ["secret.txt"])
+        self.assertEqual(cfg.exclude_patterns, ["*.tmp"])
+        self.assertEqual(cfg.agent_formats, [".pdf", ".docx"])
         self.assertEqual(cfg.root_path, "/new/machine/vault")
 
     def test_import_rejects_existing_library_id(self):
@@ -532,6 +1005,7 @@ class TestOcrChainTryFallback(unittest.TestCase):
             data_dir=self.data_dir,
         )
         self.runtime.scan()
+        self.runtime.settings.set("pdf_scan_backend", "mineru-local")
         plugin_ids = OFFICIAL_PHASE1_PLUGINS + ["official-ocr-mineru-cloud", "official-ocr-mineru-local"]
         for plugin_id in plugin_ids:
             self.runtime.load(plugin_id)
@@ -539,6 +1013,7 @@ class TestOcrChainTryFallback(unittest.TestCase):
             state = self.runtime.plugins[plugin_id]
             self.assertEqual(state.state, PluginState.ENABLED, f"{plugin_id}: {state.error}")
         self.addCleanup(lambda: self.runtime.disable("official-ocr-mineru-local"))
+        self.addCleanup(self.runtime.close)
 
         from official_embedder_bge_m3.embed import BGEM3Embedder
 
@@ -552,10 +1027,6 @@ class TestOcrChainTryFallback(unittest.TestCase):
         self.pipeline = Pipeline(self.runtime)
         self.lib_mgr = self.runtime.plugins["official-library-manager"].instance
         self.lib_mgr.store.add_library("scan-lib", "扫描件库", str(self.vault))
-        # library-manager 的默认启用格式是 [.md, .txt]（见
-        # official_library_manager/config.py），不包含 .pdf——PDF 检索
-        # 场景要显式打开，这是库层面的选择，不是extractor/OCR这一侧该
-        # 关心的事。
         self.lib_mgr.store.set_policy("scan-lib", enabled_extensions=[".md", ".txt", ".pdf"])
 
     def _restore_env(self) -> None:
@@ -565,6 +1036,98 @@ class TestOcrChainTryFallback(unittest.TestCase):
             os.environ["RAG_REDO_FAKE_OCR"] = self._fake_ocr_env_backup
         if self._api_key_backup is not None:
             os.environ["MINERU_API_KEY"] = self._api_key_backup
+
+    def test_default_none_keeps_mixed_pdf_as_scanned_terminal(self):
+        self.runtime.settings.set("pdf_scan_backend", "none")
+        report = self.pipeline.index_library("scan-lib")
+        self.assertEqual(report.succeeded, 0)
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(report.files[0].extract_failure, "scanned")
+
+    def test_stable_scanned_terminal_does_not_repeat_provider_work(self):
+        self.runtime.settings.set("pdf_scan_backend", "none")
+        first = self.pipeline.index_library("scan-lib")
+        self.assertEqual(first.failed, 1)
+        self.assertEqual(first.retried, 0)
+        local = self.runtime.plugins["official-ocr-mineru-local"].instance
+        cloud = self.runtime.plugins["official-ocr-mineru-cloud"].instance
+        with (
+            patch.object(local, "extract", side_effect=AssertionError("local OCR should not run")),
+            patch.object(cloud, "extract", side_effect=AssertionError("cloud OCR should not run")),
+        ):
+            second = self.pipeline.index_library("scan-lib")
+        self.assertEqual(second.failed, 1)
+        self.assertEqual(second.retried, 0)
+        manifest = self.pipeline._manifests.read(
+            "scan-lib", self.pipeline._generations.active("scan-lib")
+        )
+        record = manifest["files"]["scanned-contract.pdf"]
+        self.assertEqual(record["status"], "terminal")
+        self.assertEqual(record["failure_state"], "scanned")
+        self.assertFalse(self.pipeline.failure_will_retry({"path": "scanned-contract.pdf", **record}))
+
+    def test_capability_change_retries_stable_scanned_terminal(self):
+        self.runtime.settings.set("pdf_scan_backend", "none")
+        self.pipeline.index_library("scan-lib")
+        self.runtime.settings.set("pdf_scan_backend", "mineru-cloud")
+        self.assertEqual(self.pipeline.stale_libraries("scan-lib"), ["scan-lib"])
+        report = self.pipeline.index_library("scan-lib")
+        self.assertEqual(report.retried, 1)
+        self.assertEqual(report.files[0].failure_state, "scanned")
+
+    def test_deferred_is_not_a_terminal_failure_and_remains_stale(self):
+        self.runtime.settings.set("pdf_scan_backend", "mineru-local")
+        local = self.runtime.plugins["official-ocr-mineru-local"].instance
+
+        def deferred(library_id, path, root):
+            return ExtractedDocument(
+                library_id=library_id,
+                path=path,
+                text=None,
+                failure_reason="deferred",
+                extracted_by="official-ocr-mineru-local",
+                extractor_version="test",
+                content_hash="unused",
+                failure_state="deferred",
+            )
+
+        with patch.object(local, "extract", side_effect=deferred):
+            report = self.pipeline.index_library("scan-lib")
+        self.assertEqual(report.failed, 0)
+        self.assertEqual(report.deferred, 1)
+        self.assertEqual(self.pipeline.index_failures("scan-lib")["failures"], [])
+        self.assertEqual(self.pipeline.stale_libraries("scan-lib"), ["scan-lib"])
+
+    def test_cloud_without_key_keeps_exact_scanned_terminal(self):
+        self.runtime.settings.set("pdf_scan_backend", "mineru-cloud")
+        report = self.pipeline.index_library("scan-lib")
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(report.files[0].extract_failure, "scanned")
+
+    def test_mixed_pdf_routes_whole_document_to_selected_local_ocr(self):
+        (self.vault / "scanned-contract.pdf").unlink()
+        import pymupdf
+
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), "native text page content")
+        doc.new_page()
+        doc.save(str(self.vault / "mixed-contract.pdf"))
+        doc.close()
+        report = self.pipeline.index_library("scan-lib")
+        self.assertEqual(report.succeeded, 1, report.files)
+        generation = self.pipeline._generations.active("scan-lib")
+        manifest = self.pipeline._manifests.read("scan-lib", generation)
+        self.assertEqual(manifest["files"]["mixed-contract.pdf"]["extractor_id"], "official-ocr-mineru-local")
+
+    def test_existing_ocr_cache_is_reused_after_backend_changes_to_none(self):
+        self.pipeline.index_library("scan-lib")
+        self.runtime.settings.set("pdf_scan_backend", "none")
+        local = self.runtime.plugins["official-ocr-mineru-local"].instance
+        with patch.object(local, "extract", side_effect=AssertionError("OCR provider should not run")):
+            report = self.pipeline.index_library("scan-lib")
+        self.assertEqual(report.succeeded, 1)
+        self.assertEqual(report.changed, 1)
 
     def test_scanned_pdf_falls_through_to_local_ocr_and_gets_indexed(self):
         report = self.pipeline.index_library("scan-lib")

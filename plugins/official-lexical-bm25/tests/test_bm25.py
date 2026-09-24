@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 _PLUGIN_DIR = Path(__file__).parent.parent
 _REPO_ROOT = _PLUGIN_DIR.parent.parent
@@ -12,7 +14,10 @@ for p in (_REPO_ROOT, _PLUGIN_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
+from core.contracts import Chunk
+from core.runtime import PluginRuntime
 from official_lexical_bm25.bm25 import BM25Index, tokenize  # noqa: E402
+from official_lexical_bm25.plugin import LexicalBM25Plugin
 
 
 class TestTokenize(unittest.TestCase):
@@ -144,6 +149,67 @@ class TestBM25IndexPersistence(unittest.TestCase):
         self.assertEqual(restored.b, 0.6)
         self.assertEqual(restored.doc_count, 1)
         self.assertEqual(restored.search("插件系统")[0][0], "d1")
+
+
+class TestBM25PluginCache(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.data_dir = self.tmp / "data"
+        self.worker = self._runtime_instance()
+        self.host = self._runtime_instance()
+
+    def _runtime_instance(self) -> LexicalBM25Plugin:
+        runtime = PluginRuntime(_REPO_ROOT / "plugins", data_dir=self.data_dir)
+        runtime.scan()
+        runtime.load("official-lexical-bm25")
+        runtime.enable("official-lexical-bm25")
+        instance = runtime.plugins["official-lexical-bm25"].instance
+        if not isinstance(instance, LexicalBM25Plugin):
+            raise AssertionError("official-lexical-bm25 未返回有效插件实例")
+        return instance
+
+    def _chunk(self, text: str) -> Chunk:
+        return Chunk(
+            chunk_id="lib1:doc",
+            library_id="lib1",
+            path="doc.md",
+            chunk_index=0,
+            total_chunks=1,
+            text=text,
+            heading_breadcrumb="",
+            chunked_by="test",
+            chunker_version="test",
+        )
+
+    def test_external_runtime_reload_uses_size_when_mtime_is_unchanged(self):
+        self.worker.index_chunk(self._chunk("legacy"))
+        self.worker.save("lib1")
+        self.assertEqual(self.host.search("lib1", "legacy")[0][0], "lib1:doc")
+
+        path = self.data_dir / "bm25" / "lib1.json"
+        old_stat = path.stat()
+        self.worker.index_chunk(self._chunk("freshresult replacement"))
+        self.worker.save("lib1")
+        new_stat = path.stat()
+        self.assertNotEqual(old_stat.st_size, new_stat.st_size)
+        os.utime(path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+
+        self.assertEqual(self.host.search("lib1", "freshresult")[0][0], "lib1:doc")
+        self.assertEqual(self.host.search("lib1", "legacy"), [])
+
+    def test_in_process_save_and_import_do_not_reload_cached_index(self):
+        self.host.index_chunk(self._chunk("legacy"))
+        self.host.save("lib1")
+        new_index = BM25Index()
+        new_index.add("lib1:doc", "freshresult replacement")
+
+        with patch("official_lexical_bm25.plugin.BM25Index.load") as load:
+            self.assertEqual(self.host.search("lib1", "legacy")[0][0], "lib1:doc")
+            self.host.import_state("lib1", new_index.to_dict())
+            self.assertEqual(self.host.search("lib1", "freshresult")[0][0], "lib1:doc")
+
+        load.assert_not_called()
 
 
 if __name__ == "__main__":

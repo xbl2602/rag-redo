@@ -24,7 +24,11 @@ class LibraryConfig:
     selection_in: list[str] = field(default_factory=list)
     selection_out: list[str] = field(default_factory=list)
     new_file_default: str = "include"  # "include" | "exclude"
-    enabled_extensions: list[str] = field(default_factory=lambda: [".md", ".txt"])
+    enabled_extensions: list[str] = field(default_factory=lambda: [".md", ".pdf", ".docx"])
+    agent_formats: list[str] = field(default_factory=list)
+    exclude_dirs: list[str] = field(default_factory=list)
+    exclude_files: list[str] = field(default_factory=list)
+    exclude_patterns: list[str] = field(default_factory=list)
 
 
 class LibraryConfigStore:
@@ -46,7 +50,23 @@ class LibraryConfigStore:
         raw = {lib_id: asdict(cfg) for lib_id, cfg in self._libraries.items()}
         self.path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    @staticmethod
+    def _validate_identity(library_id: str, name: str, root_path: str) -> tuple[str, str, str]:
+        library_id = str(library_id).strip()
+        name = str(name).strip()
+        root_path = str(root_path).strip()
+        if not library_id or library_id in {".", ".."} or any(char in library_id for char in "/\\"):
+            raise ValueError(f"非法库 id: {library_id!r}")
+        if any(ord(char) < 32 for char in library_id + name):
+            raise ValueError("库 id 和名称不能包含控制字符")
+        if not name:
+            raise ValueError("库名称不能为空")
+        if not root_path or "\x00" in root_path:
+            raise ValueError(f"非法库路径: {root_path!r}")
+        return library_id, name, root_path
+
     def add_library(self, library_id: str, name: str, root_path: str) -> LibraryConfig:
+        library_id, name, root_path = self._validate_identity(library_id, name, root_path)
         if library_id in self._libraries:
             raise ValueError(f"库 {library_id!r} 已存在")
         cfg = LibraryConfig(library_id=library_id, name=name, root_path=root_path)
@@ -83,6 +103,9 @@ class LibraryConfigStore:
         *,
         new_file_default: str | None = None,
         enabled_extensions: list[str] | None = None,
+        exclude_dirs: list[str] | None = None,
+        exclude_files: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
     ) -> LibraryConfig:
         """改"新文件默认策略"/"启用格式列表"——这两项在 `add_library` 时
         只能取字段默认值，之前没有任何公开方法能在创建后改它们（GUI 设置
@@ -96,6 +119,29 @@ class LibraryConfigStore:
             cfg.new_file_default = new_file_default
         if enabled_extensions is not None:
             cfg.enabled_extensions = enabled_extensions
+        if exclude_dirs is not None:
+            cfg.exclude_dirs = exclude_dirs
+        if exclude_files is not None:
+            cfg.exclude_files = exclude_files
+        if exclude_patterns is not None:
+            cfg.exclude_patterns = exclude_patterns
+        self._save()
+        return cfg
+
+    def set_agent_formats(self, library_id: str, formats: list[str]) -> LibraryConfig:
+        cfg = self._libraries.get(library_id)
+        if cfg is None:
+            raise KeyError(f"未知库: {library_id}")
+        normalized: list[str] = []
+        for value in formats:
+            extension = str(value).strip().lower()
+            if extension and not extension.startswith("."):
+                extension = "." + extension
+            if extension not in {".pdf", ".docx"}:
+                raise ValueError(f"Agent 二进制授权只支持 .pdf/.docx，收到: {value!r}")
+            if extension not in normalized:
+                normalized.append(extension)
+        cfg.agent_formats = normalized
         self._save()
         return cfg
 

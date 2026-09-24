@@ -24,6 +24,7 @@
 """
 from __future__ import annotations
 
+import fnmatch
 import re
 from dataclasses import dataclass
 from typing import Literal, Sequence
@@ -66,11 +67,23 @@ def decide_included(
     selection_out: Sequence[str],
     new_file_default: NewFileDefault,
     enabled_extensions: Sequence[str] | None = None,
+    exclude_dirs: Sequence[str] | None = None,
+    exclude_files: Sequence[str] | None = None,
+    exclude_patterns: Sequence[str] | None = None,
 ) -> tuple[bool, str]:
     """判定 path 算不算在检索范围内，返回 (included, reason)。"""
     path_segs = _segments(path)
     in_match = _most_specific_match(path_segs, selection_in)
     out_match = _most_specific_match(path_segs, selection_out)
+    excluded_dirs = {_segments(value) for value in (exclude_dirs or ())}
+    directory_excluded = any(
+        rule and len(rule) < len(path_segs) and path_segs[: len(rule)] == rule
+        for rule in excluded_dirs
+    )
+    if in_match is not None and _segments(in_match.rule) in excluded_dirs:
+        return False, f"显式纳入目标同时位于排除目录：{in_match.rule}"
+    if in_match is None and out_match is None and directory_excluded:
+        return False, "命中排除目录"
 
     if in_match is None and out_match is None:
         included = new_file_default == "include"
@@ -82,6 +95,14 @@ def decide_included(
         included, reason = False, f"显式排除规则命中：{out_match.rule}"
     else:
         included, reason = False, f"路径 {path!r} 同时被纳入和排除规则命中，按安全默认排除"
+
+    if in_match is None and out_match is None:
+        basename = path.rsplit("/", 1)[-1]
+        if basename in set(exclude_files or ()) or any(
+            fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(basename, pattern)
+            for pattern in (exclude_patterns or ())
+        ):
+            return False, "命中排除文件规则"
 
     if included and enabled_extensions is not None:
         ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
@@ -101,6 +122,9 @@ def collect_included_files(
     selection_out: Sequence[str],
     new_file_default: NewFileDefault,
     enabled_extensions: Sequence[str] | None = None,
+    exclude_dirs: Sequence[str] | None = None,
+    exclude_files: Sequence[str] | None = None,
+    exclude_patterns: Sequence[str] | None = None,
 ) -> list[tuple[str, bool, str]]:
     """文件枚举唯一漏斗：任何"这个库现在应该处理哪些文件"的需求都必须走
     这个函数，不能自己再写一遍遍历+判断（docs/DATA_FLOW.md 规则4，继承
@@ -115,6 +139,9 @@ def collect_included_files(
             selection_out=selection_out,
             new_file_default=new_file_default,
             enabled_extensions=enabled_extensions,
+            exclude_dirs=exclude_dirs,
+            exclude_files=exclude_files,
+            exclude_patterns=exclude_patterns,
         ))
         for path in all_paths
     ]

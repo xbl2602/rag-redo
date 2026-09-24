@@ -73,6 +73,7 @@ class TestDemoVault(unittest.TestCase):
             data_dir=self.tmp / "data",
         )
         self.runtime.scan()
+        self.addCleanup(self.runtime.close)
         for plugin_id in REQUIRED_PLUGINS:
             self.runtime.load(plugin_id)
             self.runtime.enable(plugin_id)

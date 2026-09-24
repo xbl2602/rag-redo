@@ -159,11 +159,12 @@ def _load_engine(model_id: str):
 def _unload_engine_locked() -> None:
     """释放显存给其他 GPU 消费者让路。调用方须已持有 _ENGINE_LOCK。幂等：
     没有引擎在跑时直接返回，不是错误（/evict 空载时也该回 ok）。"""
-    global _engine
+    global _engine, _last_use
     if _engine is None:
         return
     _engine.clear()
     _engine = None
+    _last_use = time.time()
     try:
         import gc
 

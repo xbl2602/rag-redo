@@ -1,27 +1,18 @@
-"""云端OCR的提取逻辑：读文件 -> 调云端API -> ExtractedDocument。
-
-只在文字层提取器认输之后才会被链式尝试到（core/pipeline.py 的 _extract
-按插件id字母序链式尝试同一个 extractor:pdf 点的全部provider——
-official-extractor-pdf-text 排在 official-ocr-mineru-cloud 前面，见
-../official-extractor-pdf-text/official_extractor_pdf_text/extract.py 的
-"scanned:"约定）。这个提取器不需要、也不应该关心"自己是不是第二个被试
-的"，只管"给我一个文件，我能不能OCR出文字"这一件事。
-
-非PDF文件直接折叠成失败——理论上核心只会按扩展名调用registered的
-extractor:pdf点，不该收到非PDF文件，但"extractor 绝不抛异常"这条纪律
-要求即使输入不符合预期也要折叠而不是让 Path.suffix 之外的假设炸出
-未预料的异常。
-"""
+"""云端 OCR 提取与断点状态。"""
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import threading
+import time
 from pathlib import Path
 
 from core.contracts import ExtractedDocument
 
 from .ocr import MineruCloudError, _RealHttpClient
 
-EXTRACTOR_VERSION = "0.1.0"
+EXTRACTOR_VERSION = "0.3.0"
 PLUGIN_ID = "official-ocr-mineru-cloud"
 
 
@@ -29,7 +20,14 @@ def _content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _fail(library_id: str, path: str, reason: str, content_hash: str = "") -> ExtractedDocument:
+def _fail(
+    library_id: str,
+    path: str,
+    reason: str,
+    content_hash: str = "",
+    *,
+    state: str | None = None,
+) -> ExtractedDocument:
     return ExtractedDocument(
         library_id=library_id,
         path=path,
@@ -38,39 +36,176 @@ def _fail(library_id: str, path: str, reason: str, content_hash: str = "") -> Ex
         extracted_by=PLUGIN_ID,
         extractor_version=EXTRACTOR_VERSION,
         content_hash=content_hash,
+        failure_state=state,
     )
 
 
 class MineruCloudExtractor:
-    """http_client 可注入——默认懒加载的 `_RealHttpClient`，测试传入假
-    客户端（同 BGEM3Embedder(encoder=...) 的构造注入模式，不需要另起一套
-    机制）。"""
-
-    def __init__(self, http_client=None) -> None:
+    def __init__(
+        self,
+        http_client=None,
+        *,
+        pending_path: Path | None = None,
+        sidecar_dir: Path | None = None,
+        quota_path: Path | None = None,
+    ) -> None:
         self._client = http_client if http_client is not None else _RealHttpClient()
+        self._pending_path = pending_path
+        self._sidecar_dir = sidecar_dir
+        self._quota_path = quota_path
+        self._pending_lock = threading.Lock()
+
+    def _load_pending(self) -> dict:
+        if self._pending_path is None or not self._pending_path.is_file():
+            return {}
+        try:
+            data = json.loads(self._pending_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_pending(self, data: dict) -> None:
+        if self._pending_path is None:
+            return
+        try:
+            self._pending_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._pending_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, self._pending_path)
+        except OSError:
+            pass
+
+    def _pending_match(self, path: str, content_hash: str) -> dict | None:
+        with self._pending_lock:
+            for batch_id, entry in self._load_pending().items():
+                if isinstance(entry, dict) and entry.get("path") == path and entry.get("md5") == content_hash:
+                    return {"batch_id": str(batch_id), **entry}
+        return None
+
+    def _pending_add(self, batch_id: str, path: str, content_hash: str) -> None:
+        if self._pending_path is None:
+            return
+        with self._pending_lock:
+            data = self._load_pending()
+            data[str(batch_id)] = {"path": path, "md5": content_hash, "route": "ocr:mineru-cloud"}
+            self._save_pending(data)
+
+    def _pending_remove(self, batch_id: str) -> None:
+        if self._pending_path is None:
+            return
+        with self._pending_lock:
+            data = self._load_pending()
+            if data.pop(str(batch_id), None) is not None:
+                self._save_pending(data)
+
+    def _write_sidecar(self, content_hash: str, sidecar: bytes | None) -> None:
+        if self._sidecar_dir is None or sidecar is None:
+            return
+        try:
+            self._sidecar_dir.mkdir(parents=True, exist_ok=True)
+            path = self._sidecar_dir / f"{content_hash}.json"
+            temporary = path.with_suffix(".tmp")
+            temporary.write_bytes(sidecar)
+            os.replace(temporary, path)
+        except OSError:
+            pass
+
+    def _quota_add(self, pages: int) -> None:
+        if self._quota_path is None:
+            return
+        today = time.strftime("%Y-%m-%d")
+        try:
+            data = json.loads(self._quota_path.read_text(encoding="utf-8")) if self._quota_path.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if not isinstance(data, dict) or data.get("date") != today:
+            data = {"date": today, "files": 0, "pages": 0}
+        data["files"] = int(data.get("files", 0)) + 1
+        data["pages"] = int(data.get("pages", 0)) + pages
+        try:
+            self._quota_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._quota_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(temporary, self._quota_path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _retry_call(call, attempts: int = 3):
+        for attempt in range(attempts):
+            try:
+                return call()
+            except MineruCloudError as exc:
+                if not exc.retryable or attempt == attempts - 1:
+                    raise
+                time.sleep(0.05 * (2**attempt))
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _page_count(path: Path) -> int:
+        try:
+            import pymupdf
+
+            document = pymupdf.open(str(path))
+            try:
+                return int(document.page_count)
+            finally:
+                document.close()
+        except Exception:
+            return 0
 
     def extract(self, library_id: str, path: str, root: Path) -> ExtractedDocument:
         full_path = root / path
         if full_path.suffix.lower() != ".pdf":
             return _fail(library_id, path, "不是PDF，云端OCR跳过")
-
         try:
             data = full_path.read_bytes()
         except OSError as exc:
-            return _fail(library_id, path, f"读取失败: {type(exc).__name__}: {exc}")
-
+            return _fail(library_id, path, f"读取失败: {type(exc).__name__}: {exc}", state="unreadable")
         content_hash = _content_hash(data)
+        if isinstance(self._client, _RealHttpClient) and not os.environ.get("MINERU_API_KEY"):
+            return _fail(library_id, path, "scanned", content_hash, state="scanned")
 
         try:
-            text = self._client.ocr(data, full_path.name)
+            if not all(hasattr(self._client, name) for name in ("submit", "upload", "poll")):
+                text = self._retry_call(lambda: self._client.ocr(data, full_path.name))
+            else:
+                pending = self._pending_match(str(full_path), content_hash)
+                if pending is None:
+                    submitted = self._retry_call(
+                        lambda: self._client.submit(data, full_path.name, is_ocr=True)
+                    )
+                    self._retry_call(lambda: self._client.upload(submitted["upload_url"], data))
+                    self._quota_add(self._page_count(full_path))
+                    self._pending_add(str(submitted["batch_id"]), str(full_path), content_hash)
+                    batch_id = str(submitted["batch_id"])
+                else:
+                    batch_id = str(pending["batch_id"])
+                text, status, sidecar = self._retry_call(
+                    lambda: self._client.poll(batch_id, timeout=600.0)
+                )
+                if text is None:
+                    if status in {"timeout", "download"}:
+                        return _fail(library_id, path, "deferred", content_hash, state="deferred")
+                    self._pending_remove(batch_id)
+                    return _fail(
+                        library_id,
+                        path,
+                        "extract-failed" if status != "empty" else "empty",
+                        content_hash,
+                        state="extract-failed" if status != "empty" else "empty",
+                    )
+                self._pending_remove(batch_id)
+                self._write_sidecar(content_hash, sidecar)
         except MineruCloudError as exc:
-            return _fail(library_id, path, f"云端OCR失败: {exc}", content_hash)
-        except Exception as exc:  # noqa: BLE001 - extractor 绝不抛异常，见旧项目教训
-            return _fail(library_id, path, f"云端OCR失败(未分类异常): {type(exc).__name__}", content_hash)
+            if exc.retryable:
+                return _fail(library_id, path, "deferred", content_hash, state="deferred")
+            return _fail(library_id, path, f"extract-failed: {exc}", content_hash, state="extract-failed")
+        except Exception as exc:
+            return _fail(library_id, path, f"extract-failed: {type(exc).__name__}", content_hash, state="extract-failed")
 
         if not text.strip():
-            return _fail(library_id, path, "OCR结果为空", content_hash)
-
+            return _fail(library_id, path, "empty", content_hash, state="empty")
         return ExtractedDocument(
             library_id=library_id,
             path=path,

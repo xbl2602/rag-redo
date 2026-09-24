@@ -49,6 +49,12 @@ class ExtensionRegistry:
     def providers_of(self, point: str) -> list[str]:
         return list(self._providers.get(point, []))
 
+    def provider_points(self) -> list[str]:
+        return sorted(self._providers)
+
+    def active_choices(self) -> dict[str, str]:
+        return dict(self._active_choice)
+
     def is_singleton(self, point: str) -> bool:
         """一个点只要有任何一个插件声明它是 singleton，就按 singleton 处理——
         宁可多报冲突（安全），不可漏报（危险，等于悄悄拼接了两个不兼容的实现）。"""

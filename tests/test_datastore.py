@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -41,6 +42,30 @@ class TestDataStore(unittest.TestCase):
     def test_read_missing_key_returns_none(self):
         ds = DataStore()
         self.assertIsNone(ds.read("plugin-a", "no.such.key"))
+
+    def test_storage_handles_are_owner_isolated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = DataStore(root)
+            left = store.storage_handle("plugin-a", allowed=True)
+            right = store.storage_handle("plugin-b", allowed=True)
+            self.assertNotEqual(left.path("state"), right.path("state"))
+            self.assertEqual(left.path("state"), left.path("state"))
+
+    def test_storage_handle_denies_plugin_without_data_write_permission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handle = DataStore(Path(tmp)).storage_handle("plugin-a", allowed=False)
+            with self.assertRaises(DataAccessError):
+                handle.directory("state")
+
+    def test_legacy_path_is_preserved_behind_gateway(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            handle = DataStore(root).storage_handle("plugin-a", allowed=True)
+            self.assertEqual(
+                handle.file("libraries.json", legacy="libraries.json"),
+                root / "libraries.json",
+            )
 
 
 if __name__ == "__main__":

@@ -11,16 +11,22 @@ GUI/CLI/MCP 要"建索引"或"搜索"都应该调这个模块，不要在各自�
 """
 from __future__ import annotations
 
+import hashlib
+import os
+import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
-from .contracts import DocumentContent, ExtractedDocument, LibrarySummary, PageHit, SampledChunk, SearchResult
+from .contracts import Chunk, DocumentContent, ExtractedDocument, GraphResponse, LibrarySummary, PageHit, QueryExpansion, SampledChunk, SearchAdviceInput, SearchResponse, SearchResult, SemanticGraphResponse, VisualPageState
+from .graph import build_graph, select_semantic_edges
 from .extract_cache import ExtractCache
 from .index_failures import IndexFailuresStore
-from .index_progress import IndexProgressTracker
+from .index_generation import INDEX_MANIFEST_VERSION, IndexGenerationStore, IndexManifestStore
+from .index_progress import IndexProgressEvent, IndexStartResult, IndexWorkerManager
 from .note_relations import NoteRelationsStore, extract_wikilink_targets
-from .runtime import PluginRuntime
+from .runtime import PluginRuntime, PluginState
 
 
 DEFAULT_FUSION_DENSE_WEIGHT = 1.0  # RRF 融合里"向量语义"这一路的权重，对齐 obsidian-rag/config.py 同名默认值
@@ -34,6 +40,30 @@ CONF_TIER_STRONG = 0.75  # 置信度≥此值 → "高相关"（真分尺度，�
 DEFAULT_CONFIDENCE_WARN_THRESHOLD = 0.30  # 低于此值 → "弱相关"，来源行标注"仅供参考"
 DEFAULT_CONFIDENCE_DROP_THRESHOLD = 0.0  # 低于此值直接丢弃不返回；0=关闭（obsidian-rag当前默认口径：给满top_k，只标注不丢弃）
 DEFAULT_MAX_CHUNKS_PER_FILE = 3  # 同一文件在最终结果里最多出现几条，防止单篇文档占满整个结果列表
+TERMINAL_FAILURE_STATES = frozenset({"unreadable", "empty", "tbd", "scanned", "extract-failed"})
+
+
+def is_tbd_heavy(content: str, ratio: float) -> bool:
+    if ratio <= 0:
+        return False
+    lines = [line for line in content.splitlines() if line.strip()]
+    if not lines:
+        return False
+    pattern = re.compile(r"\[TBD|TBD\s*[—-]|\[todo\]|TODO\s*[—-]", re.IGNORECASE)
+    return sum(1 for line in lines if pattern.search(line)) / len(lines) >= ratio
+
+
+def normalize_failure_state(reason: str | None) -> str:
+    value = str(reason or "extract-failed").strip().lower()
+    if value == "unreadable" or value.startswith("unreadable:"):
+        return "unreadable"
+    if value == "empty" or value.startswith("empty:"):
+        return "empty"
+    if value == "tbd" or value.startswith("tbd:"):
+        return "tbd"
+    if value == "scanned" or value.startswith("scanned:"):
+        return "scanned"
+    return "extract-failed"
 
 
 def confidence_tier(conf: float, warn_threshold: float) -> str:
@@ -94,13 +124,21 @@ class IndexFileReport:
     reason: str
     extracted: bool = False
     extract_failure: str | None = None
+    failure_state: str | None = None
+    capability_signature: str | None = None
     chunk_count: int = 0
+    action: str = "processed"
 
 
 @dataclass
 class IndexReport:
     library_id: str
     files: list[IndexFileReport] = field(default_factory=list)
+    added: int = 0
+    changed: int = 0
+    removed: int = 0
+    unchanged: int = 0
+    retried: int = 0
 
     @property
     def succeeded(self) -> int:
@@ -108,7 +146,11 @@ class IndexReport:
 
     @property
     def failed(self) -> int:
-        return sum(1 for f in self.files if f.included and not f.extracted)
+        return sum(1 for f in self.files if f.failure_state in TERMINAL_FAILURE_STATES)
+
+    @property
+    def deferred(self) -> int:
+        return sum(1 for f in self.files if f.failure_state == "deferred")
 
 
 class Pipeline:
@@ -119,9 +161,27 @@ class Pipeline:
         # 插件不需要访问，所以不放进 PluginContext，直接归 Pipeline 自己
         # 持有，同"谁需要就给谁配、不无谓扩大插件可见接口"的原则。
         self._extract_cache = ExtractCache(runtime.data_dir / "extracted")
-        self._index_progress = IndexProgressTracker(runtime.data_dir / "index_progress")
+        self._generations = IndexGenerationStore(runtime.data_dir / "index_generations")
+        self._manifests = IndexManifestStore(runtime.data_dir / "index_manifests")
+        required_points = ("library_manager", "chunker", "embedder", "lexical_index", "vector_store")
+        worker_plugin_ids: set[str] = set()
+        for point in required_points:
+            plugin_id = runtime.registry.active_of(point)
+            if plugin_id is not None:
+                worker_plugin_ids.add(plugin_id)
+        for point in runtime.registry.provider_points():
+            if point == "visual_index" or point.startswith("extractor:"):
+                worker_plugin_ids.update(runtime.registry.providers_of(point))
+        self._index_progress = IndexWorkerManager(
+            runtime.plugins_dir,
+            runtime.data_dir,
+            sorted(worker_plugin_ids),
+            active_choices=runtime.registry.active_choices(),
+        )
+        self._index_progress.set_cleanup_callback(self.discard_index_generation)
         self._note_relations = NoteRelationsStore(runtime.data_dir / "note_relations")
         self._index_failures = IndexFailuresStore(runtime.data_dir / "index_failures")
+        self._graph_semantic_cache: tuple[tuple[object, ...], SemanticGraphResponse] | None = None
 
     # ---- 插件解析 --------------------------------------------------------
 
@@ -157,6 +217,9 @@ class Pipeline:
         # 的自然延伸，不需要重新设计这一层。
         for plugin_id in sorted(provider_ids):
             extractor = self._plugin(plugin_id)
+            active = getattr(extractor, "is_active", None)
+            if callable(active) and not active():
+                continue
             result = extractor.extract(library_id, path, root)
             last_result = result
             if result.text is not None:
@@ -164,20 +227,247 @@ class Pipeline:
         assert last_result is not None
         return last_result
 
+    def _manifest(self, library_id: str, generation: str | None = None) -> dict | None:
+        if generation is None:
+            generation = self._generations.active(library_id)
+        return self._manifests.read(library_id, generation)
+
+    def _plugin_signature(self, plugin_id: str) -> list[str]:
+        plugin = self.runtime.plugins.get(plugin_id)
+        version = plugin.manifest.version if plugin is not None and plugin.manifest is not None else ""
+        signature = getattr(plugin.instance, "index_signature", None) if plugin is not None else None
+        if callable(signature):
+            version = str(signature())
+        return [plugin_id, version]
+
+    def _extractor_cache_routes(self, extension: str) -> tuple[str, ...]:
+        providers = self.runtime.registry.providers_of(f"extractor:{extension}")
+        preferred = (
+            (
+                "official-ocr-mineru-cloud",
+                "official-ocr-mineru-local",
+                "official-extractor-pdf-text",
+            )
+            if extension == "pdf"
+            else ()
+        )
+        ordered = [plugin_id for plugin_id in preferred if plugin_id in providers]
+        ordered.extend(plugin_id for plugin_id in sorted(providers) if plugin_id not in ordered)
+        routes: list[str] = []
+        for plugin_id in ordered:
+            plugin = self.runtime.plugins.get(plugin_id)
+            version = plugin.manifest.version if plugin is not None and plugin.manifest is not None else "0"
+            routes.append(f"{plugin_id}:{version}")
+        return tuple(routes)
+
+    def _read_extract_cache(
+        self,
+        library_id: str,
+        path: str,
+        segments: list[str],
+    ) -> str | None:
+        extension = Path(path).suffix.lstrip(".").lower()
+        routes = self._extractor_cache_routes(extension)
+        for segment in reversed(segments):
+            if routes:
+                text = self._extract_cache.read_preferred(library_id, path, routes, generation=segment)
+                if text is None and extension != "pdf":
+                    text = self._extract_cache.read(library_id, path, generation=segment)
+            else:
+                text = self._extract_cache.read(library_id, path, generation=segment)
+            if text is not None:
+                return text
+        return None
+
+    def _pipeline_signatures(self) -> dict[str, list[list[str]]]:
+        signatures: dict[str, list[list[str]]] = {}
+        for point in self.runtime.registry.provider_points():
+            if point == "visual_index" or not point.startswith("extractor:"):
+                continue
+            signatures[point] = [
+                self._plugin_signature(plugin_id)
+                for plugin_id in sorted(self.runtime.registry.providers_of(point))
+            ]
+        for point in ("chunker", "embedder", "lexical_index", "vector_store"):
+            plugin_id = self.runtime.registry.active_of(point)
+            signatures[point] = [self._plugin_signature(plugin_id)] if plugin_id else []
+        return signatures
+
+    def _extraction_capability_signature(
+        self,
+        path: str,
+        signatures: dict[str, list[list[str]]] | None = None,
+    ) -> str:
+        extension = Path(path).suffix.lower().lstrip(".")
+        active = signatures if signatures is not None else self._pipeline_signatures()
+        providers = tuple(
+            (point, tuple(tuple(item) for item in active.get(point, [])))
+            for point in sorted(active)
+            if point == f"extractor:{extension}"
+        )
+        material: tuple[object, ...] = (extension, providers)
+        if extension == "pdf":
+            backend = str(self.runtime.settings.get("pdf_scan_backend", "none") or "none")
+            credential = bool(str(os.environ.get("MINERU_API_KEY", "") or "").strip())
+            material += (backend, credential)
+        return hashlib.sha256(repr(material).encode("utf-8")).hexdigest()
+
+    def failure_will_retry(self, record: dict) -> bool:
+        status = str(record.get("status") or "")
+        if status == "deferred":
+            return True
+        state = normalize_failure_state(
+            str(record.get("failure_state") or record.get("failure_reason") or "")
+        )
+        if state not in {"scanned", "extract-failed"}:
+            return False
+        return str(record.get("capability_signature") or "") != self._extraction_capability_signature(
+            str(record.get("path") or "")
+        )
+
+    @staticmethod
+    def _failure_record(
+        plan: dict,
+        reason: str,
+        *,
+        state: str | None = None,
+        deferred: bool = False,
+    ) -> dict:
+        state = "deferred" if deferred else (state or normalize_failure_state(reason))
+        return {
+            "size": plan["size"],
+            "mtime_ns": plan["mtime_ns"],
+            "content_hash": plan["content_hash"],
+            "status": "deferred" if deferred else "terminal",
+            "failure_state": state,
+            "failure_reason": state,
+            "failure_detail": str(reason) if str(reason) != state else None,
+            "capability_signature": plan["capability_signature"],
+            "chunk_ids": [],
+            "links": [],
+        }
+
+    @staticmethod
+    def _file_fingerprint(path: Path) -> tuple[int, int, str]:
+        stat = path.stat()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return stat.st_size, stat.st_mtime_ns, digest.hexdigest()
+
+    @staticmethod
+    def _manifest_files(manifest: dict | None) -> dict[str, dict]:
+        files = manifest.get("files", {}) if manifest else {}
+        return {
+            str(path): dict(record)
+            for path, record in files.items()
+            if isinstance(path, str) and isinstance(record, dict)
+        } if isinstance(files, dict) else {}
+
+    @staticmethod
+    def _manifest_segments(manifest: dict | None, field: str, fallback: str | None) -> list[str]:
+        values = manifest.get(field, []) if manifest else []
+        if isinstance(values, list):
+            segments = [str(value) for value in values if value]
+            if segments or not fallback:
+                return segments
+        return [fallback] if fallback else []
+
+    @staticmethod
+    def _active_chunk_ids(manifest: dict | None) -> set[str] | None:
+        files = Pipeline._manifest_files(manifest)
+        if manifest is None:
+            return None
+        result: set[str] = set()
+        for record in files.values():
+            if record.get("status") != "indexed":
+                continue
+            chunk_ids = record.get("chunk_ids", [])
+            if isinstance(chunk_ids, list):
+                result.update(str(chunk_id) for chunk_id in chunk_ids if chunk_id)
+        return result
+
+    def _vector_records(
+        self,
+        library_id: str,
+        chunk_ids: list[str],
+        generations: list[str],
+    ) -> dict[str, dict]:
+        vector_store = self._singleton("vector_store")
+        records: dict[str, dict] = {}
+        for generation in reversed(generations):
+            missing = [chunk_id for chunk_id in chunk_ids if chunk_id not in records]
+            if not missing:
+                break
+            records.update(vector_store.get_by_ids(library_id, missing, generation=generation))
+        return records
+
+    def _vector_rows(
+        self,
+        library_id: str,
+        generations: list[str],
+        active_ids: set[str] | None,
+    ) -> dict[str, dict]:
+        vector_store = self._singleton("vector_store")
+        rows: dict[str, dict] = {}
+        for generation in reversed(generations):
+            for chunk_id, row in vector_store.get_all(library_id, generation=generation).items():
+                if active_ids is not None and chunk_id not in active_ids:
+                    continue
+                rows.setdefault(chunk_id, row)
+        return rows
+
+    def _query_vector_segments(
+        self,
+        library_id: str,
+        query_vector: list[float],
+        top_k: int,
+        generations: list[str],
+        active_ids: set[str] | None,
+    ) -> list[tuple[str, float]]:
+        vector_store = self._singleton("vector_store")
+        merged: dict[str, float] = {}
+        for generation in generations:
+            count = vector_store.count(library_id, generation=generation)
+            if count <= 0:
+                continue
+            request = min(count, max(top_k * 4, 32))
+            while True:
+                hits = vector_store.query(
+                    library_id,
+                    query_vector,
+                    top_k=request,
+                    generation=generation,
+                )
+                current = {
+                    chunk_id: score
+                    for chunk_id, score in hits
+                    if active_ids is None or chunk_id in active_ids
+                }
+                for chunk_id, score in current.items():
+                    merged[chunk_id] = max(score, merged.get(chunk_id, score))
+                if len(current) >= top_k or request >= count:
+                    break
+                request = min(count, max(request * 2, top_k + 1))
+        return sorted(merged.items(), key=lambda item: item[1], reverse=True)[:top_k]
+
     # ---- 索引态 --------------------------------------------------------
 
     def index_library(
         self,
         library_id: str,
         *,
-        progress_callback: Callable[[int, int, str], None] | None = None,
+        generation_id: str | None = None,
+        full: bool = False,
+        progress_callback: Callable[[IndexProgressEvent], None] | None = None,
+        format_allowlist: tuple[str, ...] | None = None,
     ) -> IndexReport:
-        """`progress_callback(files_done, files_total, current_path)` 可选
-        ——每处理完一个（在检索范围内的）文件调一次，供
-        `core/index_progress.py::IndexProgressTracker` 在后台执行时上报
-        进度（2026-09-23 补，见该模块 docstring）。不传就是原有的纯同步
-        调用，行为完全不变——GUI/测试目前都是这样直接调用，不强制迁移
-        到后台执行那条路径。"""
+        """`progress_callback(event)` 可选——每进入一个真实索引阶段、完成
+        一个文件时调用一次，供 `core/index_progress.py::IndexWorkerManager`
+        在工作进程中上报进度。不传就是
+        原有的纯同步调用，行为完全不变——GUI/测试目前都是这样直接调用，
+        不强制迁移到后台执行那条路径。"""
         lib_mgr = self._singleton("library_manager")
         cfg = lib_mgr.store.get(library_id)
         if cfg is None:
@@ -189,112 +479,637 @@ class Pipeline:
         lexical = self._singleton("lexical_index")
         vector_store = self._singleton("vector_store")
 
-        # 整库重跑前先清空提取结果缓存——见 core/extract_cache.py 模块
-        # docstring："被删除/排除出检索范围的文件不该在缓存里留下陈旧
-        # 正文"。索引本来就是全量重跑（不做增量），缓存跟着同一个节奏
-        # 清空重建，不需要单独的失效判断。
-        self._extract_cache.clear_library(library_id)
+        generation = generation_id or uuid.uuid4().hex
+        previous = None if full else self._generations.active(library_id)
+        old_manifest = self._manifest(library_id, previous)
+        old_files = self._manifest_files(old_manifest)
+        signatures = self._pipeline_signatures()
+        old_signatures = old_manifest.get("signatures", {}) if old_manifest else {}
+        force_extract = full
+        if old_manifest is not None:
+            force_extract = force_extract or any(
+                old_signatures.get(point) != signatures.get(point)
+                for point in signatures
+                if point.startswith("extractor:")
+            )
+        force_chunks = force_extract or (
+            old_manifest is not None and old_signatures.get("chunker") != signatures.get("chunker")
+        )
+        force_embed = force_chunks or (
+            old_manifest is not None
+            and (
+                old_signatures.get("embedder") != signatures.get("embedder")
+                or old_signatures.get("vector_store") != signatures.get("vector_store")
+            )
+        )
+        force_lexical = old_manifest is not None and old_signatures.get("lexical_index") != signatures.get("lexical_index")
 
         report = IndexReport(library_id=library_id)
-        pdf_paths: list[str] = []  # 供后面 visual_index 后置阶段复用，不再问 library_manager 第二遍
-        links_by_path: dict[str, list[str]] = {}  # 供 note_relations 现算入链，见 core/note_relations.py 模块 docstring
-        included_files = lib_mgr.resolve_included_files(library_id)
+        included_files = (
+            lib_mgr.resolve_included_files(library_id)
+            if format_allowlist is None
+            else lib_mgr.resolve_included_files(
+                library_id,
+                format_allowlist=format_allowlist,
+            )
+        )
         files_total = len(included_files)
-        for files_done, (path, included, reason) in enumerate(included_files, start=1):
-            if progress_callback is not None:
-                progress_callback(files_done, files_total, path)
-            file_report = IndexFileReport(path=path, included=included, reason=reason)
-            report.files.append(file_report)
-            if not included:
-                continue
-            if path.lower().endswith(".pdf"):
-                pdf_paths.append(path)
+        files_done = 0
+        chunks_done = 0
+        plans: list[dict] = []
+        current_included_paths: set[str] = set()
 
-            doc = self._extract(library_id, path, root)
-            if doc.text is None:
-                file_report.extract_failure = doc.failure_reason
+        def _emit(
+            phase: str,
+            *,
+            current_path: str = "",
+            chunks_total: int | None = None,
+            stall_grace_s: float = 0.0,
+            message: str = "",
+        ) -> None:
+            if progress_callback is not None:
+                progress_callback(
+                    IndexProgressEvent(
+                        phase=phase,
+                        files_done=files_done,
+                        files_total=files_total,
+                        current_path=current_path,
+                        chunks_done=chunks_done,
+                        chunks_total=chunks_total,
+                        message=message,
+                        stall_grace_s=stall_grace_s,
+                    )
+                )
+
+        _emit("scanning", message=f"发现 {files_total} 个文件")
+        for path, included, reason in included_files:
+            plan = {
+                "path": path,
+                "included": included,
+                "reason": reason,
+                "old": old_files.get(path, {}),
+                "size": -1,
+                "mtime_ns": -1,
+                "content_hash": "",
+                "fingerprint_error": "",
+                "capability_signature": self._extraction_capability_signature(path, signatures),
+                "action": "excluded" if not included else "added",
+            }
+            if not included:
+                plans.append(plan)
                 continue
-            # 提取成功就落一份缓存——read_document/find_duplicates 靠这份
-            # 缓存工作，不需要索引之后再重新跑一遍提取（尤其是OCR，重新
-            # 跑代价很高）。见 core/extract_cache.py 模块 docstring。
-            self._extract_cache.write(library_id, path, doc.text)
-            # wikilink 出链记录（core/note_relations.py，2026-09-23 补齐）
-            # ——复用同一份已提取正文，不额外触发一次提取或额外的插件调用。
-            links_by_path[path] = extract_wikilink_targets(doc.text)
+            current_included_paths.add(path)
+            try:
+                stat = (root / path).stat()
+                plan["size"] = stat.st_size
+                plan["mtime_ns"] = stat.st_mtime_ns
+            except OSError as exc:
+                plan["fingerprint_error"] = f"读取文件状态失败：{type(exc).__name__}: {exc}"
+            old = plan["old"]
+            if not plan["fingerprint_error"] and old:
+                same_stat = (
+                    plan["size"] == old.get("size")
+                    and plan["mtime_ns"] == old.get("mtime_ns")
+                )
+                if same_stat and old.get("content_hash"):
+                    plan["content_hash"] = str(old["content_hash"])
+                else:
+                    try:
+                        plan["size"], plan["mtime_ns"], plan["content_hash"] = self._file_fingerprint(root / path)
+                    except OSError as exc:
+                        plan["fingerprint_error"] = f"读取文件失败：{type(exc).__name__}: {exc}"
+                if old.get("status") == "indexed":
+                    if force_extract or force_chunks or force_embed:
+                        plan["action"] = "rebuilt"
+                    elif same_stat or plan["content_hash"] == old.get("content_hash"):
+                        plan["action"] = "unchanged"
+                    else:
+                        plan["action"] = "changed"
+                else:
+                    old_state = normalize_failure_state(
+                        str(old.get("failure_state") or old.get("failure_reason") or "")
+                    )
+                    capability_changed = (
+                        old_state in {"scanned", "extract-failed"}
+                        and str(old.get("capability_signature") or "")
+                        != str(plan["capability_signature"])
+                    )
+                    stable_terminal = (
+                        old.get("status") in {"failed", "terminal"}
+                        and old_state not in {"scanned", "extract-failed"}
+                        and not (old_state == "unreadable" and not plan["fingerprint_error"])
+                    ) or (
+                        old.get("status") in {"failed", "terminal"}
+                        and not capability_changed
+                        and str(old.get("capability_signature") or "") == str(plan["capability_signature"])
+                    )
+                    if full or old.get("status") == "deferred" or not stable_terminal:
+                        plan["action"] = "retried"
+                    elif same_stat or plan["content_hash"] == old.get("content_hash"):
+                        plan["action"] = "unchanged"
+                    else:
+                        plan["action"] = "retried" if old.get("status") != "indexed" else "changed"
+            elif not plan["fingerprint_error"]:
+                try:
+                    plan["size"], plan["mtime_ns"], plan["content_hash"] = self._file_fingerprint(root / path)
+                except OSError as exc:
+                    plan["fingerprint_error"] = f"读取文件失败：{type(exc).__name__}: {exc}"
+            plan["needs_source"] = plan["action"] in {"added", "changed", "retried"} or force_extract
+            plan["needs_chunks"] = plan["needs_source"] or force_chunks or force_embed
+            plan["needs_embed"] = plan["needs_chunks"]
+            plans.append(plan)
+
+        removed_paths = set(old_files) - current_included_paths
+        report.removed = len(removed_paths)
+        report.added = sum(1 for plan in plans if plan["action"] == "added")
+        report.changed = sum(1 for plan in plans if plan["action"] in {"changed", "rebuilt"})
+        report.unchanged = sum(1 for plan in plans if plan["action"] == "unchanged")
+        report.retried = sum(1 for plan in plans if plan["action"] == "retried")
+
+        vector_segments = self._manifest_segments(old_manifest, "vector_segments", previous)
+        extract_segments = self._manifest_segments(old_manifest, "extract_segments", previous)
+        cache_segments = list(extract_segments)
+        lexical_segments = self._manifest_segments(old_manifest, "lexical_segments", previous)
+        if force_embed:
+            vector_segments = []
+        if force_extract:
+            extract_segments = []
+        needs_vector_segment = any(plan.get("needs_embed") for plan in plans)
+        needs_extract_segment = any(plan.get("needs_source") for plan in plans)
+        lexical_changed = force_lexical or bool(removed_paths) or any(
+            bool(plan.get("needs_chunks")) for plan in plans
+        )
+        lexical_current = False
+        if lexical_changed:
+            source_lexical = lexical_segments[-1] if lexical_segments else ""
+            if hasattr(lexical, "delete_generation"):
+                lexical.delete_generation(library_id, generation)
+            if source_lexical and not force_lexical:
+                if not hasattr(lexical, "export_state") or not hasattr(lexical, "import_state"):
+                    raise PipelineError("当前 lexical_index 不支持增量复制")
+                lexical.import_state(library_id, lexical.export_state(library_id, generation=source_lexical), generation=generation)
+            if generation not in lexical_segments:
+                lexical_segments.append(generation)
+            lexical_current = True
+            if not force_lexical:
+                for removed_path in removed_paths:
+                    for chunk_id in old_files.get(removed_path, {}).get("chunk_ids", []):
+                        lexical.remove_chunk(library_id, chunk_id, generation=generation)
+
+        if needs_vector_segment and generation not in vector_segments:
+            vector_segments.append(generation)
+        if needs_extract_segment and generation not in extract_segments:
+            extract_segments.append(generation)
+
+        for plan in plans:
+            path = str(plan["path"])
+            file_report = IndexFileReport(
+                path=path,
+                included=bool(plan["included"]),
+                reason=str(plan["reason"]),
+                action=str(plan["action"]),
+            )
+            report.files.append(file_report)
+            if not plan["included"]:
+                files_done += 1
+                _emit("file_complete", current_path=path, message=f"已跳过：{path}")
+                continue
+            old = plan["old"]
+            action = str(plan["action"])
+            if action == "unchanged" and not plan["needs_chunks"]:
+                record = dict(old)
+                record["size"] = plan["size"]
+                record["mtime_ns"] = plan["mtime_ns"]
+                record["content_hash"] = plan["content_hash"] or old.get("content_hash", "")
+                plan["record"] = record
+                file_report.extracted = record.get("status") == "indexed"
+                file_report.failure_state = str(record.get("failure_state")) if record.get("failure_state") else None
+                file_report.capability_signature = str(record.get("capability_signature")) if record.get("capability_signature") else None
+                file_report.chunk_count = len(record.get("chunk_ids", []))
+                files_done += 1
+                chunks_done += file_report.chunk_count
+                _emit("file_complete", current_path=path, message=f"未变化：{path}")
+                continue
+            if plan["fingerprint_error"]:
+                reason = str(plan["fingerprint_error"])
+                record = self._failure_record(plan, reason, state="unreadable")
+                plan["record"] = record
+                file_report.extract_failure = reason
+                file_report.failure_state = str(record["failure_state"])
+                file_report.capability_signature = str(record["capability_signature"])
+                files_done += 1
+                _emit("file_complete", current_path=path, message=f"索引失败：{reason}")
+                continue
+
+            if lexical_current and plan["needs_chunks"]:
+                for chunk_id in old.get("chunk_ids", []):
+                    lexical.remove_chunk(library_id, chunk_id, generation=generation)
+            doc: ExtractedDocument | None = None
+            if plan["needs_source"]:
+                if plan["action"] in {"unchanged", "rebuilt"} and plan["content_hash"] == old.get("content_hash"):
+                    cached = self._read_extract_cache(library_id, path, cache_segments)
+                    if cached is not None:
+                        doc = ExtractedDocument(
+                            library_id=library_id,
+                            path=path,
+                            text=cached,
+                            failure_reason=None,
+                            extracted_by=str(old.get("extractor_id", "core.pipeline")),
+                            extractor_version=str(old.get("extractor_version", "-")),
+                            content_hash=str(plan["content_hash"] or old.get("content_hash", "")),
+                        )
+                        self._extract_cache.write(
+                            library_id,
+                            path,
+                            cached,
+                            generation,
+                            route=f"{doc.extracted_by}:{doc.extractor_version}",
+                        )
+                if doc is None:
+                    _emit("extracting", current_path=path, stall_grace_s=300.0, message="正在提取：{path}")
+                    doc = self._extract(library_id, path, root)
+                    if doc.text is not None:
+                        self._extract_cache.write(
+                            library_id,
+                            path,
+                            doc.text,
+                            generation,
+                            route=f"{doc.extracted_by}:{doc.extractor_version}",
+                        )
+
+            else:
+                cached = self._read_extract_cache(library_id, path, extract_segments)
+                if cached is not None:
+                    doc = ExtractedDocument(
+                        library_id=library_id,
+                        path=path,
+                        text=cached,
+                        failure_reason=None,
+                        extracted_by=str(old.get("extractor_id", "core.pipeline")),
+                        extractor_version=str(old.get("extractor_version", "-")),
+                        content_hash=str(plan["content_hash"] or old.get("content_hash", "")),
+                    )
+                if doc is None:
+                    _emit("extracting", current_path=path, stall_grace_s=300.0, message=f"正在重新提取：{path}")
+                    doc = self._extract(library_id, path, root)
+                    if doc.text is not None:
+                        self._extract_cache.write(
+                            library_id,
+                            path,
+                            doc.text,
+                            generation,
+                            route=f"{doc.extracted_by}:{doc.extractor_version}",
+                        )
+            if doc is None or doc.text is None:
+                reason = str(plan["fingerprint_error"] or (doc.failure_reason if doc else "无法读取提取缓存"))
+                is_deferred = reason.strip().lower() == "deferred" or reason.strip().lower().startswith("deferred:")
+                state = str(doc.failure_state) if doc is not None and doc.failure_state else None
+                record = self._failure_record(
+                    plan,
+                    reason,
+                    state=state,
+                    deferred=is_deferred,
+                )
+                plan["record"] = record
+                file_report.extract_failure = reason
+                file_report.failure_state = str(record["failure_state"])
+                file_report.capability_signature = str(record["capability_signature"])
+                files_done += 1
+                _emit(
+                    "file_complete",
+                    current_path=path,
+                    message="本轮延后：" + reason if is_deferred else f"索引失败：{reason}",
+                )
+                continue
+            if is_tbd_heavy(
+                doc.text,
+                float(self.runtime.settings.get("tbd_exclude_ratio", 0.1) or 0.0),
+            ):
+                reason = "tbd"
+                record = self._failure_record(plan, reason, state="tbd")
+                record["content_hash"] = doc.content_hash or plan["content_hash"]
+                record["links"] = extract_wikilink_targets(doc.text)
+                plan["record"] = record
+                file_report.extract_failure = reason
+                file_report.failure_state = "tbd"
+                file_report.capability_signature = str(record["capability_signature"])
+                files_done += 1
+                _emit("file_complete", current_path=path, message="已跳过占位重文件：tbd")
+                continue
+            if not plan["needs_chunks"]:
+                record = dict(old)
+                record["size"] = plan["size"]
+                record["mtime_ns"] = plan["mtime_ns"]
+                record["content_hash"] = doc.content_hash or plan["content_hash"]
+                plan["record"] = record
+                file_report.extracted = record.get("status") == "indexed"
+                file_report.chunk_count = len(record.get("chunk_ids", []))
+                files_done += 1
+                chunks_done += file_report.chunk_count
+                _emit("file_complete", current_path=path, message=f"已完成：{path}")
+                continue
 
             chunks = chunker.chunk(doc)
-            if not chunks:
-                file_report.extract_failure = "提取成功但没有产出任何chunk"
-                continue
-
-            vectors = embedder.embed_chunks(chunks)
-            vector_by_id = {v.chunk_id: list(v.vector) for v in vectors}
-
-            chunk_ids = [c.chunk_id for c in chunks]
-            embed_vectors = [vector_by_id[cid] for cid in chunk_ids]
-            documents = [c.text for c in chunks]
-            metadatas = [
-                {"path": c.path, "heading_breadcrumb": c.heading_breadcrumb, "chunk_index": c.chunk_index}
-                for c in chunks
-            ]
-            vector_store.upsert(library_id, chunk_ids, embed_vectors, documents=documents, metadatas=metadatas)
+            section_counts: dict[str, int] = {}
+            section_headings: dict[str, str] = {}
+            section_texts: dict[str, str] = {}
             for chunk in chunks:
-                lexical.index_chunk(chunk)
-
+                if not chunk.section_id:
+                    continue
+                section_counts[chunk.section_id] = section_counts.get(chunk.section_id, 0) + 1
+                section_headings.setdefault(chunk.section_id, chunk.heading_breadcrumb)
+                section_texts.setdefault(chunk.section_id, chunk.section_text)
+            if not chunks:
+                reason = "提取成功但没有产出任何chunk"
+                record = self._failure_record(plan, reason, state="empty")
+                record["content_hash"] = doc.content_hash or plan["content_hash"]
+                record["links"] = extract_wikilink_targets(doc.text)
+                plan["record"] = record
+                file_report.extract_failure = reason
+                file_report.failure_state = "empty"
+                file_report.capability_signature = str(record["capability_signature"])
+                files_done += 1
+                _emit("file_complete", current_path=path, message=f"索引失败：{reason}")
+                continue
+            _emit("embedding", current_path=path, stall_grace_s=300.0, message=f"正在嵌入：{path}")
+            vectors = embedder.embed_chunks(chunks)
+            vector_by_id = {vector.chunk_id: list(vector.vector) for vector in vectors}
+            chunk_ids = [chunk.chunk_id for chunk in chunks]
+            embed_vectors = [vector_by_id[chunk_id] for chunk_id in chunk_ids]
+            _emit("writing", current_path=path, stall_grace_s=180.0, message=f"正在写入：{path}")
+            vector_store.upsert(
+                library_id,
+                chunk_ids,
+                embed_vectors,
+                documents=[chunk.text for chunk in chunks],
+                metadatas=[
+                    {
+                        "path": chunk.path,
+                        "heading_breadcrumb": chunk.heading_breadcrumb,
+                        "chunk_index": chunk.chunk_index,
+                        "section_id": chunk.section_id,
+                    }
+                    for chunk in chunks
+                ],
+                generation=generation,
+            )
+            if lexical_current:
+                for chunk in chunks:
+                    lexical.index_chunk(chunk, generation=generation)
+            record = {
+                "size": plan["size"],
+                "mtime_ns": plan["mtime_ns"],
+                "content_hash": doc.content_hash or plan["content_hash"],
+                "status": "indexed",
+                "failure_state": None,
+                "failure_reason": None,
+                "failure_detail": None,
+                "capability_signature": plan["capability_signature"],
+                "extractor_id": doc.extracted_by,
+                "extractor_version": doc.extractor_version,
+                "chunker_id": chunks[0].chunked_by,
+                "chunker_version": chunks[0].chunker_version,
+                "embedder_id": vectors[0].model_id,
+                "embedder_version": vectors[0].model_version,
+                "dim": vectors[0].dim,
+                "chunk_ids": chunk_ids,
+                "sections": {
+                    section_id: {
+                        "heading": section_headings[section_id],
+                        "text": section_texts[section_id],
+                        "chunk_count": section_counts[section_id],
+                    }
+                    for section_id in section_counts
+                },
+                "links": extract_wikilink_targets(doc.text),
+            }
+            plan["record"] = record
             file_report.extracted = True
             file_report.chunk_count = len(chunks)
+            files_done += 1
+            chunks_done += len(chunks)
+            _emit("file_complete", current_path=path, message=f"已完成：{path}")
 
-        if hasattr(lexical, "save"):
-            # BM25 索引不像 Chroma 那样每次 upsert 自动落盘，攒到一整个库
-            # 处理完再存一次——见 official-lexical-bm25 插件的模块 docstring
-            # （早期实现完全没有这一步，进程重启后 BM25 那一路会悄悄清空，
-            # 是端到端测试之外才发现的真实缺口）。`hasattr` 判断是因为
-            # `lexical_index` 扩展点目前没有强制的接口契约，不是所有实现
-            # 都必须支持持久化——见 docs/PLUGIN_SPEC.md 对 Phase 1 阶段
-            # "先把官方实现做对、通用契约留给后续显现真实需求"的说明。
-            lexical.save(library_id)
+        if lexical_current:
+            if force_lexical:
+                if hasattr(lexical, "delete_generation"):
+                    lexical.delete_generation(library_id, generation)
+                active_ids = self._active_chunk_ids({"files": {str(plan["path"]): plan.get("record", {}) for plan in plans if plan.get("record")}})
+                records = self._vector_records(library_id, sorted(active_ids or set()), vector_segments)
+                total_by_path: dict[str, int] = {}
+                for record in records.values():
+                    meta = record.get("metadata") or {}
+                    path = str(meta.get("path", ""))
+                    index = int(meta.get("chunk_index", 0))
+                    total_by_path[path] = max(total_by_path.get(path, 0), index + 1)
+                for chunk_id, record in sorted(records.items()):
+                    meta = record.get("metadata") or {}
+                    path = str(meta.get("path", ""))
+                    state = next((plan.get("record", {}) for plan in plans if plan.get("path") == path), {})
+                    lexical.index_chunk(
+                        Chunk(
+                            chunk_id=chunk_id,
+                            library_id=library_id,
+                            path=path,
+                            chunk_index=int(meta.get("chunk_index", 0)),
+                            total_chunks=total_by_path.get(path, 1),
+                            text=str(record.get("document") or ""),
+                            heading_breadcrumb=str(meta.get("heading_breadcrumb", "")),
+                            chunked_by=str(state.get("chunker_id", "core.pipeline")),
+                            chunker_version=str(state.get("chunker_version", "-")),
+                        ),
+                        generation=generation,
+                    )
+            if hasattr(lexical, "save"):
+                _emit("writing", stall_grace_s=180.0, message="正在保存词法索引")
+                lexical.save(library_id, generation=generation)
 
-        # 页级视觉索引（visual_index，比如 official-visual-wemm）作为独立
-        # 后置阶段自动跟随——镜像旧项目 index.py 的 _wemm_auto_phase：每次
-        # 文字索引跑完自动同步页级视觉索引，和上面文字那条流水线彻底独立
-        # （不影响 report、不影响主链路成功/失败判定）。这里不包一层
-        # try/except——按架构红线4的同一条纪律，"绝不抛异常、失败自己折叠"
-        # 是 visual_index 插件自己的契约（同 extractor 绝不抛异常），不是
-        # 编排层兜底出来的，编排层只负责按顺序调用。没装/没启用任何
-        # visual_index 插件时这里是零开销空循环，见 docs/ROADMAP.md TODO
-        # 第1条的调查结论。
+        manifest_files = {
+            str(plan["path"]): dict(plan["record"])
+            for plan in plans
+            if plan.get("included") and plan.get("record")
+        }
+        active_ids = self._active_chunk_ids({"files": manifest_files})
+        compacted_state = bool(old_manifest and old_manifest.get("compacted", False))
+        compacted_vector_segment = False
+        compaction_due = callable(getattr(vector_store, "get_all", None)) and (
+            len(vector_segments) >= 3
+            or bool(old_manifest is not None and not old_manifest.get("compacted", False))
+        )
+        if compaction_due:
+            compact_segment = f"{generation}-compact"
+            if active_ids:
+                _emit("writing", stall_grace_s=180.0, message="正在压缩向量索引")
+                rows = self._vector_rows(library_id, vector_segments, active_ids)
+                compact_ids = sorted(rows)
+                for start in range(0, len(compact_ids), 1000):
+                    batch = compact_ids[start : start + 1000]
+                    vector_store.upsert(
+                        library_id,
+                        batch,
+                        [rows[chunk_id]["embedding"] for chunk_id in batch],
+                        documents=[rows[chunk_id]["document"] for chunk_id in batch],
+                        metadatas=[rows[chunk_id]["metadata"] for chunk_id in batch],
+                        generation=compact_segment,
+                    )
+                vector_segments = [compact_segment]
+                compacted_vector_segment = True
+            else:
+                vector_segments = []
+            compacted_extract_segments: list[str] = []
+            compacted_any = False
+            for path, record in manifest_files.items():
+                if record.get("status") != "indexed":
+                    continue
+                seen_routes: set[str] = set()
+                for segment in reversed(extract_segments):
+                    for text, route in self._extract_cache.iter_entries(library_id, path, segment):
+                        route_key = route or "legacy"
+                        if route_key in seen_routes:
+                            continue
+                        seen_routes.add(route_key)
+                        self._extract_cache.write(
+                            library_id,
+                            path,
+                            text,
+                            compact_segment,
+                            route=route,
+                        )
+                        compacted_any = True
+            if compacted_any:
+                compacted_extract_segments.append(compact_segment)
+            if lexical_segments and hasattr(lexical, "export_state") and hasattr(lexical, "import_state"):
+                lexical.import_state(
+                    library_id,
+                    lexical.export_state(library_id, generation=lexical_segments[-1]),
+                    generation=compact_segment,
+                )
+                compacted_lexical_segments = [compact_segment]
+            else:
+                compacted_lexical_segments = []
+            extract_segments = compacted_extract_segments
+            lexical_segments = compacted_lexical_segments
+            compacted_state = True
+        pdf_paths = [str(plan["path"]) for plan in plans if plan.get("included") and str(plan["path"]).lower().endswith(".pdf")]
+        changed_pdf_paths = [
+            str(plan["path"])
+            for plan in plans
+            if plan.get("included") and str(plan["path"]).lower().endswith(".pdf") and plan.get("action") != "unchanged"
+        ]
+        _emit("visual", chunks_total=chunks_done, stall_grace_s=300.0, message="正在建立视觉索引")
         for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
             visual = self._plugin(plugin_id)
-            visual.index_library(library_id, root, pdf_paths)
+            visual.index_library(
+                library_id,
+                root,
+                pdf_paths,
+                generation=generation,
+                changed_paths=changed_pdf_paths,
+                previous_generation=previous,
+            )
 
-        # 整库出链数据一次性覆盖写（不是逐文件增量写）——同索引本身"不做
-        # 增量、全量重跑"的节奏一致，见 core/note_relations.py 模块 docstring。
-        self._note_relations.write_library(library_id, links_by_path)
-
-        # 索引失败溯源诊断数据同样整库覆盖写一次——见 core/index_failures.py
-        # 模块 docstring，两条同步/后台调用路径都走这里，不需要调用方
-        # 自己再另外持久化一份。
+        links_by_path = {
+            path: [str(link) for link in record.get("links", [])]
+            for path, record in manifest_files.items()
+            if record.get("status") == "indexed"
+        }
+        _emit("finalizing", chunks_total=chunks_done, message="正在完成索引")
+        self._note_relations.write_library(library_id, links_by_path, generation)
+        failures = [
+            {
+                "path": path,
+                "reason": str(record.get("failure_state") or record.get("failure_reason") or "extract-failed"),
+                "detail": record.get("failure_detail"),
+                "capability_signature": record.get("capability_signature"),
+                "will_retry": self.failure_will_retry({"path": path, **record}),
+            }
+            for path, record in manifest_files.items()
+            if record.get("status") in {"failed", "terminal"}
+        ]
         self._index_failures.write_library(
             library_id,
             succeeded=report.succeeded,
-            failures=[
-                {"path": f.path, "reason": f.extract_failure}
-                for f in report.files
-                if f.included and not f.extracted
-            ],
+            failures=failures,
+            generation=generation,
         )
-
+        manifest = {
+            "format_version": INDEX_MANIFEST_VERSION,
+            "library_id": library_id,
+            "generation": generation,
+            "previous_generation": previous,
+            "signatures": signatures,
+            "files": manifest_files,
+            "vector_segments": vector_segments,
+            "extract_segments": extract_segments,
+            "lexical_segments": lexical_segments,
+            "active_chunk_ids": sorted(active_ids or set()),
+            "compacted": compacted_state,
+        }
+        if not self._manifests.write(manifest):
+            self.discard_index_generation(library_id, generation)
+            raise PipelineError("索引清单写入失败，旧索引保持不变")
+        known_generations = set(self._manifests.list_generations(library_id))
+        if previous:
+            known_generations.add(previous)
+        if not self._generations.commit(library_id, generation):
+            self.discard_index_generation(library_id, generation)
+            raise PipelineError("索引数据已生成，但发布 generation 失败，旧索引保持不变")
+        if compacted_vector_segment:
+            vector_store.delete_generation(library_id, generation)
+        keep_generations = {generation, *self._generations.history(library_id)}
+        referenced_generations = self._manifests.referenced_generations(library_id, [generation])
+        candidates = set(known_generations)
+        for known_generation in list(candidates):
+            data = self._manifests.read(library_id, known_generation)
+            if data:
+                for field in ("vector_segments", "extract_segments", "lexical_segments"):
+                    values = data.get(field, [])
+                    if isinstance(values, list):
+                        candidates.update(str(value) for value in values if value)
+        for candidate in sorted(candidates - keep_generations - referenced_generations):
+            self.discard_index_generation(library_id, candidate)
+            self._manifests.clear(library_id, candidate)
         return report
 
+
+    def discard_index_generation(self, library_id: str, generation: str) -> None:
+        if self._generations.active(library_id) == generation:
+            return
+        self._extract_cache.clear_library(library_id, generation)
+        self._note_relations.clear_generation(library_id, generation)
+        self._index_failures.clear_generation(library_id, generation)
+        vector_plugin = self.runtime.registry.active_of("vector_store") or ""
+        visual_plugins = set(self.runtime.registry.providers_of("visual_index"))
+        for plugin_id in sorted(
+            {
+                self.runtime.registry.active_of("lexical_index") or "",
+                vector_plugin,
+                *visual_plugins,
+            }
+        ):
+            if not plugin_id:
+                continue
+            plugin = self._plugin(plugin_id)
+            cleanup = getattr(plugin, "delete_generation", None)
+            if cleanup is None:
+                continue
+            targets = [generation]
+            if plugin_id == vector_plugin or plugin_id in visual_plugins:
+                targets.append(f"{generation}-compact")
+            for target in targets:
+                try:
+                    cleanup(library_id, target)
+                except Exception:
+                    pass
+
     def index_failures(self, library_id: str) -> dict | None:
-        """索引失败溯源（只读诊断，对齐 obsidian-rag 的 `index_failures`
-        工具——简化版，见 `core/index_failures.py` 模块 docstring）：列出
+        """索引失败溯源（只读诊断，对齐 obsidian-rag 的 `index_failures` 工具）：列出
         最近一次 `index_library()` 跑完后，库内"没转成/没索引上"的文件
         及原因。库存在但从没索引过时返回 `None`（不是错误）。"""
         lib_mgr = self._singleton("library_manager")
         if lib_mgr.store.get(library_id) is None:
             raise KeyError(f"未知库: {library_id}")
-        return self._index_failures.read(library_id)
+        return self._index_failures.read(library_id, self._generations.active(library_id))
 
     def note_relations(self, library_id: str, path: str) -> dict:
         """双链关系查询（对齐 obsidian-rag 的 `note_relations` 工具）：
@@ -310,28 +1125,118 @@ class Pipeline:
         lib_mgr = self._singleton("library_manager")
         if lib_mgr.store.get(library_id) is None:
             raise KeyError(f"未知库: {library_id}")
-        return self._note_relations.resolve(library_id, path)
+        return self._note_relations.resolve(library_id, path, self._generations.active(library_id))
 
-    def start_index_library(self, library_id: str) -> tuple[bool, str]:
+    def graph(self, libraries: str = "all") -> GraphResponse:
+        lib_mgr = self._singleton("library_manager")
+        entries = lib_mgr.resolve_libraries(libraries or "all")
+        library_ids = tuple(entry.library_id for entry in entries)
+        manifests: dict[str, dict | None] = {}
+        relation_edges: dict[str, tuple[tuple[str, str], ...]] = {}
+        included_files: dict[str, tuple[tuple[str, bool, str], ...]] = {}
+        page_states: dict[str, tuple[VisualPageState, ...]] = {}
+        for library_id in library_ids:
+            generation = self._generations.active(library_id)
+            manifests[library_id] = self._manifest(library_id, generation)
+            relation_edges[library_id] = self._note_relations.resolved_edges(library_id, generation)
+            included_files[library_id] = tuple(lib_mgr.resolve_included_files(library_id))
+            states: list[VisualPageState] = []
+            for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
+                try:
+                    visual = self._plugin(plugin_id)
+                    page_reader = getattr(visual, "graph_page_states", None)
+                    generated = page_reader(library_id, generation) if generation and callable(page_reader) else ()
+                    states.extend(state for state in generated if isinstance(state, VisualPageState))
+                except Exception:
+                    continue
+            page_states[library_id] = tuple(states)
+        return build_graph(
+            library_ids=library_ids,
+            manifests=manifests,
+            relation_edges=relation_edges,
+            included_files=included_files,
+            page_states=page_states,
+        )
+
+    def graph_semantic_edges(
+        self,
+        libraries: str = "all",
+        *,
+        threshold: float = 0.62,
+    ) -> SemanticGraphResponse:
+        response = self.graph(libraries)
+        nodes = [
+            node
+            for node in response.nodes
+            if node.node_type in {"md", "txt", "docx"}
+            or (node.node_type == "pdf" and node.chunks > 0)
+        ]
+        if len(nodes) < 3:
+            return SemanticGraphResponse(edges=())
+        plugin_id = self.runtime.registry.active_of("embedder") or ""
+        signature = tuple(tuple(value) for value in self._plugin_signature(plugin_id))
+        key = (
+            tuple((node.node_id, node.updated_ns, node.chunks, node.failure_reason) for node in nodes),
+            float(threshold),
+            signature,
+        )
+        if self._graph_semantic_cache is not None and self._graph_semantic_cache[0] == key:
+            return self._graph_semantic_cache[1]
+        texts = [f"{Path(node.path).stem} {node.path}" for node in nodes]
+        try:
+            vectors = self._singleton("embedder").embed_texts(texts)
+            if len(vectors) != len(nodes) or any(len(vector) == 0 for vector in vectors):
+                raise ValueError("嵌入结果数量或维度无效")
+            result = SemanticGraphResponse(
+                edges=select_semantic_edges(
+                    [node.node_id for node in nodes],
+                    vectors,
+                    threshold=threshold,
+                )
+            )
+        except Exception as exc:
+            return SemanticGraphResponse(
+                edges=(),
+                error=f"语义边计算失败：{type(exc).__name__}",
+            )
+        self._graph_semantic_cache = (key, result)
+        return result
+
+    def start_index_library(
+        self,
+        library_id: str,
+        source: str = "api",
+        full: bool = False,
+        *,
+        format_allowlist: tuple[str, ...] | None = None,
+    ) -> IndexStartResult:
         """后台重建索引——对齐 obsidian-rag 的 `reindex_knowledge`"后台
-        执行、立即返回"语义（2026-09-23 全面功能审计发现的缺口，见
-        `core/index_progress.py` 模块 docstring）。真正的索引逻辑还是
-        `index_library()`，这里只是把它丢进一个后台线程、定期上报进度。
+        执行、立即返回"语义。真正的索引逻辑仍是 `index_library()`，由独立
+        worker 进程执行并上报进度。
 
-        返回 `(started, message)`——`started=False` 时是"这个库已经有一
-        个索引任务在跑"，不是错误，调用方（MCP工具）应该把 message 原样
-        转达，不是折叠成失败。库不存在时提前校验一次并直接抛
-        `KeyError`（不进后台线程才发现——那样错误要等一轮心跳超时才能
-        被用户看到，对"打错库名"这种立刻能判断的错误没有意义）。
+        返回值仍可按 `(started, message)` 两值解包；库不存在时提前校验并
+        直接抛 `KeyError`。
         """
         lib_mgr = self._singleton("library_manager")
         if lib_mgr.store.get(library_id) is None:
             raise KeyError(f"未知库: {library_id}")
+        self._index_progress.set_active_choices(self.runtime.registry.active_choices())
+        if format_allowlist is None:
+            if full:
+                return self._index_progress.start(library_id, source, full=True)
+            return self._index_progress.start(library_id, source)
+        return self._index_progress.start(
+            library_id,
+            source,
+            full=full,
+            format_allowlist=format_allowlist,
+        )
 
-        def _run(progress_callback):
-            return self.index_library(library_id, progress_callback=progress_callback)
-
-        return self._index_progress.start(library_id, _run)
+    def stop_index_library(self, library_id: str, run_id: str = "") -> tuple[bool, str]:
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+        return self._index_progress.stop(library_id, run_id)
 
     def index_status(self, library_id: str) -> dict | None:
         """查询索引进度——对齐 obsidian-rag 的 `index_status` 工具。返回
@@ -341,6 +1246,91 @@ class Pipeline:
         if lib_mgr.store.get(library_id) is None:
             raise KeyError(f"未知库: {library_id}")
         return self._index_progress.status(library_id)
+
+    def has_index(self, library_id: str) -> bool:
+        lib_mgr = self._singleton("library_manager")
+        if lib_mgr.store.get(library_id) is None:
+            raise KeyError(f"未知库: {library_id}")
+        generation = self._generations.active(library_id)
+        return generation is not None and self._manifest(library_id, generation) is not None
+
+    def stale_libraries(
+        self,
+        libraries: str = "all",
+        *,
+        exclude: str = "",
+        format_allowlist: Mapping[str, tuple[str, ...]] | None = None,
+    ) -> list[str]:
+        lib_mgr = self._singleton("library_manager")
+        entries = lib_mgr.resolve_libraries(libraries or "all", exclude)
+        stale: list[str] = []
+        for entry in entries:
+            library_id = entry.library_id
+            generation = self._generations.active(library_id)
+            manifest = self._manifest(library_id, generation)
+            if generation is None or manifest is None:
+                stale.append(library_id)
+                continue
+            allowlist = (
+                format_allowlist.get(library_id, ())
+                if format_allowlist is not None
+                else None
+            )
+            decisions = (
+                lib_mgr.resolve_included_files(library_id)
+                if allowlist is None
+                else lib_mgr.resolve_included_files(
+                    library_id,
+                    format_allowlist=allowlist,
+                )
+            )
+            included = {
+                path: included
+                for path, included, _reason in decisions
+                if included
+            }
+            records = self._manifest_files(manifest)
+            allowed = (
+                {str(value).lower() for value in allowlist}
+                if allowlist is not None
+                else None
+            )
+            scoped_paths = {
+                path
+                for path in included
+                if allowed is None
+                or ("." + path.rsplit(".", 1)[-1].lower()) in allowed
+            }
+            record_paths = {
+                path
+                for path in records
+                if allowed is None
+                or ("." + path.rsplit(".", 1)[-1].lower()) in allowed
+            }
+            if scoped_paths != record_paths:
+                stale.append(library_id)
+                continue
+            changed = False
+            root = Path(entry.root_path)
+            for path in scoped_paths:
+                record = records[path]
+                if self.failure_will_retry({"path": path, **record}):
+                    changed = True
+                    break
+                try:
+                    stat = (root / path).stat()
+                except OSError:
+                    changed = True
+                    break
+                if (
+                    stat.st_size != record.get("size")
+                    or stat.st_mtime_ns != record.get("mtime_ns")
+                ):
+                    changed = True
+                    break
+            if changed:
+                stale.append(library_id)
+        return stale
 
     # ---- 查询态 --------------------------------------------------------
 
@@ -352,6 +1342,108 @@ class Pipeline:
         top_k: int = 10,
         exclude: str = "",
         folder: str = "",
+        include_body: bool = True,
+        format_allowlist: tuple[str, ...] | Mapping[str, tuple[str, ...]] | None = None,
+    ) -> list[SearchResult]:
+        first = self._search_once(
+            libraries,
+            query,
+            top_k=top_k,
+            exclude=exclude,
+            folder=folder,
+            include_body=include_body,
+            format_allowlist=format_allowlist,
+        )
+        top_confidence = first[0].confidence if first else None
+        for plugin_id in sorted(self.runtime.registry.providers_of("query_enhancer")):
+            try:
+                enhancer = self._plugin(plugin_id)
+                if not enhancer.should_enhance(query, top_confidence):
+                    continue
+                expansion = enhancer.enhance(query)
+                if not isinstance(expansion, QueryExpansion) or not expansion.query.strip():
+                    continue
+                second = self._search_once(
+                    libraries,
+                    expansion.query,
+                    top_k=top_k,
+                    exclude=exclude,
+                    folder=folder,
+                    include_body=include_body,
+                    format_allowlist=format_allowlist,
+                )
+            except Exception:
+                continue
+            first_confidence = first[0].confidence if first else -1.0
+            second_confidence = second[0].confidence if second else -1.0
+            return second if second_confidence > first_confidence else first
+        return first
+
+    def search_with_advice(
+        self,
+        libraries: str,
+        query: str,
+        *,
+        top_k: int = 10,
+        exclude: str = "",
+        folder: str = "",
+        include_body: bool = True,
+        format_allowlist: tuple[str, ...] | Mapping[str, tuple[str, ...]] | None = None,
+    ) -> SearchResponse:
+        results = self.search(
+            libraries,
+            query,
+            top_k=top_k,
+            exclude=exclude,
+            folder=folder,
+            include_body=include_body,
+            format_allowlist=format_allowlist,
+        )
+        request = SearchAdviceInput(
+            results=tuple(results),
+            query=query,
+            mode="body" if include_body else "list",
+            top_k=top_k,
+            default_libraries=tuple(
+                str(value)
+                for value in self.runtime.settings.get("default_libraries", [])
+            ),
+            warn_threshold=float(
+                self.runtime.settings.get(
+                    "confidence_warn_threshold",
+                    DEFAULT_CONFIDENCE_WARN_THRESHOLD,
+                )
+            ),
+            strong_threshold=CONF_TIER_STRONG,
+        )
+        advice: list[str] = []
+        for plugin_id in sorted(self.runtime.registry.providers_of("result_advisor")):
+            try:
+                generated = self._plugin(plugin_id).advise(request)
+            except Exception:
+                continue
+            if not isinstance(generated, tuple):
+                continue
+            for line in generated:
+                text = str(line).strip()
+                if text and text not in advice:
+                    advice.append(text)
+                if len(advice) >= 2:
+                    break
+            if len(advice) >= 2:
+                break
+        return SearchResponse(results=tuple(results), advice=tuple(advice))
+
+    def _search_once(
+        self,
+        libraries: str,
+        query: str,
+        *,
+        top_k: int = 10,
+        exclude: str = "",
+        folder: str = "",
+        include_body: bool = True,
+        format_allowlist: tuple[str, ...] | Mapping[str, tuple[str, ...]] | None = None,
     ) -> list[SearchResult]:
         """混合检索：词法 BM25 + 向量 + 每库 RRF 融合 → 跨库候选池 → 全局
         重排 → 装配 SearchResult。
@@ -404,9 +1496,47 @@ class Pipeline:
         pool_ids: list[str] = []
         for cfg in entries:
             library_id = cfg.library_id
-            lexical_hits = lexical.search(library_id, query, top_k=candidate_pool)
-            vector_hits = vector_store.query(library_id, list(query_vector), top_k=candidate_pool)
-            lexical_ranked = [cid for cid, _ in lexical_hits if _in_folder(_chunk_path(cid), folder_norm)]
+            generation = self._generations.active(library_id)
+            manifest = self._manifest(library_id, generation)
+            lexical_segments = self._manifest_segments(manifest, "lexical_segments", generation)
+            vector_segments = self._manifest_segments(manifest, "vector_segments", generation)
+            active_ids = self._active_chunk_ids(manifest)
+            library_allowlist = (
+                format_allowlist.get(library_id, ())
+                if isinstance(format_allowlist, Mapping)
+                else format_allowlist
+            )
+            if library_allowlist is not None:
+                allowed = {str(value).lower() for value in library_allowlist}
+                states = self._manifest_files(manifest)
+                active_ids = {
+                    chunk_id
+                    for path, record in states.items()
+                    if ("." + path.rsplit(".", 1)[-1].lower()) in allowed
+                    for chunk_id in record.get("chunk_ids", [])
+                }
+            lexical_hits = []
+            for segment in reversed(lexical_segments):
+                lexical_hits = lexical.search(
+                    library_id,
+                    query,
+                    top_k=candidate_pool,
+                    generation=segment,
+                )
+                if lexical_hits:
+                    break
+            vector_hits = self._query_vector_segments(
+                library_id,
+                list(query_vector),
+                candidate_pool,
+                vector_segments,
+                active_ids,
+            )
+            lexical_ranked = [
+                cid
+                for cid, _ in lexical_hits
+                if (active_ids is None or cid in active_ids) and _in_folder(_chunk_path(cid), folder_norm)
+            ]
             vector_ranked = [cid for cid, _ in vector_hits if _in_folder(_chunk_path(cid), folder_norm)]
             fused = fusion.fuse([lexical_ranked, vector_ranked], weights=[bm25_weight, dense_weight])
             pool_ids.extend(chunk_id for chunk_id, _ in fused[: top_k * 2])
@@ -420,8 +1550,17 @@ class Pipeline:
         for chunk_id in pool_ids:
             by_library.setdefault(_chunk_library(chunk_id), []).append(chunk_id)
         records: dict[str, dict] = {}
+        sections_by_library: dict[str, dict[str, dict]] = {}
         for library_id, ids in by_library.items():
-            records.update(vector_store.get_by_ids(library_id, ids))
+            generation = self._generations.active(library_id)
+            manifest = self._manifest(library_id, generation)
+            vector_segments = self._manifest_segments(manifest, "vector_segments", generation)
+            records.update(self._vector_records(library_id, ids, vector_segments))
+            sections_by_library[library_id] = {
+                path: dict(record.get("sections", {}))
+                for path, record in self._manifest_files(manifest).items()
+                if record.get("status") == "indexed" and isinstance(record.get("sections"), dict)
+            }
 
         # 喂给重排器的文本前面带上标题面包屑——重排器只看纯段落正文的话，
         # 少了"这段话出自哪个标题/章节"这个人类读者天然会用到的判断依据，
@@ -439,41 +1578,65 @@ class Pipeline:
             rerank_input.append((chunk_id, prefixed))
         if not rerank_input:
             return []
-        reranked = reranker.rerank(query, rerank_input, top_k=top_k)
+        reranked = reranker.rerank(query, rerank_input, top_k=len(rerank_input))
         if not reranked:
             return []
 
         drop_threshold = self.runtime.settings.get("confidence_drop_threshold", DEFAULT_CONFIDENCE_DROP_THRESHOLD)
         max_chunks_per_file = self.runtime.settings.get("max_chunks_per_file", DEFAULT_MAX_CHUNKS_PER_FILE)
 
+        small_to_big = include_body and self.runtime.settings.get("small_to_big", True)
         results: list[SearchResult] = []
         per_file_count: dict[tuple[str, str], int] = {}
+        emitted_sections: set[tuple[str, str, str]] = set()
         for chunk_id, score in reranked:
+            if len(results) >= top_k:
+                break
             confidence = max(0.0, min(1.0, float(score)))
             if confidence < drop_threshold:
-                # 低置信护栏（drop）：噪音命中直接不返回，宁缺毋滥——对齐
-                # obsidian-rag 同名护栏，默认阈值0.0=关闭（给满top_k，只
-                # 标注不丢弃，是否收紧是产品决策，交给 confidence_drop_
-                # threshold 设置项，不在代码里硬编码收紧）。
                 continue
-            record = records[chunk_id]
+            record = records.get(chunk_id)
+            if record is None:
+                continue
             meta = record["metadata"] or {}
-            file_key = (_chunk_library(chunk_id), meta.get("path", ""))
-            if per_file_count.get(file_key, 0) >= max_chunks_per_file:
-                # 同篇结果封顶：该文件的展示名额已满——对齐 obsidian-rag
-                # 的 max_chunks_per_file（防止单篇文档挤占整个结果列表），
-                # 被封顶掉的候选不占 top_k 名额，也不会被其他文件的候选
-                # 补位（候选池本来就已经是重排后的最终名次，跳过即可）。
+            library_id = _chunk_library(chunk_id)
+            path = str(meta.get("path", ""))
+            file_key = (library_id, path)
+            section_id = str(meta.get("section_id") or "")
+            section = (
+                sections_by_library.get(library_id, {})
+                .get(path, {})
+                .get(section_id, {})
+            )
+            parent_text = ""
+            backfilled = False
+            if small_to_big and section_id and isinstance(section, dict):
+                try:
+                    section_chunks = int(section.get("chunk_count") or 0)
+                except (TypeError, ValueError):
+                    section_chunks = 0
+                candidate_parent = str(section.get("text") or "")
+                if section_chunks > 1 and len(candidate_parent) > 300:
+                    parent_text = candidate_parent
+                    backfilled = True
+            section_key = (library_id, path, section_id)
+            if backfilled and section_key in emitted_sections:
                 continue
-            per_file_count[file_key] = per_file_count.get(file_key, 0) + 1
+            if include_body and per_file_count.get(file_key, 0) >= max_chunks_per_file:
+                continue
+            if include_body:
+                per_file_count[file_key] = per_file_count.get(file_key, 0) + 1
+            if backfilled:
+                emitted_sections.add(section_key)
             results.append(
                 SearchResult(
                     chunk_id=chunk_id,
-                    library_id=file_key[0],
-                    path=file_key[1],
+                    library_id=library_id,
+                    path=path,
                     heading_breadcrumb=meta.get("heading_breadcrumb", ""),
-                    text=record["document"],
+                    text=parent_text or record["document"],
                     confidence=confidence,
+                    backfilled=backfilled,
                 )
             )
         return results
@@ -553,12 +1716,24 @@ class Pipeline:
                 raise ValueError(f"读取源文件失败: {type(exc).__name__}: {exc}") from exc
             return DocumentContent(library_id=library_id, path=path, text=text, source="源文件直读")
 
-        cached = self._extract_cache.read(library_id, path)
+        generation = self._generations.active(library_id)
+        manifest = self._manifest(library_id, generation)
+        state = self._manifest_files(manifest).get(path)
+        if manifest is not None and (state is None or state.get("status") != "indexed"):
+            raise ValueError(f"「{path}」还没有被成功索引过，先调用 index_library 建好索引再重试")
+        segments = self._manifest_segments(manifest, "extract_segments", generation)
+        cached = self._read_extract_cache(library_id, path, segments)
         if cached is None:
             raise ValueError(f"「{path}」还没有被成功索引过，先调用 index_library 建好索引再重试")
         return DocumentContent(library_id=library_id, path=path, text=cached, source="提取缓存")
 
-    def find_duplicates(self, library_id: str, *, threshold: float = 0.7) -> dict[str, list[list[str]]]:
+    def find_duplicates(
+        self,
+        library_id: str,
+        *,
+        threshold: float = 0.7,
+        format_allowlist: tuple[str, ...] | None = None,
+    ) -> dict[str, list[list[str]]]:
         """近似重复检测（只读建议，绝不自动删/移动文件）——对齐
         obsidian-rag 的 `find_duplicates` MCP 工具（2026-09-23 全面功能
         审计发现的缺口）：找出库内"内容几乎相同"的重复文档（同一课件多份
@@ -577,8 +1752,24 @@ class Pipeline:
             raise KeyError(f"未知库: {library_id}")
 
         texts: dict[str, str] = {}
-        for path in self._extract_cache.list_relative_paths(library_id):
-            text = self._extract_cache.read(library_id, path)
+        generation = self._generations.active(library_id)
+        manifest = self._manifest(library_id, generation)
+        states = self._manifest_files(manifest)
+        segments = self._manifest_segments(manifest, "extract_segments", generation)
+        paths = {
+            path
+            for path, record in states.items()
+            if record.get("status") == "indexed"
+        } if manifest is not None else set(self._extract_cache.list_relative_paths(library_id, generation))
+        if format_allowlist is not None:
+            allowed = {str(value).lower() for value in format_allowlist}
+            paths = {
+                path
+                for path in paths
+                if ("." + path.rsplit(".", 1)[-1].lower()) in allowed
+            }
+        for path in paths:
+            text = self._read_extract_cache(library_id, path, segments)
             if text is not None:
                 texts[path] = text
 
@@ -606,14 +1797,38 @@ class Pipeline:
             raise KeyError(f"未知库: {library_id}")
         return self._singleton("library_summary").get(library_id)
 
-    def sample_library(self, library_id: str, k: int = 20) -> list[SampledChunk]:
+    def sample_library(
+        self,
+        library_id: str,
+        k: int = 20,
+        *,
+        format_allowlist: tuple[str, ...] | None = None,
+    ) -> list[SampledChunk]:
         lib_mgr = self._singleton("library_manager")
         if lib_mgr.store.get(library_id) is None:
             raise KeyError(f"未知库: {library_id}")
         vector_store = self._singleton("vector_store")
         if not hasattr(vector_store, "sample"):
             raise PipelineError("当前 vector_store 实现不支持采样（缺少 sample）")
-        return vector_store.sample(library_id, k=k)
+        generation = self._generations.active(library_id)
+        manifest = self._manifest(library_id, generation)
+        vector_segments = self._manifest_segments(manifest, "vector_segments", generation)
+        active_ids = self._active_chunk_ids(manifest)
+        if format_allowlist is not None:
+            allowed = {str(value).lower() for value in format_allowlist}
+            states = self._manifest_files(manifest)
+            active_ids = {
+                chunk_id
+                for path, record in states.items()
+                if ("." + path.rsplit(".", 1)[-1].lower()) in allowed
+                for chunk_id in record.get("chunk_ids", [])
+            }
+        if hasattr(vector_store, "sample_records"):
+            rows = self._vector_rows(library_id, vector_segments, active_ids)
+            return vector_store.sample_records(rows, k=k)
+        if format_allowlist is not None:
+            raise PipelineError("当前 vector_store 实现不支持带格式门禁的采样")
+        return vector_store.sample(library_id, k=k, generation=vector_segments[-1] if vector_segments else generation)
 
     def propose_library_summary(self, library_id: str, text: str) -> dict:
         lib_mgr = self._singleton("library_manager")
@@ -687,7 +1902,7 @@ class Pipeline:
         vector_store = self._singleton("vector_store")
         archive_codec = self._singleton("archive_codec")
 
-        manifest = {
+        config_manifest = {
             "library_id": cfg.library_id,
             "name": cfg.name,
             # root_path 刻意不导出——它是导出方机器上的本地文件系统路径，
@@ -698,17 +1913,61 @@ class Pipeline:
             "selection_out": cfg.selection_out,
             "new_file_default": cfg.new_file_default,
             "enabled_extensions": cfg.enabled_extensions,
+            "agent_formats": list(cfg.agent_formats),
+            "exclude_dirs": list(cfg.exclude_dirs),
+            "exclude_files": list(cfg.exclude_files),
+            "exclude_patterns": list(cfg.exclude_patterns),
         }
 
         if not hasattr(vector_store, "get_all"):
             raise PipelineError("当前 vector_store 实现不支持导出（缺少 get_all）")
-        vectors = vector_store.get_all(library_id)
+        generation = self._generations.active(library_id)
+        index_manifest = self._manifest(library_id, generation)
+        vector_segments = self._manifest_segments(index_manifest, "vector_segments", generation)
+        active_ids = self._active_chunk_ids(index_manifest)
+        vectors = self._vector_rows(library_id, vector_segments, active_ids)
 
         if not hasattr(lexical, "export_state"):
             raise PipelineError("当前 lexical_index 实现不支持导出（缺少 export_state）")
-        bm25_state = lexical.export_state(library_id)
+        lexical_segments = self._manifest_segments(index_manifest, "lexical_segments", generation)
+        bm25_state = lexical.export_state(
+            library_id,
+            generation=lexical_segments[-1] if lexical_segments else generation,
+        )
 
-        return archive_codec.pack(manifest, vectors, bm25_state)
+        extracted_state = (
+            self._extract_cache.export_state(library_id, generation)
+            if generation
+            else {}
+        )
+        relations_state = (
+            self._note_relations.read_library(library_id, generation)
+            if generation
+            else {}
+        )
+        failures_state = (
+            self._index_failures.read(library_id, generation)
+            if generation
+            else None
+        )
+        visual_states: dict[str, dict] = {}
+        for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
+            visual = self._plugin(plugin_id)
+            exporter = getattr(visual, "export_state", None)
+            if generation and callable(exporter):
+                state = exporter(library_id, generation)
+                if isinstance(state, dict):
+                    visual_states[plugin_id] = state
+        return archive_codec.pack(
+            config_manifest,
+            vectors,
+            bm25_state,
+            index_manifest=index_manifest,
+            extracted=extracted_state,
+            relations=relations_state,
+            failures=failures_state,
+            visual=visual_states or None,
+        )
 
     def import_library(self, archive_bytes: bytes, *, root_path: str, library_id: str | None = None) -> str:
         """把 export_library 产出的归档恢复成一个新库，返回恢复出的
@@ -746,18 +2005,150 @@ class Pipeline:
         lib_mgr.store.set_policy(
             target_id,
             new_file_default=manifest.get("new_file_default", "include"),
-            enabled_extensions=manifest.get("enabled_extensions", [".md", ".txt"]),
+            enabled_extensions=manifest.get("enabled_extensions", [".md", ".pdf", ".docx"]),
+            exclude_dirs=list(manifest.get("exclude_dirs", [])),
+            exclude_files=list(manifest.get("exclude_files", [])),
+            exclude_patterns=list(manifest.get("exclude_patterns", [])),
         )
+        lib_mgr.store.set_agent_formats(target_id, list(manifest.get("agent_formats", [])))
 
-        vectors = payload["vectors"]
-        if vectors:
-            chunk_ids = list(vectors.keys())
-            embed_vectors = [vectors[cid]["embedding"] for cid in chunk_ids]
-            documents = [vectors[cid]["document"] for cid in chunk_ids]
-            metadatas = [vectors[cid]["metadata"] for cid in chunk_ids]
-            vector_store.upsert(target_id, chunk_ids, embed_vectors, documents=documents, metadatas=metadatas)
+        generation = uuid.uuid4().hex
+        source_manifest = payload.get("index_manifest") or {}
+        source_files = source_manifest.get("files", {})
+        if not isinstance(source_files, dict):
+            source_files = {}
+        vectors = payload["vectors"] if isinstance(payload.get("vectors"), dict) else {}
+        id_map: dict[str, str] = {}
+        remapped_vectors: dict[str, dict] = {}
+        for source_chunk_id, row in vectors.items():
+            if not isinstance(row, dict):
+                continue
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            path = str(metadata.get("path", ""))
+            chunk_index = int(metadata.get("chunk_index", 0))
+            target_chunk_id = f"{target_id}:{path}:{chunk_index}"
+            id_map[str(source_chunk_id)] = target_chunk_id
+            remapped_vectors[target_chunk_id] = row
+
+        files: dict[str, dict] = {}
+        for path, source_record in source_files.items():
+            if not isinstance(path, str) or not isinstance(source_record, dict):
+                continue
+            record = dict(source_record)
+            record["chunk_ids"] = [
+                id_map.get(str(chunk_id), f"{target_id}:{path}:{index}")
+                for index, chunk_id in enumerate(record.get("chunk_ids", []))
+            ]
+            try:
+                record["size"], record["mtime_ns"], record["content_hash"] = self._file_fingerprint(
+                    Path(root_path) / path
+                )
+            except OSError:
+                record.setdefault("size", -1)
+                record.setdefault("mtime_ns", -1)
+                record.setdefault("content_hash", "")
+            files[path] = record
+        for target_chunk_id, row in remapped_vectors.items():
+            metadata = row.get("metadata") or {}
+            path = str(metadata.get("path", ""))
+            record = files.setdefault(
+                path,
+                {
+                    "size": -1,
+                    "mtime_ns": -1,
+                    "content_hash": "",
+                    "status": "indexed",
+                    "failure_state": None,
+                    "failure_reason": None,
+                    "failure_detail": None,
+                    "links": [],
+                },
+            )
+            record.setdefault("chunk_ids", []).append(target_chunk_id)
+        for record in files.values():
+            record["chunk_ids"] = list(dict.fromkeys(record.get("chunk_ids", [])))
+
+        if remapped_vectors:
+            chunk_ids = list(remapped_vectors)
+            vector_store.upsert(
+                target_id,
+                chunk_ids,
+                [remapped_vectors[cid]["embedding"] for cid in chunk_ids],
+                documents=[remapped_vectors[cid].get("document", "") for cid in chunk_ids],
+                metadatas=[remapped_vectors[cid].get("metadata", {}) for cid in chunk_ids],
+                generation=generation,
+            )
 
         if hasattr(lexical, "import_state"):
-            lexical.import_state(target_id, payload["bm25"])
+            bm25_state = payload.get("bm25") or {}
+            if isinstance(bm25_state, dict):
+                bm25_state = dict(bm25_state)
+                bm25_state["doc_lengths"] = {
+                    id_map.get(str(key), f"{target_id}:{key}"): value
+                    for key, value in (bm25_state.get("doc_lengths", {}) or {}).items()
+                }
+                bm25_state["doc_tokens_cache"] = {
+                    id_map.get(str(key), f"{target_id}:{key}"): value
+                    for key, value in (bm25_state.get("doc_tokens_cache", {}) or {}).items()
+                }
+            lexical.import_state(target_id, bm25_state, generation=generation)
+
+        extracted = payload.get("extracted")
+        if isinstance(extracted, dict) and extracted:
+            self._extract_cache.import_state(target_id, extracted, generation)
+
+        index_manifest = {
+            "format_version": INDEX_MANIFEST_VERSION,
+            "library_id": target_id,
+            "generation": generation,
+            "previous_generation": None,
+            "signatures": self._pipeline_signatures(),
+            "files": files,
+            "vector_segments": [generation] if remapped_vectors else [],
+            "extract_segments": [generation] if extracted else [],
+            "lexical_segments": [generation],
+            "active_chunk_ids": list(remapped_vectors),
+            "compacted": True,
+        }
+        relations = payload.get("relations")
+        self._note_relations.write_library(
+            target_id,
+            relations if isinstance(relations, dict) else {},
+            generation,
+        )
+        visual_states = payload.get("visual")
+        if isinstance(visual_states, dict):
+            for plugin_id, state in visual_states.items():
+                if plugin_id not in self.runtime.registry.providers_of("visual_index"):
+                    continue
+                visual = self._plugin(plugin_id)
+                importer = getattr(visual, "import_state", None)
+                if callable(importer):
+                    importer(target_id, state, generation)
+        failures = payload.get("failures")
+        if not isinstance(failures, dict):
+            failures = {
+                "succeeded": sum(1 for record in files.values() if record.get("status") == "indexed"),
+                "failures": [
+                    {"path": path, "reason": record.get("failure_state", "extract-failed")}
+                    for path, record in files.items()
+                    if record.get("status") in {"failed", "terminal"}
+                ],
+            }
+        self._index_failures.write_library(
+            target_id,
+            succeeded=int(failures.get("succeeded", 0)),
+            failures=list(failures.get("failures", [])),
+            generation=generation,
+        )
+        if not self._manifests.write(index_manifest):
+            self.discard_index_generation(target_id, generation)
+            lib_mgr.store.remove_library(target_id)
+            raise PipelineError("导入数据已生成，但索引清单写入失败")
+        if not self._generations.commit(target_id, generation):
+            self.discard_index_generation(target_id, generation)
+            self._manifests.clear(target_id, generation)
+            lib_mgr.store.remove_library(target_id)
+            raise PipelineError("导入数据已生成，但发布 generation 失败")
 
         return target_id

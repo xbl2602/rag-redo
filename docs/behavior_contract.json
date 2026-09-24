@@ -1,0 +1,329 @@
+{
+  "format_version": 1,
+  "policy": "strict-behavior-compatibility",
+  "status_values": ["blocked", "partial", "pass"],
+  "contracts": [
+    {
+      "id": "BC-01",
+      "title": "混合 PDF 整本路由",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/extractors.py:507-511",
+        "obsidian-rag/extractors.py:612-726",
+        "obsidian-rag/extractors.py:323-357"
+      ],
+      "redo_refs": [
+        "rag-redo/plugins/official-extractor-pdf-text/official_extractor_pdf_text/extract.py:25-67",
+        "rag-redo/core/pipeline.py:166-251",
+        "rag-redo/core/extract_cache.py:87-164",
+        "rag-redo/plugins/official-ocr-mineru-cloud/official_ocr_mineru_cloud/ocr.py:_RealHttpClient",
+        "rag-redo/plugins/official-ocr-mineru-cloud/official_ocr_mineru_cloud/extract.py::MineruCloudExtractor",
+        "rag-redo/plugins/official-ocr-mineru-cloud/official_ocr_mineru_cloud/plugin.py:16-21",
+        "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/plugin.py:136-179"
+      ],
+      "test_refs": [
+        "rag-redo/plugins/official-extractor-pdf-text/tests/test_extract.py::TestExtractPdfText.test_mixed_pdf_routes_whole_document_to_scanned_failure",
+        "rag-redo/plugins/official-extractor-pdf-text/tests/test_extract.py::TestExtractPdfText.test_exactly_ten_characters_is_a_text_page",
+        "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_mixed_pdf_routes_whole_document_to_selected_local_ocr",
+        "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_default_none_keeps_mixed_pdf_as_scanned_terminal",
+        "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_existing_ocr_cache_is_reused_after_backend_changes_to_none",
+        "rag-redo/tests/test_extract_cache.py::TestExtractCache.test_route_caches_keep_cloud_local_and_text_results_with_legacy_priority",
+        "rag-redo/plugins/official-ocr-mineru-cloud/tests/test_extract.py::TestMineruCloudExtractorWithFakeClient.test_batch_pending_resume_and_sidecar"
+      ],
+      "acceptance": "PDF 任一页 strip 后少于 10 个字符时整本进入扫描件路由，不得返回文字页半份结果；扫描后端默认 none、无 Key 保留精确 scanned，缓存按云端→本地→文字层优先，切换后端不破坏既有 OCR 缓存。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-02",
+      "title": "Agent 格式授权",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/server.py:111-137",
+        "obsidian-rag/index.py:2058-2066"
+      ],
+      "redo_refs": [
+        "rag-redo/plugins/official-library-manager/official_library_manager/config.py:19-28",
+        "rag-redo/plugins/official-library-manager/official_library_manager/config.py:103-118",
+        "rag-redo/plugins/official-library-manager/official_library_manager/plugin.py:92-133",
+        "rag-redo/core/index_progress.py:259-274",
+        "rag-redo/core/pipeline.py:371-430",
+        "rag-redo/core/pipeline.py:1113-1310",
+        "rag-redo/plugins/official-mcp-server/official_mcp_server/tools.py:62-71",
+        "rag-redo/plugins/official-mcp-server/official_mcp_server/tools.py:338-378"
+      ],
+      "test_refs": [
+        "rag-redo/plugins/official-library-manager/tests/test_config.py::TestLibraryConfigStore.test_agent_allowlist_cannot_be_pierced_by_explicit_selection",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_agent_format_allowlist_freezes_unapproved_docx_until_authorized",
+        "rag-redo/tests/test_index_progress.py::TestIndexWorkerManager.test_format_allowlist_crosses_process_boundary",
+        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_agent_read_document_blocks_docx_until_user_authorizes_format",
+        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_reindex_knowledge_returns_started_true_not_a_synchronous_report"
+      ],
+      "acceptance": "Agent 默认只能处理 md/txt 和用户通过 agent_formats 批准的 pdf/docx；授权在显式路径裁决后再次硬过滤，并跨进程 worker、搜索候选、读取、导航、关系、去重、失败诊断和采样入口生效。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-03",
+      "title": "搜索前自动同步",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/server.py:227-317"
+      ],
+      "redo_refs": [
+        "rag-redo/core/pipeline.py::Pipeline.stale_libraries",
+        "rag-redo/plugins/official-mcp-server/official_mcp_server/tools.py::register_tools.ensure_agent_fresh"
+      ],
+      "test_refs": [
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_stale_libraries_detects_first_run_changes_additions_and_removals",
+        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_waits_for_first_index_before_returning",
+        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_starts_background_refresh_for_nonempty_library"
+      ],
+      "acceptance": "搜索前必须检测变化；空库首跑同步，非空库后台增量并可继续使用旧索引，不得让搜索悄悄使用过期数据。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-04",
+      "title": "失败终态与重试",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/index.py:114-159",
+        "obsidian-rag/index.py:2142-2157"
+      ],
+      "redo_refs": [
+        "rag-redo/core/pipeline.py::normalize_failure_state",
+        "rag-redo/core/pipeline.py::Pipeline._failure_record",
+        "rag-redo/core/pipeline.py::Pipeline.failure_will_retry",
+        "rag-redo/core/index_progress.py::IndexProgress"
+      ],
+      "test_refs": [
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_empty_and_tbd_terminal_states_are_stable_until_content_changes",
+        "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_stable_scanned_terminal_does_not_repeat_provider_work",
+        "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_capability_change_retries_stable_scanned_terminal",
+        "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_deferred_is_not_a_terminal_failure_and_remains_stale"
+      ],
+      "acceptance": "unreadable、empty、tbd、scanned、extract-failed 等终态可区分；稳定失败不重复消耗资源；能力签名变化和内容变化可重试；deferred 不得伪装成终态。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-05",
+      "title": "DataStore 持久化边界",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/index.py:30-35",
+        "obsidian-rag/library.py:30"
+      ],
+      "redo_refs": [
+        "rag-redo/core/datastore.py::StorageHandle",
+        "rag-redo/core/runtime.py::PluginRuntime._make_context",
+        "rag-redo/plugins/official-library-manager/official_library_manager/plugin.py::LibraryManagerPlugin.on_load",
+        "rag-redo/plugins/official-vector-store-chroma/official_vector_store_chroma/plugin.py::ChromaVectorStorePlugin.on_load",
+        "rag-redo/plugins/official-lexical-bm25/official_lexical_bm25/plugin.py::LexicalBM25Plugin.on_load"
+      ],
+      "test_refs": [
+        "rag-redo/tests/test_datastore.py::TestDataStore.test_storage_handles_are_owner_isolated",
+        "rag-redo/tests/test_datastore.py::TestDataStore.test_storage_handle_denies_plugin_without_data_write_permission",
+        "rag-redo/tests/test_datastore.py::TestDataStore.test_legacy_path_is_preserved_behind_gateway",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_index_then_search_finds_relevant_doc"
+      ],
+      "acceptance": "非存储插件不能直接打开或写入持久化路径；存储插件只能使用 DataStore 发放的 namespace/handle。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-06",
+      "title": "插件隔离与权限",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/gpu_arbiter.py:38-50",
+        "obsidian-rag/singleton.py:64-110"
+      ],
+      "redo_refs": [
+        "rag-redo/core/runtime.py::PluginRuntime._validate_import_boundary",
+        "rag-redo/core/runtime.py::PluginRuntime._validate_capability_boundary",
+        "rag-redo/core/context.py::PluginContext.storage",
+        "rag-redo/core/subprocess_service.py::SubprocessServiceHandle"
+      ],
+      "test_refs": [
+        "rag-redo/tests/test_runtime.py::TestPluginRuntimeLifecycle.test_cross_plugin_import_is_rejected_before_load",
+        "rag-redo/tests/test_datastore.py::TestDataStore.test_storage_handle_denies_plugin_without_data_write_permission",
+        "rag-redo/tests/test_subprocess_service.py::TestSubprocessServiceHandle.test_start_then_call_gets_real_response_from_subprocess"
+      ],
+      "acceptance": "in_process 插件不得 import 另一个插件；subprocess_service 必须有独立进程/环境；manifest 权限必须在运行前校验并在运行时限制能力。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-07",
+      "title": "small-to-big 与结果交付",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/retriever.py:300-335",
+        "obsidian-rag/retriever.py:367-498"
+      ],
+      "redo_refs": [
+        "rag-redo/plugins/official-chunker/official_chunker/chunk.py:84-161",
+        "rag-redo/core/pipeline.py:603-723",
+        "rag-redo/core/pipeline.py:1085-1185",
+        "rag-redo/plugins/official-mcp-server/official_mcp_server/tools.py:35-90"
+      ],
+      "test_refs": [
+        "rag-redo/plugins/official-chunker/tests/test_chunk.py::TestChunkDocument.test_sibling_chunks_share_exact_parent_section",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_small_to_big_backfills_and_folds_parent_section",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_small_to_big_list_mode_keeps_small_chunks"
+      ],
+      "acceptance": "小块检索保持不变；正文模式回填父节、同节只交付一次、同文件封顶后能补足 top_k；list 模式不展开正文。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-08",
+      "title": "自适应结果建议",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/advice.py:1-36",
+        "obsidian-rag/advice.py:73-174"
+      ],
+      "redo_refs": [
+        "rag-redo/plugins/official-result-advisor/official_result_advisor/plugin.py:1-182",
+        "rag-redo/core/contracts.py:132-153",
+        "rag-redo/core/pipeline.py:984-1033",
+        "rag-redo/plugins/official-mcp-server/official_mcp_server/tools.py:40-95"
+      ],
+      "test_refs": [
+        "rag-redo/plugins/official-result-advisor/tests/test_advice.py::TestResultAdvisorPlugin",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_search_advice_uses_separate_response_channel",
+        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpToolsAsyncBase.test_search_knowledge_returns_separate_advice_channel"
+      ],
+      "acceptance": "建议必须纯规则、零 I/O、同一输入同一输出、最多限定数量，并与结果本体使用不同通道。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-09",
+      "title": "Graph 读模型",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/guiweb/graph_data.py:79-209",
+        "obsidian-rag/guiweb/semantic.py:26-57"
+      ],
+      "redo_refs": [
+        "rag-redo/core/contracts.py::GraphNode",
+        "rag-redo/core/graph.py::build_graph",
+        "rag-redo/core/pipeline.py::Pipeline.graph",
+        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py::VisualWemmPlugin.export_state",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/api.py::Api.graph",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/api.py::Api.open_source"
+      ],
+      "test_refs": [
+        "rag-redo/tests/test_graph.py::TestGraphReadModel",
+        "rag-redo/tests/test_graph.py::TestSemanticEdgeSelection",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_graph_reads_active_manifest_and_relations_without_loading_embedder",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_graph_semantic_edges_are_separate_and_use_existing_embedder",
+        "rag-redo/plugins/official-gui-shell/tests/test_assets.py::TestGraphAssets",
+        "rag-redo/plugins/official-gui-shell/tests/test_api.py::TestApi.test_open_source_resolves_only_inside_library",
+        "rag-redo/tests/test_pipeline_e2e.py::TestExportImportLibrary.test_import_preserves_terminal_failure_diagnostics"
+      ],
+      "acceptance": "Graph 必须提供文件/页节点、双链/归属边、终态和可选语义边；GUI 只能消费只读模型，不能直接读存储；源文件打开必须限制在对应库目录内。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-10",
+      "title": "导入导出等价性",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/export.py:142-249",
+        "obsidian-rag/import.py:149-189"
+      ],
+      "redo_refs": [
+        "rag-redo/core/pipeline.py::Pipeline.export_library",
+        "rag-redo/core/pipeline.py::Pipeline.import_library",
+        "rag-redo/core/extract_cache.py::ExtractCache.export_state",
+        "rag-redo/core/note_relations.py::NoteRelationsStore.read_library",
+        "rag-redo/plugins/official-import-export/official_import_export/archive.py::pack"
+      ],
+      "test_refs": [
+        "rag-redo/tests/test_pipeline_e2e.py::TestExportImportLibrary.test_import_creates_library_with_same_search_results",
+        "rag-redo/tests/test_pipeline_e2e.py::TestExportImportLibrary.test_import_preserves_terminal_failure_diagnostics",
+        "rag-redo/tests/test_pipeline_e2e.py::TestExportImportLibrary.test_import_survives_process_restart",
+        "rag-redo/plugins/official-import-export/tests/test_archive.py::TestPackUnpackRoundTrip.test_round_trip_preserves_all_three_sections"
+      ],
+      "acceptance": "导入后必须恢复搜索、正文、关系、失败状态、版本和校验能力；归档不得静默丢失旧系统状态。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-11",
+      "title": "跨进程资源仲裁",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/gpu_arbiter.py:38-50",
+        "obsidian-rag/gpu_arbiter.py:131-143"
+      ],
+      "redo_refs": [
+        "rag-redo/core/resource_arbiter.py:46-375",
+        "rag-redo/core/index_progress.py:252-829",
+        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py:97-180"
+      ],
+      "test_refs": [
+        "rag-redo/tests/test_resource_arbiter.py::TestCrossProcessResourceArbiter",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_worker_process_takes_over_and_parent_can_reacquire_later",
+        "rag-redo/plugins/official-ocr-mineru-local/tests/test_plugin.py::TestMineruLocalOcrPlugin.test_worker_process_takes_over_and_parent_can_reacquire_later"
+      ],
+      "acceptance": "GUI、MCP、worker 同时运行时不能双驻留；优先级抢占必须作用于真实 holder；锁状态未知不能宣称资源空闲。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-12",
+      "title": "模型热切换与版本失效",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/index.py:609-630",
+        "obsidian-rag/index.py:1486-1599"
+      ],
+      "redo_refs": [
+        "rag-redo/core/runtime.py::PluginRuntime.set_active_choice",
+        "rag-redo/core/index_progress.py::IndexWorkerManager.set_active_choices",
+        "rag-redo/core/pipeline.py::Pipeline.start_index_library",
+        "rag-redo/core/pipeline.py::Pipeline._pipeline_signatures"
+      ],
+      "test_refs": [
+        "rag-redo/tests/test_runtime.py::TestPluginRuntimeLifecycle.test_active_choice_switch_is_live_and_persisted_without_reinstall",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_embedder_signature_change_reembeds_all_without_reextracting"
+      ],
+      "acceptance": "切换 active choice 后不需要重新安装；新 worker 获得同一快照；模型/chunker/存储版本变化会使旧 generation 受控失效。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-13",
+      "title": "规范与门禁一致性",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/tests/run.py:1-129"
+      ],
+      "redo_refs": [
+        "rag-redo/AGENTS.md:1-11",
+        "rag-redo/CLAUDE.md:1-11",
+        "rag-redo/tests/test_agents_contract.py"
+      ],
+      "test_refs": [
+        "tests/test_agents_contract.py::TestAgentsContract"
+      ],
+      "acceptance": "AGENTS/CLAUDE 正文同步；契约 ID 唯一且被规范引用；每条契约有旧项目证据、当前实现和测试映射。",
+      "blocker": ""
+    },
+    {
+      "id": "BC-14",
+      "title": "HyDE 低置信查询增强",
+      "status": "pass",
+      "legacy_refs": [
+        "obsidian-rag/retriever.py:503-581",
+        "obsidian-rag/config.py:66-70"
+      ],
+      "redo_refs": [
+        "rag-redo/plugins/official-query-enhancer-hyde/official_query_enhancer_hyde/plugin.py:43-75",
+        "rag-redo/core/pipeline.py:925-961",
+        "rag-redo/core/contracts.py:111-116"
+      ],
+      "test_refs": [
+        "rag-redo/plugins/official-query-enhancer-hyde/tests/test_plugin.py::TestHydePlugin",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_hyde_rechecks_and_keeps_strictly_higher_confidence"
+      ],
+      "acceptance": "HyDE 默认关闭；首轮 top1 置信度低于阈值时生成假设文档并重查；仅第二轮置信度严格更高时替换；LLM 失败或空响应时保留首轮。",
+      "blocker": ""
+    }
+  ]
+}

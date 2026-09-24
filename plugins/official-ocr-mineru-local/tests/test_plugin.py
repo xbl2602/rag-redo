@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -50,8 +51,13 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
         os.environ["RAG_REDO_FAKE_OCR"] = "1"
         self.addCleanup(self._restore_env)
 
-        self.rt = PluginRuntime(REPO_ROOT / "plugins", state_file=self.tmp / "plugins_state.json")
+        self.rt = PluginRuntime(
+            REPO_ROOT / "plugins",
+            state_file=self.tmp / "plugins_state.json",
+            data_dir=self.tmp / "data",
+        )
         self.rt.scan()
+        self.rt.settings.set("pdf_scan_backend", "mineru-local")
         self.assertIn("official-ocr-mineru-local", self.rt.plugins)
         self.rt.load("official-ocr-mineru-local")
         self.assertEqual(self.rt.plugins["official-ocr-mineru-local"].state, PluginState.LOADED)
@@ -71,7 +77,54 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
         else:
             os.environ["RAG_REDO_FAKE_OCR"] = self._env_backup
 
+    def test_default_none_does_not_start_ocr_subprocess(self):
+        runtime = PluginRuntime(
+            REPO_ROOT / "plugins",
+            state_file=self.tmp / "default-none-state.json",
+            data_dir=self.tmp / "default-none-data",
+        )
+        runtime.scan()
+        runtime.load("official-ocr-mineru-local")
+        runtime.enable("official-ocr-mineru-local")
+        self.addCleanup(runtime.disable, "official-ocr-mineru-local")
+        plugin = runtime.plugins["official-ocr-mineru-local"].instance
+        self.assertFalse(plugin.is_active())
+        self.assertIsNone(plugin._handle)
+        self.assertIsNone(runtime.resource_arbiter.holder_of("gpu:0"))
+
     def test_enable_acquires_gpu_lease(self):
+        self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "official-ocr-mineru-local")
+
+    def test_worker_process_takes_over_and_parent_can_reacquire_later(self):
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "from pathlib import Path\n"
+            "from core.runtime import PluginRuntime\n"
+            f"runtime = PluginRuntime(Path({str(REPO_ROOT / 'plugins')!r}), "
+            f"state_file=Path({str(self.tmp / 'worker_state.json')!r}), "
+            f"data_dir=Path({str(self.tmp / 'data')!r}))\n"
+            "runtime.scan()\n"
+            "runtime.load('official-ocr-mineru-local')\n"
+            "runtime.enable('official-ocr-mineru-local')\n"
+            "plugin = runtime.plugins['official-ocr-mineru-local']\n"
+            "print('WORKER_ENABLED', plugin.instance._enabled, flush=True)\n"
+            "runtime.disable('official-ocr-mineru-local')\n"
+            "runtime.unload('official-ocr-mineru-local')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WORKER_ENABLED True", result.stdout)
+        self.assertIsNone(self.rt.resource_arbiter.holder_of("gpu:0"))
+        self.assertTrue(self.instance._handle.is_alive)
+        (self.tmp / "after-worker.pdf").write_bytes(b"%PDF-fake-scanned-content")
+        document = self.instance.extract("lib-after-worker", "after-worker.pdf", self.tmp)
+        self.assertIn("fake-ocr", document.text)
         self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "official-ocr-mineru-local")
 
     def test_extract_real_pdf_via_subprocess_returns_fake_text(self):
@@ -103,7 +156,7 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
         self.rt.disable("official-ocr-mineru-local")
         doc = self.instance.extract("lib1", "whatever.pdf", self.tmp)
         self.assertIsNone(doc.text)
-        self.assertIn("未运行", doc.failure_reason)
+        self.assertEqual(doc.failure_reason, "deferred")
 
     def test_mineru_local_timeout_scales_with_pages(self):
         f = self.plugin_module._mineru_local_timeout

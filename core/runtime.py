@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 import logging
@@ -63,13 +64,40 @@ class PluginRuntime:
         self.state_file = state_file
         self.data_dir = data_dir
         self.registry = ExtensionRegistry()
-        self.data_store = data_store if data_store is not None else DataStore()
-        self.resource_arbiter = resource_arbiter if resource_arbiter is not None else ResourceArbiter()
+        self.data_store = data_store if data_store is not None else DataStore(data_dir)
+        if self.data_store.root is None:
+            self.data_store.root = data_dir
+        self.resource_arbiter = (
+            resource_arbiter
+            if resource_arbiter is not None
+            else ResourceArbiter(lock_dir=data_dir / "resource_locks")
+        )
         self.write_gate = write_gate if write_gate is not None else WriteGate()
         self.settings = settings if settings is not None else SettingsStore(data_dir / "settings.json")
+        saved_choices = self.settings.get("active_choices", {})
+        if isinstance(saved_choices, dict):
+            for point, plugin_id in saved_choices.items():
+                if isinstance(point, str) and isinstance(plugin_id, str):
+                    self.registry.set_active(point, plugin_id)
         self.plugins: dict[str, Plugin] = {}
         self._logger = logging.getLogger("rag_redo.core.runtime")
         self._enabled_ids: set[str] = self._load_state()
+
+    def close(self) -> None:
+        for plugin_id in reversed(list(self.plugins)):
+            plugin = self.plugins[plugin_id]
+            if plugin.state.value == "enabled":
+                self.disable(plugin_id)
+            if plugin.state.value == "disabled":
+                self.unload(plugin_id)
+
+    def set_active_choice(self, point: str, plugin_id: str) -> None:
+        if not self.registry.is_singleton(point):
+            raise ValueError(f"扩展点 {point!r} 不是单例扩展点")
+        if plugin_id not in self.registry.providers_of(point):
+            raise ValueError(f"插件 {plugin_id!r} 未注册到扩展点 {point!r}")
+        self.registry.set_active(point, plugin_id)
+        self.settings.set("active_choices", self.registry.active_choices())
 
     # ---- 发现 ----------------------------------------------------------
 
@@ -111,6 +139,12 @@ class PluginRuntime:
         if plugin.state != PluginState.DISCOVERED:
             return
         assert plugin.manifest is not None
+        boundary_errors = self._validate_import_boundary(plugin.manifest)
+        boundary_errors.extend(self._validate_capability_boundary(plugin.manifest))
+        if boundary_errors:
+            plugin.state = PluginState.INVALID
+            plugin.error = "; ".join(boundary_errors)
+            return
         try:
             instance = self._instantiate(plugin.manifest)
             ctx = self._make_context(plugin.manifest.id)
@@ -173,6 +207,69 @@ class PluginRuntime:
 
     # ---- 内部 ----------------------------------------------------------
 
+    def _validate_capability_boundary(self, manifest: PluginManifest) -> list[str]:
+        if manifest.runtime.kind != "in_process":
+            return []
+        permissions = manifest.permissions
+        forbidden: set[str] = set()
+        if permissions.get("network") is False:
+            forbidden.update({"aiohttp", "http", "httpx", "requests", "socket", "urllib"})
+        if permissions.get("gpu") is False:
+            forbidden.update({"cupy", "pynvml", "torch"})
+        if not forbidden:
+            return []
+        errors: list[str] = []
+        for source in sorted(manifest.source_dir.rglob("*.py")):
+            relative = source.relative_to(manifest.source_dir)
+            if any(part.startswith(".") for part in relative.parts) or "tests" in relative.parts:
+                continue
+            try:
+                tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+            except (OSError, SyntaxError) as exc:
+                errors.append(f"无法解析 {relative}: {exc}")
+                continue
+            for node in ast.walk(tree):
+                names: list[str] = []
+                if isinstance(node, ast.Import):
+                    names.extend(alias.name.split(".", 1)[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    names.append(node.module.split(".", 1)[0])
+                for name in names:
+                    if name in forbidden:
+                        errors.append(f"{relative} 使用未授权能力依赖 {name}")
+        return sorted(set(errors))
+
+    def _validate_import_boundary(self, manifest: PluginManifest) -> list[str]:
+        own_root = (manifest.runtime.entry or "").partition(":")[0].split(".", 1)[0]
+        forbidden = {
+            (other.manifest.runtime.entry or "").partition(":")[0].split(".", 1)[0]
+            for other in self.plugins.values()
+            if other.manifest is not None
+            and other.manifest.id != manifest.id
+        }
+        forbidden.discard(own_root)
+        if not forbidden:
+            return []
+        errors: list[str] = []
+        for source in sorted(manifest.source_dir.rglob("*.py")):
+            relative = source.relative_to(manifest.source_dir)
+            if any(part.startswith(".") for part in relative.parts) or "tests" in relative.parts:
+                continue
+            try:
+                tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+            except (OSError, SyntaxError) as exc:
+                errors.append(f"无法解析 {relative}: {exc}")
+                continue
+            for node in ast.walk(tree):
+                imported: str | None = None
+                if isinstance(node, ast.Import):
+                    imported = node.names[0].name.split(".", 1)[0] if node.names else None
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    imported = node.module.split(".", 1)[0]
+                if imported in forbidden:
+                    errors.append(f"{relative} 试图导入其他插件 {imported}")
+        return sorted(set(errors))
+
     def _instantiate(self, manifest: PluginManifest) -> object:
         # in_process 和 subprocess_service 用同一条实例化路径：两者都通过
         # runtime.entry 指向一个本地 Python 类。区别只在于这个类的
@@ -196,6 +293,8 @@ class PluginRuntime:
     def _make_context(self, plugin_id: str) -> PluginContext:
         manifest = self.plugins[plugin_id].manifest
         assert manifest is not None  # ctx 只在插件通过校验后才会被构造
+        filesystem = manifest.permissions.get("filesystem", [])
+        can_store = isinstance(filesystem, list) and "data_write" in filesystem
         return PluginContext(
             plugin_id=plugin_id,
             logger=logging.getLogger(f"rag_redo.plugin.{plugin_id}"),
@@ -203,7 +302,7 @@ class PluginRuntime:
             resource_arbiter=self.resource_arbiter,
             write_gate=self.write_gate,
             settings=self.settings,
-            data_dir=self.data_dir,
+            storage=self.data_store.storage_handle(plugin_id, allowed=can_store),
             runtime=manifest.runtime,
         )
 

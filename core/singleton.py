@@ -24,6 +24,7 @@ PID 写进文件、持锁到进程退出；后来者抢不到锁立即知道"已
 """
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 
@@ -99,34 +100,58 @@ def _lock_try_acquire(f) -> None:
     else:
         import fcntl
 
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        getattr(fcntl, "flock")(f.fileno(), getattr(fcntl, "LOCK_EX") | getattr(fcntl, "LOCK_NB"))
 
 
-def _lock_release(f) -> None:
-    # msvcrt 按当前文件指针位置锁定/解锁，必须先归位到0，否则解锁位置
-    # 与加锁位置不一致会报 PermissionError（同 _lock_try_acquire 对称）。
-    f.seek(0)
-    if _IS_WINDOWS:
-        import msvcrt
+class FileByteLock:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._f = None
 
-        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-    else:
-        import fcntl
+    def acquire(self) -> bool:
+        if self._f is not None:
+            return False
 
-        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        f = _open_lock_file(self._path)
+        try:
+            try:
+                f.seek(0, 2)
+                if f.tell() == 0:
+                    f.write(b"0")
+                    f.flush()
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+            f.seek(0)
+            try:
+                _lock_try_acquire(f)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    f.close()
+                    return False
+                raise
+        except BaseException:
+            f.close()
+            raise
 
+        self._f = f
+        return True
 
-def _record_holder_pid(f) -> None:
-    # 先 truncate 清空再写：旧内容若残留会与新 PID 直接拼接（如 "31008"+
-    # "999" → "31008999"），读取方解析出完全错误的 PID。
-    try:
-        f.seek(0)
-        f.truncate(0)
-        f.write(str(os.getpid()).encode("ascii"))
-        f.flush()
-        f.seek(0)
-    except OSError:
-        pass
+    def write(self, data: bytes) -> None:
+        if self._f is None:
+            raise RuntimeError("文件锁尚未获取")
+        self._f.seek(0)
+        self._f.truncate(0)
+        self._f.write(data)
+        self._f.flush()
+        self._f.seek(0)
+
+    def release(self) -> None:
+        f = self._f
+        self._f = None
+        if f is not None:
+            f.close()
 
 
 class ProcessSingletonGuard:
@@ -136,74 +161,26 @@ class ProcessSingletonGuard:
 
     def __init__(self, pid_file: Path) -> None:
         self._pid_file = pid_file
-        self._f = None
+        self._lock = FileByteLock(pid_file)
 
     def acquire(self) -> bool:
-        """尝试成为唯一实例。返回 `False` 表示已有存活实例持锁在跑——
-        这不是异常状况，是"本实例应该谦让退出"的正常信号，调用方自己
-        决定退出方式（`sys.exit(0)`），这个方法不会替调用方退出进程。
-
-        两段判定，都是为了防"文件不存在/未写就绪"窗口期的误判，不是为了
-        性能：
-        1) 预检：PID 文件已记录一个存活 PID → 视为已有实例（覆盖"持锁
-           进程刚死、锁已自动释放，但文件里的 PID 记录还没被清理"这类
-           陈旧残留场景）。
-        2) 文件锁：对 PID 文件本身加非阻塞字节锁，抢不到锁说明有其他
-           实例持锁运行中——这一步才是真正原子的判定，第1步只是快速
-           短路，不能替代它（同 obsidian-rag 记录过的教训：只做检查-
-           写入两步会有竞态窗口，双实例几乎同时启动时都能通过检查）。
-
-        锁原语本身失败（极端环境限制等）时选择放行继续启动，不让单例
-        机制本身成为服务不可用的原因。
-        """
+        """尝试成为唯一实例。文件锁是唯一权威，PID 内容只用于诊断。"""
         try:
-            raw = self._pid_file.read_text(encoding="utf-8").strip().split()[0]
-            if raw.isdigit() and int(raw) != os.getpid() and pid_alive(int(raw)):
-                return False
-        except (OSError, IndexError, ValueError):
-            pass
-
-        try:
-            self._pid_file.parent.mkdir(parents=True, exist_ok=True)
-            f = _open_lock_file(self._pid_file)
-            try:
-                f.seek(0, 2)
-                if f.tell() == 0:
-                    f.write(b"0")  # 保证≥1字节，字节锁才有可锁范围
-                    f.flush()
-            except OSError:
-                pass  # 并发启动时对方可能已持锁锁住首字节，写失败不要紧，锁判定会兜底
-            f.seek(0)
+            acquired = self._lock.acquire()
         except OSError:
-            return True  # 锁原语不可用：放行继续启动，见方法 docstring
-
-        try:
-            _lock_try_acquire(f)
-            _record_holder_pid(f)
-        except OSError:
-            try:
-                f.close()
-            except OSError:
-                pass
+            return False
+        if not acquired:
             return False
 
-        self._f = f
+        try:
+            self._lock.write(str(os.getpid()).encode("ascii"))
+        except OSError:
+            pass
         return True
 
     def release(self) -> None:
-        """释放字节锁 + 仅当 PID 文件确实是本进程写的才删除它（不误删
-        后来者的记录——理论上不该发生，因为持锁期间没有其他实例能写，
-        但删除前多一层确认没有坏处）。"""
+        """释放字节锁，保留 PID 文件供下一次启动覆盖。"""
         try:
-            if self._f is not None:
-                self._f.close()  # 关闭文件即释放锁（msvcrt/fcntl 锁随 fd 生命周期）
-                self._f = None
+            self._lock.release()
         except OSError:
-            pass
-        try:
-            if self._pid_file.exists():
-                current = int(self._pid_file.read_text(encoding="utf-8").strip().split()[0])
-                if current == os.getpid():
-                    self._pid_file.unlink()
-        except (OSError, IndexError, ValueError):
             pass

@@ -278,6 +278,30 @@ class TestResolvePluginPythonEnvBootstrap(unittest.TestCase):
             with self.assertRaises(SubprocessServiceError):
                 resolve_plugin_python(self.tmp)
 
+    def test_frozen_build_uses_packaged_portable_python_for_bootstrap(self):
+        from core import subprocess_service
+
+        app = self.tmp / "app"
+        portable = app / "runtime" / "python" / "python.exe"
+        portable.parent.mkdir(parents=True)
+        portable.write_text("portable", encoding="utf-8")
+        script = self.tmp / "env_bootstrap.py"
+        script.write_text("pass\n", encoding="utf-8")
+        created = self._venv_python_path()
+
+        def fake_run(command, **kwargs):
+            created.parent.mkdir(parents=True, exist_ok=True)
+            created.write_text("created", encoding="utf-8")
+            return subprocess_service.subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with patch.object(subprocess_service.sys, "frozen", True, create=True):
+            with patch.object(subprocess_service.sys, "executable", str(app / "gui" / "rag-redo.exe")):
+                with patch.dict(os.environ, {}, clear=True):
+                    with patch.object(subprocess_service.subprocess, "run", side_effect=fake_run) as run:
+                        result = subprocess_service.resolve_plugin_python(self.tmp, env_bootstrap="env_bootstrap.py")
+        self.assertEqual(result, str(created))
+        self.assertEqual(run.call_args.args[0][0], str(portable))
+
     def test_frozen_build_with_existing_venv_still_works_normally(self):
         """冻结环境下如果插件专属venv已经真的建好了（之前手动跑过一次
         env_bootstrap，或者未来打包了便携python自动建好的），照常返回，

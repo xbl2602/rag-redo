@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 _PLUGIN_DIR = Path(__file__).parent.parent
 _REPO_ROOT = _PLUGIN_DIR.parent.parent
@@ -38,6 +39,7 @@ REQUIRED_PLUGINS = [
     "official-import-export",
     "official-library-summary",
     "official-llm-openai-compatible",
+    "official-result-advisor",
 ]
 
 
@@ -121,11 +123,10 @@ class TestApi(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("error", result)
 
-    def test_reindex_and_search_round_trip(self):
+    def test_index_and_search_round_trip(self):
         self.api.add_library("lib1", "测试库", str(self.vault))
-        reindex_result = self.api.reindex_library("lib1")
-        self.assertTrue(reindex_result["ok"])
-        self.assertEqual(reindex_result["succeeded"], 1)
+        report = self.pipeline.index_library("lib1")
+        self.assertEqual(report.succeeded, 1)
 
         search_result = self.api.search("lib1", "插件 架构")
         self.assertTrue(search_result["ok"])
@@ -133,9 +134,76 @@ class TestApi(unittest.TestCase):
         self.assertEqual(search_result["results"][0]["path"], "notes.md")
         self.assertIn("confidence_tier", search_result["results"][0])
 
-    def test_reindex_unknown_library_returns_error_not_exception(self):
-        result = self.api.reindex_library("no-such-lib")
-        self.assertFalse(result["ok"])
+    def test_reindex_library_starts_background_index_from_gui(self):
+        start_result = Mock(
+            started=True,
+            message="已开始后台重建索引",
+            run_id="run-1",
+            worker_pid=1234,
+        )
+        with patch.object(
+            self.pipeline, "start_index_library", return_value=start_result
+        ) as start_index:
+            result = self.api.reindex_library("lib1")
+        self.assertEqual(
+            result,
+            {
+                "ok": True,
+                "started": True,
+                "message": "已开始后台重建索引",
+                "run_id": "run-1",
+                "worker_pid": 1234,
+                "full": False,
+            },
+        )
+        start_index.assert_called_once_with("lib1", source="gui")
+
+    def test_reindex_library_can_force_full_rebuild(self):
+        start_result = Mock(started=True, message="started", run_id="run-2", worker_pid=2345)
+        with patch.object(self.pipeline, "start_index_library", return_value=start_result) as start_index:
+            result = self.api.reindex_library("lib1", full=True)
+        self.assertTrue(result["full"])
+        start_index.assert_called_once_with("lib1", source="gui", full=True)
+
+    def test_index_status_returns_none_or_pipeline_dict(self):
+        status = {"stage": "running", "files_done": 1}
+        with patch.object(
+            self.pipeline, "index_status", side_effect=[None, status]
+        ) as index_status:
+            self.assertEqual(self.api.index_status("lib1"), {"ok": True, "status": None})
+            self.assertEqual(self.api.index_status("lib1"), {"ok": True, "status": status})
+        self.assertEqual(index_status.call_count, 2)
+        index_status.assert_called_with("lib1")
+
+    def test_stop_index_returns_pipeline_result(self):
+        for stopped, message in (
+            (True, "索引任务已取消"),
+            (False, "拒绝停止：索引任务 run_id 不匹配"),
+        ):
+            with self.subTest(stopped=stopped):
+                with patch.object(
+                    self.pipeline, "stop_index_library", return_value=(stopped, message)
+                ) as stop_index:
+                    result = self.api.stop_index("lib1", "run-1")
+                self.assertEqual(
+                    result,
+                    {"ok": True, "stopped": stopped, "message": message},
+                )
+                stop_index.assert_called_once_with("lib1", "run-1")
+
+    def test_index_api_folds_unknown_library_errors(self):
+        error = "未知库: no-such-lib"
+        expected_error = str(KeyError(error))
+        calls = (
+            ("start_index_library", lambda: self.api.reindex_library("no-such-lib")),
+            ("index_status", lambda: self.api.index_status("no-such-lib")),
+            ("stop_index_library", lambda: self.api.stop_index("no-such-lib", "run-1")),
+        )
+        for method_name, call in calls:
+            with self.subTest(method_name=method_name):
+                with patch.object(self.pipeline, method_name, side_effect=KeyError(error)):
+                    result = call()
+                self.assertEqual(result, {"ok": False, "error": expected_error})
 
     def test_search_unknown_library_returns_error_not_exception(self):
         """GUI 是零侵入观察者：Pipeline 抛出的任何异常（比如查询一个不存在
@@ -152,9 +220,94 @@ class TestApi(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["results"], [])
 
-    def test_export_then_import_writes_real_file_and_restores_search(self):
+    def test_search_marks_small_to_big_parent_backfill(self):
+        parent = "\n\n".join(f"细节第{i}段。" + "工程内容" * 60 for i in range(8))
+        (self.vault / "long.md").write_text(f"# 长父节\n\n{parent}", encoding="utf-8")
         self.api.add_library("lib1", "测试库", str(self.vault))
-        self.api.reindex_library("lib1")
+        self.pipeline.index_library("lib1")
+        result = self.api.search("lib1", "细节", top_k=3)
+        self.assertTrue(result["ok"])
+        self.assertIn("advice", result)
+        self.assertTrue(result["results"])
+        self.assertTrue(result["results"][0]["backfilled"])
+        self.assertGreater(len(result["results"][0]["text"]), 300)
+
+    def test_graph_serializes_read_model_and_uses_all_for_empty_scope(self):
+        node = Mock(
+            node_id="lib1|a.md",
+            library_id="lib1",
+            path="a.md",
+            node_type="md",
+            chunks=2,
+            updated_ns=1_500_000_000,
+            failure_reason=None,
+            theme="general",
+            extraction_state="done",
+            visual_state="none",
+            page_number=None,
+            page_count=None,
+            is_hub=True,
+        )
+        edge = Mock(source="lib1|a.md", target="lib1|b.md", kind="link")
+        response = Mock(
+            nodes=(node,),
+            edges=(edge,),
+            library_ids=("lib1",),
+            stats=Mock(nodes=2, edges=1),
+        )
+        with patch.object(self.pipeline, "graph", return_value=response) as graph:
+            result = self.api.graph("")
+        graph.assert_called_once_with("all")
+        self.assertEqual(result["nodes"][0]["id"], "lib1|a.md")
+        self.assertEqual(result["nodes"][0]["pipeline"], {"mineru": "done", "wemm": "none"})
+        self.assertEqual(result["edges"], [{"a": "lib1|a.md", "b": "lib1|b.md", "kind": "link"}])
+        self.assertEqual(result["stats"], {"nodes": 2, "edges": 1})
+
+    def test_graph_semantic_edges_exposes_error_without_raising(self):
+        with patch.object(
+            self.pipeline,
+            "graph_semantic_edges",
+            return_value=Mock(edges=(), error="模型不可用"),
+        ) as semantic_edges:
+            result = self.api.graph_semantic_edges("lib1", 0.7)
+        semantic_edges.assert_called_once_with("lib1", threshold=0.7)
+        self.assertEqual(result, {"ok": True, "edges": [], "error": "模型不可用"})
+
+    def test_graph_api_folds_pipeline_errors(self):
+        with patch.object(self.pipeline, "graph", side_effect=ValueError("bad graph")):
+            self.assertEqual(self.api.graph("bad"), {"ok": False, "error": "bad graph"})
+
+    def test_open_source_resolves_only_inside_library(self):
+        self.api.add_library("lib1", "测试库", str(self.vault))
+        with patch("os.startfile") as startfile:
+            result = self.api.open_source("lib1", "notes.md")
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["opened"])
+        startfile.assert_called_once_with(str(self.vault / "notes.md"))
+        outside = self.api.open_source("lib1", "../outside.txt")
+        self.assertFalse(outside["ok"])
+        self.assertIn("越出", outside["error"])
+
+    def test_index_failures_read_document_and_relations_delegate(self):
+        failures = {"succeeded": 1, "failures": [{"path": "bad.md", "reason": "提取失败"}]}
+        document = Mock(path="notes.md", text="正文", source="源文件直读")
+        relations = {"resolved": True, "file": "notes.md", "outlinks": ["a.md"], "inlinks": []}
+        with patch.object(self.pipeline, "index_failures", return_value=failures) as index_failures:
+            self.assertEqual(
+                self.api.index_failures("lib1"),
+                {"ok": True, "failures": failures["failures"]},
+            )
+            index_failures.assert_called_once_with("lib1")
+        with patch.object(self.pipeline, "read_document", return_value=document):
+            self.assertEqual(
+                self.api.read_document("lib1", "notes.md"),
+                {"ok": True, "path": "notes.md", "text": "正文", "source": "源文件直读"},
+            )
+        with patch.object(self.pipeline, "note_relations", return_value=relations):
+            self.assertEqual(self.api.note_relations("lib1", "notes.md"), {"ok": True, **relations})
+
+        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.pipeline.index_library("lib1")
         before = self.api.search("lib1", "插件 架构")
 
         dest = str(self.tmp / "lib1.ragexport.zip")
@@ -203,7 +356,7 @@ class TestApi(unittest.TestCase):
 
     def test_refresh_library_summary_calls_llm_and_writes_directly(self):
         self.api.add_library("lib1", "测试库", str(self.vault))
-        self.api.reindex_library("lib1")
+        self.pipeline.index_library("lib1")
         result = self.api.refresh_library_summary("lib1")
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["text"], self.fake_llm.response)
@@ -213,7 +366,7 @@ class TestApi(unittest.TestCase):
 
     def test_refresh_library_summary_needs_confirm_when_user_authored_and_not_forced(self):
         self.api.add_library("lib1", "测试库", str(self.vault))
-        self.api.reindex_library("lib1")
+        self.pipeline.index_library("lib1")
         self.api.set_library_summary("lib1", "用户手写的简介")
         result = self.api.refresh_library_summary("lib1")
         self.assertFalse(result["ok"])
@@ -223,7 +376,7 @@ class TestApi(unittest.TestCase):
 
     def test_refresh_library_summary_force_overwrites_user_authored(self):
         self.api.add_library("lib1", "测试库", str(self.vault))
-        self.api.reindex_library("lib1")
+        self.pipeline.index_library("lib1")
         self.api.set_library_summary("lib1", "用户手写的简介")
         result = self.api.refresh_library_summary("lib1", force=True)
         self.assertTrue(result["ok"], result)

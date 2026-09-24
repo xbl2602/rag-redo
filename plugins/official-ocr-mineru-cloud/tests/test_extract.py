@@ -3,6 +3,7 @@ official-embedder-bge-m3 的"真实依赖懒加载、测试注入假实现"纪�
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -31,6 +32,40 @@ class _FakeHttpClient:
         return self.text
 
 
+class _FakeBatchClient:
+    def __init__(self, *, first_timeout: bool = False) -> None:
+        self.first_timeout = first_timeout
+        self.submit_calls = 0
+        self.upload_calls = 0
+        self.poll_calls = 0
+
+    def submit(self, file_bytes: bytes, filename: str, *, is_ocr: bool) -> dict:
+        self.submit_calls += 1
+        return {"batch_id": "batch-1", "upload_url": "https://upload.invalid/file"}
+
+    def upload(self, upload_url: str, file_bytes: bytes) -> None:
+        self.upload_calls += 1
+
+    def poll(self, batch_id: str, *, timeout: float) -> tuple[str | None, str, bytes | None]:
+        self.poll_calls += 1
+        if self.first_timeout and self.poll_calls == 1:
+            return None, "timeout", None
+        return "云端正文", "done", b"[]"
+
+
+class _RetryClient(_FakeHttpClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.remaining = 2
+
+    def ocr(self, file_bytes: bytes, filename: str) -> str:
+        self.calls.append((file_bytes, filename))
+        if self.remaining:
+            self.remaining -= 1
+            raise MineruCloudError("临时错误", retryable=True)
+        return "重试成功"
+
+
 class TestMineruCloudExtractorWithFakeClient(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -48,6 +83,37 @@ class TestMineruCloudExtractorWithFakeClient(unittest.TestCase):
         self.assertEqual(doc.extracted_by, "official-ocr-mineru-cloud")
         self.assertEqual(len(fake.calls), 1)
         self.assertEqual(fake.calls[0][1], "scan.pdf")
+
+    def test_retryable_client_error_is_retried(self):
+        (self.tmp / "scan.pdf").write_bytes(b"%PDF-fake-bytes")
+        fake = _RetryClient()
+        doc = MineruCloudExtractor(http_client=fake).extract("lib1", "scan.pdf", self.tmp)
+        self.assertEqual(doc.text, "重试成功")
+        self.assertEqual(len(fake.calls), 3)
+
+    def test_batch_pending_resume_and_sidecar(self):
+        (self.tmp / "scan.pdf").write_bytes(b"%PDF-fake-bytes")
+        pending = self.tmp / "state" / "pending.json"
+        sidecars = self.tmp / "state" / "sidecars"
+        first_client = _FakeBatchClient(first_timeout=True)
+        first = MineruCloudExtractor(
+            http_client=first_client,
+            pending_path=pending,
+            sidecar_dir=sidecars,
+        ).extract("lib1", "scan.pdf", self.tmp)
+        self.assertEqual(first.failure_state, "deferred")
+        self.assertTrue(pending.is_file())
+        second_client = _FakeBatchClient()
+        second = MineruCloudExtractor(
+            http_client=second_client,
+            pending_path=pending,
+            sidecar_dir=sidecars,
+        ).extract("lib1", "scan.pdf", self.tmp)
+        self.assertEqual(second.text, "云端正文")
+        self.assertEqual(second_client.submit_calls, 0)
+        self.assertEqual(second_client.upload_calls, 0)
+        self.assertEqual(json.loads(pending.read_text(encoding="utf-8")), {})
+        self.assertTrue(list(sidecars.glob("*.json")))
 
     def test_non_pdf_file_skipped_not_error(self):
         (self.tmp / "notes.txt").write_text("纯文本", encoding="utf-8")
@@ -88,7 +154,7 @@ class TestMineruCloudExtractorWithFakeClient(unittest.TestCase):
         doc = extractor.extract("lib1", "scan.pdf", self.tmp)
 
         self.assertIsNone(doc.text)
-        self.assertIn("未分类", doc.failure_reason)
+        self.assertTrue(doc.failure_reason.startswith("extract-failed:"))
 
     def test_empty_ocr_result_folds_to_failure(self):
         (self.tmp / "scan.pdf").write_bytes(b"%PDF-fake-bytes")
@@ -96,7 +162,7 @@ class TestMineruCloudExtractorWithFakeClient(unittest.TestCase):
         extractor = MineruCloudExtractor(http_client=fake)
         doc = extractor.extract("lib1", "scan.pdf", self.tmp)
         self.assertIsNone(doc.text)
-        self.assertIn("为空", doc.failure_reason)
+        self.assertEqual(doc.failure_reason, "empty")
 
     def test_content_hash_is_stable_for_same_bytes(self):
         (self.tmp / "scan.pdf").write_bytes(b"%PDF-fixed-content")

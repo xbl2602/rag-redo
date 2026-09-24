@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-CHUNKER_VERSION = "0.1.0"
+CHUNKER_VERSION = "0.2.0"
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _SENTENCE_END_RE = re.compile(r"(?<=[。！？.!?])\s*")
@@ -28,6 +28,8 @@ _SENTENCE_END_RE = re.compile(r"(?<=[。！？.!?])\s*")
 class ChunkPiece:
     heading_breadcrumb: str
     text: str
+    section_id: str
+    section_text: str
 
 
 def _is_table_line(line: str) -> bool:
@@ -84,8 +86,9 @@ def _split_long_block_by_sentence(block: str, max_chars: int) -> list[str]:
 def chunk_document(text: str, *, max_chars: int = 800, overlap_chars: int = 100) -> list[ChunkPiece]:
     lines = text.splitlines()
     heading_stack: list[str] = []
-    sections: list[tuple[str, list[str]]] = []
+    sections: list[tuple[str, str, str]] = []
     body: list[str] = []
+    section_index = 0
 
     def breadcrumb() -> str:
         return " > ".join(heading_stack) if heading_stack else "(无标题)"
@@ -94,7 +97,8 @@ def chunk_document(text: str, *, max_chars: int = 800, overlap_chars: int = 100)
         m = _HEADING_RE.match(line)
         if m:
             if body:
-                sections.append((breadcrumb(), body))
+                sections.append((breadcrumb(), f"s{section_index}", "\n".join(body).strip()))
+                section_index += 1
                 body = []
             level = len(m.group(1))
             title = m.group(2).strip()
@@ -102,10 +106,11 @@ def chunk_document(text: str, *, max_chars: int = 800, overlap_chars: int = 100)
         else:
             body.append(line)
     if body:
-        sections.append((breadcrumb(), body))
+        sections.append((breadcrumb(), f"s{section_index}", "\n".join(body).strip()))
 
     pieces: list[ChunkPiece] = []
-    for crumb, body_lines in sections:
+    for crumb, section_id, section_text in sections:
+        body_lines = section_text.splitlines()
         blocks: list[str] = []
         for block in _split_blocks(body_lines):
             if len(block) > max_chars:
@@ -116,12 +121,26 @@ def chunk_document(text: str, *, max_chars: int = 800, overlap_chars: int = 100)
         current = ""
         for block in blocks:
             if current and len(current) + 1 + len(block) > max_chars:
-                pieces.append(ChunkPiece(heading_breadcrumb=crumb, text=current))
+                pieces.append(
+                    ChunkPiece(
+                        heading_breadcrumb=crumb,
+                        text=current,
+                        section_id=section_id,
+                        section_text=section_text,
+                    )
+                )
                 tail = current[-overlap_chars:] if overlap_chars > 0 else ""
                 current = f"{tail}\n{block}" if tail else block
             else:
                 current = f"{current}\n{block}" if current else block
         if current:
-            pieces.append(ChunkPiece(heading_breadcrumb=crumb, text=current))
+            pieces.append(
+                ChunkPiece(
+                    heading_breadcrumb=crumb,
+                    text=current,
+                    section_id=section_id,
+                    section_text=section_text,
+                )
+            )
 
     return pieces

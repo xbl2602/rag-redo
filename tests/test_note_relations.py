@@ -110,6 +110,27 @@ class TestNoteRelationsStore(unittest.TestCase):
         result = self.store.resolve("lib1", "笔记A.md")
         self.assertEqual(result["outlinks"], [])
 
+    def test_resolved_edges_are_undirected_deduplicated_and_sorted(self):
+        self.store.write_library(
+            "lib1",
+            {
+                "a.md": ["b", "子/c.md", "a"],
+                "b.md": ["a"],
+                "子/c.md": ["a.md"],
+                "dangling.md": ["missing"],
+            },
+        )
+        self.assertEqual(
+            self.store.resolved_edges("lib1"),
+            (("a.md", "b.md"), ("a.md", "子/c.md")),
+        )
+
+    def test_resolved_edges_are_generation_scoped(self):
+        self.store.write_library("lib1", {"a.md": ["b"], "b.md": []}, "old")
+        self.store.write_library("lib1", {"a.md": ["c"], "c.md": []}, "new")
+        self.assertEqual(self.store.resolved_edges("lib1", "old"), (("a.md", "b.md"),))
+        self.assertEqual(self.store.resolved_edges("lib1", "new"), (("a.md", "c.md"),))
+
     def test_rewriting_library_replaces_stale_links(self):
         self.store.write_library("lib1", {"笔记A.md": ["笔记B"]})
         self.store.write_library("lib1", {"笔记A.md": []})  # 全量重跑覆盖旧数据

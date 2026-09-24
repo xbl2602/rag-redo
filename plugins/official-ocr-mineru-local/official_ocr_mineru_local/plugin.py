@@ -54,7 +54,7 @@ from pathlib import Path
 from core.contracts import ExtractedDocument
 from core.subprocess_service import SubprocessServiceError, SubprocessServiceHandle
 
-EXTRACTOR_VERSION = "0.1.0"
+EXTRACTOR_VERSION = "0.2.0"
 PLUGIN_ID = "official-ocr-mineru-local"
 GPU_RESOURCE_ID = "gpu:0"
 GPU_PRIORITY = 10  # 和 official-visual-wemm 同一层级，互相抢占（preempt_equal）
@@ -126,6 +126,8 @@ class MineruLocalOcrPlugin:
         self._runtime_health_check: str | None = None
         self._runtime_command: tuple[str, ...] | None = None
         self._settings = None
+        self._resource_arbiter = None
+        self._plugin_id = ""
 
     def on_load(self, ctx):
         self._logger = ctx.logger
@@ -133,24 +135,47 @@ class MineruLocalOcrPlugin:
         ctx.logger.info("MinerU本机OCR已加载")
 
     def on_enable(self, ctx):
-        # 名额协商，不是真实GPU探测——见模块docstring。
-        ctx.resource_arbiter.acquire(
-            GPU_RESOURCE_ID, ctx.plugin_id, priority=GPU_PRIORITY, on_preempt=self._soft_evict, preempt_equal=True
-        )
+        self._resource_arbiter = ctx.resource_arbiter
+        self._plugin_id = ctx.plugin_id
         self._plugin_dir = Path(__file__).parent
         self._runtime_health_check = ctx.runtime.health_check
         self._runtime_command = ctx.runtime.command
         self._enabled = True
-        self._start_handle()
+        if not self.is_active():
+            return
+        acquired = ctx.resource_arbiter.acquire(
+            GPU_RESOURCE_ID,
+            ctx.plugin_id,
+            priority=GPU_PRIORITY,
+            on_preempt=self._soft_evict,
+            preempt_equal=True,
+        )
+        if acquired:
+            self._start_handle()
 
     def on_disable(self, ctx):
         self._enabled = False
         self._stop_handle()
         ctx.resource_arbiter.release(GPU_RESOURCE_ID, ctx.plugin_id)
+        self._resource_arbiter = None
+        self._plugin_id = ""
 
     def on_unload(self, ctx):
         self._enabled = False
         self._stop_handle()
+        if self._resource_arbiter is not None and self._plugin_id:
+            self._resource_arbiter.release(GPU_RESOURCE_ID, self._plugin_id)
+        self._resource_arbiter = None
+        self._plugin_id = ""
+
+    def is_active(self) -> bool:
+        selected = self._settings.get("pdf_scan_backend", "none") if self._settings is not None else "none"
+        return selected == "mineru-local"
+
+    def index_signature(self) -> str:
+        selected = self._settings.get("pdf_scan_backend", "none") if self._settings is not None else "none"
+        readiness = "ready" if _resolve_mineru_python(settings=self._settings) else "noready"
+        return f"selected:{selected}:{readiness}"
 
     def _start_handle(self) -> None:
         assert self._plugin_dir is not None and self._runtime_command is not None
@@ -183,6 +208,16 @@ class MineruLocalOcrPlugin:
     def _ensure_alive(self) -> bool:
         if not self._enabled:
             return False
+        if self._resource_arbiter is not None and self._resource_arbiter.holder_of(GPU_RESOURCE_ID) != self._plugin_id:
+            acquired = self._resource_arbiter.acquire(
+                GPU_RESOURCE_ID,
+                self._plugin_id,
+                priority=GPU_PRIORITY,
+                on_preempt=self._soft_evict,
+                preempt_equal=True,
+            )
+            if not acquired:
+                return False
         if self._handle is not None and self._handle.is_alive:
             return True
         try:
@@ -197,7 +232,7 @@ class MineruLocalOcrPlugin:
         if full_path.suffix.lower() != ".pdf":
             return self._fail(library_id, path, "不是PDF，本机OCR跳过")
         if not self._ensure_alive():
-            return self._fail(library_id, path, "本机OCR子进程未运行")
+            return self._fail(library_id, path, "deferred")
 
         try:
             data = full_path.read_bytes()
@@ -212,13 +247,15 @@ class MineruLocalOcrPlugin:
         try:
             result = self._handle.call("extract", {"path": path, "root": str(root)}, timeout=timeout)
         except SubprocessServiceError as exc:
-            return self._fail(library_id, path, f"本机OCR调用失败: {exc}", content_hash)
+            return self._fail(library_id, path, f"extract-failed: {type(exc).__name__}", content_hash)
 
         text = result.get("text")
         if text is None:
-            return self._fail(library_id, path, result.get("failure_reason") or "本机OCR未返回文本", content_hash)
+            reason = str(result.get("failure_reason") or "本机OCR未返回文本")
+            category = "scanned" if reason.startswith("too-many-pages:") else "extract-failed"
+            return self._fail(library_id, path, f"{category}:{reason}", content_hash)
         if not text.strip():
-            return self._fail(library_id, path, "OCR结果为空", content_hash)
+            return self._fail(library_id, path, "empty", content_hash)
 
         return ExtractedDocument(
             library_id=library_id,

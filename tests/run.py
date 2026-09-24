@@ -1,5 +1,6 @@
-"""统一测试入口，风格对齐旧 obsidian-rag 项目 tests/run.py：单进程跑完全部
-套件，打印"结果：N/M 套通过"。见 ../AGENTS.md 测试纪律一节。
+"""统一测试入口，风格对齐旧 obsidian-rag 项目 tests/run.py：核心套件在
+同一进程运行，插件套件各自在隔离子进程运行，避免 Chroma/原生扩展的进程级
+句柄在几十个测试 runtime 之间累积，打印“结果：N/M 套通过”。
 
 覆盖三类测试：
 - 核心测试（本目录下的 test_*.py，测 core/ 里的核心组件）
@@ -11,7 +12,9 @@ test_config.py"这种同名冲突。
 """
 from __future__ import annotations
 
+import gc
 import importlib.util
+import subprocess
 import sys
 import time
 import unittest
@@ -31,6 +34,7 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
 CORE_SUITES = [
+    "test_agents_contract",
     "test_manifest",
     "test_plugin_manifests_sane",
     "test_registry",
@@ -43,6 +47,7 @@ CORE_SUITES = [
     "test_index_progress",
     "test_index_failures",
     "test_note_relations",
+    "test_graph",
     "test_singleton",
     "test_runtime",
     "test_subprocess_service",
@@ -87,21 +92,25 @@ def main() -> int:
         elapsed = time.time() - start
         timings.append((f"core/{name}", elapsed))
         ok = result.wasSuccessful()
+        gc.collect()
         total_ok += 1 if ok else 0
         print(f"{'PASS' if ok else 'FAIL'} core/{name} ({result.testsRun} 用例, {elapsed:.2f}s)")
 
+    runner = Path(__file__).resolve()
     for path in _discover_extra_test_files():
         label = str(path.relative_to(REPO_ROOT))
         total += 1
-        module = _load_module_from_path(path)
-        suite = loader.loadTestsFromModule(module)
         start = time.time()
-        result = unittest.TextTestRunner(verbosity=0).run(suite)
+        completed = subprocess.run(
+            [sys.executable, str(runner), "--suite", str(path.resolve())],
+            cwd=str(REPO_ROOT),
+            check=False,
+        )
         elapsed = time.time() - start
         timings.append((label, elapsed))
-        ok = result.wasSuccessful()
+        ok = completed.returncode == 0
         total_ok += 1 if ok else 0
-        print(f"{'PASS' if ok else 'FAIL'} {label} ({result.testsRun} 用例, {elapsed:.2f}s)")
+        print(f"{'PASS' if ok else 'FAIL'} {label} ({elapsed:.2f}s)")
 
     print(f"\n结果：{total_ok}/{total} 套通过")
     timings.sort(key=lambda t: -t[1])
@@ -109,5 +118,14 @@ def main() -> int:
     return 0 if total_ok == total else 1
 
 
+def _run_single_suite(path: Path) -> int:
+    module = _load_module_from_path(path)
+    suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+    result = unittest.TextTestRunner(verbosity=0).run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--suite":
+        sys.exit(_run_single_suite(Path(sys.argv[2])))
     sys.exit(main())

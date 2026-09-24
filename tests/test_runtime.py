@@ -173,7 +173,11 @@ class TestPluginRuntimeLifecycle(unittest.TestCase):
         self.state_file = self.tmp / "data" / "plugins_state.json"
 
     def _runtime(self) -> PluginRuntime:
-        return PluginRuntime(self.plugins_dir, state_file=self.state_file)
+        return PluginRuntime(
+            self.plugins_dir,
+            state_file=self.state_file,
+            data_dir=self.tmp / "data",
+        )
 
     def test_scan_discovers_valid_plugin(self):
         _make_plugin(self.plugins_dir, "t-hello", "t_hello_mod", "Hello", _LIFECYCLE_BODY.format(cls="Hello"))
@@ -193,6 +197,50 @@ class TestPluginRuntimeLifecycle(unittest.TestCase):
         self.assertEqual(rt.plugins["t-cycle"].state, PluginState.DISABLED)
         rt.unload("t-cycle")
         self.assertEqual(rt.plugins["t-cycle"].state, PluginState.DISCOVERED)
+
+    def test_active_choice_switch_is_live_and_persisted_without_reinstall(self):
+        body_a = "class ChoiceA:\n    def on_load(self, ctx): self.loaded = True\n    def on_enable(self, ctx): pass\n    def on_disable(self, ctx): pass\n    def on_unload(self, ctx): pass\n"
+        body_b = "class ChoiceB:\n    def on_load(self, ctx): self.loaded = True\n    def on_enable(self, ctx): pass\n    def on_disable(self, ctx): pass\n    def on_unload(self, ctx): pass\n"
+        _make_plugin(self.plugins_dir, "t-choice-a", "t_choice_a", "ChoiceA", body_a, 'model = "singleton"')
+        _make_plugin(self.plugins_dir, "t-choice-b", "t_choice_b", "ChoiceB", body_b, 'model = "singleton"')
+        rt = self._runtime()
+        rt.scan()
+        rt.load("t-choice-a")
+        rt.load("t-choice-b")
+        rt.enable("t-choice-a")
+        rt.enable("t-choice-b")
+        with self.assertRaises(ExtensionConflictError):
+            rt.registry.active_of("model")
+        rt.set_active_choice("model", "t-choice-b")
+        self.assertEqual(rt.registry.active_of("model"), "t-choice-b")
+        selected = rt.plugins["t-choice-b"].instance
+        self.assertIs(selected, rt.plugins["t-choice-b"].instance)
+        restarted = self._runtime()
+        restarted.scan()
+        restarted.load("t-choice-a")
+        restarted.load("t-choice-b")
+        self.assertEqual(restarted.registry.active_of("model"), "t-choice-b")
+
+    def test_cross_plugin_import_is_rejected_before_load(self):
+        _make_plugin(
+            self.plugins_dir,
+            "t-boundary-a",
+            "t_boundary_a",
+            "BoundaryA",
+            "import t_boundary_b\nclass BoundaryA:\n    def on_load(self, ctx): pass\n",
+        )
+        _make_plugin(
+            self.plugins_dir,
+            "t-boundary-b",
+            "t_boundary_b",
+            "BoundaryB",
+            _LIFECYCLE_BODY.format(cls="BoundaryB"),
+        )
+        rt = self._runtime()
+        rt.scan()
+        rt.load("t-boundary-a")
+        self.assertEqual(rt.plugins["t-boundary-a"].state, PluginState.INVALID)
+        self.assertIn("t_boundary_b", rt.plugins["t-boundary-a"].error)
 
     def test_broken_on_enable_isolated_as_failed(self):
         _make_plugin(

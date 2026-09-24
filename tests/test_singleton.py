@@ -8,11 +8,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from core.singleton import ProcessSingletonGuard, pid_alive  # noqa: E402
+from core.singleton import FileByteLock, ProcessSingletonGuard, pid_alive  # noqa: E402
 
 
 class TestPidAlive(unittest.TestCase):
@@ -31,6 +32,60 @@ class TestPidAlive(unittest.TestCase):
         # 不保证在所有平台上都不存在，但 99999999 在正常桌面/CI 环境下
         # 极不可能是一个真实存活的进程——同类探测型测试的常见务实做法。
         self.assertFalse(pid_alive(99999999))
+
+
+class TestFileByteLock(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.lock_file = self.tmp / "resource.lock"
+
+    def test_second_lock_in_same_process_fails_while_first_holds(self):
+        first = FileByteLock(self.lock_file)
+        self.assertTrue(first.acquire())
+        second = FileByteLock(self.lock_file)
+        self.assertFalse(second.acquire())
+        first.release()
+
+    def test_after_release_a_new_lock_can_acquire(self):
+        first = FileByteLock(self.lock_file)
+        self.assertTrue(first.acquire())
+        first.release()
+        first.release()
+
+        second = FileByteLock(self.lock_file)
+        self.assertTrue(second.acquire())
+        second.release()
+
+    def test_real_second_process_cannot_acquire_while_first_holds(self):
+        first = FileByteLock(self.lock_file)
+        self.assertTrue(first.acquire())
+        try:
+            script = (
+                "import sys; sys.path.insert(0, r'%s');"
+                "from core.singleton import FileByteLock;"
+                "from pathlib import Path;"
+                "lock = FileByteLock(Path(r'%s'));"
+                "print('ACQUIRED' if lock.acquire() else 'REJECTED')"
+            ) % (str(REPO_ROOT), str(self.lock_file))
+            result = subprocess.run(
+                [sys.executable, "-c", script], capture_output=True, text=True, timeout=15
+            )
+            self.assertIn("REJECTED", result.stdout, result.stderr)
+        finally:
+            first.release()
+
+    def test_open_oserror_propagates(self):
+        lock = FileByteLock(self.lock_file)
+        with patch("core.singleton._open_lock_file", side_effect=OSError("open failed")):
+            with self.assertRaises(OSError):
+                lock.acquire()
+
+    def test_lock_oserror_propagates(self):
+        lock = FileByteLock(self.lock_file)
+        with patch("core.singleton._lock_try_acquire", side_effect=OSError("lock failed")):
+            with self.assertRaises(OSError):
+                lock.acquire()
 
 
 class TestProcessSingletonGuard(unittest.TestCase):
@@ -63,12 +118,23 @@ class TestProcessSingletonGuard(unittest.TestCase):
         self.assertTrue(second.acquire())
         second.release()
 
-    def test_release_removes_pid_file_written_by_this_process(self):
+    def test_release_keeps_pid_file_for_next_diagnostic_overwrite(self):
         guard = ProcessSingletonGuard(self.pid_file)
         guard.acquire()
         self.assertTrue(self.pid_file.exists())
         guard.release()
-        self.assertFalse(self.pid_file.exists())
+        self.assertTrue(self.pid_file.exists())
+
+    def test_lock_unavailable_fails_closed(self):
+        guard = ProcessSingletonGuard(self.pid_file)
+        with patch.object(guard._lock, "acquire", side_effect=OSError("lock failed")):
+            self.assertFalse(guard.acquire())
+
+    def test_live_pid_record_does_not_replace_file_lock_authority(self):
+        self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        guard = ProcessSingletonGuard(self.pid_file)
+        self.assertTrue(guard.acquire())
+        guard.release()
 
     def test_stale_pid_file_from_dead_process_does_not_block_acquire(self):
         """PID 文件残留一个已经不存在的进程号（比如上次崩溃/被强杀没走到

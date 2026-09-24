@@ -21,18 +21,25 @@ from __future__ import annotations
 from pathlib import Path
 
 from core.contracts import Chunk
+from core.index_generation import IndexGenerationStore
 
-from .bm25 import BM25Index
+from .bm25 import BM25Index, INDEXER_VERSION
 
 
 class LexicalBM25Plugin:
     def __init__(self) -> None:
-        self.indexes: dict[str, BM25Index] | None = None
+        self.indexes: dict[tuple[str, str], BM25Index] | None = None
+        self._index_file_identities: dict[tuple[str, str], tuple[int, int] | None] | None = None
         self._data_dir: Path | None = None
+        self._generations: IndexGenerationStore | None = None
 
     def on_load(self, ctx):
         self.indexes = {}
-        self._data_dir = ctx.data_dir / "bm25"
+        self._index_file_identities = {}
+        self._data_dir = ctx.storage.directory("bm25", legacy="bm25")
+        self._generations = IndexGenerationStore(
+            ctx.storage.directory("index_generations", legacy="index_generations")
+        )
         ctx.logger.info("BM25词法索引已加载")
 
     def on_enable(self, ctx):
@@ -43,42 +50,94 @@ class LexicalBM25Plugin:
 
     def on_unload(self, ctx):
         self.indexes = None
+        self._index_file_identities = None
         self._data_dir = None
+        self._generations = None
 
-    def _path_for(self, library_id: str) -> Path:
+    def _path_for(self, library_id: str, generation: str | None = None) -> Path:
         assert self._data_dir is not None
+        if generation:
+            safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in library_id)
+            return self._data_dir / "generations" / safe / f"{generation}.json"
         return self._data_dir / f"{library_id}.json"
 
-    def _index_for(self, library_id: str) -> BM25Index:
+    def _file_identity(self, path: Path) -> tuple[int, int] | None:
+        try:
+            file_stat = path.stat()
+        except OSError:
+            return None
+        return file_stat.st_mtime_ns, file_stat.st_size
+
+    def _index_for(self, library_id: str, generation: str | None = None) -> BM25Index:
         assert self.indexes is not None
-        if library_id not in self.indexes:
-            self.indexes[library_id] = BM25Index.load(self._path_for(library_id))
-        return self.indexes[library_id]
+        assert self._index_file_identities is not None
+        if generation is None and self._generations is not None:
+            generation = self._generations.active(library_id)
+        key = (library_id, generation or "")
+        path = self._path_for(library_id, generation)
+        identity = self._file_identity(path)
+        if key not in self.indexes or self._index_file_identities.get(key) != identity:
+            self.indexes[key] = BM25Index.load(path)
+            self._index_file_identities[key] = identity
+        return self.indexes[key]
 
-    def index_chunk(self, chunk: Chunk) -> None:
-        self._index_for(chunk.library_id).add(chunk.chunk_id, chunk.text)
+    def index_signature(self) -> str:
+        return INDEXER_VERSION
 
-    def remove_chunk(self, library_id: str, chunk_id: str) -> None:
-        self._index_for(library_id).remove(chunk_id)
+    def index_chunk(self, chunk: Chunk, generation: str | None = None) -> None:
+        self._index_for(chunk.library_id, generation).add(chunk.chunk_id, chunk.text)
 
-    def search(self, library_id: str, query: str, top_k: int = 10) -> list[tuple[str, float]]:
-        return self._index_for(library_id).search(query, top_k=top_k)
+    def remove_chunk(self, library_id: str, chunk_id: str, generation: str | None = None) -> None:
+        self._index_for(library_id, generation).remove(chunk_id)
 
-    def save(self, library_id: str) -> None:
+    def search(
+        self,
+        library_id: str,
+        query: str,
+        top_k: int = 10,
+        generation: str | None = None,
+    ) -> list[tuple[str, float]]:
+        return self._index_for(library_id, generation).search(query, top_k=top_k)
+
+    def save(self, library_id: str, generation: str | None = None) -> None:
         """索引一个库结束后调用一次（见 core/pipeline.py），不是每加一个
         chunk 就存一次——批量索引一个库可能有几百个chunk，逐个落盘是不
         必要的 I/O 开销，攒到这一批全部处理完再写一次。"""
-        if self.indexes is not None and library_id in self.indexes:
-            self.indexes[library_id].save(self._path_for(library_id))
+        key = (library_id, generation or "")
+        if (
+            self.indexes is not None
+            and self._index_file_identities is not None
+            and key in self.indexes
+        ):
+            path = self._path_for(library_id, generation)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.indexes[key].save(path)
+            self._index_file_identities[key] = self._file_identity(path)
 
-    def export_state(self, library_id: str) -> dict:
+    def delete_generation(self, library_id: str, generation: str) -> None:
+        key = (library_id, generation)
+        if self.indexes is not None:
+            self.indexes.pop(key, None)
+        if self._index_file_identities is not None:
+            self._index_file_identities.pop(key, None)
+        try:
+            self._path_for(library_id, generation).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def export_state(self, library_id: str, generation: str | None = None) -> dict:
         """给 official-import-export 插件用：拿这个库的 BM25 索引状态
         （纯 JSON 兼容字典），打包进导出归档，不用先落盘再读文件。"""
-        return self._index_for(library_id).to_dict()
+        return self._index_for(library_id, generation).to_dict()
 
-    def import_state(self, library_id: str, data: dict) -> None:
+    def import_state(
+        self,
+        library_id: str,
+        data: dict,
+        generation: str | None = None,
+    ) -> None:
         """从导出归档恢复这个库的 BM25 索引状态，并立刻落盘（恢复完的
         状态不该只活在内存里，否则马上重启又得重新导入一遍）。"""
         assert self.indexes is not None
-        self.indexes[library_id] = BM25Index.from_dict(data)
-        self.save(library_id)
+        self.indexes[(library_id, generation or "")] = BM25Index.from_dict(data)
+        self.save(library_id, generation)

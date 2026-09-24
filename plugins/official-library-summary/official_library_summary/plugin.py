@@ -59,7 +59,10 @@ class LibrarySummaryPlugin:
         self._logger = None
 
     def on_load(self, ctx):
-        self._store = SummaryStore(ctx.data_dir / "library_summary" / "summaries.json")
+        self._store = SummaryStore(
+            ctx.storage.directory("library_summary", legacy="library_summary")
+            / "summaries.json"
+        )
         self._write_gate = ctx.write_gate
         self._logger = ctx.logger
         ctx.logger.info("库摘要插件已加载")

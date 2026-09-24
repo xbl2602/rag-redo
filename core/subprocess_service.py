@@ -33,6 +33,19 @@ class EnvBootstrapError(Exception):
     异常类型本身只是让失败原因可读，不是要往外传播炸宿主进程。"""
 
 
+def _portable_python() -> Path | None:
+    configured = os.environ.get("RAG_REDO_PORTABLE_PYTHON")
+    if configured:
+        candidate = Path(configured)
+        return candidate if candidate.is_file() else None
+    executable = Path(sys.executable).resolve()
+    candidates = [
+        executable.parent / "runtime" / "python" / "python.exe",
+        executable.parent.parent / "runtime" / "python" / "python.exe",
+    ]
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+
 def _venv_python_path(venv_dir: Path) -> Path:
     if sys.platform == "win32":
         return venv_dir / "Scripts" / "python.exe"
@@ -64,19 +77,21 @@ def _run_env_bootstrap(plugin_dir: Path, env_bootstrap: str, *, timeout: float, 
     自我复制的进程炸弹。真正的修复（给冻结产物打包一份独立的、能当脚本
     解释器用的便携 Python）是后续工作，还没做，见 docs/ROADMAP.md。"""
     if getattr(sys, "frozen", False):
-        raise EnvBootstrapError(
-            "当前是 PyInstaller 冻结产物，没有可以用来跑 env_bootstrap 脚本的独立解释器"
-            "（sys.executable 是这个冻结 exe 自己，不是通用 Python，直接拿它当解释器用"
-            "会导致 exe 把自己重新拉起——已知问题，见 core/subprocess_service.py 本函数"
-            "docstring，真正的修复需要给冻结产物打包一份独立便携 Python，还没做）"
-        )
+        python = _portable_python()
+        if python is None:
+            raise EnvBootstrapError(
+                "当前是 PyInstaller 冻结产物，但找不到独立便携 Python；"
+                "请确认安装目录包含 runtime/python/python.exe"
+            )
+    else:
+        python = Path(sys.executable)
     script = plugin_dir / env_bootstrap
     if not script.is_file():
         raise EnvBootstrapError(f"env_bootstrap 脚本缺失: {script}")
     logger.info("插件 %s 首次启用，正在建独立环境（%s）……这一步可能要几分钟", plugin_dir.name, env_bootstrap)
     try:
         result = subprocess.run(
-            [sys.executable, str(script)],
+            [str(python), str(script)],
             cwd=str(plugin_dir),
             capture_output=True,
             timeout=timeout,

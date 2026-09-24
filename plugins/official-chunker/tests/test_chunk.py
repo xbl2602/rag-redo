@@ -72,6 +72,19 @@ class TestChunkDocument(unittest.TestCase):
         pieces = chunk_document("没有标题，直接是正文。")
         self.assertEqual(pieces[0].heading_breadcrumb, "(无标题)")
 
+    def test_sibling_chunks_share_exact_parent_section(self):
+        para = "父节内容" * 50
+        pieces = chunk_document(f"# 标题\n\n{para}\n\n{para}", max_chars=100, overlap_chars=20)
+        self.assertGreater(len(pieces), 1)
+        self.assertEqual(len({piece.section_id for piece in pieces}), 1)
+        self.assertEqual(len({piece.section_text for piece in pieces}), 1)
+        self.assertIn("父节内容", pieces[0].section_text)
+
+    def test_different_sections_have_different_ids(self):
+        pieces = chunk_document("# 甲\n\n正文甲\n# 乙\n\n正文乙")
+        self.assertEqual(len(pieces), 2)
+        self.assertNotEqual(pieces[0].section_id, pieces[1].section_id)
+
     def test_empty_text_returns_no_pieces(self):
         self.assertEqual(chunk_document(""), [])
 

@@ -49,6 +49,22 @@ class TestPackUnpackRoundTrip(unittest.TestCase):
         zf = zipfile.ZipFile(BytesIO(data))
         self.assertEqual(set(zf.namelist()), {"manifest.json", "vectors.json", "bm25.json"})
 
+    def test_optional_index_state_sections_round_trip(self):
+        data = pack(
+            {"library_id": "lib1"},
+            {},
+            {},
+            index_manifest={"files": {"a.md": {"status": "terminal"}}},
+            extracted={"a.pdf": [{"text": "正文", "route": "ocr"}]},
+            relations={"a.md": ["b.md"]},
+            failures={"succeeded": 0, "failures": [{"path": "a.md", "reason": "empty"}]},
+        )
+        result = unpack(data)
+        self.assertEqual(result["index_manifest"]["files"]["a.md"]["status"], "terminal")
+        self.assertEqual(result["extracted"]["a.pdf"][0]["text"], "正文")
+        self.assertEqual(result["relations"], {"a.md": ["b.md"]})
+        self.assertEqual(result["failures"]["failures"][0]["reason"], "empty")
+
     def test_empty_vectors_and_bm25_round_trip(self):
         data = pack({"library_id": "lib1"}, {}, {})
         result = unpack(data)

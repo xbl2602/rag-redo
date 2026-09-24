@@ -51,40 +51,86 @@ def extract_wikilink_targets(text: str) -> list[str]:
 class NoteRelationsStore:
     """按库持久化"每个文件→出链目标列表"，供 `resolve()` 现算入链。
 
-    每次 `index_library()` 全量重跑都通过 `write_library()` 整库覆盖写
-    一次（不是逐文件增量写）——同索引本身"不做增量、全量重跑"的节奏
-    一致，不需要单独的失效判断。
+    每次 `index_library()` 都从当前有效文件清单合并出完整出链图，再按 generation
+    原子覆盖写一次；未变化文件直接复用清单里的出链，删除/失败文件从新图中消失。
     """
 
     def __init__(self, root: Path) -> None:
         self._root = root
 
-    def _path_for(self, library_id: str) -> Path:
+    def _path_for(self, library_id: str, generation: str | None = None) -> Path:
         safe = re.sub(r"[^\w.-]", "_", library_id)
+        if generation:
+            return self._root / "generations" / safe / f"{generation}.json"
         return self._root / f"{safe}.json"
 
-    def write_library(self, library_id: str, links_by_path: dict[str, list[str]]) -> None:
+    def write_library(
+        self,
+        library_id: str,
+        links_by_path: dict[str, list[str]],
+        generation: str | None = None,
+    ) -> None:
         try:
             self._root.mkdir(parents=True, exist_ok=True)
-            target = self._path_for(library_id)
+            target = self._path_for(library_id, generation)
+            target.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = target.with_suffix(".tmp")
             tmp_path.write_text(json.dumps(links_by_path, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp_path, target)
         except OSError:
             pass  # 双链关系写盘失败不该让索引任务本身失败——fail-open，同其他核心服务的一贯原则
 
-    def resolve(self, library_id: str, target: str) -> dict:
+    def clear_generation(self, library_id: str, generation: str) -> None:
+        try:
+            self._path_for(library_id, generation).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _read_library(self, library_id: str, generation: str | None) -> dict[str, list[str]]:
+        store_path = self._path_for(library_id, generation)
+        try:
+            data = json.loads(store_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(path): [str(value) for value in values if value]
+            for path, values in data.items()
+            if isinstance(path, str) and isinstance(values, list)
+        }
+
+    def read_library(self, library_id: str, generation: str | None = None) -> dict[str, list[str]]:
+        return self._read_library(library_id, generation)
+
+    def resolved_edges(
+        self,
+        library_id: str,
+        generation: str | None = None,
+    ) -> tuple[tuple[str, str], ...]:
+        data = self._read_library(library_id, generation)
+        by_stem = {Path(path).stem: path for path in data}
+
+        def resolve_name(name: str) -> str | None:
+            if name in data:
+                return name
+            return by_stem.get(Path(name).stem)
+
+        edges: set[tuple[str, str]] = set()
+        for path, links in data.items():
+            for name in links:
+                target = resolve_name(name)
+                if target and target != path:
+                    first, second = sorted((path, target))
+                    edges.add((first, second))
+        return tuple(sorted(edges))
+
+    def resolve(self, library_id: str, target: str, generation: str | None = None) -> dict:
         """给定笔记标识（库内相对路径，或不含扩展名的标题），返回其出链
         （本文链接到谁）与入链（谁链接到本文）。库从没索引过（没有出链
         数据文件）时返回 `resolved=False`，同"找不到这篇笔记"一致处理，
         调用方不需要区分这两种情况。"""
-        store_path = self._path_for(library_id)
-        data: dict[str, list[str]] = {}
-        if store_path.is_file():
-            try:
-                data = json.loads(store_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                data = {}
+        data = self._read_library(library_id, generation)
 
         by_stem: dict[str, str] = {}
         for rel in data:

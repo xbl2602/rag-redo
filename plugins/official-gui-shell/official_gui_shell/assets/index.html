@@ -7,12 +7,16 @@
   :root {
     --bg: #0f1115;
     --panel: #171a21;
+    --panel-deep: #121722;
     --border: #262b36;
     --text: #e6e8ee;
     --muted: #8b92a3;
     --accent: #5b8cff;
     --accent-dim: #2c3b66;
+    --accent-soft: #91aaff;
     --danger: #e5636b;
+    --warning: #e5b765;
+    --success: #62c69a;
   }
   * { box-sizing: border-box; }
   body {
@@ -25,16 +29,28 @@
     overflow: hidden;
   }
   #sidebar {
-    width: 260px;
+    width: 300px;
+    flex: 0 0 300px;
     background: var(--panel);
     border-right: 1px solid var(--border);
     display: flex;
     flex-direction: column;
     padding: 16px;
     gap: 12px;
+    overflow-y: auto;
   }
-  #sidebar h1 { font-size: 15px; margin: 0 0 4px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
-  #library-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; flex: 1; overflow-y: auto; }
+  #sidebar h1 { font-size: 15px; margin: 10px 0 0; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  #library-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-height: 76px;
+    max-height: 25vh;
+    overflow-y: auto;
+  }
   #library-list li {
     padding: 8px 10px;
     border-radius: 6px;
@@ -42,10 +58,40 @@
     font-size: 13px;
     color: var(--muted);
     border: 1px solid transparent;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
   }
   #library-list li:hover { background: #1e2230; }
   #library-list li.active { background: var(--accent-dim); color: var(--text); border-color: var(--accent); }
-  #library-list li .path { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #library-list li.status-running { border-color: #344c88; }
+  #library-list li.status-stalled { border-color: #80633b; }
+  #library-list li.status-orphaned { border-color: #844a55; }
+  #library-list li.status-failed { border-color: #653b43; }
+  #library-list li.status-done { border-color: #315747; }
+  #library-list li.status-cancelled { border-color: #555a70; }
+  #library-list .library-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #library-list .library-line { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  #library-list .library-line input { accent-color: var(--accent); flex: 0 0 auto; }
+  #scope-controls { display: flex; gap: 5px; margin-top: 6px; }
+  #scope-controls button { padding: 4px 7px; font-size: 10px; }
+  #scope-label { color: var(--muted); font-size: 10px; margin-top: 6px; }
+  .sidebar-section { border-top: 1px solid var(--border); padding-top: 12px; }
+  .sidebar-section summary { color: var(--muted); font-size: 11px; cursor: pointer; }
+  .sidebar-section[open] summary { margin-bottom: 8px; }
+  #summary-text, #settings-value, #document-text { width: 100%; resize: vertical; background: #0d0f13; border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px; font: inherit; font-size: 12px; }
+  #summary-text { min-height: 72px; }
+  #settings-key, #settings-value { margin-bottom: 5px; }
+  .sidebar-actions { display: flex; gap: 5px; flex-wrap: wrap; }
+  .sidebar-actions button { padding: 5px 7px; font-size: 10px; }
+  .sidebar-note { color: var(--muted); font-size: 10px; line-height: 1.4; margin: 6px 0 0; }
+  #library-list .path { display: block; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #library-list .library-status { font-size: 11px; color: var(--muted); }
+  #library-list .status-running .library-status { color: var(--accent-soft); }
+  #library-list .status-stalled .library-status,
+  #library-list .status-orphaned .library-status { color: var(--warning); }
+  #library-list .status-failed .library-status { color: var(--danger); }
+  #library-list .status-done .library-status { color: var(--success); }
 
   .field { display: flex; flex-direction: column; gap: 4px; }
   .field label { font-size: 11px; color: var(--muted); }
@@ -57,7 +103,7 @@
     padding: 8px 10px;
     font-size: 13px;
   }
-  input[type=text]:focus { outline: none; border-color: var(--accent); }
+  input[type=text]:focus { border-color: var(--accent); }
   button {
     background: var(--accent);
     color: #fff;
@@ -68,13 +114,70 @@
     cursor: pointer;
   }
   button.secondary { background: #232837; color: var(--text); }
+  button.danger { background: #4a2730; color: #ffe4e7; }
   button:disabled { opacity: .5; cursor: default; }
+  :focus-visible { outline: 2px solid var(--accent-soft); outline-offset: 2px; }
+
+  #index-status-panel {
+    background: var(--panel-deep);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+  }
+  .status-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  .status-eyebrow { color: var(--muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+  #status-library-name { margin: 3px 0 0; font-size: 14px; line-height: 1.35; word-break: break-word; }
+  .status-badge { border-radius: 999px; padding: 3px 7px; font-size: 10px; white-space: nowrap; background: #252b39; color: var(--muted); }
+  .status-badge.running { background: #26365f; color: var(--accent-soft); }
+  .status-badge.stalled,
+  .status-badge.orphaned { background: #4a3b24; color: var(--warning); }
+  .status-badge.failed { background: #4b2930; color: #ff9da5; }
+  .status-badge.done { background: #214235; color: var(--success); }
+  .status-badge.cancelled { background: #303545; color: #b4bbcd; }
+  .status-badge.error { background: #4b2930; color: #ff9da5; }
+  #status-summary { margin-top: 9px; font-size: 12px; font-weight: 600; }
+  #status-summary.error { color: var(--danger); }
+  #status-message { margin-top: 3px; min-height: 16px; color: var(--muted); font-size: 11px; line-height: 1.45; word-break: break-word; }
+  .status-body { display: flex; gap: 12px; margin-top: 11px; }
+  .phase-track { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; flex: 0 0 72px; }
+  .phase-step { position: relative; display: grid; grid-template-columns: 17px 1fr; align-items: start; gap: 5px; min-height: 28px; color: #5f687a; font-size: 10px; line-height: 1.2; }
+  .phase-step:not(:last-child)::after { content: ""; position: absolute; top: 15px; bottom: 0; left: 7px; width: 1px; background: #2a3140; }
+  .phase-dot { position: relative; z-index: 1; width: 15px; height: 15px; border: 2px solid #3b4353; border-radius: 50%; background: var(--panel-deep); }
+  .phase-step.done { color: var(--muted); }
+  .phase-step.done .phase-dot { border-color: var(--success); background: var(--success); }
+  .phase-step.active { color: var(--text); font-weight: 600; }
+  .phase-step.active .phase-dot { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 3px rgba(91, 140, 255, .15); }
+  .phase-step.failed { color: var(--danger); font-weight: 600; }
+  .phase-step.failed .phase-dot { border-color: var(--danger); background: var(--danger); }
+  .phase-step.cancelled { color: var(--warning); font-weight: 600; }
+  .phase-step.cancelled .phase-dot { border-color: var(--warning); background: var(--warning); }
+  .status-details { min-width: 0; flex: 1; }
+  .progress-track { height: 6px; border-radius: 99px; background: #252b38; overflow: hidden; position: relative; }
+  .progress-fill { width: 0; height: 100%; border-radius: inherit; background: var(--accent); transition: width .25s ease; }
+  .progress-track.indeterminate .progress-fill { width: 34%; animation: progress-slide 1.2s ease-in-out infinite; }
+  @keyframes progress-slide { 0% { transform: translateX(-110%); } 100% { transform: translateX(330%); } }
+  .progress-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 4px; color: var(--muted); font-size: 10px; }
+  #progress-percent { color: var(--text); font-variant-numeric: tabular-nums; }
+  .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 8px; margin-top: 9px; }
+  .stat { min-width: 0; }
+  .stat-label { display: block; color: var(--muted); font-size: 9px; }
+  .stat-value { display: block; color: var(--text); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #health-alert { display: none; margin-top: 8px; border-radius: 5px; padding: 6px 7px; background: #3c3020; color: #f0c779; font-size: 10px; line-height: 1.4; }
+  #health-alert.visible { display: block; }
+  #health-alert.error { background: #40262d; color: #ff9da5; }
+  .current-file { margin-top: 8px; }
+  .current-file-label { display: block; color: var(--muted); font-size: 9px; }
+  #current-path { color: var(--text); font-size: 10px; line-height: 1.4; white-space: pre-wrap; word-break: break-all; max-height: 42px; overflow: auto; }
+  #stop-hint { margin-top: 7px; color: var(--warning); font-size: 10px; line-height: 1.35; }
+  #stop-index-btn { width: 100%; margin-top: 8px; }
 
   #main { flex: 1; display: flex; flex-direction: column; padding: 24px 32px; overflow-y: auto; }
   #search-row { display: flex; gap: 8px; margin-bottom: 8px; }
   #search-row input { flex: 1; font-size: 15px; padding: 12px 14px; }
-  #status-line { font-size: 12px; color: var(--muted); min-height: 18px; margin-bottom: 16px; }
+  #status-line { font-size: 12px; color: var(--muted); min-height: 18px; margin-bottom: 8px; }
   #status-line.error { color: var(--danger); }
+  #search-advice { color: var(--muted); font-size: 12px; line-height: 1.5; white-space: pre-wrap; margin: 0 0 14px; }
+  #search-advice:not(:empty) { padding: 9px 12px; border-left: 2px solid var(--accent); background: var(--panel); }
 
   #results { display: flex; flex-direction: column; gap: 10px; }
   .result-card {
@@ -83,62 +186,466 @@
     border-radius: 8px;
     padding: 14px 16px;
   }
-  .result-card .meta { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
-  .result-card .confidence { font-variant-numeric: tabular-nums; }
+  .result-card .meta { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .result-card .result-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .result-card .confidence { font-variant-numeric: tabular-nums; white-space: nowrap; }
   .result-card .text { font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
 
   #empty-state { color: var(--muted); font-size: 13px; margin-top: 40px; text-align: center; }
+  #document-panel { margin: 14px 0; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 12px; }
+  .document-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+  #document-title { font-size: 13px; overflow-wrap: anywhere; }
+  #document-text { min-height: 180px; }
+  #document-relations { white-space: pre-wrap; color: var(--muted); font-size: 11px; line-height: 1.5; margin: 9px 0 0; }
+
+  .view-nav {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+    padding: 4px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-deep);
+  }
+  .view-nav button { background: transparent; color: var(--muted); padding: 7px 10px; }
+  .view-nav button.active { background: var(--accent-dim); color: var(--text); box-shadow: inset 0 0 0 1px #465f9c; }
+
+  #main { min-width: 0; min-height: 0; padding-bottom: 18px; overflow: hidden; }
+  .view-panel { min-width: 0; }
+  .view-panel[hidden] { display: none; }
+  #search-view { flex: 1; min-height: 0; height: 100%; overflow-y: auto; padding-right: 2px; }
+  #graph-view { height: 100%; display: flex; flex-direction: column; }
+
+  .graph-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    margin-bottom: 10px;
+  }
+  .graph-eyebrow { color: var(--muted); font-size: 10px; letter-spacing: .09em; text-transform: uppercase; }
+  .graph-heading h2 { margin: 3px 0 0; font-size: 20px; letter-spacing: -.02em; }
+  #graph-summary { color: var(--muted); font-size: 11px; text-align: right; font-variant-numeric: tabular-nums; }
+
+  .graph-toolbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 7px 12px;
+    min-height: 42px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+  }
+  .graph-control {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .graph-control input[type=checkbox] { accent-color: var(--accent); }
+  .graph-control input[type=range] { width: 92px; accent-color: var(--accent); }
+  .graph-control output { width: 30px; color: var(--text); font-variant-numeric: tabular-nums; }
+  .graph-toolbar .secondary { margin-left: auto; padding: 6px 9px; font-size: 11px; }
+  #graph-alert {
+    margin-top: 8px;
+    border: 1px solid #5a4929;
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: #f0c779;
+    background: #30291d;
+    font-size: 11px;
+    line-height: 1.45;
+  }
+  #graph-alert.error { color: #ffadb4; background: #382229; border-color: #70404a; }
+
+  #graph-stage {
+    position: relative;
+    flex: 1;
+    min-height: 460px;
+    height: clamp(460px, calc(100vh - 190px), 760px);
+    margin-top: 9px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #0c1018;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .02);
+  }
+  #graph-svg { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+  #graph-svg.panning { cursor: grabbing; }
+  .graph-grid { fill: url(#graph-grid); }
+  .graph-link { stroke: #59657a; stroke-width: 1.1; opacity: .62; }
+  .graph-page-edge { stroke: #b88650; stroke-width: 1.25; stroke-dasharray: 4 3; opacity: .72; }
+  .graph-semantic-edge { stroke: #a77ad2; stroke-width: 1.2; stroke-dasharray: 2 4; opacity: .56; }
+  .graph-node { cursor: pointer; outline: none; }
+  .graph-node-shape { stroke: #dce5f4; stroke-width: 1.2; vector-effect: non-scaling-stroke; }
+  .graph-node.page .graph-node-shape { fill-opacity: .78; stroke: #d2a875; }
+  .graph-node.pagegroup .graph-node-shape { fill-opacity: .82; stroke: #e0b27d; }
+  .graph-node.st-failed .graph-node-shape { fill: #b84f5a; stroke: #ff9da5; }
+  .graph-node.st-queued .graph-node-shape,
+  .graph-node.st-none .graph-node-shape { fill-opacity: .45; stroke-dasharray: 3 2; }
+  .graph-node.st-partial .graph-node-shape { stroke: #e5b765; }
+  .graph-node-status { stroke: #0c1018; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+  .graph-node.st-failed .graph-node-status { fill: #ffadb4; }
+  .graph-node.st-queued .graph-node-status,
+  .graph-node.st-none .graph-node-status { fill: #8b92a3; }
+  .graph-node.st-partial .graph-node-status { fill: #e5b765; }
+  .graph-node-halo { fill: none; stroke: #d8e1f0; stroke-width: 1; opacity: .24; vector-effect: non-scaling-stroke; }
+  .graph-node:hover .graph-node-shape,
+  .graph-node:focus .graph-node-shape,
+  .graph-node.selected .graph-node-shape { stroke: #fff; stroke-width: 2.3; filter: drop-shadow(0 0 5px rgba(145, 170, 255, .75)); }
+  .graph-node-label {
+    fill: #cbd2df;
+    font-size: 10px;
+    font-family: inherit;
+    paint-order: stroke;
+    stroke: #0c1018;
+    stroke-width: 3px;
+    stroke-linejoin: round;
+    pointer-events: none;
+  }
+  .graph-node.page .graph-node-label,
+  .graph-node.pagegroup .graph-node-label { fill: #c7a37c; font-size: 9px; }
+
+  #graph-state {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    color: var(--muted);
+    background: rgba(12, 16, 24, .86);
+    font-size: 13px;
+    text-align: center;
+    pointer-events: none;
+  }
+  #graph-state[hidden] { display: none; }
+  #graph-state.error { color: #ffadb4; }
+  .graph-state-card { max-width: 420px; line-height: 1.6; }
+  .graph-state-dot {
+    width: 9px;
+    height: 9px;
+    display: inline-block;
+    margin-right: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 5px rgba(91, 140, 255, .13);
+    animation: graph-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes graph-pulse { 50% { opacity: .35; transform: scale(.78); } }
+
+  #graph-tooltip {
+    position: absolute;
+    z-index: 5;
+    max-width: 260px;
+    padding: 6px 8px;
+    border: 1px solid #3a4353;
+    border-radius: 5px;
+    color: var(--text);
+    background: rgba(22, 27, 38, .96);
+    font-size: 10px;
+    line-height: 1.4;
+    pointer-events: none;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, .28);
+  }
+  #graph-tooltip[hidden] { display: none; }
+
+  #graph-inspector {
+    position: absolute;
+    z-index: 6;
+    top: 12px;
+    right: 12px;
+    width: min(280px, calc(100% - 24px));
+    display: none;
+    border: 1px solid #354052;
+    border-radius: 8px;
+    color: var(--text);
+    background: rgba(20, 24, 34, .97);
+    box-shadow: 0 14px 36px rgba(0, 0, 0, .35);
+  }
+  #graph-inspector.visible { display: block; }
+  .graph-inspector-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 10px 11px 8px; border-bottom: 1px solid var(--border); }
+  .graph-inspector-title { min-width: 0; font-size: 12px; font-weight: 600; line-height: 1.4; overflow-wrap: anywhere; }
+  .graph-inspector-kind { color: var(--muted); font-size: 9px; font-weight: 400; }
+  #graph-inspector-close { background: transparent; color: var(--muted); padding: 1px 5px; font-size: 16px; line-height: 1; }
+  #graph-inspector-body { display: grid; gap: 6px; padding: 9px 11px 11px; }
+  .inspector-row { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; font-size: 10px; line-height: 1.4; }
+  .inspector-label { color: var(--muted); }
+  .inspector-value { min-width: 0; overflow-wrap: anywhere; }
+  .inspector-value.error { color: #ffadb4; }
+
+  .graph-zoom { position: absolute; right: 12px; bottom: 12px; display: flex; gap: 4px; }
+  .graph-zoom button { min-width: 30px; padding: 6px 8px; background: rgba(31, 37, 51, .94); border: 1px solid #354052; }
+  .graph-footer { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; padding: 9px 2px 0; color: var(--muted); font-size: 10px; }
+  .library-legend, .edge-legend { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; }
+  .legend-title { color: #687184; }
+  .library-key, .edge-key { display: inline-flex; align-items: center; gap: 5px; }
+  .library-swatch { width: 8px; height: 8px; border-radius: 50%; }
+  .edge-swatch { width: 18px; height: 2px; background: #59657a; }
+  .edge-swatch.page { height: 0; border-top: 2px dashed #b88650; background: transparent; }
+  .edge-swatch.semantic { height: 0; border-top: 2px dashed #a77ad2; background: transparent; }
+
+  @media (max-width: 960px) {
+    #sidebar { width: 250px; flex-basis: 250px; }
+    #main { padding: 18px 20px; }
+    .graph-toolbar .secondary { margin-left: 0; }
+  }
+  @media (max-width: 720px) {
+    #sidebar { width: 210px; flex-basis: 210px; padding: 12px; }
+    #main { padding: 14px 12px; }
+    .graph-heading { align-items: flex-start; }
+    #graph-summary { max-width: 48%; }
+    #graph-inspector { top: auto; bottom: 50px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+  }
 </style>
 </head>
 <body>
   <div id="sidebar">
+    <nav class="view-nav" aria-label="主视图">
+      <button id="search-view-btn" class="active" type="button" aria-current="page">搜索</button>
+      <button id="graph-view-btn" type="button">图谱</button>
+    </nav>
+
     <h1>库</h1>
+    <div id="scope-controls">
+      <button class="secondary" id="select-all-libraries" type="button">全选</button>
+      <button class="secondary" id="clear-library-selection" type="button">清空</button>
+    </div>
+    <div id="scope-label">搜索范围：全部库</div>
     <ul id="library-list"></ul>
+
+    <section id="index-status-panel" aria-live="polite">
+      <div class="status-heading">
+        <div>
+          <div class="status-eyebrow">当前库索引</div>
+          <h2 id="status-library-name">未选择库</h2>
+        </div>
+        <span id="status-badge" class="status-badge">未索引</span>
+      </div>
+      <div id="status-summary">尚未启动索引</div>
+      <div id="status-message"></div>
+      <div class="status-body">
+        <ol id="phase-track" class="phase-track" aria-label="索引进度阶段">
+          <li class="phase-step" data-phase="scanning"><span class="phase-dot"></span><span>扫描</span></li>
+          <li class="phase-step" data-phase="extracting"><span class="phase-dot"></span><span>提取</span></li>
+          <li class="phase-step" data-phase="embedding"><span class="phase-dot"></span><span>嵌入</span></li>
+          <li class="phase-step" data-phase="writing"><span class="phase-dot"></span><span>写库</span></li>
+          <li class="phase-step" data-phase="visual"><span class="phase-dot"></span><span>视觉</span></li>
+          <li class="phase-step" data-phase="finalizing"><span class="phase-dot"></span><span>收尾</span></li>
+        </ol>
+        <div class="status-details">
+          <div id="progress-track" class="progress-track" role="progressbar" aria-label="索引进度" aria-valuemin="0" aria-valuemax="100">
+            <div id="progress-fill" class="progress-fill"></div>
+          </div>
+          <div class="progress-meta">
+            <span id="progress-label">等待开始</span>
+            <span id="progress-percent">—</span>
+          </div>
+          <div class="stats-grid">
+            <div class="stat"><span class="stat-label">文件</span><span id="file-count" class="stat-value">—</span></div>
+            <div class="stat"><span class="stat-label">块</span><span id="chunk-count" class="stat-value">—</span></div>
+            <div class="stat"><span class="stat-label">成功</span><span id="succeeded-count" class="stat-value">—</span></div>
+            <div class="stat"><span class="stat-label">失败</span><span id="failed-count" class="stat-value">—</span></div>
+            <div class="stat"><span class="stat-label">增量</span><span id="delta-count" class="stat-value">—</span></div>
+            <div class="stat"><span class="stat-label">耗时</span><span id="elapsed-time" class="stat-value">—</span></div>
+            <div class="stat"><span class="stat-label">ETA</span><span id="eta-time" class="stat-value">—</span></div>
+            <div class="stat"><span class="stat-label">PID</span><span id="worker-pid" class="stat-value">—</span></div>
+          </div>
+          <div id="health-alert" role="alert"></div>
+          <div class="current-file">
+            <span class="current-file-label">当前文件</span>
+            <div id="current-path">—</div>
+          </div>
+          <div id="stop-hint"></div>
+          <button class="secondary danger" id="stop-index-btn" type="button" disabled>停止本轮索引</button>
+          <button class="secondary" id="failures-btn" type="button">查看失败明细</button>
+        </div>
+      </div>
+    </section>
+
     <div class="field">
-      <label>新建库：名称</label>
+      <label for="new-lib-name">新建库：名称</label>
       <input type="text" id="new-lib-name" placeholder="比如：工作笔记" />
     </div>
     <div class="field">
-      <label>新建库：路径</label>
+      <label for="new-lib-path">新建库：路径</label>
       <input type="text" id="new-lib-path" placeholder="/path/to/vault" />
     </div>
-    <button class="secondary" id="add-lib-btn">+ 新建库</button>
-    <button class="secondary" id="reindex-btn">重建当前库索引</button>
+    <button class="secondary" id="add-lib-btn" type="button">+ 新建库</button>
+    <button class="secondary" id="reindex-btn" type="button">增量更新当前库</button>
+    <button class="secondary" id="full-reindex-btn" type="button">完整重建当前库</button>
 
     <h1>搬到另一台机器</h1>
     <div class="field">
-      <label>导出当前库到文件</label>
+      <label for="export-dest">导出当前库到文件</label>
       <input type="text" id="export-dest" placeholder="/path/to/save/lib.ragexport.zip" />
     </div>
-    <button class="secondary" id="export-btn">导出当前库</button>
+    <button class="secondary" id="export-btn" type="button">导出当前库</button>
     <div class="field">
-      <label>从归档导入：归档文件路径</label>
+      <label for="import-archive">从归档导入：归档文件路径</label>
       <input type="text" id="import-archive" placeholder="/path/to/lib.ragexport.zip" />
     </div>
     <div class="field">
-      <label>导入：笔记文件在本机的目录</label>
+      <label for="import-root">导入：笔记文件在本机的目录</label>
       <input type="text" id="import-root" placeholder="/path/to/vault" />
     </div>
     <div class="field">
-      <label>导入：新库的id（留空沿用原id）</label>
+      <label for="import-lib-id">导入：新库的id（留空沿用原id）</label>
       <input type="text" id="import-lib-id" placeholder="留空则沿用归档里的id" />
     </div>
-    <button class="secondary" id="import-btn">导入为新库</button>
+    <button class="secondary" id="import-btn" type="button">导入为新库</button>
+
+    <details class="sidebar-section" open>
+      <summary>库摘要</summary>
+      <textarea id="summary-text" placeholder="先选择一个库查看摘要"></textarea>
+      <div class="sidebar-actions" style="margin-top: 6px">
+        <button class="secondary" id="summary-refresh-btn" type="button">AI 生成</button>
+        <button class="secondary" id="summary-save-btn" type="button">保存</button>
+      </div>
+    </details>
+
+    <details class="sidebar-section">
+      <summary>设置</summary>
+      <input type="text" id="settings-key" placeholder="设置键" />
+      <input type="text" id="settings-value" placeholder="设置值" />
+      <div class="sidebar-actions">
+        <button class="secondary" id="settings-save-btn" type="button">保存</button>
+        <button class="secondary" id="settings-unset-btn" type="button">恢复默认</button>
+      </div>
+      <pre id="settings-list" class="sidebar-note"></pre>
+    </details>
   </div>
   <div id="main">
-    <div id="search-row">
-      <input type="text" id="search-input" placeholder="搜索当前库…" />
-      <button id="search-btn">搜索</button>
-    </div>
-    <div id="status-line"></div>
-    <div id="results"></div>
-    <div id="empty-state">选一个库，然后搜点什么。</div>
+    <section id="search-view" class="view-panel" aria-label="搜索">
+      <div id="search-row">
+        <input type="text" id="search-input" placeholder="搜索当前库…" />
+        <button id="search-btn" type="button">搜索</button>
+      </div>
+      <div id="status-line"></div>
+      <div id="search-advice" role="status"></div>
+      <div id="results"></div>
+      <section id="document-panel" hidden aria-live="polite">
+        <div class="document-heading">
+          <strong id="document-title">正文</strong>
+          <button class="secondary" id="document-close" type="button">关闭</button>
+        </div>
+        <textarea id="document-text" readonly></textarea>
+        <pre id="document-relations"></pre>
+      </section>
+      <div id="empty-state">选一个库，然后搜点什么。</div>
+    </section>
+
+    <section id="graph-view" class="view-panel" aria-label="图谱" hidden>
+      <div class="graph-heading">
+        <div>
+          <div class="graph-eyebrow">知识关系</div>
+          <h2>图谱</h2>
+        </div>
+        <div id="graph-summary">尚未加载</div>
+        <button id="graph-refresh-btn" class="secondary" type="button">刷新图谱</button>
+      </div>
+      <div class="graph-toolbar" aria-label="图谱图层">
+        <label class="graph-control"><input id="graph-links-toggle" type="checkbox" checked />双链边</label>
+        <label class="graph-control"><input id="graph-pages-toggle" type="checkbox" checked />页面 / 页面组</label>
+        <label class="graph-control" for="graph-semantic-threshold">语义阈值
+          <input id="graph-semantic-threshold" type="range" min="0.5" max="0.85" step="0.01" value="0.62" />
+          <output id="graph-semantic-value" for="graph-semantic-threshold">0.62</output>
+        </label>
+        <label class="graph-control"><input id="graph-semantic-toggle" type="checkbox" />语义边</label>
+        <button id="graph-semantic-btn" class="secondary" type="button">加载语义边</button>
+      </div>
+      <div id="graph-alert" role="alert" hidden></div>
+      <div id="graph-stage">
+        <svg id="graph-svg" viewBox="0 0 1200 720" role="img" aria-label="知识图谱，可拖动平移并滚轮缩放">
+          <defs>
+            <pattern id="graph-grid" width="28" height="28" patternUnits="userSpaceOnUse">
+              <circle cx="1" cy="1" r="1" fill="#273044" />
+            </pattern>
+          </defs>
+          <rect class="graph-grid" width="1200" height="720" />
+          <g id="graph-scene">
+            <g id="graph-link-layer" aria-label="双链边图层"></g>
+            <g id="graph-page-layer" aria-label="页面边图层"></g>
+            <g id="graph-semantic-layer" aria-label="语义边图层"></g>
+            <g id="graph-node-layer" aria-label="节点图层"></g>
+          </g>
+        </svg>
+        <div id="graph-state" aria-live="polite"><div class="graph-state-card"><span class="graph-state-dot"></span>打开图谱后读取结构关系。</div></div>
+        <div id="graph-tooltip" role="tooltip" hidden></div>
+        <aside id="graph-inspector" aria-label="节点详情">
+          <div class="graph-inspector-head">
+            <div id="graph-inspector-title" class="graph-inspector-title"></div>
+            <button id="graph-inspector-close" type="button" aria-label="关闭节点详情">×</button>
+          </div>
+          <div id="graph-inspector-body"></div>
+        </aside>
+        <div class="graph-zoom" aria-label="图谱缩放">
+          <button id="graph-zoom-out" type="button" aria-label="缩小">−</button>
+          <button id="graph-zoom-in" type="button" aria-label="放大">＋</button>
+          <button id="graph-fit-btn" type="button">适应</button>
+          <button id="graph-reset-btn" type="button">重置</button>
+        </div>
+      </div>
+      <div class="graph-footer">
+        <div id="graph-legend" class="library-legend" aria-label="库颜色图例"></div>
+        <div class="edge-legend" aria-label="边类型图例">
+          <span class="legend-title">边</span>
+          <span class="edge-key"><span class="edge-swatch"></span>双链</span>
+          <span class="edge-key"><span class="edge-swatch page"></span>页面归属</span>
+          <span class="edge-key"><span class="edge-swatch semantic"></span>语义</span>
+        </div>
+      </div>
+    </section>
   </div>
 
 <script>
-const state = { libraries: [], activeLibraryId: null };
+const state = {
+  libraries: [],
+  activeLibraryId: null,
+  selectedLibraryIds: new Set(),
+  statuses: new Map(),
+  statusErrors: new Map(),
+  polling: false,
+  pollingStarted: false,
+  view: "search",
+  graph: {
+    nodes: [],
+    edges: [],
+    semanticEdges: [],
+    byId: new Map(),
+    libs: [],
+    positions: new Map(),
+    loaded: false,
+    loading: false,
+    error: "",
+    semanticLoading: false,
+    semanticLoaded: false,
+    semanticVisible: false,
+    semanticError: "",
+    showLinks: true,
+    showPages: true,
+    threshold: 0.62,
+    transform: { x: 0, y: 0, k: 1 },
+    drag: null,
+    selectedId: null
+  }
+};
+const phaseOrder = ["scanning", "extracting", "embedding", "writing", "visual", "finalizing"];
+const phaseLabels = { scanning: "扫描", extracting: "提取", embedding: "嵌入", writing: "写库", file_complete: "写库", visual: "视觉", finalizing: "收尾" };
 
-function api() { return window.pywebview.api; }
+function api() {
+  const bridge = window.pywebview && window.pywebview.api;
+  if (!bridge) throw new Error("后端服务尚未就绪");
+  return bridge;
+}
 
 function setStatus(text, isError) {
   const el = document.getElementById("status-line");
@@ -146,108 +653,1439 @@ function setStatus(text, isError) {
   el.className = isError ? "error" : "";
 }
 
-async function refreshLibraries() {
-  state.libraries = await api().list_libraries();
-  const list = document.getElementById("library-list");
-  list.innerHTML = "";
-  for (const lib of state.libraries) {
-    const li = document.createElement("li");
-    li.className = lib.library_id === state.activeLibraryId ? "active" : "";
-    li.innerHTML = `${lib.name}<span class="path">${lib.root_path}</span>`;
-    li.onclick = () => { state.activeLibraryId = lib.library_id; refreshLibraries(); };
-    list.appendChild(li);
+function readableError(error, fallback) {
+  const raw = error && typeof error === "object" && error.message ? String(error.message) : String(error || "");
+  if (!raw) return fallback;
+  if (/timeout|timed out/i.test(raw)) return "请求超时，请稍后重试";
+  if (/network|connection|not available|not a function|undefined/i.test(raw)) return "后端接口不可用，请稍后重试";
+  return raw;
+}
+
+function getActiveLibrary() {
+  return state.libraries.find((lib) => lib.library_id === state.activeLibraryId) || null;
+}
+
+function isRunning(status) {
+  if (!status) return false;
+  if (typeof status.active === "boolean") return status.active;
+  if (status.health === "orphaned") return false;
+  return status.stage === "starting" || status.stage === "running";
+}
+
+function getStatusInfo(status) {
+  if (!status) return { short: "未索引", label: "未索引", tone: "idle", running: false };
+  const stage = status.stage;
+  if (stage === "starting") {
+    if (!isRunning(status)) return { short: "进程失联", label: "索引进程已失联", tone: "orphaned", running: false };
+    return { short: "启动中", label: "正在启动索引", tone: "running", running: true };
   }
-  if (state.activeLibraryId === null && state.libraries.length > 0) {
-    state.activeLibraryId = state.libraries[0].library_id;
-    refreshLibraries();
+  if (stage === "running") {
+    if (status.health === "orphaned") return { short: "进程失联", label: "索引进程已失联", tone: "orphaned", running: true };
+    if (status.health === "stalled_no_heartbeat") return { short: "运行中 · 停滞", label: "索引运行中，但长时间没有心跳", tone: "stalled", running: true };
+    if (status.health === "stalled_no_progress") return { short: "运行中 · 停滞", label: "索引运行中，但长时间没有进展", tone: "stalled", running: true };
+    return { short: "运行中", label: "索引运行中", tone: "running", running: true };
+  }
+  if (stage === "done") return { short: "已完成", label: "索引已完成", tone: "done", running: false };
+  if (stage === "failed") return { short: "失败", label: "索引失败", tone: "failed", running: false };
+  if (stage === "cancelled") return { short: "已取消", label: "索引已取消", tone: "cancelled", running: false };
+  return { short: "状态未知", label: "索引状态未知", tone: "idle", running: false };
+}
+
+function renderScopeLabel() {
+  const selected = state.selectedLibraryIds.size;
+  const label = selected === state.libraries.length
+    ? "搜索范围：全部库"
+    : selected === 0
+      ? "搜索范围：未选择"
+      : `搜索范围：已选 ${selected} 个库`;
+  document.getElementById("scope-label").textContent = label;
+}
+
+function libraryScope() {
+  return Array.from(state.selectedLibraryIds).join(",");
+}
+
+function renderLibraryList() {
+  const list = document.getElementById("library-list");
+  const fragment = document.createDocumentFragment();
+  for (const lib of state.libraries) {
+    const id = lib.library_id || "";
+    const status = state.statuses.get(id) || null;
+    const statusError = state.statusErrors.get(id) || "";
+    const info = getStatusInfo(status);
+    const li = document.createElement("li");
+    li.className = "library-item";
+    li.classList.toggle("active", id === state.activeLibraryId);
+    li.classList.toggle(`status-${info.tone}`, !statusError && info.tone !== "idle");
+    li.classList.toggle("status-error", !!statusError);
+    li.setAttribute("role", "button");
+    li.setAttribute("tabindex", "0");
+    li.setAttribute("aria-selected", id === state.activeLibraryId ? "true" : "false");
+
+    const line = document.createElement("span");
+    line.className = "library-line";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = state.selectedLibraryIds.has(id);
+    checkbox.setAttribute("aria-label", `选择 ${lib.name || id || "未命名库"}`);
+    checkbox.addEventListener("click", (event) => event.stopPropagation());
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) state.selectedLibraryIds.add(id);
+      else state.selectedLibraryIds.delete(id);
+      renderScopeLabel();
+      renderLibraryList();
+    });
+    const name = document.createElement("span");
+    name.className = "library-name";
+    name.textContent = lib.name || id || "未命名库";
+    line.append(checkbox, name);
+    li.appendChild(line);
+
+    const path = document.createElement("span");
+    path.className = "path";
+    path.textContent = lib.root_path || "";
+    li.appendChild(path);
+
+    const itemStatus = document.createElement("span");
+    itemStatus.className = "library-status";
+    itemStatus.textContent = statusError ? "状态查询失败" : info.short;
+    li.appendChild(itemStatus);
+
+    li.addEventListener("click", () => selectLibrary(id));
+    li.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectLibrary(id);
+      }
+    });
+    fragment.appendChild(li);
+  }
+  list.replaceChildren(fragment);
+}
+
+async function refreshSummary() {
+  const library = getActiveLibrary();
+  const field = document.getElementById("summary-text");
+  if (!library) {
+    field.value = "";
+    field.placeholder = "先选择一个库查看摘要";
+    return;
+  }
+  try {
+    const result = await api().get_library_summary(library.library_id);
+    field.value = result && result.ok ? result.text || "" : "";
+    field.placeholder = result && result.ok ? "暂无摘要，可手写或让 AI 生成" : "无法读取摘要";
+  } catch (error) {
+    field.value = "";
+    field.placeholder = readableError(error, "无法读取摘要");
+  }
+}
+
+async function refreshSettings() {
+  const list = document.getElementById("settings-list");
+  try {
+    const result = await api().get_settings();
+    const entries = Object.entries(result || {}).sort(([left], [right]) => left.localeCompare(right));
+    list.textContent = entries.length ? entries.map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join("\\n") : "没有显式设置，使用各插件默认值";
+  } catch (error) {
+    list.textContent = readableError(error, "无法读取设置");
+  }
+}
+
+function selectLibrary(libraryId) {
+  if (!state.libraries.some((lib) => lib.library_id === libraryId)) return;
+  state.activeLibraryId = libraryId;
+  renderLibraryList();
+  renderStatusPanel();
+  refreshSummary();
+}
+
+function setView(view) {
+  if (view !== "search" && view !== "graph") return;
+  state.view = view;
+  const searchActive = view === "search";
+  document.getElementById("search-view").hidden = !searchActive;
+  document.getElementById("graph-view").hidden = searchActive;
+  const searchButton = document.getElementById("search-view-btn");
+  const graphButton = document.getElementById("graph-view-btn");
+  searchButton.classList.toggle("active", searchActive);
+  graphButton.classList.toggle("active", !searchActive);
+  searchButton.setAttribute("aria-current", searchActive ? "page" : "false");
+  graphButton.setAttribute("aria-current", searchActive ? "false" : "page");
+  if (!searchActive && !state.graph.loaded && !state.graph.loading) loadGraph();
+}
+
+function setProgress(percent, label, indeterminate) {
+  const track = document.getElementById("progress-track");
+  const fill = document.getElementById("progress-fill");
+  const labelEl = document.getElementById("progress-label");
+  const percentEl = document.getElementById("progress-percent");
+  track.classList.toggle("indeterminate", !!indeterminate);
+  if (indeterminate) {
+    track.removeAttribute("aria-valuenow");
+    track.setAttribute("aria-valuetext", label);
+    fill.style.width = "34%";
+    percentEl.textContent = "—";
+  } else {
+    const value = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
+    track.setAttribute("aria-valuenow", String(Math.round(value)));
+    track.setAttribute("aria-valuetext", label);
+    fill.style.width = `${value}%`;
+    percentEl.textContent = `${Math.round(value)}%`;
+  }
+  labelEl.textContent = label;
+}
+
+function resetStatusPanel() {
+  document.getElementById("status-library-name").textContent = "未选择库";
+  const badge = document.getElementById("status-badge");
+  badge.className = "status-badge";
+  badge.textContent = "未索引";
+  const summary = document.getElementById("status-summary");
+  summary.className = "";
+  summary.textContent = "尚未启动索引";
+  document.getElementById("status-message").textContent = "";
+  for (const step of document.querySelectorAll(".phase-step")) step.className = "phase-step";
+  setProgress(0, "等待开始", false);
+  document.getElementById("file-count").textContent = "—";
+  document.getElementById("chunk-count").textContent = "—";
+  document.getElementById("succeeded-count").textContent = "—";
+  document.getElementById("failed-count").textContent = "—";
+  document.getElementById("delta-count").textContent = "—";
+  document.getElementById("elapsed-time").textContent = "—";
+  document.getElementById("eta-time").textContent = "—";
+  document.getElementById("worker-pid").textContent = "—";
+  document.getElementById("current-path").textContent = "—";
+  document.getElementById("health-alert").className = "";
+  document.getElementById("health-alert").textContent = "";
+  document.getElementById("stop-hint").textContent = "";
+  document.getElementById("stop-index-btn").disabled = true;
+  document.getElementById("reindex-btn").disabled = true;
+  document.getElementById("full-reindex-btn").disabled = true;
+}
+
+function formatDuration(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  const rounded = Math.floor(seconds);
+  if (rounded < 60) return `${rounded}秒`;
+  const minutes = Math.floor(rounded / 60);
+  if (minutes < 60) return `${minutes}分${rounded % 60}秒`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}时${minutes % 60}分`;
+}
+
+function formatPair(done, total) {
+  const doneText = done === null || done === undefined || done === "" ? "—" : String(done);
+  if (total === null || total === undefined || total === "") return `${doneText} / 未知`;
+  return `${doneText} / ${String(total)}`;
+}
+
+function formatPid(value) {
+  return value === null || value === undefined || value === "" || Number(value) <= 0 ? "—" : String(value);
+}
+
+function renderPhaseTrack(status) {
+  const currentIndex = phaseOrder.indexOf(status.phase === "file_complete" ? "writing" : status.phase);
+  const stage = status.stage;
+  for (const step of document.querySelectorAll(".phase-step")) {
+    const index = phaseOrder.indexOf(step.dataset.phase);
+    step.className = "phase-step";
+    step.removeAttribute("aria-current");
+    if (stage === "done") {
+      step.classList.add("done");
+    } else if (stage === "running" || stage === "starting") {
+      const activeIndex = stage === "starting" ? 0 : currentIndex;
+      if (activeIndex >= 0 && index < activeIndex) step.classList.add("done");
+      if (index === activeIndex) {
+        step.classList.add("active");
+        step.setAttribute("aria-current", "step");
+      }
+    } else if (stage === "failed" || stage === "cancelled") {
+      if (currentIndex >= 0 && index < currentIndex) step.classList.add("done");
+      if (index === currentIndex) step.classList.add(stage);
+    }
+  }
+}
+
+function renderHealth(status, statusError) {
+  const alert = document.getElementById("health-alert");
+  alert.className = "";
+  alert.textContent = "";
+  if (statusError) {
+    alert.className = "visible error";
+    alert.textContent = `索引状态查询失败：${statusError}`;
+    return;
+  }
+  if (!status) return;
+  if (status.health === "orphaned") {
+    alert.className = "visible";
+    alert.textContent = "警告：索引工作进程已失联，状态可能已过期";
+  } else if (status.health === "stalled_no_heartbeat") {
+    alert.className = "visible";
+    alert.textContent = "警告：索引进程长时间没有心跳，可能已停滞";
+  } else if (status.health === "stalled_no_progress") {
+    alert.className = "visible";
+    alert.textContent = "警告：索引长时间没有进展，可能已停滞";
+  }
+}
+
+function renderStatusPanel() {
+  const library = getActiveLibrary();
+  const reindexButton = document.getElementById("reindex-btn");
+  const fullReindexButton = document.getElementById("full-reindex-btn");
+  const stopButton = document.getElementById("stop-index-btn");
+  if (!library) {
+    resetStatusPanel();
+    return;
+  }
+
+  const id = library.library_id || "";
+  const statusError = state.statusErrors.get(id) || "";
+  const status = statusError ? null : state.statuses.get(id) || null;
+  const info = getStatusInfo(status);
+  const badge = document.getElementById("status-badge");
+  const summary = document.getElementById("status-summary");
+  const message = document.getElementById("status-message");
+
+  document.getElementById("status-library-name").textContent = library.name || id || "未命名库";
+  badge.className = `status-badge ${statusError ? "error" : info.tone}`;
+  badge.textContent = statusError ? "查询失败" : info.short;
+  summary.className = statusError ? "error" : "";
+  summary.textContent = statusError ? "无法获取索引状态" : info.label;
+  message.textContent = status ? (status.message || status.error || "") : (statusError ? "请检查后端服务后重试" : "选择库后启动一次索引即可查看进度");
+  reindexButton.disabled = isRunning(status) || !!statusError;
+  fullReindexButton.disabled = reindexButton.disabled;
+  renderPhaseTrack(status || {});
+  renderHealth(status, statusError);
+
+  if (!status) {
+    setProgress(0, "等待开始", false);
+    document.getElementById("file-count").textContent = "—";
+    document.getElementById("chunk-count").textContent = "—";
+    document.getElementById("succeeded-count").textContent = "—";
+    document.getElementById("failed-count").textContent = "—";
+    document.getElementById("elapsed-time").textContent = "—";
+    document.getElementById("eta-time").textContent = "—";
+    document.getElementById("worker-pid").textContent = "—";
+    document.getElementById("current-path").textContent = "—";
+    document.getElementById("stop-hint").textContent = "";
+    stopButton.disabled = true;
+    return;
+  }
+
+  const phaseLabel = phaseLabels[status.phase] || "索引";
+  const percentValue = Number(status.percent);
+  const hasPercent = Number.isFinite(percentValue);
+  const terminal = status.stage === "done";
+  const indeterminate = !terminal && (!hasPercent || status.phase === "visual" || status.phase === "finalizing" || (status.stage === "starting" && !(Number(status.files_total) > 0)));
+  const progressLabel = terminal ? "索引已完成" : status.stage === "failed" ? "索引失败" : status.stage === "cancelled" ? "索引已取消" : indeterminate ? `${phaseLabel}处理中` : `${phaseLabel}中`;
+  setProgress(terminal ? 100 : hasPercent ? percentValue : 0, progressLabel, indeterminate);
+  document.getElementById("file-count").textContent = formatPair(status.files_done, status.files_total);
+  document.getElementById("chunk-count").textContent = formatPair(status.chunks_done, status.chunks_total);
+  document.getElementById("succeeded-count").textContent = Number.isFinite(Number(status.succeeded)) ? String(status.succeeded) : "—";
+  document.getElementById("failed-count").textContent = Number.isFinite(Number(status.failed)) ? String(status.failed) : "—";
+  document.getElementById("delta-count").textContent = terminal
+    ? `+${Number(status.added) || 0} ~${Number(status.changed) || 0} -${Number(status.removed) || 0} =${Number(status.unchanged) || 0}${Number(status.retried) ? ` ↻${Number(status.retried)}` : ""}`
+    : "—";
+  document.getElementById("elapsed-time").textContent = formatDuration(status.elapsed_s);
+  document.getElementById("eta-time").textContent = formatDuration(status.eta_s);
+  document.getElementById("worker-pid").textContent = formatPid(status.worker_pid);
+  document.getElementById("current-path").textContent = status.current_path || "—";
+
+  const foreign = status.owner === "foreign";
+  const stopHint = document.getElementById("stop-hint");
+  if (foreign && isRunning(status)) {
+    stopHint.textContent = "由其他进程启动，不能从这里停止";
+  } else if (isRunning(status) && status.can_stop !== true) {
+    stopHint.textContent = "当前索引无法从这里停止";
+  } else {
+    stopHint.textContent = "";
+  }
+  stopButton.disabled = !isRunning(status) || status.can_stop !== true || !status.run_id;
+}
+
+async function refreshLibraries() {
+  try {
+    const libraries = await api().list_libraries();
+    if (!Array.isArray(libraries)) throw new Error("库列表返回格式异常");
+    state.libraries = libraries;
+    const ids = new Set(libraries.map((lib) => lib.library_id));
+    for (const id of state.statuses.keys()) {
+      if (!ids.has(id)) state.statuses.delete(id);
+    }
+    for (const id of state.statusErrors.keys()) {
+      if (!ids.has(id)) state.statusErrors.delete(id);
+    }
+    for (const id of Array.from(state.selectedLibraryIds)) {
+      if (!ids.has(id)) state.selectedLibraryIds.delete(id);
+    }
+    if (state.selectedLibraryIds.size === 0 && libraries.length > 0) {
+      for (const library of libraries) state.selectedLibraryIds.add(library.library_id);
+    }
+    if (!state.activeLibraryId || !ids.has(state.activeLibraryId)) {
+      state.activeLibraryId = libraries.length > 0 ? libraries[0].library_id : null;
+    }
+    renderScopeLabel();
+    renderLibraryList();
+    renderStatusPanel();
+    await refreshSummary();
+    await refreshSettings();
+  } catch (error) {
+    setStatus(`读取库列表失败：${readableError(error, "无法连接后端服务")}`, true);
   }
 }
 
 async function addLibrary() {
   const name = document.getElementById("new-lib-name").value.trim();
   const path = document.getElementById("new-lib-path").value.trim();
-  if (!name || !path) { setStatus("名称和路径都要填", true); return; }
+  if (!name || !path) {
+    setStatus("名称和路径都要填", true);
+    return;
+  }
   const libraryId = name.toLowerCase().replace(/[^a-z0-9]+/g, "-") + "-" + Date.now().toString(36);
-  const result = await api().add_library(libraryId, name, path);
-  if (!result.ok) { setStatus("新建库失败：" + result.error, true); return; }
-  document.getElementById("new-lib-name").value = "";
-  document.getElementById("new-lib-path").value = "";
-  setStatus("已新建库：" + name, false);
-  await refreshLibraries();
+  setStatus("正在新建库…", false);
+  try {
+    const result = await api().add_library(libraryId, name, path);
+    if (!result || result.ok !== true) {
+      setStatus(`新建库失败：${readableError(result && (result.error || result.message), "后端拒绝了新建请求")}`, true);
+      return;
+    }
+    document.getElementById("new-lib-name").value = "";
+    document.getElementById("new-lib-path").value = "";
+    setStatus(`已新建库：${name}`, false);
+    await refreshLibraries();
+  } catch (error) {
+    setStatus(`新建库失败：${readableError(error, "无法连接后端服务")}`, true);
+  }
 }
 
-async function reindexActive() {
-  if (!state.activeLibraryId) { setStatus("先选一个库", true); return; }
-  setStatus("正在建索引…", false);
-  const result = await api().reindex_library(state.activeLibraryId);
-  if (!result.ok) { setStatus("建索引失败：" + result.error, true); return; }
-  setStatus(`建索引完成：成功 ${result.succeeded} 个，失败 ${result.failed} 个`, result.failed > 0);
+async function reindexActive(full = false) {
+  const library = getActiveLibrary();
+  if (!library) {
+    setStatus("先选一个库", true);
+    return;
+  }
+  const current = state.statuses.get(library.library_id) || null;
+  if (isRunning(current)) {
+    setStatus("当前库正在索引，不能重复启动", true);
+    return;
+  }
+  setStatus(full ? "正在启动完整重建…" : "正在启动增量更新…", false);
+  document.getElementById("reindex-btn").disabled = true;
+  document.getElementById("full-reindex-btn").disabled = true;
+  try {
+    const result = await api().reindex_library(library.library_id, full);
+    if (!result || result.ok !== true) {
+      setStatus(`启动索引失败：${readableError(result && (result.error || result.message), "后端拒绝了启动请求")}`, true);
+      renderStatusPanel();
+      return;
+    }
+    if (result.started !== true) {
+      setStatus(`索引未启动：${readableError(result.message, "当前库可能已有索引任务在运行，请查看状态")}`, true);
+      renderStatusPanel();
+      return;
+    }
+    state.statuses.set(library.library_id, {
+      stage: "starting",
+      phase: "scanning",
+      message: result.message || "索引工作进程已启动",
+      files_done: 0,
+      files_total: 0,
+      chunks_done: 0,
+      chunks_total: null,
+      current_path: "",
+      elapsed_s: 0,
+      eta_s: null,
+      percent: 0,
+      worker_pid: result.worker_pid || null,
+      run_id: result.run_id || "",
+      owner: "self",
+      active: true,
+      can_stop: true,
+      health: "healthy",
+      full
+    });
+    state.statusErrors.delete(library.library_id);
+    setStatus("索引已启动，正在处理…", false);
+    renderLibraryList();
+    renderStatusPanel();
+  } catch (error) {
+    setStatus(`启动索引失败：${readableError(error, "无法连接后端服务")}`, true);
+    renderStatusPanel();
+  }
+}
+
+async function stopActiveIndex() {
+  const library = getActiveLibrary();
+  const status = library ? state.statuses.get(library.library_id) || null : null;
+  if (!library || !isRunning(status) || status.can_stop !== true || !status.run_id) {
+    setStatus("当前没有可以停止的本轮索引", true);
+    return;
+  }
+  const button = document.getElementById("stop-index-btn");
+  button.disabled = true;
+  setStatus("正在停止本轮索引…", false);
+  try {
+    const result = await api().stop_index(library.library_id, status.run_id);
+    let stopped = false;
+    let message = "";
+    if (Array.isArray(result)) {
+      stopped = result[0] === true;
+      message = result[1] || "";
+    } else if (result && typeof result === "object") {
+      stopped = result.stopped === true;
+      message = result.message || result.error || "";
+    } else {
+      stopped = result === true;
+    }
+    if (!stopped) {
+      setStatus(`停止索引失败：${readableError(message, "后端没有成功停止这轮索引")}`, true);
+    } else {
+      setStatus(message || "索引任务已取消", false);
+    }
+    await pollAllStatuses();
+  } catch (error) {
+    setStatus(`停止索引失败：${readableError(error, "无法连接后端服务")}`, true);
+    renderStatusPanel();
+  }
+}
+
+async function openDocument(libraryId, path) {
+  if (!libraryId || !path) return;
+  try {
+    const result = await api().read_document(libraryId, path);
+    if (!result || result.ok !== true) throw new Error(result && (result.error || result.message));
+    document.getElementById("document-panel").hidden = false;
+    document.getElementById("document-title").textContent = path;
+    document.getElementById("document-text").value = result.text || "";
+    const relations = await api().note_relations(libraryId, path);
+    document.getElementById("document-relations").textContent = relations && relations.ok
+      ? `出链：${(relations.outlinks || []).join("、") || "无"}\n入链：${(relations.inlinks || []).join("、") || "无"}`
+      : `关系读取失败：${relations && relations.error || "未知错误"}`;
+  } catch (error) {
+    setStatus(`打开正文失败：${readableError(error, "无法读取文件")}`, true);
+  }
+}
+
+async function showFailures() {
+  const library = getActiveLibrary();
+  if (!library) {
+    setStatus("先选择一个库", true);
+    return;
+  }
+  try {
+    const result = await api().index_failures(library.library_id);
+    if (!result || result.ok !== true) throw new Error(result && (result.error || result.message));
+    const failures = result.failures || [];
+    document.getElementById("document-panel").hidden = false;
+    document.getElementById("document-title").textContent = `${library.name || library.library_id} · 失败明细`;
+    document.getElementById("document-text").value = failures.length
+      ? failures.map((item) => `${item.path || "—"}\n${item.reason || item.error || "未知原因"}`).join("\\n\\n")
+      : "最近一次索引没有失败文件。";
+    document.getElementById("document-relations").textContent = "";
+  } catch (error) {
+    setStatus(`读取失败明细失败：${readableError(error, "无法读取失败记录")}`, true);
+  }
 }
 
 async function runSearch() {
   const query = document.getElementById("search-input").value.trim();
-  if (!state.activeLibraryId) { setStatus("先选一个库", true); return; }
-  if (!query) { return; }
-  setStatus("搜索中…", false);
-  const result = await api().search(state.activeLibraryId, query, 10);
-  const resultsEl = document.getElementById("results");
-  const emptyEl = document.getElementById("empty-state");
-  resultsEl.innerHTML = "";
-  if (!result.ok) { setStatus("搜索失败：" + result.error, true); emptyEl.style.display = "block"; return; }
-  setStatus(`找到 ${result.results.length} 条结果`, false);
-  if (result.results.length === 0) {
-    emptyEl.textContent = "没搜到相关内容。";
-    emptyEl.style.display = "block";
+  if (!state.libraries.length) {
+    setStatus("先新建或选择一个库", true);
     return;
   }
-  emptyEl.style.display = "none";
-  for (const r of result.results) {
-    const card = document.createElement("div");
-    card.className = "result-card";
-    card.innerHTML = `
-      <div class="meta">
-        <span>${r.path}${r.heading ? " · " + r.heading : ""}</span>
-        <span class="confidence">置信度 ${(r.confidence * 100).toFixed(0)}%</span>
-      </div>
-      <div class="text"></div>`;
-    card.querySelector(".text").textContent = r.text;
-    resultsEl.appendChild(card);
+  const scope = libraryScope();
+  if (!scope) {
+    setStatus("至少选择一个库", true);
+    return;
+  }
+  if (!query) return;
+  setStatus("搜索中…", false);
+  const resultsEl = document.getElementById("results");
+  const emptyEl = document.getElementById("empty-state");
+  const adviceEl = document.getElementById("search-advice");
+  resultsEl.replaceChildren();
+  adviceEl.textContent = "";
+  try {
+    const result = await api().search(scope, query, 10);
+    if (!result || result.ok !== true) {
+      setStatus(`搜索失败：${readableError(result && (result.error || result.message), "后端拒绝了搜索请求")}`, true);
+      emptyEl.style.display = "block";
+      return;
+    }
+    const results = Array.isArray(result.results) ? result.results : [];
+    const advice = Array.isArray(result.advice) ? result.advice.filter(Boolean) : [];
+    adviceEl.textContent = advice.map((line) => `提示：${line}`).join("\n");
+    setStatus(`找到 ${results.length} 条结果`, false);
+    if (results.length === 0) {
+      emptyEl.textContent = "没搜到相关内容。";
+      emptyEl.style.display = "block";
+      return;
+    }
+    emptyEl.style.display = "none";
+    const fragment = document.createDocumentFragment();
+    for (const resultItem of results) {
+      const card = document.createElement("div");
+      card.className = "result-card";
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      const path = document.createElement("span");
+      path.className = "result-path";
+      path.textContent = resultItem.path || "";
+      if (resultItem.heading) path.textContent += ` · ${resultItem.heading}`;
+      if (resultItem.backfilled) path.textContent += " · 已回填父节全文";
+      const confidence = document.createElement("span");
+      confidence.className = "confidence";
+      const confidenceValue = Number(resultItem.confidence);
+      confidence.textContent = Number.isFinite(confidenceValue) ? `置信度 ${(confidenceValue * 100).toFixed(0)}%` : "置信度 —";
+      meta.appendChild(path);
+      meta.appendChild(confidence);
+      const text = document.createElement("div");
+      text.className = "text";
+      text.textContent = resultItem.text || "";
+      card.appendChild(meta);
+      card.appendChild(text);
+      const open = document.createElement("button");
+      open.className = "secondary";
+      open.type = "button";
+      open.textContent = "打开正文";
+      open.addEventListener("click", () => openDocument(resultItem.library_id, resultItem.path));
+      card.appendChild(open);
+      fragment.appendChild(card);
+    }
+    resultsEl.replaceChildren(fragment);
+  } catch (error) {
+    setStatus(`搜索失败：${readableError(error, "无法连接后端服务")}`, true);
+    emptyEl.style.display = "block";
   }
 }
 
 async function exportActive() {
-  if (!state.activeLibraryId) { setStatus("先选一个库", true); return; }
+  if (!state.activeLibraryId) {
+    setStatus("先选一个库", true);
+    return;
+  }
   const dest = document.getElementById("export-dest").value.trim();
-  if (!dest) { setStatus("先填导出目标路径", true); return; }
+  if (!dest) {
+    setStatus("先填导出目标路径", true);
+    return;
+  }
   setStatus("正在导出…", false);
-  const result = await api().export_library(state.activeLibraryId, dest);
-  if (!result.ok) { setStatus("导出失败：" + result.error, true); return; }
-  setStatus("已导出到 " + dest, false);
+  try {
+    const result = await api().export_library(state.activeLibraryId, dest);
+    if (!result || result.ok !== true) {
+      setStatus(`导出失败：${readableError(result && (result.error || result.message), "后端拒绝了导出请求")}`, true);
+      return;
+    }
+    setStatus(`已导出到 ${dest}`, false);
+  } catch (error) {
+    setStatus(`导出失败：${readableError(error, "无法连接后端服务")}`, true);
+  }
 }
 
 async function importLibrary() {
   const archivePath = document.getElementById("import-archive").value.trim();
   const rootPath = document.getElementById("import-root").value.trim();
   const libraryId = document.getElementById("import-lib-id").value.trim();
-  if (!archivePath || !rootPath) { setStatus("归档路径和笔记目录都要填", true); return; }
+  if (!archivePath || !rootPath) {
+    setStatus("归档路径和笔记目录都要填", true);
+    return;
+  }
   setStatus("正在导入…", false);
-  const result = await api().import_library(archivePath, rootPath, libraryId);
-  if (!result.ok) { setStatus("导入失败：" + result.error, true); return; }
-  setStatus("已导入为库：" + result.library_id, false);
-  document.getElementById("import-archive").value = "";
-  document.getElementById("import-root").value = "";
-  document.getElementById("import-lib-id").value = "";
-  await refreshLibraries();
+  try {
+    const result = await api().import_library(archivePath, rootPath, libraryId);
+    if (!result || result.ok !== true) {
+      setStatus(`导入失败：${readableError(result && (result.error || result.message), "后端拒绝了导入请求")}`, true);
+      return;
+    }
+    setStatus(`已导入为库：${result.library_id || "新库"}`, false);
+    document.getElementById("import-archive").value = "";
+    document.getElementById("import-root").value = "";
+    document.getElementById("import-lib-id").value = "";
+    await refreshLibraries();
+  } catch (error) {
+    setStatus(`导入失败：${readableError(error, "无法连接后端服务")}`, true);
+  }
 }
 
-document.getElementById("add-lib-btn").onclick = addLibrary;
-document.getElementById("reindex-btn").onclick = reindexActive;
+const graphPalette = ["#5b8cff", "#62c69a", "#e5b765", "#d77ba8", "#8f7fe8", "#55b9c7", "#e58a65", "#9eb767"];
+const graphWidth = 1200;
+const graphHeight = 720;
+const graphGoldenAngle = Math.PI * (3 - Math.sqrt(5));
+
+function graphNodeIsPage(node) {
+  return !!node && (node.type === "page" || node.type === "pagegroup");
+}
+
+function pageParentId(pageNodeId) {
+  const child = state.graph.byId.get(pageNodeId);
+  if (!graphNodeIsPage(child)) return "";
+  return state.graph.nodes.find((node) => (
+    node.id !== child.id
+    && node.type === "pdf"
+    && node.lib === child.lib
+    && node.rel === child.rel
+  ))?.id || "";
+}
+
+function pageEdgeChild(edge) {
+  const endpoints = [edge.a, edge.b].map((id) => state.graph.byId.get(id)).filter(Boolean);
+  const child = endpoints.find((node) => graphNodeIsPage(node));
+  if (!child) return null;
+  const parent = state.graph.byId.get(pageParentId(child.id));
+  return parent && parent.type === "pdf" && endpoints.some((node) => node.id === parent.id) ? child : null;
+}
+
+function graphNodeVisible(node) {
+  return !graphNodeIsPage(node) || state.graph.showPages;
+}
+
+function graphEdgeVisible(edge) {
+  const first = state.graph.byId.get(edge.a);
+  const second = state.graph.byId.get(edge.b);
+  if (!first || !second || !graphNodeVisible(first) || !graphNodeVisible(second)) return false;
+  if (edge.kind === "page") return state.graph.showPages;
+  if (edge.kind === "link") return state.graph.showLinks;
+  return false;
+}
+
+function graphLibraries() {
+  if (state.graph.libs.length > 0) return state.graph.libs;
+  return Array.from(new Set(state.graph.nodes.map((node) => node.lib).filter(Boolean))).sort();
+}
+
+function graphColor(libraryId) {
+  const libs = graphLibraries();
+  const index = Math.max(0, libs.indexOf(libraryId));
+  return graphPalette[index % graphPalette.length];
+}
+
+function graphFileName(path) {
+  const parts = String(path || "").split(/[\\/]/);
+  return parts[parts.length - 1] || String(path || "");
+}
+
+function graphNodeLabel(node) {
+  if (node.type === "page") return `${graphFileName(node.rel)} · ${node.page ?? "?"} 页`;
+  if (node.type === "pagegroup") return `${graphFileName(node.rel)} · ${node.page ?? node.pages ?? "?"} 页组`;
+  return String(node.rel || node.id || "");
+}
+
+function graphTruncateLabel(value, limit = 28) {
+  const characters = Array.from(String(value || ""));
+  return characters.length > limit ? `${characters.slice(0, limit - 1).join("")}…` : characters.join("");
+}
+
+function graphTypeLabel(node) {
+  if (node.type === "pdf") return "PDF 原件";
+  if (node.type === "page") return "页面";
+  if (node.type === "pagegroup") return "页面组";
+  return String(node.type || "文件").toUpperCase();
+}
+
+function graphNodeState(node) {
+  if (graphNodeIsPage(node)) return "done";
+  const extraction = node.pipeline && node.pipeline.mineru;
+  const visual = node.pipeline && node.pipeline.wemm;
+  if (extraction === "failed") return "failed";
+  if (extraction === "queued" || extraction === "none") return "none";
+  if (visual === "failed") return "partial";
+  if (visual === "done" || node.type !== "pdf") return "done";
+  return "partial";
+}
+
+function setGraphAlert(message, isError = false) {
+  const alert = document.getElementById("graph-alert");
+  alert.textContent = String(message || "");
+  alert.className = isError ? "error" : "";
+  alert.hidden = !message;
+}
+
+function renderGraphControls() {
+  const graph = state.graph;
+  const refreshButton = document.getElementById("graph-refresh-btn");
+  const semanticButton = document.getElementById("graph-semantic-btn");
+  const semanticToggle = document.getElementById("graph-semantic-toggle");
+  refreshButton.disabled = graph.loading;
+  semanticButton.disabled = graph.loading || graph.semanticLoading;
+  semanticButton.textContent = graph.semanticLoading ? "计算中…" : graph.semanticLoaded ? "重新计算" : "加载语义边";
+  semanticToggle.disabled = graph.loading || graph.semanticLoading;
+  document.getElementById("graph-links-toggle").checked = graph.showLinks;
+  document.getElementById("graph-pages-toggle").checked = graph.showPages;
+  semanticToggle.checked = graph.semanticVisible;
+  document.getElementById("graph-semantic-threshold").value = String(graph.threshold);
+  document.getElementById("graph-semantic-value").value = graph.threshold.toFixed(2);
+}
+
+function renderGraphState() {
+  const graph = state.graph;
+  const stateEl = document.getElementById("graph-state");
+  const visible = graph.nodes.filter(graphNodeVisible);
+  stateEl.className = "";
+  stateEl.replaceChildren();
+  if (graph.loading) {
+    const message = document.createElement("div");
+    message.className = "graph-state-card";
+    const dot = document.createElement("span");
+    dot.className = "graph-state-dot";
+    message.append(dot, document.createTextNode("正在读取结构图谱…"));
+    stateEl.appendChild(message);
+  } else if (graph.error && graph.nodes.length === 0) {
+    stateEl.className = "error";
+    const message = document.createElement("div");
+    message.className = "graph-state-card";
+    message.textContent = `图谱加载失败：${graph.error}`;
+    stateEl.appendChild(message);
+  } else if (visible.length === 0) {
+    const message = document.createElement("div");
+    message.className = "graph-state-card";
+    message.textContent = graph.nodes.length > 0
+      ? "当前图层没有可显示的节点。PDF 原件始终保留。"
+      : "当前没有可显示的图谱节点。完成索引后再打开图谱。";
+    stateEl.appendChild(message);
+  } else {
+    stateEl.hidden = true;
+    return;
+  }
+  stateEl.hidden = false;
+}
+
+function renderGraphSummary() {
+  const graph = state.graph;
+  if (!graph.loaded && !graph.loading) {
+    document.getElementById("graph-summary").textContent = "尚未加载";
+    return;
+  }
+  const visibleNodes = graph.nodes.filter(graphNodeVisible);
+  const visibleEdges = [
+    ...graph.edges.filter(graphEdgeVisible),
+    ...(graph.semanticLoaded && graph.semanticVisible
+      ? graph.semanticEdges.filter((edge) => {
+          const first = graph.byId.get(edge.a);
+          const second = graph.byId.get(edge.b);
+          return first && second && graphNodeVisible(first) && graphNodeVisible(second);
+        })
+      : [])
+  ];
+  document.getElementById("graph-summary").textContent = `显示 ${visibleNodes.length} / ${graph.nodes.length} 节点 · ${visibleEdges.length} 条边`;
+}
+
+function renderLibraryLegend() {
+  const legend = document.getElementById("graph-legend");
+  const fragment = document.createDocumentFragment();
+  const title = document.createElement("span");
+  title.className = "legend-title";
+  title.textContent = "库";
+  fragment.appendChild(title);
+  const libraries = graphLibraries();
+  if (libraries.length === 0) {
+    const empty = document.createElement("span");
+    empty.textContent = "暂无";
+    fragment.appendChild(empty);
+  } else {
+    for (const libraryId of libraries) {
+      const library = state.libraries.find((item) => item.library_id === libraryId);
+      const item = document.createElement("span");
+      item.className = "library-key";
+      const swatch = document.createElement("span");
+      swatch.className = "library-swatch";
+      swatch.style.backgroundColor = graphColor(libraryId);
+      const label = document.createElement("span");
+      label.textContent = library ? library.name || libraryId : libraryId;
+      item.append(swatch, label);
+      fragment.appendChild(item);
+    }
+  }
+  legend.replaceChildren(fragment);
+}
+
+function layoutGraph() {
+  const graph = state.graph;
+  const visible = graph.nodes.filter(graphNodeVisible);
+  const documents = visible.filter((node) => !graphNodeIsPage(node));
+  const pages = visible.filter(graphNodeIsPage);
+  const positions = new Map();
+  const libraries = graphLibraries();
+  const byLibrary = new Map();
+  for (const node of documents) {
+    if (!byLibrary.has(node.lib)) byLibrary.set(node.lib, []);
+    byLibrary.get(node.lib).push(node);
+  }
+  const clusterRadius = Math.min(310, 190 + libraries.length * 16);
+  const centers = new Map();
+  libraries.forEach((libraryId, index) => {
+    if (libraries.length === 1) {
+      centers.set(libraryId, { x: graphWidth / 2, y: graphHeight / 2 });
+    } else {
+      const angle = -Math.PI / 2 + index * Math.PI * 2 / libraries.length;
+      centers.set(libraryId, {
+        x: graphWidth / 2 + Math.cos(angle) * clusterRadius,
+        y: graphHeight / 2 + Math.sin(angle) * clusterRadius
+      });
+    }
+  });
+  documents
+    .slice()
+    .sort((left, right) => Number(right.big) - Number(left.big) || String(left.rel).localeCompare(String(right.rel)))
+    .forEach((node) => {
+      const group = byLibrary.get(node.lib) || [];
+      group.sort((left, right) => Number(right.big) - Number(left.big) || String(left.rel).localeCompare(String(right.rel)));
+      const index = group.indexOf(node);
+      const center = centers.get(node.lib) || { x: graphWidth / 2, y: graphHeight / 2 };
+      const ratio = group.length > 1 ? (index + .5) / group.length : 0;
+      const radius = group.length > 1 ? 36 + 132 * Math.sqrt(ratio) : 0;
+      const angle = index * graphGoldenAngle + libraries.indexOf(node.lib) * .73;
+      positions.set(node.id, {
+        x: Math.max(58, Math.min(graphWidth - 58, center.x + Math.cos(angle) * radius)),
+        y: Math.max(52, Math.min(graphHeight - 52, center.y + Math.sin(angle) * radius))
+      });
+    });
+  const pagesByParent = new Map();
+  for (const page of pages) {
+    const parentId = pageParentId(page.id);
+    const key = parentId || `unlinked|${page.lib}`;
+    if (!pagesByParent.has(key)) pagesByParent.set(key, []);
+    pagesByParent.get(key).push(page);
+  }
+  for (const [key, siblings] of pagesByParent) {
+    const parent = positions.get(key) || centers.get(siblings[0].lib) || { x: graphWidth / 2, y: graphHeight / 2 };
+    siblings.sort((left, right) => String(left.id).localeCompare(String(right.id)));
+    const orbit = 28 + Math.min(78, 10 * Math.sqrt(siblings.length));
+    siblings.forEach((node, index) => {
+      const angle = index * graphGoldenAngle;
+      positions.set(node.id, {
+        x: Math.max(46, Math.min(graphWidth - 46, parent.x + Math.cos(angle) * orbit)),
+        y: Math.max(42, Math.min(graphHeight - 42, parent.y + Math.sin(angle) * orbit))
+      });
+    });
+  }
+  graph.positions = positions;
+}
+
+function setGraphTransform(x, y, scale) {
+  const next = { x, y, k: Math.max(.08, Math.min(5, scale)) };
+  state.graph.transform = next;
+  document.getElementById("graph-scene").setAttribute("transform", `translate(${next.x} ${next.y}) scale(${next.k})`);
+}
+
+function fitGraph() {
+  const positions = Array.from(state.graph.positions.values());
+  if (positions.length === 0) {
+    setGraphTransform(0, 0, 1);
+    return;
+  }
+  const minX = Math.min(...positions.map((point) => point.x)) - 46;
+  const minY = Math.min(...positions.map((point) => point.y)) - 38;
+  const maxX = Math.max(...positions.map((point) => point.x)) + 46;
+  const maxY = Math.max(...positions.map((point) => point.y)) + 38;
+  const width = Math.max(1, maxX - minX);
+  const height = Math.max(1, maxY - minY);
+  const scale = Math.max(.08, Math.min(1.8, Math.min((graphWidth - 44) / width, (graphHeight - 44) / height)));
+  setGraphTransform(
+    (graphWidth - width * scale) / 2 - minX * scale,
+    (graphHeight - height * scale) / 2 - minY * scale,
+    scale
+  );
+}
+
+function graphSvgPoint(event) {
+  const rect = document.getElementById("graph-svg").getBoundingClientRect();
+  return {
+    x: (event.clientX - rect.left) / Math.max(1, rect.width) * graphWidth,
+    y: (event.clientY - rect.top) / Math.max(1, rect.height) * graphHeight
+  };
+}
+
+function zoomGraph(factor, center = { x: graphWidth / 2, y: graphHeight / 2 }) {
+  const current = state.graph.transform;
+  const scale = Math.max(.08, Math.min(5, current.k * factor));
+  const ratio = scale / current.k;
+  setGraphTransform(
+    center.x - (center.x - current.x) * ratio,
+    center.y - (center.y - current.y) * ratio,
+    scale
+  );
+}
+
+function resetGraphView() {
+  layoutGraph();
+  fitGraph();
+}
+
+function positionGraphTooltip(event) {
+  const tooltip = document.getElementById("graph-tooltip");
+  const stage = document.getElementById("graph-stage").getBoundingClientRect();
+  const left = Math.max(8, Math.min(stage.width - 268, event.clientX - stage.left + 12));
+  const top = Math.max(8, Math.min(stage.height - 48, event.clientY - stage.top + 12));
+  tooltip.style.left = `${left}px`;
+  tooltip.style.top = `${top}px`;
+}
+
+function showGraphTooltip(event, node) {
+  const tooltip = document.getElementById("graph-tooltip");
+  tooltip.textContent = `${graphNodeLabel(node)} · ${graphTypeLabel(node)}`;
+  tooltip.hidden = false;
+  positionGraphTooltip(event);
+}
+
+function hideGraphTooltip() {
+  document.getElementById("graph-tooltip").hidden = true;
+}
+
+function renderGraphInspector(node) {
+  const inspector = document.getElementById("graph-inspector");
+  const body = document.getElementById("graph-inspector-body");
+  if (!node) {
+    inspector.classList.remove("visible");
+    body.replaceChildren();
+    return;
+  }
+  const library = state.libraries.find((item) => item.library_id === node.lib);
+  const pipeline = node.pipeline || {};
+  const details = [
+    ["类型", graphTypeLabel(node)],
+    ["状态", graphNodeState(node)],
+    ["库", library ? library.name || node.lib : node.lib || "—"],
+    ["路径", node.rel || "—"],
+    ["主题", node.theme || "general"],
+    ["块", Number.isFinite(Number(node.chunks)) ? String(node.chunks) : "—"],
+    ["页数", node.pages ?? node.page ?? "—"],
+    ["MinerU", pipeline.mineru || "none"],
+    ["WEMM", pipeline.wemm || "none"],
+    ["更新时间", node.updated ? new Date(Number(node.updated) * 1000).toLocaleString() : "—"],
+    ["失败原因", node.fail_reason || "无"]
+  ];
+  if (node.big) details.push(["连接度", "重点节点"]);
+  const fragment = document.createDocumentFragment();
+  for (const [label, value] of details) {
+    const row = document.createElement("div");
+    row.className = "inspector-row";
+    const key = document.createElement("span");
+    key.className = "inspector-label";
+    key.textContent = label;
+    const text = document.createElement("span");
+    text.className = label === "失败原因" && value !== "无" ? "inspector-value error" : "inspector-value";
+    text.textContent = String(value);
+    row.append(key, text);
+    fragment.appendChild(row);
+  }
+  document.getElementById("graph-inspector-title").textContent = graphNodeLabel(node);
+  if (node.lib && node.rel) {
+    const open = document.createElement("button");
+    open.className = "secondary";
+    open.type = "button";
+    open.textContent = "打开源文件";
+    open.addEventListener("click", () => openGraphSource(node));
+    fragment.appendChild(open);
+  }
+  body.replaceChildren(fragment);
+  inspector.classList.add("visible");
+}
+
+async function openGraphSource(node) {
+  if (!node || !node.lib || !node.rel) return;
+  try {
+    const result = await api().open_source(node.lib, node.rel);
+    if (!result || result.ok !== true) throw new Error(result && (result.error || result.message));
+    setStatus(result.opened ? `已打开：${node.rel}` : `源文件：${result.path || node.rel}`, false);
+  } catch (error) {
+    setStatus(`打开源文件失败：${readableError(error, "无法打开源文件")}`, true);
+  }
+}
+
+function selectGraphNode(nodeId) {
+  state.graph.selectedId = nodeId;
+  const node = state.graph.byId.get(nodeId) || null;
+  for (const item of document.getElementById("graph-node-layer").children) {
+    item.classList.toggle("selected", item.dataset.nodeId === nodeId);
+  }
+  renderGraphInspector(node);
+}
+
+function addGraphNode(node) {
+  const position = state.graph.positions.get(node.id);
+  if (!position) return;
+  const namespace = "http://www.w3.org/2000/svg";
+  const group = document.createElementNS(namespace, "g");
+  const nodeState = graphNodeState(node);
+  group.setAttribute("class", `graph-node ${node.type} st-${nodeState}`);
+  group.dataset.nodeId = node.id;
+  group.setAttribute("transform", `translate(${position.x} ${position.y})`);
+  group.setAttribute("tabindex", "0");
+  group.setAttribute("role", "button");
+  group.setAttribute("aria-label", `${graphNodeLabel(node)}，${graphTypeLabel(node)}，状态 ${nodeState}`);
+  if (node.big) {
+    const halo = document.createElementNS(namespace, "circle");
+    halo.setAttribute("class", "graph-node-halo");
+    halo.setAttribute("r", "15");
+    group.appendChild(halo);
+  }
+  const shape = document.createElementNS(namespace, node.type === "page" ? "circle" : "rect");
+  if (node.type === "page") {
+    shape.setAttribute("r", node.big ? "6.5" : "5");
+  } else {
+    const radius = node.big ? 10 : 8;
+    shape.setAttribute("x", String(-radius));
+    shape.setAttribute("y", String(-radius));
+    shape.setAttribute("width", String(radius * 2));
+    shape.setAttribute("height", String(radius * 2));
+    shape.setAttribute("rx", node.type === "pagegroup" || node.type === "pdf" ? "3" : "7");
+  }
+  shape.setAttribute("class", "graph-node-shape");
+  shape.setAttribute("fill", graphColor(node.lib));
+  group.appendChild(shape);
+  if (nodeState !== "done") {
+    const status = document.createElementNS(namespace, "circle");
+    status.setAttribute("class", "graph-node-status");
+    status.setAttribute("cx", "9");
+    status.setAttribute("cy", "-9");
+    status.setAttribute("r", "3");
+    group.appendChild(status);
+  }
+  const label = document.createElementNS(namespace, "text");
+  label.setAttribute("class", "graph-node-label");
+  label.setAttribute("x", "0");
+  label.setAttribute("y", graphNodeIsPage(node) ? "18" : "22");
+  label.setAttribute("text-anchor", "middle");
+  label.textContent = graphTruncateLabel(graphNodeLabel(node), graphNodeIsPage(node) ? 22 : 28);
+  group.appendChild(label);
+  group.addEventListener("pointerenter", (event) => showGraphTooltip(event, node));
+  group.addEventListener("pointermove", positionGraphTooltip);
+  group.addEventListener("pointerleave", hideGraphTooltip);
+  group.addEventListener("click", (event) => {
+    event.stopPropagation();
+    selectGraphNode(node.id);
+  });
+  group.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      selectGraphNode(node.id);
+    }
+  });
+  group.classList.toggle("selected", state.graph.selectedId === node.id);
+  document.getElementById("graph-node-layer").appendChild(group);
+}
+
+function addGraphEdge(edge, layerId, className) {
+  const first = state.graph.positions.get(edge.a);
+  const second = state.graph.positions.get(edge.b);
+  if (!first || !second) return;
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  line.setAttribute("class", className);
+  line.setAttribute("x1", String(first.x));
+  line.setAttribute("y1", String(first.y));
+  line.setAttribute("x2", String(second.x));
+  line.setAttribute("y2", String(second.y));
+  line.setAttribute("pointer-events", "none");
+  if (className === "graph-semantic-edge") {
+    const similarity = Math.max(0, Math.min(1, Number(edge.sim) || 0));
+    line.setAttribute("stroke-width", String(1 + similarity * 1.8));
+  }
+  document.getElementById(layerId).appendChild(line);
+}
+
+function clearGraphLayer(layerId) {
+  const layer = document.getElementById(layerId);
+  while (layer.firstChild) layer.removeChild(layer.firstChild);
+}
+
+function renderGraph(refit = false) {
+  const graph = state.graph;
+  layoutGraph();
+  for (const layerId of ["graph-link-layer", "graph-page-layer", "graph-semantic-layer", "graph-node-layer"]) clearGraphLayer(layerId);
+  if (graph.showLinks) {
+    for (const edge of graph.edges) {
+      if (edge.kind === "link" && graphEdgeVisible(edge)) addGraphEdge(edge, "graph-link-layer", "graph-link");
+    }
+  }
+  if (graph.showPages) {
+    for (const edge of graph.edges) {
+      if (edge.kind === "page" && graphEdgeVisible(edge) && pageEdgeChild(edge)) addGraphEdge(edge, "graph-page-layer", "graph-page-edge");
+    }
+  }
+  if (graph.semanticLoaded && graph.semanticVisible) {
+    for (const edge of graph.semanticEdges) {
+      const first = graph.byId.get(edge.a);
+      const second = graph.byId.get(edge.b);
+      if (first && second && graphNodeVisible(first) && graphNodeVisible(second)) addGraphEdge(edge, "graph-semantic-layer", "graph-semantic-edge");
+    }
+  }
+  for (const node of graph.nodes) {
+    if (graphNodeVisible(node)) addGraphNode(node);
+  }
+  const selected = graph.selectedId ? graph.byId.get(graph.selectedId) : null;
+  if (graph.selectedId && (!selected || !graphNodeVisible(selected))) {
+    graph.selectedId = null;
+    renderGraphInspector(null);
+  }
+  renderLibraryLegend();
+  renderGraphControls();
+  renderGraphSummary();
+  renderGraphState();
+  if (refit) fitGraph();
+}
+
+async function loadGraph() {
+  if (state.graph.loading) return;
+  if (!libraryScope()) {
+    setGraphAlert("至少选择一个库才能加载图谱", true);
+    return;
+  }
+  state.graph.loading = true;
+  setGraphAlert("");
+  renderGraph();
+  try {
+    const result = await api().graph(libraryScope());
+    if (!result || result.ok !== true) {
+      throw new Error(readableError(result && (result.error || result.message), "后端返回了无法识别的图谱"));
+    }
+    if (!Array.isArray(result.nodes) || !Array.isArray(result.edges)) throw new Error("图谱返回格式异常");
+    const nodes = result.nodes.filter((node) => node && node.id);
+    state.graph.nodes = nodes;
+    state.graph.edges = result.edges.filter((edge) => edge && edge.a && edge.b);
+    state.graph.byId = new Map(nodes.map((node) => [node.id, node]));
+    state.graph.libs = Array.isArray(result.libs) && result.libs.length > 0
+      ? result.libs
+      : Array.from(new Set(nodes.map((node) => node.lib).filter(Boolean))).sort();
+    state.graph.loaded = true;
+    state.graph.error = "";
+    state.graph.semanticEdges = [];
+    state.graph.semanticLoaded = false;
+    state.graph.semanticVisible = false;
+    state.graph.semanticError = "";
+    state.graph.selectedId = null;
+    renderGraphInspector(null);
+  } catch (error) {
+    state.graph.error = readableError(error, "无法连接后端服务");
+    state.graph.loaded = state.graph.nodes.length > 0;
+    setGraphAlert(`图谱刷新失败：${state.graph.error}`, true);
+  } finally {
+    state.graph.loading = false;
+    renderGraph(true);
+  }
+}
+
+async function loadSemanticEdges() {
+  if (state.graph.semanticLoading) return;
+  if (!libraryScope()) {
+    setGraphAlert("至少选择一个库才能加载语义边", true);
+    return;
+  }
+  state.graph.threshold = Number(document.getElementById("graph-semantic-threshold").value);
+  state.graph.semanticLoading = true;
+  state.graph.semanticVisible = true;
+  state.graph.semanticError = "";
+  setGraphAlert("");
+  renderGraphControls();
+  try {
+    const result = await api().graph_semantic_edges(libraryScope(), state.graph.threshold);
+    if (!result || result.ok !== true) {
+      throw new Error(readableError(result && result.error, "后端拒绝了语义边请求"));
+    }
+    if (!Array.isArray(result.edges)) throw new Error("语义边返回格式异常");
+    state.graph.semanticEdges = result.edges;
+    state.graph.semanticLoaded = true;
+    state.graph.semanticVisible = true;
+    state.graph.semanticError = String(result.error || "");
+    if (state.graph.semanticError) setGraphAlert(state.graph.semanticError, true);
+  } catch (error) {
+    state.graph.semanticEdges = [];
+    state.graph.semanticLoaded = false;
+    state.graph.semanticVisible = false;
+    state.graph.semanticError = readableError(error, "语义边计算失败");
+    setGraphAlert(state.graph.semanticError, true);
+  } finally {
+    state.graph.semanticLoading = false;
+    renderGraph(true);
+  }
+}
+
+function initGraphInteractions() {
+  const svg = document.getElementById("graph-svg");
+  svg.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || (event.target.closest && event.target.closest(".graph-node"))) return;
+    const point = graphSvgPoint(event);
+    state.graph.drag = {
+      pointerId: event.pointerId,
+      start: point,
+      x: state.graph.transform.x,
+      y: state.graph.transform.y
+    };
+    svg.classList.add("panning");
+    svg.setPointerCapture(event.pointerId);
+    hideGraphTooltip();
+  });
+  svg.addEventListener("pointermove", (event) => {
+    if (!state.graph.drag || state.graph.drag.pointerId !== event.pointerId) return;
+    const point = graphSvgPoint(event);
+    setGraphTransform(
+      state.graph.drag.x + point.x - state.graph.drag.start.x,
+      state.graph.drag.y + point.y - state.graph.drag.start.y,
+      state.graph.transform.k
+    );
+  });
+  const finishPan = (event) => {
+    if (!state.graph.drag || state.graph.drag.pointerId !== event.pointerId) return;
+    state.graph.drag = null;
+    svg.classList.remove("panning");
+    if (svg.hasPointerCapture(event.pointerId)) svg.releasePointerCapture(event.pointerId);
+  };
+  svg.addEventListener("pointerup", finishPan);
+  svg.addEventListener("pointercancel", finishPan);
+  svg.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    zoomGraph(event.deltaY < 0 ? 1.12 : .89, graphSvgPoint(event));
+  }, { passive: false });
+  svg.addEventListener("dblclick", fitGraph);
+}
+
+async function pollAllStatuses() {
+  if (state.polling) return;
+  state.polling = true;
+  try {
+    const libraries = state.libraries.slice();
+    for (const library of libraries) {
+      const id = library.library_id || "";
+      try {
+        const result = await api().index_status(id);
+        if (!result || result.ok !== true) {
+          state.statusErrors.set(id, readableError(result && (result.error || result.message), "后端返回了无法识别的状态"));
+        } else {
+          state.statuses.set(id, result.status || null);
+          state.statusErrors.delete(id);
+        }
+      } catch (error) {
+        state.statusErrors.set(id, readableError(error, "无法连接后端服务"));
+      }
+      renderLibraryList();
+      renderStatusPanel();
+    }
+  } finally {
+    state.polling = false;
+    window.setTimeout(pollAllStatuses, 1000);
+  }
+}
+
+function startPolling() {
+  if (state.pollingStarted) return;
+  state.pollingStarted = true;
+  pollAllStatuses();
+}
+
+document.getElementById("select-all-libraries").onclick = () => {
+  state.selectedLibraryIds = new Set(state.libraries.map((library) => library.library_id));
+  renderScopeLabel();
+  renderLibraryList();
+};
+document.getElementById("clear-library-selection").onclick = () => {
+  state.selectedLibraryIds.clear();
+  renderScopeLabel();
+  renderLibraryList();
+};
+document.getElementById("failures-btn").onclick = showFailures;
+document.getElementById("document-close").onclick = () => {
+  document.getElementById("document-panel").hidden = true;
+};
+document.getElementById("summary-save-btn").onclick = async () => {
+  const library = getActiveLibrary();
+  if (!library) {
+    setStatus("先选择一个库", true);
+    return;
+  }
+  const result = await api().set_library_summary(library.library_id, document.getElementById("summary-text").value);
+  setStatus(result && result.ok ? "摘要已保存" : readableError(result && result.error, "保存摘要失败"), !(result && result.ok));
+};
+document.getElementById("summary-refresh-btn").onclick = async () => {
+  const library = getActiveLibrary();
+  if (!library) {
+    setStatus("先选择一个库", true);
+    return;
+  }
+  setStatus("正在生成摘要…", false);
+  let result = await api().refresh_library_summary(library.library_id);
+  if (result && result.needs_confirm) result = await api().refresh_library_summary(library.library_id, true);
+  document.getElementById("summary-text").value = result && result.ok ? result.text || "" : "";
+  setStatus(result && result.ok ? "摘要已生成" : readableError(result && result.error, "生成摘要失败"), !(result && result.ok));
+};
+document.getElementById("settings-save-btn").onclick = async () => {
+  const key = document.getElementById("settings-key").value.trim();
+  const raw = document.getElementById("settings-value").value;
+  if (!key) {
+    setStatus("先填写设置键", true);
+    return;
+  }
+  let value = raw;
+  try { value = JSON.parse(raw); } catch (error) { void error; }
+  const result = await api().set_setting(key, value);
+  setStatus(result && result.ok ? "设置已保存" : readableError(result && result.error, "保存设置失败"), !(result && result.ok));
+  if (result && result.ok) await refreshSettings();
+};
+document.getElementById("settings-unset-btn").onclick = async () => {
+  const key = document.getElementById("settings-key").value.trim();
+  if (!key) {
+    setStatus("先填写设置键", true);
+    return;
+  }
+  const result = await api().unset_setting(key);
+  setStatus(result && result.ok ? "已恢复默认值" : readableError(result && result.error, "恢复默认失败"), !(result && result.ok));
+  if (result && result.ok) await refreshSettings();
+};
+
+document.getElementById("reindex-btn").onclick = () => reindexActive(false);
+document.getElementById("full-reindex-btn").onclick = () => reindexActive(true);
+document.getElementById("stop-index-btn").onclick = stopActiveIndex;
 document.getElementById("export-btn").onclick = exportActive;
 document.getElementById("import-btn").onclick = importLibrary;
 document.getElementById("search-btn").onclick = runSearch;
-document.getElementById("search-input").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
+document.getElementById("search-input").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") runSearch();
+});
 
-window.addEventListener("pywebviewready", refreshLibraries);
+initGraphInteractions();
+document.getElementById("search-view-btn").onclick = () => setView("search");
+document.getElementById("graph-view-btn").onclick = () => setView("graph");
+document.getElementById("graph-refresh-btn").onclick = loadGraph;
+document.getElementById("graph-links-toggle").addEventListener("change", (event) => {
+  state.graph.showLinks = event.target.checked;
+  renderGraph(true);
+});
+document.getElementById("graph-pages-toggle").addEventListener("change", (event) => {
+  state.graph.showPages = event.target.checked;
+  renderGraph(true);
+});
+document.getElementById("graph-semantic-threshold").addEventListener("input", (event) => {
+  state.graph.threshold = Number(event.target.value);
+  renderGraphControls();
+});
+document.getElementById("graph-semantic-toggle").addEventListener("change", (event) => {
+  state.graph.semanticVisible = event.target.checked;
+  if (state.graph.semanticVisible) loadSemanticEdges();
+  else {
+    setGraphAlert("");
+    renderGraph();
+  }
+});
+document.getElementById("graph-semantic-btn").onclick = () => {
+  state.graph.semanticVisible = true;
+  document.getElementById("graph-semantic-toggle").checked = true;
+  loadSemanticEdges();
+};
+document.getElementById("graph-zoom-in").onclick = () => zoomGraph(1.18);
+document.getElementById("graph-zoom-out").onclick = () => zoomGraph(.84);
+document.getElementById("graph-fit-btn").onclick = fitGraph;
+document.getElementById("graph-reset-btn").onclick = resetGraphView;
+document.getElementById("graph-inspector-close").onclick = () => {
+  state.graph.selectedId = null;
+  for (const item of document.getElementById("graph-node-layer").children) item.classList.remove("selected");
+  renderGraphInspector(null);
+};
+
+window.addEventListener("pywebviewready", async () => {
+  await refreshLibraries();
+  startPolling();
+});
 </script>
 </body>
 </html>

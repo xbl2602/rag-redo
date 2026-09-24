@@ -1,0 +1,17 @@
+id = "official-query-enhancer-hyde"
+name = "HyDE查询增强"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+query_enhancer = "multi"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_query_enhancer_hyde.plugin:HydeQueryEnhancerPlugin"
+
+[permissions]
+network = true
+gpu = false

@@ -13,6 +13,9 @@ from core.write_gate import WriteGateError
 from .config import LibraryConfig, LibraryConfigStore
 from .selection import apply_selection_changes, collect_included_files, normalize_selection_changes
 
+AGENT_TEXT_EXTENSIONS = (".md", ".txt")
+AGENT_BINARY_EXTENSIONS = (".pdf", ".docx")
+
 
 class LibraryManagerPlugin:
     def __init__(self) -> None:
@@ -22,7 +25,9 @@ class LibraryManagerPlugin:
         self._logger = None
 
     def on_load(self, ctx):
-        self.store = LibraryConfigStore(ctx.data_dir / "libraries.json")
+        self.store = LibraryConfigStore(
+            ctx.storage.file("libraries.json", legacy="libraries.json")
+        )
         self._settings = ctx.settings
         self._write_gate = ctx.write_gate
         self._logger = ctx.logger
@@ -86,7 +91,24 @@ class LibraryManagerPlugin:
             )
         return [by_id[n] for n in final]
 
-    def resolve_included_files(self, library_id: str) -> list[tuple[str, bool, str]]:
+    def agent_allowed_extensions(self, library_id: str) -> tuple[str, ...]:
+        cfg = self.store.get(library_id) if self.store is not None else None
+        if cfg is None:
+            raise KeyError(f"未知库: {library_id}")
+        allowed: set[str] = set(AGENT_TEXT_EXTENSIONS)
+        allowed.update(
+            extension
+            for extension in cfg.agent_formats
+            if extension in AGENT_BINARY_EXTENSIONS
+        )
+        return tuple(sorted(allowed))
+
+    def resolve_included_files(
+        self,
+        library_id: str,
+        *,
+        format_allowlist: tuple[str, ...] | None = None,
+    ) -> list[tuple[str, bool, str]]:
         """返回某个库里全部文件的裁决结果（含未纳入的，附原因）——给"文件
         生效明细"这类界面直接用，不用重新扫一遍。"""
         assert self.store is not None
@@ -94,13 +116,27 @@ class LibraryManagerPlugin:
         if cfg is None:
             raise KeyError(f"未知库: {library_id}")
         all_paths = self._enumerate_files(cfg.root_path)
-        return collect_included_files(
+        decisions = collect_included_files(
             all_paths,
             selection_in=cfg.selection_in,
             selection_out=cfg.selection_out,
             new_file_default=cfg.new_file_default,  # type: ignore[arg-type]
             enabled_extensions=cfg.enabled_extensions,
+            exclude_dirs=cfg.exclude_dirs,
+            exclude_files=cfg.exclude_files,
+            exclude_patterns=cfg.exclude_patterns,
         )
+        if format_allowlist is None:
+            return decisions
+        allowed = {str(value).strip().lower() for value in format_allowlist}
+        result: list[tuple[str, bool, str]] = []
+        for path, included, reason in decisions:
+            extension = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            if extension not in allowed:
+                result.append((path, False, f"Agent 未授权格式 {extension or '(无后缀)'}"))
+            else:
+                result.append((path, included, reason))
+        return result
 
     @staticmethod
     def _enumerate_files(root_path: str) -> list[str]:

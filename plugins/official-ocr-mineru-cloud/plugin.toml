@@ -1,6 +1,6 @@
 id = "official-ocr-mineru-cloud"
 name = "MinerU 云端 OCR"
-version = "0.1.0"
+version = "0.3.0"
 api_version = ">=0.1,<0.2"
 
 [provides]
@@ -13,6 +13,6 @@ kind = "in_process"
 entry = "official_ocr_mineru_cloud.plugin:MineruCloudOcrPlugin"
 
 [permissions]
-filesystem = ["vault_read"]
+filesystem = ["vault_read", "data_write"]
 network = true
 gpu = false

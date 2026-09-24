@@ -7,9 +7,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
-from .datastore import DataStore
+from .datastore import DataStore, StorageHandle
 from .manifest import RuntimeSpec
 from .resource_arbiter import ResourceArbiter
 from .settings import SettingsStore
@@ -29,12 +28,7 @@ class PluginContext:
     #: `ctx.settings.set(key, value)`，不要自己发明一份环境变量或本地
     #: 文件——那样每个插件各管一套，GUI 没法统一列出"当前有哪些设置"。
     settings: SettingsStore
-    #: 本应用的数据根目录（向量库/配置/缓存都应该落在这底下）。插件绝不
-    #: 应该自己硬编码一个相对路径当数据目录——那样的插件在"从桌面快捷方式
-    #: 启动、cwd 不是仓库根目录"这种真实场景下会把数据写到意料之外的地方，
-    #: 或者压根找不到之前写的数据。AGENTS.md 架构红线7"所有数据落在 data/
-    #: 目录下"说的就是这个目录，来源必须是 ctx，不是插件自己拼字符串。
-    data_dir: Path
+    storage: StorageHandle
     #: 这个插件自己在 plugin.toml 里声明的 [runtime] 段——subprocess_service
     #: 插件的 on_enable/on_disable 从这里读 command/health_check/
     #: env_bootstrap，用 core.subprocess_service.SubprocessServiceHandle

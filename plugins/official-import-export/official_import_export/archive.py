@@ -21,11 +21,16 @@ import json
 import zipfile
 from io import BytesIO
 
-ARCHIVE_FORMAT_VERSION = 1
+ARCHIVE_FORMAT_VERSION = 2
 
 _MANIFEST_ENTRY = "manifest.json"
 _VECTORS_ENTRY = "vectors.json"
 _BM25_ENTRY = "bm25.json"
+_INDEX_ENTRY = "index.json"
+_EXTRACTED_ENTRY = "extracted.json"
+_RELATIONS_ENTRY = "relations.json"
+_FAILURES_ENTRY = "failures.json"
+_VISUAL_ENTRY = "visual.json"
 
 
 class ArchiveFormatError(Exception):
@@ -35,11 +40,18 @@ class ArchiveFormatError(Exception):
     """
 
 
-def pack(manifest: dict, vectors: dict, bm25: dict) -> bytes:
-    """manifest/vectors/bm25 都是纯 JSON 兼容字典——来源分别是
-    core.pipeline.export_library 里 library_manager 的库配置、
-    vector_store.get_all() 的全量向量记录、lexical_index.export_state()
-    的 BM25 状态，这个函数本身不知道、也不需要知道数据是怎么来的。"""
+def pack(
+    manifest: dict,
+    vectors: dict,
+    bm25: dict,
+    *,
+    index_manifest: dict | None = None,
+    extracted: dict | None = None,
+    relations: dict | None = None,
+    failures: dict | None = None,
+    visual: dict | None = None,
+) -> bytes:
+    """manifest/vectors/bm25 以及可选的完整索引状态都是纯 JSON 兼容字典。"""
     payload_manifest = dict(manifest)
     payload_manifest["archive_format_version"] = ARCHIVE_FORMAT_VERSION
     buf = BytesIO()
@@ -47,6 +59,16 @@ def pack(manifest: dict, vectors: dict, bm25: dict) -> bytes:
         zf.writestr(_MANIFEST_ENTRY, json.dumps(payload_manifest, ensure_ascii=False))
         zf.writestr(_VECTORS_ENTRY, json.dumps(vectors, ensure_ascii=False))
         zf.writestr(_BM25_ENTRY, json.dumps(bm25, ensure_ascii=False))
+        optional = {
+            _INDEX_ENTRY: index_manifest,
+            _EXTRACTED_ENTRY: extracted,
+            _RELATIONS_ENTRY: relations,
+            _FAILURES_ENTRY: failures,
+            _VISUAL_ENTRY: visual,
+        }
+        for name, value in optional.items():
+            if value is not None:
+                zf.writestr(name, json.dumps(value, ensure_ascii=False))
     return buf.getvalue()
 
 
@@ -64,6 +86,17 @@ def unpack(data: bytes) -> dict:
         manifest = json.loads(zf.read(_MANIFEST_ENTRY))
         vectors = json.loads(zf.read(_VECTORS_ENTRY))
         bm25 = json.loads(zf.read(_BM25_ENTRY))
+        optional = {
+            name: json.loads(zf.read(name))
+            for name in (
+                _INDEX_ENTRY,
+                _EXTRACTED_ENTRY,
+                _RELATIONS_ENTRY,
+                _FAILURES_ENTRY,
+                _VISUAL_ENTRY,
+            )
+            if name in zf.namelist()
+        }
     except json.JSONDecodeError as exc:
         raise ArchiveFormatError(f"归档内容损坏，不是合法JSON: {exc}") from exc
 
@@ -73,4 +106,13 @@ def unpack(data: bytes) -> dict:
             f"归档格式版本 {version!r} 比本软件支持的版本({ARCHIVE_FORMAT_VERSION})更新，请先升级软件再导入"
         )
 
-    return {"manifest": manifest, "vectors": vectors, "bm25": bm25}
+    return {
+        "manifest": manifest,
+        "vectors": vectors,
+        "bm25": bm25,
+        "index_manifest": optional.get(_INDEX_ENTRY),
+        "extracted": optional.get(_EXTRACTED_ENTRY),
+        "relations": optional.get(_RELATIONS_ENTRY),
+        "failures": optional.get(_FAILURES_ENTRY),
+        "visual": optional.get(_VISUAL_ENTRY),
+    }

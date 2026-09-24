@@ -56,6 +56,9 @@ class EmbedderPlugin:
     def on_unload(self, ctx):
         self.embedder = None
 
+    def index_signature(self) -> str:
+        return MODEL_VERSION
+
     def embed_texts(self, texts: list[str]) -> list[tuple[float, ...]]:
         """给编排层(core/pipeline.py)直接对查询字符串编码用——查询不是
         Chunk，不需要为它硬凑一个假 Chunk 才能复用 embed_chunks。"""

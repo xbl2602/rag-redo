@@ -1,6 +1,6 @@
 # RAG REDO
 
-> Obsidian 笔记本地语义检索系统的完全重构版本。**核心检索链路已经能跑通，Windows 安装包也真实装卸验证过了**（见下面"现状"）。[English README](README.en.md)
+> Obsidian 笔记本地语义检索系统的完全重构版本。**核心检索链路已经能跑通，Windows 便携版也完成构建路径验证**（见下面“现状”）。[English README](README.en.md)
 
 ## 这是什么
 
@@ -8,11 +8,11 @@
 
 ## 现状
 
-Phase 1（文字检索 MVP）核心链路已实现并有真实测试覆盖（350+ 用例）：19 个官方插件（多格式提取、切块、库管理、BM25 词法检索、BGE-M3 向量化、Chroma 向量库、RRF 融合、重排、MCP 工具、GUI 壳、近似去重、导出/导入、MinerU云端/本机OCR、WEMM页级视觉导航、库摘要、OpenAI兼容LLM Provider）+ 编排层 + Agent 写权限门禁。`official-visual-wemm`（页级视觉导航，独立于文字检索的"第二检索系统"，MCP 工具 `navigate_knowledge`）已经在真实 Windows 机器上完整实现并用真实 `tencent/WeMM-Embedding-2B` 模型验证过语义效果；GPU/显存精细生命周期管理（空闲卸载/自退出/主动驱逐/检索侧优先抢占）已按旧项目真实行为补齐。库摘要功能（帮 AI 在检索前先判断"这个库值不值得查"，用户手写的简介受 Agent 写权限门禁保护）已完整实现。详见 [docs/ROADMAP.md](docs/ROADMAP.md) 的逐项完成情况。
+Phase 1（文字检索 MVP）核心链路已实现并有真实测试覆盖（600+ 用例）：21 个官方插件（多格式提取、切块、库管理、BM25 词法检索、BGE-M3 向量化、Chroma 向量库、RRF 融合、重排、MCP 工具、GUI 壳、近似去重、导出/导入、MinerU云端/本机OCR、WEMM页级视觉导航、库摘要、OpenAI兼容LLM Provider、HyDE查询增强、自适应结果建议）+ 编排层 + Agent 写权限门禁。`official-visual-wemm`（页级视觉导航，独立于文字检索的"第二检索系统"，MCP 工具 `navigate_knowledge`）已经在真实 Windows 机器上完整实现并用真实 `tencent/WeMM-Embedding-2B` 模型验证过语义效果；GPU/显存精细生命周期管理（空闲卸载/自退出/主动驱逐/检索侧优先抢占，以及 GUI/MCP 宿主与 spawn worker 之间的跨进程让锁/移交）已按旧项目真实行为补齐。库摘要功能（帮 AI 在检索前先判断"这个库值不值得查"，用户手写的简介受 Agent 写权限门禁保护）已完整实现。HyDE 查询增强以独立 `query_enhancer` 插件提供，默认关闭；仅首轮 top1 置信度低于阈值时调用本地 OpenAI 兼容 LLM 生成假设文档并重查，只有第二轮置信度严格更高才替换首轮，LLM 不可用时静默保留原结果。文字检索默认启用 small-to-big：仍用小块完成 BM25/向量/重排，正文模式把多块父节整体回填、同节只交付一次，并在同文件封顶后继续补足 `top_k`；MCP list 模式保持小块列表。自适应结果建议由独立 `official-result-advisor` 插件提供，MCP/GUI 通过顶层 `advice` 通道返回最多 2 条零副作用建议。Graph 基础读模型已接入：GUI 可查看全库文件/双链/PDF→page/pagegroup 直接归属、节点终态和按需语义边，GUI 不直接读取索引存储。索引现在由独立 spawn worker 执行，`reindex_knowledge` 返回 `run_id`/PID；`index_status` 与 GUI 可查看阶段/进度/健康，并可停止本 GUI 启动的 worker。每轮索引先写独立 generation，全部完成后才原子发布；停止或崩溃不会把半成品切换成当前索引。默认索引是真正的文件级增量：内容未变和仅时间戳变化的文件跳过提取/切块/嵌入，插件、模型或阶段版本变化会精确触发全库重算，旧段在压缩时无重算合并并清理；WEMM PDF 页库同样按内容指纹增量。MCP `reindex_knowledge` 和 GUI 均支持默认增量与显式完整重建。详见 [docs/ROADMAP.md](docs/ROADMAP.md) 的逐项完成情况。
 
 `official-ocr-mineru-local`（本机 PDF OCR）已经接了真实 MinerU 模型——探测复用本机已装好的 `uv tool install mineru[all]` 工具环境（不重新下载权重），真实识别过中英文混排扫描件。
 
-**还没做的**：Windows 安装包已经能真实装/卸（Inno Setup 打包，`/CURRENTUSER` 免管理员权限，装/卸真实验证过开始菜单快捷方式+注册表项干净、用户数据卸载后保留，见 [installer/README.md](installer/README.md)），但还没在一台"没装过开发工具"的干净机器上验证过（只在打包机器本机验证过），且当前打包产物里 `official-visual-wemm`/`official-ocr-mineru-local` 暂时不可用（冻结产物缺一个能跑 env_bootstrap/探测外部工具环境的独立解释器，已知限制）；查询侧 HyDE 增强（旧项目里和库摘要平行独立的功能，这次调查库摘要时确认还没做）。
+**还没做的**：GUI 的多库勾选树、设置/摘要/失败明细/正文面板和 Graph 打开源文件交互已补齐，仍需做真实 GUI 冒烟；Windows 便携版已改为内置 Python 的 ZIP 方案，干净机器验收与体积优化仍待完成。
 
 架构设计文档：
 
@@ -25,7 +25,7 @@ Phase 1（文字检索 MVP）核心链路已实现并有真实测试覆盖（350
 
 ## 现在就能试（源码方式，Linux/Windows 都验证过）
 
-Windows 安装包脚本已经装卸验证过（见 [installer/README.md](installer/README.md)），但还没有发布出去给人直接下载——想要安装包的话，`.venv/Scripts/python.exe installer/build_windows.py` 打包，再用 Inno Setup 编译 `installer/rag-redo.iss` 得到 `setup.exe`。下面是更常用的源码+虚拟环境这条路径，Linux/Windows 下命令等价，把 `.venv/bin/` 换成 `.venv\Scripts\`：
+Windows 便携版脚本会生成自带 Python 的 ZIP：`.venv/Scripts/python.exe installer/build_windows.py`，产物在 `dist/rag-redo-portable.zip`；解压后双击 `start-gui.cmd`，不需要安装 Python、CUDA、Node 或 Inno Setup。详见 [installer/README.md](installer/README.md)。下面是源码+虚拟环境路径，Linux/Windows 下命令等价，把 `.venv/bin/` 换成 `.venv\Scripts\`：
 
 ```bash
 git clone <this-repo> rag-redo
@@ -40,7 +40,7 @@ python3 -m venv .venv
 .venv/bin/pip install transformers qwen-vl-utils torchvision --index-url https://download.pytorch.org/whl/cpu
 ```
 
-打开图形界面（自带 [demo-vault/](demo-vault/) 可以直接拿来试，点"新建库"填个名字和 `demo-vault` 的绝对路径，再点"重建当前库索引"，然后搜"插件 架构"之类的词）：
+打开图形界面（自带 [demo-vault/](demo-vault/) 可以直接拿来试，点"新建库"填个名字和 `demo-vault` 的绝对路径，再点"增量更新当前库"，然后搜"插件 架构"之类的词）：
 
 ```bash
 .venv/bin/python gui_main.py
@@ -57,7 +57,7 @@ python3 -m venv .venv
 }
 ```
 
-接好后 AI 就能用这些工具：`search_knowledge`（文字混合检索，支持多库并查/exclude反选/folder子目录过滤，libraries 留空默认查全部库）/ `navigate_knowledge`（PDF页级视觉导航，独立的"第二检索系统"，不参与前者的融合排序）/ `list_libraries` / `reindex_knowledge` / `export_library` / `import_library` / `get_library_sample`+`propose_library_summary`+`apply_library_summary`（库摘要：帮 AI 在检索前先判断"这个库值不值得查"，用户手写的简介受写权限门禁保护，AI 不能未经确认就覆盖）。
+接好后 AI 就能用这些工具：`search_knowledge`（文字混合检索，支持多库并查/exclude反选/folder子目录过滤，libraries 留空默认查全部库）/ `navigate_knowledge`（PDF页级视觉导航，独立的"第二检索系统"，不参与前者的融合排序）/ `list_libraries` / `reindex_knowledge`（默认增量，`full=true` 完整重建）/ `index_status` / `index_failures` / `read_document` / `note_relations` / `find_duplicates` / `wemm_status` / `export_library` / `import_library` / `get_library_sample`+`propose_library_summary`+`apply_library_summary`（库摘要：帮 AI 在检索前先判断"这个库值不值得查"，用户手写的简介受写权限门禁保护，AI 不能未经确认就覆盖）/ `get_selection`+`propose_selection_changes`+`apply_selection_changes`。
 
 跑测试（不需要装 torch/sentence-transformers/qwen-vl-utils——测试全程注入假模型，见 [docs/LESSONS.md](docs/LESSONS.md)）：
 

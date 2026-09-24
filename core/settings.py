@@ -30,11 +30,9 @@ config import CFG` 就能读任意键——这在插件互相隔离、"同一件
 在很远的地方才炸出一个费解的 TypeError——对齐 obsidian-rag/config.py
 `_coerce` 的教训（同一个理由，换成不需要预先声明全局 DEFAULTS 的写法）。
 
-**为什么不路由进 `core/datastore.py::DataStore`**：那个类的 docstring
-自己写明是"Phase 0 最小实现，不需要真正落盘"的占位，且实际上没有任何一个
-Phase 1 插件真的在用它做持久化（Chroma/BM25/library_manager 都是各自
-直接写自己 `ctx.data_dir` 下的文件）——沿着现状走，这里也直接落盘到
-`data_dir/settings.json`，不是新引入一套和现状脱节的存储路径。
+**为什么不路由进 `core/datastore.py::DataStore`**：设置存储是核心服务，
+不是插件私有数据；DataStore 负责插件存储 handle 和跨插件契约权限，设置
+仍由 SettingsStore 直接管理自身文件。规则见 ../AGENTS.md"两个核心组件"节。
 """
 from __future__ import annotations
 

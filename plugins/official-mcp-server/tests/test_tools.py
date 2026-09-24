@@ -6,15 +6,15 @@ tests/test_pipeline_e2e.py 覆盖过，这里的重点是 MCP 这一层薄封装
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import shutil
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from docx import Document
 import pymupdf
 
 _PLUGIN_DIR = Path(__file__).parent.parent
@@ -28,12 +28,14 @@ for other_plugin_dir in (_REPO_ROOT / "plugins").glob("*"):
 
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 
+from core.index_progress import IndexStartResult  # noqa: E402
 from core.pipeline import Pipeline  # noqa: E402
 from core.runtime import PluginRuntime  # noqa: E402
 from official_mcp_server.plugin import McpServerPlugin  # noqa: E402
 
 REQUIRED_PLUGINS = [
     "official-extractor-text",
+    "official-extractor-docx",
     "official-chunker",
     "official-library-manager",
     "official-lexical-bm25",
@@ -42,10 +44,10 @@ REQUIRED_PLUGINS = [
     "official-fusion-rrf",
     "official-reranker",
     "official-import-export",
-    "official-visual-wemm",
     "official-dedup",
     "official-library-summary",
     "official-llm-openai-compatible",
+    "official-result-advisor",
 ]
 
 
@@ -92,6 +94,7 @@ class TestMcpToolsAsyncBase(unittest.IsolatedAsyncioTestCase):
             "# 插件架构\n\n这篇笔记讲插件系统的架构设计。", encoding="utf-8"
         )
 
+        self._optional_enabled: list[str] = []
         self.runtime = PluginRuntime(
             _REPO_ROOT / "plugins",
             state_file=self.tmp / "plugins_state.json",
@@ -131,19 +134,14 @@ class TestMcpToolsAsyncBase(unittest.IsolatedAsyncioTestCase):
         mcp_plugin.register_tools(self.server, self.pipeline, lib_mgr)
 
     async def asyncTearDown(self) -> None:
-        # 真实在 Windows 上踩过的坑：这个类此前完全没有 tearDown，之前
-        # REQUIRED_PLUGINS 里全是 in_process 插件，没人管禁用与否都不会
-        # 留下真实痕迹；加了 official-visual-wemm（真实 subprocess_service）
-        # 之后就不一样了——这个类每个测试方法都在 asyncSetUp 里新建一个
-        # PluginRuntime 真的拉起一个子进程，如果不在这里对称地 disable
-        # 掉，每跑一次这个文件（10个测试方法）就在系统里留下10个真的游离
-        # 子进程，这是真机器上跑测试真实抓到的坑（架构红线6"不产生游离
-        # 进程"对测试代码自己同样适用，同 tests/test_runtime.py 里同类
-        # 修复的教训）。
-        for plugin_id in reversed(REQUIRED_PLUGINS):
+        # 真实子进程插件只给专门测试它的方法按需启用；无论正常还是可选插件，
+        # 都对称 disable→unload，避免测试自己留下子进程、文件锁或客户端句柄。
+        for plugin_id in reversed(REQUIRED_PLUGINS + self._optional_enabled):
             state = self.runtime.plugins.get(plugin_id)
             if state is not None and state.state.value == "enabled":
                 self.runtime.disable(plugin_id)
+            if state is not None and state.state.value == "disabled":
+                self.runtime.unload(plugin_id)
 
     def _restore_wemm_env(self) -> None:
         if self._wemm_env_backup is None:
@@ -155,27 +153,9 @@ class TestMcpToolsAsyncBase(unittest.IsolatedAsyncioTestCase):
         else:
             os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = self._skip_bootstrap_backup
 
-    async def _reindex_and_wait(self, library_id: str, *, timeout_s: float = 10.0) -> dict:
-        """`reindex_knowledge` 现在是后台执行+立即返回（对齐 obsidian-rag，
-        2026-09-23 补齐），测试里大量用例的模式是"重建索引后紧接着断言
-        搜得到/读得到"——这个 helper 把"触发+轮询 index_status 到终态"
-        封成一步，返回最终的 status 字典（含 succeeded/failed/stage），
-        免得每个用例都重复写轮询循环。测试用的是内存假模型，真实场景下
-        几十毫秒内就会跑完，10s 超时是给够余量，不是预期真的要等这么久。
-        """
-        reindex_result = await self.server.call_tool("reindex_knowledge", {"library_id": library_id})
-        assert not reindex_result.is_error, reindex_result
-        assert reindex_result.structured_content["ok"], reindex_result.structured_content
-
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            status_result = await self.server.call_tool("index_status", {"library_id": library_id})
-            assert not status_result.is_error, status_result
-            status = status_result.structured_content["status"]
-            if status is not None and status["stage"] in ("done", "failed"):
-                return status
-            await asyncio.sleep(0.02)
-        raise AssertionError(f"index_status 在 {timeout_s}s 内一直没有变成 done/failed：库={library_id}")
+    async def _reindex_and_wait(self, library_id: str) -> dict:
+        report = self.pipeline.index_library(library_id)
+        return {"stage": "done", "succeeded": report.succeeded, "failed": report.failed}
 
 
 class TestMcpTools(TestMcpToolsAsyncBase):
@@ -212,6 +192,46 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertIn("confidence_tier", hits[0])
         self.assertIn(hits[0]["confidence_tier"], ("高相关", "中相关", "弱相关"))
 
+    async def test_search_waits_for_first_index_before_returning(self):
+        started: list[tuple[str, tuple[str, ...]]] = []
+        with (
+            patch.object(self.pipeline, "stale_libraries", return_value=["test-lib"]),
+            patch.object(self.pipeline, "has_index", return_value=False),
+            patch.object(
+                self.pipeline,
+                "start_index_library",
+                side_effect=lambda library_id, **kwargs: started.append(
+                    (library_id, kwargs["format_allowlist"])
+                ),
+            ),
+            patch.object(
+                self.pipeline,
+                "index_status",
+                return_value={"stage": "done", "succeeded": 1, "failed": 0},
+            ),
+        ):
+            result = await self.server.call_tool(
+                "search_knowledge", {"query": "插件 架构", "libraries": "test-lib"}
+            )
+        self.assertFalse(result.is_error)
+        self.assertEqual(started, [("test-lib", (".md", ".txt"))])
+        self.assertEqual(result.structured_content["refreshing"], [])
+
+    async def test_search_starts_background_refresh_for_nonempty_library(self):
+        await self._reindex_and_wait("test-lib")
+        with (
+            patch.object(self.pipeline, "stale_libraries", return_value=["test-lib"]),
+            patch.object(self.pipeline, "has_index", return_value=True),
+            patch.object(self.pipeline, "start_index_library") as start,
+        ):
+            result = await self.server.call_tool(
+                "search_knowledge", {"query": "插件 架构", "libraries": "test-lib"}
+            )
+        self.assertFalse(result.is_error)
+        self.assertTrue(result.structured_content["results"])
+        self.assertEqual(result.structured_content["refreshing"], ["test-lib"])
+        start.assert_called_once()
+
     async def test_read_document_tool_reads_source_file_for_md(self):
         await self._reindex_and_wait("test-lib")
         result = await self.server.call_tool("read_document", {"library_id": "test-lib", "path": "notes.md"})
@@ -220,6 +240,24 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["source"], "源文件直读")
         self.assertIn("插件系统的架构设计", payload["text"])
+
+    async def test_agent_read_document_blocks_docx_until_user_authorizes_format(self):
+        document = Document()
+        document.add_paragraph("private binary body")
+        document.save(str(self.tmp / "vault" / "private.docx"))
+        denied = await self.server.call_tool(
+            "read_document",
+            {"library_id": "test-lib", "path": "private.docx"},
+        )
+        self.assertFalse(denied.structured_content["ok"])
+        self.lib_mgr.store.set_agent_formats("test-lib", [".docx"])
+        self.pipeline.index_library("test-lib")
+        allowed = await self.server.call_tool(
+            "read_document",
+            {"library_id": "test-lib", "path": "private.docx"},
+        )
+        self.assertTrue(allowed.structured_content["ok"])
+        self.assertIn("private binary body", allowed.structured_content["text"])
 
     async def test_read_document_tool_unknown_path_reports_error(self):
         await self._reindex_and_wait("test-lib")
@@ -397,6 +435,10 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         pdf_doc.close()
         self.lib_mgr.store.add_library("pdf-lib", "PDF库", str(pdf_vault))
         self.lib_mgr.store.set_policy("pdf-lib", enabled_extensions=[".md", ".txt", ".pdf"])
+        self.lib_mgr.store.set_agent_formats("pdf-lib", [".pdf"])
+        self.runtime.load("official-visual-wemm")
+        self.runtime.enable("official-visual-wemm")
+        self._optional_enabled.append("official-visual-wemm")
 
         status = await self._reindex_and_wait("pdf-lib")
         self.assertEqual(status["stage"], "done")
@@ -418,7 +460,10 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertTrue(status_payload["ok"])
         wemm_status = status_payload["providers"]["official-visual-wemm"]
         self.assertTrue(wemm_status["subprocess_alive"])
-        self.assertEqual(wemm_status["libraries"]["pdf-lib"], {"page_count": 1, "pdf_count": 1})
+        self.assertEqual(
+            wemm_status["libraries"]["pdf-lib"],
+            {"page_count": 1, "pdf_count": 1, "failures": []},
+        )
 
     async def test_navigate_knowledge_unknown_library_reports_error_not_crash(self):
         result = await self.server.call_tool(
@@ -454,7 +499,20 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertGreater(len(payload["results"]), 0)
         for hit in payload["results"]:
             self.assertNotIn("text", hit)
+            self.assertNotIn("backfilled", hit)
             self.assertIn("path", hit)
+
+    async def test_search_knowledge_returns_separate_advice_channel(self):
+        await self._reindex_and_wait("test-lib")
+        result = await self.server.call_tool(
+            "search_knowledge", {"query": "完全不存在的主题", "libraries": "test-lib"}
+        )
+        payload = result.structured_content
+        self.assertTrue(payload["ok"])
+        self.assertIn("advice", payload)
+        self.assertLessEqual(len(payload["advice"]), 2)
+        for hit in payload["results"]:
+            self.assertNotIn("advice", hit)
 
     async def test_unknown_library_id_reports_error_not_crash(self):
         """实测过：MCP SDK 2.2.0 的工具函数如果裸抛异常，call_tool() 会
@@ -642,17 +700,50 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertFalse(result.structured_content["ok"])
 
     async def test_reindex_knowledge_returns_started_true_not_a_synchronous_report(self):
-        """钉住这次行为变更本身：reindex_knowledge 现在只承诺"已经开始
-        在后台跑"，不再像之前那样同步返回 succeeded/failed——那些字段
-        现在只能从 index_status 的终态里读到（见
-        test_reindex_then_search_knowledge_tool）。"""
-        result = await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
+        """钉住这次行为变更本身：reindex_knowledge 只返回 worker 启动信息，
+        不返回 succeeded/failed 索引终态。"""
+        start_result = IndexStartResult(True, "started", "run-mcp-1", 4321)
+        with patch.object(
+            self.pipeline, "start_index_library", return_value=start_result
+        ) as start_index:
+            result = await self.server.call_tool("reindex_knowledge", {"library_id": "test-lib"})
         self.assertFalse(result.is_error)
         payload = result.structured_content
-        self.assertTrue(payload["ok"])
-        self.assertTrue(payload["started"])
+        self.assertEqual(
+            payload,
+            {
+                "ok": True,
+                "started": True,
+                "message": "started",
+                "run_id": "run-mcp-1",
+                "worker_pid": 4321,
+                "full": False,
+            },
+        )
+        start_index.assert_called_once_with(
+            "test-lib",
+            source="mcp",
+            format_allowlist=(".md", ".txt"),
+        )
         self.assertNotIn("succeeded", payload)
         self.assertNotIn("failed", payload)
+
+    async def test_reindex_knowledge_can_force_full_rebuild(self):
+        start_result = IndexStartResult(True, "started", "run-mcp-full", 9876)
+        with patch.object(
+            self.pipeline, "start_index_library", return_value=start_result
+        ) as start_index:
+            result = await self.server.call_tool(
+                "reindex_knowledge", {"library_id": "test-lib", "full": True}
+            )
+        self.assertFalse(result.is_error)
+        self.assertTrue(result.structured_content["full"])
+        start_index.assert_called_once_with(
+            "test-lib",
+            source="mcp",
+            full=True,
+            format_allowlist=(".md", ".txt"),
+        )
 
     async def test_reindex_knowledge_unknown_library_reports_error(self):
         result = await self.server.call_tool("reindex_knowledge", {"library_id": "no-such-lib"})

@@ -27,8 +27,28 @@ class ImportExportPlugin:
     def on_unload(self, ctx):
         pass
 
-    def pack(self, manifest: dict, vectors: dict, bm25: dict) -> bytes:
-        return archive.pack(manifest, vectors, bm25)
+    def pack(
+        self,
+        manifest: dict,
+        vectors: dict,
+        bm25: dict,
+        *,
+        index_manifest: dict | None = None,
+        extracted: dict | None = None,
+        relations: dict | None = None,
+        failures: dict | None = None,
+        visual: dict | None = None,
+    ) -> bytes:
+        return archive.pack(
+            manifest,
+            vectors,
+            bm25,
+            index_manifest=index_manifest,
+            extracted=extracted,
+            relations=relations,
+            failures=failures,
+            visual=visual,
+        )
 
     def unpack(self, data: bytes) -> dict:
         return archive.unpack(data)

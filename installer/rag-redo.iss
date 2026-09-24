@@ -1,4 +1,5 @@
-; Inno Setup 安装包脚本——Phase 4 最后一块拼图（见 ../docs/ROADMAP.md）。
+; 历史方案：当前 Windows 分发已改为便携 ZIP，请使用 installer/build_windows.py。
+;
 ;
 ; 跑法（Windows 上装好 Inno Setup 6 之后）：
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\rag-redo.iss
@@ -28,7 +29,7 @@
 ;      的检索索引，这条数据丢失比"卸载后残留几十MB数据"的代价大得多。
 
 #define MyAppName "RAG Redo"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "RAG Redo"
 #define MyAppExeName "rag-redo-gui.exe"
 
@@ -68,6 +69,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; （dist/ 里理论上不该有，防御性排除不算多余）。
 Source: "..\dist\rag-redo-gui\*"; DestDir: "{app}\gui"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "__pycache__"
 Source: "..\dist\rag-redo-mcp\*"; DestDir: "{app}\mcp"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "__pycache__"
+Source: "..\dist\runtime\python\*"; DestDir: "{app}\runtime\python"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "__pycache__"
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.en.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 

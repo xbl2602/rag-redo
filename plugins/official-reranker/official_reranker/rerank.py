@@ -45,7 +45,7 @@ class _RealReranker:
         self._resource_arbiter = resource_arbiter
         self._logger = logger
         self._last_use = time.time()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def _log(self, message: str) -> None:
         if self._logger is not None:
@@ -71,16 +71,24 @@ class _RealReranker:
         except Exception:  # noqa: BLE001
             return "cpu"
         if self._resource_arbiter is not None:
-            self._resource_arbiter.acquire(GPU_RESOURCE_ID, GPU_HOLDER_ID, priority=GPU_PRIORITY, on_preempt=self._unload_locked)
+            acquired = self._resource_arbiter.acquire(
+                GPU_RESOURCE_ID,
+                GPU_HOLDER_ID,
+                priority=GPU_PRIORITY,
+                on_preempt=self._unload,
+            )
+            if not acquired:
+                return "cpu"
         gpu_arbiter.wait_for_vram(MIN_VRAM_GB, timeout_s=900.0, log=self._log)
         return "cuda"
 
     def score(self, query: str, texts: list[str]) -> list[float]:
-        model = self._ensure_loaded()
-        pairs = [[query, text] for text in texts]
-        result = list(model.predict(pairs))
-        self._last_use = time.time()
-        return result
+        with self._lock:
+            model = self._ensure_loaded()
+            pairs = [[query, text] for text in texts]
+            result = list(model.predict(pairs))
+            self._last_use = time.time()
+            return result
 
     def idle_check(self) -> None:
         if IDLE_UNLOAD_SECONDS <= 0 or self._model is None:
@@ -89,6 +97,10 @@ class _RealReranker:
             with self._lock:
                 if time.time() - self._last_use > IDLE_UNLOAD_SECONDS and self._model is not None:
                     self._unload_locked()
+
+    def _unload(self) -> None:
+        with gpu_arbiter.GPU_LOCK, self._lock:
+            self._unload_locked()
 
     def _unload_locked(self) -> None:
         if self._model is None:

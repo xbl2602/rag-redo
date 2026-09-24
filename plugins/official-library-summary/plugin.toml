@@ -13,5 +13,6 @@ kind = "in_process"
 entry = "official_library_summary.plugin:LibrarySummaryPlugin"
 
 [permissions]
+filesystem = ["data_write"]
 network = false
 gpu = false

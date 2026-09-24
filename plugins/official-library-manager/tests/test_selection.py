@@ -112,6 +112,47 @@ class TestDecideIncluded(unittest.TestCase):
         )
         self.assertTrue(included)
 
+    def test_weak_exclude_rules_apply_to_default_files(self):
+        self.assertFalse(
+            decide_included(
+                "private/note.md",
+                selection_in=[],
+                selection_out=[],
+                new_file_default="include",
+                exclude_dirs=["private"],
+            )[0]
+        )
+        self.assertFalse(
+            decide_included(
+                "drafts/note.md",
+                selection_in=[],
+                selection_out=[],
+                new_file_default="include",
+                exclude_patterns=["*.md"],
+            )[0]
+        )
+        self.assertFalse(
+            decide_included(
+                "secret.txt",
+                selection_in=[],
+                selection_out=[],
+                new_file_default="include",
+                exclude_files=["secret.txt"],
+            )[0]
+        )
+
+    def test_explicit_pick_pierces_weak_exclude_rules(self):
+        self.assertTrue(
+            decide_included(
+                "private/keep.md",
+                selection_in=["private/keep.md"],
+                selection_out=[],
+                new_file_default="exclude",
+                exclude_dirs=["private"],
+                exclude_patterns=["*.md"],
+            )[0]
+        )
+
     def test_root_level_file_no_ancestor_match_still_default(self):
         included, _ = decide_included(
             "readme.md", selection_in=[], selection_out=["other"], new_file_default="include"

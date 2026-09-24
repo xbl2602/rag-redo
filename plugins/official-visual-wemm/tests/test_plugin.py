@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -88,7 +90,14 @@ class TestVisualWemmPlugin(unittest.TestCase):
             self.rt.plugins["official-visual-wemm"].error,
         )
         self.instance = self.rt.plugins["official-visual-wemm"].instance
-        self.addCleanup(lambda: self.rt.disable("official-visual-wemm"))
+
+        def _cleanup_runtime() -> None:
+            if self.rt.plugins["official-visual-wemm"].state.value == "enabled":
+                self.rt.disable("official-visual-wemm")
+            if self.rt.plugins["official-visual-wemm"].state.value == "disabled":
+                self.rt.unload("official-visual-wemm")
+
+        self.addCleanup(_cleanup_runtime)
 
     def _restore_env(self) -> None:
         if self._env_backup is None:
@@ -101,6 +110,37 @@ class TestVisualWemmPlugin(unittest.TestCase):
             os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = self._skip_bootstrap_backup
 
     def test_enable_acquires_gpu_lease(self):
+        self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "official-visual-wemm")
+
+    def test_worker_process_takes_over_and_parent_can_reacquire_later(self):
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "from pathlib import Path\n"
+            "from core.runtime import PluginRuntime\n"
+            f"runtime = PluginRuntime(Path({str(REPO_ROOT / 'plugins')!r}), "
+            f"state_file=Path({str(self.tmp / 'worker_state.json')!r}), "
+            f"data_dir=Path({str(self.tmp / 'data')!r}))\n"
+            "runtime.scan()\n"
+            "runtime.load('official-visual-wemm')\n"
+            "runtime.enable('official-visual-wemm')\n"
+            "plugin = runtime.plugins['official-visual-wemm']\n"
+            "print('WORKER_ENABLED', plugin.instance._enabled, flush=True)\n"
+            "runtime.disable('official-visual-wemm')\n"
+            "runtime.unload('official-visual-wemm')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WORKER_ENABLED True", result.stdout)
+        self.assertIsNone(self.rt.resource_arbiter.holder_of("gpu:0"))
+        self.assertTrue(self.instance._handle.is_alive)
+        self.instance.index_library("lib-after-worker", self.vault, ["doc.pdf"])
+        self.assertEqual(self.instance._collection("lib-after-worker").count(), 2)
         self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "official-visual-wemm")
 
     def test_index_library_writes_one_vector_per_page(self):
@@ -130,6 +170,18 @@ class TestVisualWemmPlugin(unittest.TestCase):
         self.assertTrue(status["enabled"])
         self.assertTrue(status["subprocess_alive"])
         self.assertEqual(status["libraries"], {"lib1": {"page_count": 2, "pdf_count": 1}})
+
+    def test_graph_page_states_are_typed_and_read_generation_without_starting_worker(self):
+        self.instance.index_library("lib1", self.vault, ["doc.pdf"], generation="g1")
+        self.rt.disable("official-visual-wemm")
+        states = self.instance.graph_page_states("lib1", "g1")
+        self.assertEqual(len(states), 1)
+        self.assertEqual(states[0].library_id, "lib1")
+        self.assertEqual(states[0].path, "doc.pdf")
+        self.assertEqual(states[0].provider_id, "official-visual-wemm")
+        self.assertEqual(states[0].status, "indexed")
+        self.assertEqual(states[0].pages, (1, 2))
+        self.assertFalse(self.rt.plugins["official-visual-wemm"].instance._handle)
 
     def test_status_before_any_indexing_has_no_libraries(self):
         status = self.instance.status()
@@ -163,6 +215,65 @@ class TestVisualWemmPlugin(unittest.TestCase):
         self.assertEqual(collection.count(), 2)
         ids = set(collection.get(include=[])["ids"])
         self.assertEqual(ids, {"doc.pdf::0", "doc.pdf::1"})
+
+    def test_incremental_generation_reuses_unchanged_pdf_segments(self):
+        self.instance.index_library("lib1", self.vault, ["doc.pdf"], generation="g1")
+        self.assertTrue(self.instance._generations.commit("lib1", "g1"))
+        original_call = self.instance._handle.call
+        with patch.object(self.instance._handle, "call", wraps=original_call) as call_mock:
+            self.instance.index_library(
+                "lib1",
+                self.vault,
+                ["doc.pdf"],
+                generation="g2",
+                changed_paths=[],
+                previous_generation="g1",
+            )
+        self.assertEqual(call_mock.call_count, 0)
+        self.assertTrue(self.instance._generations.commit("lib1", "g2"))
+        state = self.instance._read_state("lib1", "g2")
+        self.assertEqual(state["segments"], ["g1"])
+        self.assertEqual(len(self.instance.navigate("lib1", "query", top_k=5)), 2)
+
+    def test_unchanged_pdf_is_not_reencoded_when_text_stage_rebuild_marks_it_changed(self):
+        self.instance.index_library("lib1", self.vault, ["doc.pdf"], generation="g1")
+        self.assertTrue(self.instance._generations.commit("lib1", "g1"))
+        original_call = self.instance._handle.call
+        with patch.object(self.instance._handle, "call", wraps=original_call) as call_mock:
+            self.instance.index_library(
+                "lib1",
+                self.vault,
+                ["doc.pdf"],
+                generation="g2",
+                changed_paths=["doc.pdf"],
+                previous_generation="g1",
+            )
+        self.assertEqual(call_mock.call_count, 0)
+        self.assertTrue(self.instance._generations.commit("lib1", "g2"))
+        self.assertEqual(self.instance._read_state("lib1", "g2")["segments"], ["g1"])
+
+    def test_changed_pdf_uses_new_segment_and_masks_old_pages(self):
+        second_pdf = self.vault / "second.pdf"
+        _make_pdf(second_pdf, ["temporary"])
+        self.instance.index_library("lib1", self.vault, ["doc.pdf", "second.pdf"], generation="g1")
+        self.assertTrue(self.instance._generations.commit("lib1", "g1"))
+        second_pdf.unlink()
+        _make_pdf(self.vault / "doc.pdf", ["changed first", "changed second"])
+        self.instance.index_library(
+            "lib1",
+            self.vault,
+            ["doc.pdf"],
+            generation="g2",
+            changed_paths=["doc.pdf"],
+            previous_generation="g1",
+        )
+        self.assertTrue(self.instance._generations.commit("lib1", "g2"))
+        state = self.instance._read_state("lib1", "g2")
+        self.assertEqual(state["segments"], ["g1", "g2"])
+        self.assertEqual(set(state["files"]), {"doc.pdf"})
+        hits = self.instance.navigate("lib1", "query", top_k=5)
+        self.assertEqual({hit.path for hit in hits}, {"doc.pdf"})
+        self.assertEqual(len(hits), 2)
 
     def test_disable_releases_gpu_lease_and_kills_subprocess(self):
         pid = self.instance._handle._process.pid  # noqa: SLF001 - 直接问操作系统这个pid还在不在
@@ -205,11 +316,18 @@ class TestVisualWemmPlugin(unittest.TestCase):
             "gpu:0", "some-other-gpu-consumer", priority=10, preempt_equal=True
         )
         self.assertTrue(acquired)
+        self.addCleanup(
+            self.rt.resource_arbiter.release,
+            "gpu:0",
+            "some-other-gpu-consumer",
+        )
         self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "some-other-gpu-consumer")
         # 子进程本身还活着、还是同一个 pid——只是模型被卸载了，不是整个被杀掉
         self.assertIsNotNone(self.instance._handle)  # noqa: SLF001
         self.assertEqual(self.instance._handle._process.pid, pid_before)  # noqa: SLF001
         self.assertTrue(self.instance._handle.is_alive)
+        self.instance.index_library("lib-after-preempt", self.vault, ["doc.pdf"])
+        self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "official-visual-wemm")
 
 
 if __name__ == "__main__":

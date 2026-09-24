@@ -29,6 +29,15 @@ class TestLibraryConfigStore(unittest.TestCase):
         store.add_library("lib1", "我的库", "/vaults/lib1")
         self.assertEqual([c.library_id for c in store.list_libraries()], ["lib1"])
 
+    def test_invalid_library_identity_is_rejected(self):
+        store = LibraryConfigStore(self.path)
+        with self.assertRaises(ValueError):
+            store.add_library("../escape", "坏 id", "/vault")
+        with self.assertRaises(ValueError):
+            store.add_library("lib2", " ", "/vault")
+        with self.assertRaises(ValueError):
+            store.add_library("lib3", "坏路径", "")
+
     def test_duplicate_id_raises(self):
         store = LibraryConfigStore(self.path)
         store.add_library("lib1", "我的库", "/vaults/lib1")
@@ -56,6 +65,20 @@ class TestLibraryConfigStore(unittest.TestCase):
         with self.assertRaises(KeyError):
             store.set_selection("nope", selection_in=["a.md"])
 
+    def test_set_policy_persists_excludes(self):
+        store = LibraryConfigStore(self.path)
+        store.add_library("lib1", "我的库", "/vaults/lib1")
+        store.set_policy(
+            "lib1",
+            exclude_dirs=["private"],
+            exclude_files=["secret.txt"],
+            exclude_patterns=["*.tmp"],
+        )
+        cfg = LibraryConfigStore(self.path).get("lib1")
+        self.assertEqual(cfg.exclude_dirs, ["private"])
+        self.assertEqual(cfg.exclude_files, ["secret.txt"])
+        self.assertEqual(cfg.exclude_patterns, ["*.tmp"])
+
     def test_set_policy_persists(self):
         store = LibraryConfigStore(self.path)
         store.add_library("lib1", "我的库", "/vaults/lib1")
@@ -71,7 +94,45 @@ class TestLibraryConfigStore(unittest.TestCase):
         store.set_policy("lib1", new_file_default="exclude")
         cfg = store.get("lib1")
         self.assertEqual(cfg.new_file_default, "exclude")
-        self.assertEqual(cfg.enabled_extensions, [".md", ".txt"])  # 默认值没被动过
+        self.assertEqual(cfg.enabled_extensions, [".md", ".pdf", ".docx"])
+
+    def test_agent_formats_persist_and_reject_unknown_binary(self):
+        store = LibraryConfigStore(self.path)
+        store.add_library("lib1", "我的库", "/vaults/lib1")
+        store.set_agent_formats("lib1", ["pdf", ".docx", "pdf"])
+        self.assertEqual(store.get("lib1").agent_formats, [".pdf", ".docx"])
+        with self.assertRaises(ValueError):
+            store.set_agent_formats("lib1", [".exe"])
+
+    def test_agent_allowlist_cannot_be_pierced_by_explicit_selection(self):
+        vault = self.tmp / "vault"
+        vault.mkdir()
+        (vault / "notes.md").write_text("text", encoding="utf-8")
+        (vault / "scan.pdf").write_bytes(b"%PDF")
+        store = LibraryConfigStore(self.path)
+        store.add_library("lib1", "我的库", str(vault))
+        store.set_selection("lib1", selection_in=["scan.pdf"])
+        plugin = LibraryManagerPlugin()
+        plugin.store = store
+        self.assertEqual(plugin.agent_allowed_extensions("lib1"), (".md", ".txt"))
+        decisions = {
+            path: included
+            for path, included, _reason in plugin.resolve_included_files(
+                "lib1",
+                format_allowlist=plugin.agent_allowed_extensions("lib1"),
+            )
+        }
+        self.assertTrue(decisions["notes.md"])
+        self.assertFalse(decisions["scan.pdf"])
+        store.set_agent_formats("lib1", [".pdf"])
+        decisions = {
+            path: included
+            for path, included, _reason in plugin.resolve_included_files(
+                "lib1",
+                format_allowlist=plugin.agent_allowed_extensions("lib1"),
+            )
+        }
+        self.assertTrue(decisions["scan.pdf"])
 
     def test_set_policy_unknown_library_raises(self):
         store = LibraryConfigStore(self.path)

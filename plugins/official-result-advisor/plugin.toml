@@ -1,0 +1,17 @@
+id = "official-result-advisor"
+name = "自适应结果建议"
+version = "0.1.0"
+api_version = ">=0.1,<0.2"
+
+[provides]
+result_advisor = "multi"
+
+[requires]
+
+[runtime]
+kind = "in_process"
+entry = "official_result_advisor.plugin:ResultAdvisorPlugin"
+
+[permissions]
+network = false
+gpu = false

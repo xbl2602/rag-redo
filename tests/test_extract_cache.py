@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from core.extract_cache import ExtractCache  # noqa: E402
+from core.index_generation import INDEX_MANIFEST_VERSION, IndexManifestStore  # noqa: E402
 
 
 class TestExtractCache(unittest.TestCase):
@@ -45,6 +46,34 @@ class TestExtractCache(unittest.TestCase):
         self.cache.write("lib1", rel_path, "内容")
         self.assertEqual(self.cache.read("lib1", rel_path), "内容")
 
+    def test_route_caches_keep_cloud_local_and_text_results_with_legacy_priority(self):
+        self.cache.write("lib1", "mixed.pdf", "text", generation="g1", route="official-extractor-pdf-text:0.2.0")
+        self.cache.write("lib1", "mixed.pdf", "local", generation="g1", route="official-ocr-mineru-local:0.2.0")
+        self.cache.write("lib1", "mixed.pdf", "cloud", generation="g1", route="official-ocr-mineru-cloud:0.2.0")
+        routes = (
+            "official-ocr-mineru-cloud:0.2.0",
+            "official-ocr-mineru-local:0.2.0",
+            "official-extractor-pdf-text:0.2.0",
+        )
+        self.assertEqual(self.cache.read_preferred("lib1", "mixed.pdf", routes, generation="g1"), "cloud")
+        self.assertEqual(
+            self.cache.read_preferred("lib1", "mixed.pdf", routes[1:], generation="g1"),
+            "local",
+        )
+
+    def test_route_cache_and_legacy_cache_are_isolated(self):
+        self.cache.write("lib1", "a.pdf", "legacy")
+        self.cache.write("lib1", "a.pdf", "cloud", route="official-ocr-mineru-cloud:0.2.0")
+        self.assertEqual(
+            self.cache.read_preferred(
+                "lib1",
+                "a.pdf",
+                ("official-ocr-mineru-cloud:0.2.0",),
+            ),
+            "cloud",
+        )
+        self.assertEqual(self.cache.read("lib1", "a.pdf"), "legacy")
+
     def test_clear_library_removes_all_entries(self):
         self.cache.write("lib1", "a.md", "a")
         self.cache.write("lib1", "b.md", "b")
@@ -71,6 +100,42 @@ class TestExtractCache(unittest.TestCase):
 
     def test_list_relative_paths_empty_library_returns_empty_list(self):
         self.assertEqual(self.cache.list_relative_paths("never-existed"), [])
+
+
+class TestIndexManifestStore(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.store = IndexManifestStore(self.tmp / "manifests")
+
+    def test_write_read_and_reference_segments(self):
+        manifest = {
+            "format_version": INDEX_MANIFEST_VERSION,
+            "library_id": "lib1",
+            "generation": "g2",
+            "vector_segments": ["g1", "g2"],
+            "extract_segments": ["g1"],
+            "lexical_segments": ["g2"],
+        }
+        self.assertTrue(self.store.write(manifest))
+        self.assertEqual(self.store.read("lib1", "g2"), manifest)
+        self.assertEqual(
+            self.store.referenced_generations("lib1", ["g2"]),
+            {"g1", "g2"},
+        )
+
+    def test_corrupt_or_missing_manifest_returns_none(self):
+        self.assertIsNone(self.store.read("lib1", "missing"))
+        self.store.write(
+            {
+                "format_version": INDEX_MANIFEST_VERSION,
+                "library_id": "lib1",
+                "generation": "g1",
+            }
+        )
+        self.assertEqual(self.store.list_generations("lib1"), ["g1"])
+        self.store.clear("lib1", "g1")
+        self.assertIsNone(self.store.read("lib1", "g1"))
 
 
 if __name__ == "__main__":

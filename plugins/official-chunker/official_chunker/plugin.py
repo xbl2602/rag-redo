@@ -19,6 +19,9 @@ class ChunkerPlugin:
     def on_unload(self, ctx):
         pass
 
+    def index_signature(self) -> str:
+        return CHUNKER_VERSION
+
     def chunk(self, doc: ExtractedDocument) -> list[Chunk]:
         assert doc.text is not None, "chunk() 只接受提取成功的文档"
         pieces = chunk_document(doc.text)
@@ -34,6 +37,8 @@ class ChunkerPlugin:
                 heading_breadcrumb=piece.heading_breadcrumb,
                 chunked_by="official-chunker",
                 chunker_version=CHUNKER_VERSION,
+                section_id=piece.section_id,
+                section_text=piece.section_text,
             )
             for i, piece in enumerate(pieces)
         ]

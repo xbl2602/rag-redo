@@ -1,6 +1,6 @@
 id = "official-library-manager"
 name = "多库与路径级勾选管理"
-version = "0.1.0"
+version = "0.2.0"
 api_version = ">=0.1,<0.2"
 
 [provides]

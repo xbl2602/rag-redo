@@ -19,14 +19,13 @@ collection——**故意不复用 official-vector-store-chroma 的存储**，那
 Chroma 文件、不同 collection"的隔离粒度更彻底，行为效果一致（绝不混
 向量空间）。
 
-**已知的、刻意的简化**（相对调查到的旧项目 obsidian-rag 行为）：
-- 不做增量判断（每次 index_library 全量重渲染重编码全部PDF）——
-  core/pipeline.py 文字那条流水线 Phase 1 现状本身就是全量重跑（见
-  official-mcp-server reindex_knowledge 工具的 docstring），这里跟着
-  同一个简化程度，不是遗漏，等文字那边的版本号增量机制落地后可以一起补。
-- `env_bootstrap` 还没被核心真正执行（同 official-ocr-mineru-local 的
-  已知限制，见 core/subprocess_service.py::resolve_plugin_python 的
-  docstring），子进程目前会退化用核心自己的解释器。
+**增量页库**：插件自己的 generation 状态记录 PDF 内容指纹、渲染/模型签名、页 id 和
+segment。Pipeline 只把新增或修改的 PDF 交给本轮重渲染；删除/失败文件通过当前有效
+页 id 集合屏蔽，查询跨 segment 合并。段数达到阈值时复制现有页向量到 compact segment，
+不重新编码模型。
+
+**冻结产物限制**：`env_bootstrap` 在源码环境可执行；PyInstaller 冻结主程序没有通用解释器
+时仍拒绝退化到自身 exe，安装包需要携带独立便携 Python。
 
 **GPU 生命周期管理（2026-09-23 补齐，按 obsidian-rag 真实行为移植）**：
 子进程自己在 server.py 里做懒加载+两级空闲释放（空闲卸载模型/再空闲更久
@@ -45,11 +44,15 @@ core/resource_arbiter.py::acquire 的 preempt_equal 参数说明）；②
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
+import os
 from pathlib import Path
 
 import chromadb
 
-from core.contracts import PageHit
+from core.contracts import PageHit, VisualPageState
+from core.index_generation import IndexGenerationStore
 from core.subprocess_service import SubprocessServiceError, SubprocessServiceHandle, resolve_plugin_python
 
 PLUGIN_ID = "official-visual-wemm"
@@ -57,9 +60,13 @@ GPU_RESOURCE_ID = "gpu:0"
 GPU_PRIORITY = 10  # 和 official-ocr-mineru-local 同一层级，互相抢占（preempt_equal）
 WEMM_RENDER_DPI = 60  # 页图渲染 DPI，行为对齐旧项目 wemm_indexer.py 的默认值
 WEMM_DIM = 512  # 输出向量维度，行为对齐旧项目 config.py 的默认值
+VISUAL_INDEX_VERSION = "1"
 
 
-def _collection_name(library_id: str) -> str:
+def _collection_name(library_id: str, generation: str | None = None) -> str:
+    if generation:
+        key = hashlib.sha256(f"{library_id}\0{generation}".encode("utf-8")).hexdigest()[:40]
+        return f"visualg_{key}"
     return f"visual_{library_id}"
 
 
@@ -73,35 +80,62 @@ class VisualWemmPlugin:
         self._runtime_health_check: str | None = None
         self._runtime_command: tuple[str, ...] | None = None
         self._runtime_env_bootstrap: str | None = None
+        self._generations: IndexGenerationStore | None = None
+        self._state_root: Path | None = None
+        self._resource_arbiter = None
+        self._plugin_id = ""
 
     def on_load(self, ctx):
-        persist_dir = ctx.data_dir / "visual_wemm" / "chroma"
+        storage_root = ctx.storage.directory("visual_wemm", legacy="visual_wemm")
+        persist_dir = storage_root / "chroma"
         persist_dir.mkdir(parents=True, exist_ok=True)
         self._client = chromadb.PersistentClient(path=str(persist_dir))
+        self._generations = IndexGenerationStore(
+            ctx.storage.directory("index_generations", legacy="index_generations")
+        )
+        self._state_root = storage_root / "state"
         self._logger = ctx.logger
         ctx.logger.info("WEMM页级视觉导航已加载")
 
     def on_enable(self, ctx):
-        # 名额协商，不是真实GPU探测——见模块docstring、
-        # official-ocr-mineru-local/plugin.py 的同名注释。
-        ctx.resource_arbiter.acquire(
-            GPU_RESOURCE_ID, ctx.plugin_id, priority=GPU_PRIORITY, on_preempt=self._soft_evict, preempt_equal=True
-        )
+        self._resource_arbiter = ctx.resource_arbiter
+        self._plugin_id = ctx.plugin_id
         self._plugin_dir = Path(__file__).parent
         self._runtime_health_check = ctx.runtime.health_check
         self._runtime_command = ctx.runtime.command
         self._runtime_env_bootstrap = ctx.runtime.env_bootstrap
         self._enabled = True
-        self._start_handle()
+        acquired = ctx.resource_arbiter.acquire(
+            GPU_RESOURCE_ID,
+            ctx.plugin_id,
+            priority=GPU_PRIORITY,
+            on_preempt=self._soft_evict,
+            preempt_equal=True,
+        )
+        if acquired:
+            self._start_handle()
 
     def on_disable(self, ctx):
         self._enabled = False
         self._stop_handle()
         ctx.resource_arbiter.release(GPU_RESOURCE_ID, ctx.plugin_id)
+        self._resource_arbiter = None
+        self._plugin_id = ""
 
     def on_unload(self, ctx):
         self._enabled = False
         self._stop_handle()
+        if self._resource_arbiter is not None and self._plugin_id:
+            self._resource_arbiter.release(GPU_RESOURCE_ID, self._plugin_id)
+        self._resource_arbiter = None
+        self._plugin_id = ""
+        if self._client is not None:
+            close = getattr(self._client, "close", None)
+            if callable(close):
+                close()
+        self._client = None
+        self._generations = None
+        self._state_root = None
 
     def _start_handle(self) -> None:
         assert self._plugin_dir is not None and self._runtime_command is not None
@@ -131,6 +165,16 @@ class VisualWemmPlugin:
     def _ensure_alive(self) -> bool:
         if not self._enabled:
             return False
+        if self._resource_arbiter is not None and self._resource_arbiter.holder_of(GPU_RESOURCE_ID) != self._plugin_id:
+            acquired = self._resource_arbiter.acquire(
+                GPU_RESOURCE_ID,
+                self._plugin_id,
+                priority=GPU_PRIORITY,
+                on_preempt=self._soft_evict,
+                preempt_equal=True,
+            )
+            if not acquired:
+                return False
         if self._handle is not None and self._handle.is_alive:
             return True
         try:
@@ -140,80 +184,349 @@ class VisualWemmPlugin:
             self._logger.warning("WEMM子进程重新拉起失败：%s", exc)
             return False
 
-    def _collection(self, library_id: str):
+    def _collection(self, library_id: str, generation: str | None = None):
         return self._client.get_or_create_collection(
-            name=_collection_name(library_id), metadata={"hnsw:space": "cosine"}
+            name=_collection_name(library_id, generation),
+            metadata={"hnsw:space": "cosine", "library_id": library_id},
         )
+
+    def _state_path(self, library_id: str, generation: str) -> Path:
+        assert self._state_root is not None
+        key = hashlib.sha256(library_id.encode("utf-8")).hexdigest()[:24]
+        return self._state_root / key / f"{generation}.json"
+
+    def _read_state(self, library_id: str, generation: str | None) -> dict:
+        if self._state_root is None or not generation:
+            return {"format_version": 1, "segments": [], "files": {}}
+        try:
+            data = json.loads(self._state_path(library_id, generation).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"format_version": 1, "segments": [], "files": {}}
+        if not isinstance(data, dict) or data.get("format_version") != 1:
+            return {"format_version": 1, "segments": [], "files": {}}
+        return data
+
+    def _write_state(self, library_id: str, generation: str, state: dict) -> None:
+        if self._state_root is None:
+            return
+        path = self._state_path(library_id, generation)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _fingerprint(path: Path) -> tuple[int, int, str]:
+        stat = path.stat()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return stat.st_size, stat.st_mtime_ns, digest.hexdigest()
 
     # ---- 索引态 ----------------------------------------------------------
 
-    def index_library(self, library_id: str, root: Path, pdf_paths: list[str]) -> None:
-        """对一个库里已经被 library_manager 裁定"在检索范围内"的全部 PDF
-        做页级视觉索引——绝不向调用方抛异常（core/pipeline.py::
-        index_library() 调这个方法时不包 try/except，失败折叠是这个方法
-        自己的契约，同 extractor "绝不抛异常"的纪律）。pdf_paths 由编排层
-        传入（已经是 library_manager 唯一裁决过的结果），这个方法自己不
-        重新判断"这个文件算不算在检索范围内"（数据流铁律4）。"""
-        if not self._ensure_alive():
-            self._logger.warning("WEMM子进程未运行，页级索引本轮跳过")
-            return
-
-        import pymupdf
-
-        collection = self._collection(library_id)
-        current_ids: set[str] = set()
+    def index_library(
+        self,
+        library_id: str,
+        root: Path,
+        pdf_paths: list[str],
+        generation: str | None = None,
+        changed_paths: list[str] | None = None,
+        previous_generation: str | None = None,
+    ) -> None:
+        generation_key = generation or "legacy"
+        if previous_generation:
+            state = self._read_state(library_id, previous_generation)
+        elif generation is None:
+            state = self._read_state(library_id, generation_key)
+        else:
+            state = {"format_version": 1, "segments": [], "files": {}}
+        files = {
+            str(path): dict(record)
+            for path, record in state.get("files", {}).items()
+            if isinstance(record, dict)
+        } if isinstance(state.get("files"), dict) else {}
+        segments = [str(value) for value in state.get("segments", []) if value]
+        signature = f"{VISUAL_INDEX_VERSION}:{WEMM_RENDER_DPI}:{WEMM_DIM}"
+        old_signature = str(state.get("signature", ""))
+        requested = set(changed_paths) if changed_paths is not None else set(pdf_paths)
+        if old_signature and old_signature != signature:
+            requested.update(pdf_paths)
+        current_paths = set(pdf_paths)
+        files = {path: record for path, record in files.items() if path in current_paths}
         indexed_pages = 0
-        for path in pdf_paths:
-            full_path = root / path
+        alive = self._ensure_alive()
+        collection = None
+        if alive and requested:
             try:
-                doc = pymupdf.open(str(full_path))
-            except Exception as exc:  # noqa: BLE001 - 单个PDF渲染失败不该拖垮整库
-                self._logger.warning("WEMM渲染失败，跳过 %s：%s: %s", path, type(exc).__name__, exc)
-                continue
+                collection = self._collection(library_id, generation)
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning("WEMM页库创建失败：%s: %s", type(exc).__name__, exc)
+                alive = False
+        if alive:
+            import pymupdf
+
+            for path in pdf_paths:
+                old = files.get(path, {})
+                full_path = root / path
+                if path not in requested and old.get("signature") == signature:
+                    indexed_pages += len(old.get("page_ids", []))
+                    continue
+                try:
+                    size, mtime_ns, content_hash = self._fingerprint(full_path)
+                except OSError as exc:
+                    files[path] = {
+                        "signature": signature,
+                        "status": "failed",
+                        "failure_reason": f"{type(exc).__name__}: {exc}",
+                        "page_ids": [],
+                        "segment": generation_key,
+                    }
+                    continue
+                if old.get("signature") == signature and old.get("content_hash") == content_hash:
+                    files[path] = old
+                    indexed_pages += len(old.get("page_ids", []))
+                    continue
+                try:
+                    document = pymupdf.open(str(full_path))
+                except Exception as exc:  # noqa: BLE001
+                    files[path] = {
+                        "size": size,
+                        "mtime_ns": mtime_ns,
+                        "content_hash": content_hash,
+                        "signature": signature,
+                        "status": "failed",
+                        "failure_reason": f"{type(exc).__name__}: {exc}",
+                        "page_ids": [],
+                        "segment": generation_key,
+                    }
+                    continue
+                ids: list[str] = []
+                embeddings: list[list[float]] = []
+                metadatas: list[dict] = []
+                try:
+                    for page_index in range(document.page_count):
+                        try:
+                            page = document.load_page(page_index)
+                            png_bytes = page.get_pixmap(dpi=WEMM_RENDER_DPI).tobytes("png")
+                            encoded = base64.b64encode(png_bytes).decode("ascii")
+                            result = self._handle.call(
+                                "embed", {"kind": "image", "content": encoded, "dim": WEMM_DIM}, timeout=120.0
+                            )
+                        except SubprocessServiceError as exc:
+                            self._logger.warning("WEMM调用失败，跳过 %s 第%d页：%s", path, page_index, exc)
+                            continue
+                        if not result.get("ok"):
+                            self._logger.warning(
+                                "WEMM编码失败，跳过 %s 第%d页：%s", path, page_index, result.get("error")
+                            )
+                            continue
+                        ids.append(f"{path}::{page_index}")
+                        embeddings.append(result["embedding"])
+                        metadatas.append(
+                            {
+                                "path": path,
+                                "page": page_index,
+                                "abs_path": str(full_path),
+                                "library_id": library_id,
+                            }
+                        )
+                    if ids and collection is not None:
+                        collection.upsert(ids=ids, embeddings=embeddings, metadatas=metadatas)
+                        indexed_pages += len(ids)
+                    files[path] = {
+                        "size": size,
+                        "mtime_ns": mtime_ns,
+                        "content_hash": content_hash,
+                        "signature": signature,
+                        "status": "indexed" if len(ids) == document.page_count else "partial" if ids else "failed",
+                        "failure_reason": None if len(ids) == document.page_count else "部分页面编码失败",
+                        "page_ids": ids,
+                        "segment": generation_key,
+                    }
+                finally:
+                    document.close()
+        else:
+            for path in requested:
+                files[path] = {
+                    "signature": signature,
+                    "status": "failed",
+                    "failure_reason": "WEMM子进程未运行",
+                    "page_ids": [],
+                    "segment": generation_key,
+                }
+            self._logger.warning("WEMM子进程未运行，页级索引本轮跳过")
+        if collection is not None and generation_key not in segments and any(
+            record.get("segment") == generation_key and record.get("page_ids")
+            for record in files.values()
+        ):
+            segments.append(generation_key)
+        active_ids = {
+            page_id
+            for record in files.values()
+            if record.get("status") in {"indexed", "partial"}
+            for page_id in record.get("page_ids", [])
+        }
+        if len(segments) >= 3 and active_ids:
+            compact_segment = f"{generation_key}-compact"
             try:
-                ids, embeddings, metadatas = [], [], []
-                for page_index in range(doc.page_count):
-                    try:
-                        page = doc.load_page(page_index)
-                        png_bytes = page.get_pixmap(dpi=WEMM_RENDER_DPI).tobytes("png")
-                        b64 = base64.b64encode(png_bytes).decode("ascii")
-                        result = self._handle.call(
-                            "embed", {"kind": "image", "content": b64, "dim": WEMM_DIM}, timeout=120.0
-                        )
-                    except SubprocessServiceError as exc:
-                        self._logger.warning("WEMM调用失败，跳过 %s 第%d页：%s", path, page_index, exc)
+                compact = self._collection(library_id, compact_segment)
+                by_segment: dict[str, list[str]] = {}
+                for record in files.values():
+                    segment = str(record.get("segment", ""))
+                    by_segment.setdefault(segment, []).extend(record.get("page_ids", []))
+                for segment, page_ids in by_segment.items():
+                    if not segment or not page_ids:
                         continue
-                    if not result.get("ok"):
-                        self._logger.warning(
-                            "WEMM编码失败，跳过 %s 第%d页：%s", path, page_index, result.get("error")
+                    source = self._collection(library_id, segment)
+                    rows = source.get(ids=page_ids, include=["embeddings", "metadatas"])
+                    if rows.get("ids"):
+                        compact.upsert(
+                            ids=rows["ids"],
+                            embeddings=rows.get("embeddings"),
+                            metadatas=rows.get("metadatas"),
                         )
-                        continue
-                    page_id = f"{path}::{page_index}"
-                    ids.append(page_id)
-                    embeddings.append(result["embedding"])
-                    metadatas.append(
-                        {"path": path, "page": page_index, "abs_path": str(full_path), "library_id": library_id}
-                    )
-                    current_ids.add(page_id)
-                if ids:
-                    collection.upsert(ids=ids, embeddings=embeddings, metadatas=metadatas)
-                    indexed_pages += len(ids)
-            finally:
-                doc.close()
-
-        # 精确清理：本轮真实存在且渲染成功的页 id 之外的旧条目一律清掉——
-        # 对应磁盘上已删除/改名的 PDF 不该留下幽灵页向量（镜像旧项目
-        # wemm_indexer.py 的清理逻辑，简化成全量重跑版本：这里的 current_ids
-        # 已经是"本轮全部 PDF 全部成功页"的完整集合，不是增量意义上的子集）。
-        try:
-            existing_ids = collection.get(include=[])["ids"]
-            stale = [i for i in existing_ids if i not in current_ids]
-            if stale:
-                collection.delete(ids=stale)
-        except Exception as exc:  # noqa: BLE001 - 清理失败不该让本轮已经写成功的页向量前功尽弃
-            self._logger.warning("WEMM清理旧页失败：%s: %s", type(exc).__name__, exc)
-
+                for record in files.values():
+                    record["segment"] = compact_segment
+                segments = [compact_segment]
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning("WEMM页库压缩失败：%s: %s", type(exc).__name__, exc)
+        if generation is None and collection is not None:
+            try:
+                existing_ids = collection.get(include=[])["ids"]
+                stale_ids = [page_id for page_id in existing_ids if page_id not in active_ids]
+                if stale_ids:
+                    collection.delete(ids=stale_ids)
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning("WEMM清理旧页失败：%s: %s", type(exc).__name__, exc)
+        self._write_state(
+            library_id,
+            generation_key,
+            {
+                "format_version": 1,
+                "library_id": library_id,
+                "generation": generation_key,
+                "signature": signature,
+                "segments": segments,
+                "files": files,
+            },
+        )
         self._logger.info("WEMM页级索引完成：库=%s，%d页", library_id, indexed_pages)
+
+    def export_state(self, library_id: str, generation: str) -> dict:
+        state = dict(self._read_state(library_id, generation))
+        collections: dict[str, list[dict]] = {}
+        for segment in state.get("segments", []):
+            try:
+                collection = self._client.get_collection(name=_collection_name(library_id, segment))
+                rows = collection.get(include=["embeddings", "documents", "metadatas"])
+                collections[str(segment)] = [
+                    {
+                        "id": str(page_id),
+                        "embedding": [float(value) for value in (embedding or [])],
+                        "document": document or "",
+                        "metadata": dict(metadata or {}),
+                    }
+                    for page_id, embedding, document, metadata in zip(
+                        rows.get("ids", []),
+                        rows.get("embeddings", []),
+                        rows.get("documents", []),
+                        rows.get("metadatas", []),
+                    )
+                ]
+            except Exception:
+                continue
+        state["collections"] = collections
+        return state
+
+    def import_state(self, library_id: str, state: dict, generation: str) -> None:
+        if not isinstance(state, dict):
+            return
+        restored = dict(state)
+        restored["library_id"] = library_id
+        restored["generation"] = generation
+        self._write_state(library_id, generation, restored)
+        for segment, rows in (restored.get("collections", {}) or {}).items():
+            if not isinstance(rows, list):
+                continue
+            collection = self._client.get_or_create_collection(
+                name=_collection_name(library_id, str(segment)),
+                metadata={"hnsw:space": "cosine", "library_id": library_id},
+            )
+            for row in rows:
+                if not isinstance(row, dict) or not row.get("id"):
+                    continue
+                collection.upsert(
+                    ids=[str(row["id"])],
+                    embeddings=[row.get("embedding", [])],
+                    documents=[row.get("document", "")],
+                    metadatas=[row.get("metadata", {})],
+                )
+
+    def graph_page_states(
+        self,
+        library_id: str,
+        generation: str,
+    ) -> tuple[VisualPageState, ...]:
+        files = self._read_state(library_id, generation).get("files", {})
+        if not isinstance(files, dict):
+            return ()
+        states: list[VisualPageState] = []
+        for path, record in sorted(files.items()):
+            if not isinstance(path, str) or not isinstance(record, dict):
+                continue
+            pages = tuple(
+                sorted(
+                    {
+                        int(page_id.rsplit("::", 1)[1]) + 1
+                        for page_id in record.get("page_ids", [])
+                        if isinstance(page_id, str)
+                        and page_id.startswith(f"{path}::")
+                        and page_id.rsplit("::", 1)[-1].isdigit()
+                    }
+                )
+            )
+            reason = record.get("failure_reason")
+            states.append(
+                VisualPageState(
+                    library_id=library_id,
+                    path=path,
+                    provider_id="official-visual-wemm",
+                    status=str(record.get("status") or "failed"),
+                    failure_reason=str(reason) if reason else None,
+                    pages=pages,
+                )
+            )
+        return tuple(states)
+
+    def delete_generation(self, library_id: str, generation: str) -> None:
+        before = {str(value) for value in self._read_state(library_id, generation).get("segments", [])}
+        referenced: set[str] = set()
+        if self._generations is not None:
+            active = self._generations.active(library_id)
+            for state_generation in [active, *self._generations.history(library_id)]:
+                if state_generation:
+                    referenced.update(str(value) for value in self._read_state(library_id, state_generation).get("segments", []))
+        for segment in before - referenced:
+            try:
+                segment_name = None if segment == "legacy" else segment
+                self._client.delete_collection(name=_collection_name(library_id, segment_name))
+            except Exception:
+                pass
+        if generation not in referenced:
+            try:
+                self._client.delete_collection(name=_collection_name(library_id, generation))
+            except Exception:
+                pass
+        if self._state_root is not None:
+            try:
+                self._state_path(library_id, generation).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # ---- 只读诊断 ----------------------------------------------------------
 
@@ -224,23 +537,44 @@ class VisualWemmPlugin:
         服务、不加载模型"的承诺——用 `self._handle` 的现有快照判断存活，
         不调用 `_ensure_alive()`）。
 
-        **一处简化，如实记录**：obsidian-rag 的 `wemm_status` 还会报告
-        "当前索引的 PDF 里有哪些失败（未渲染成功）"——rag-redo 的
-        `index_library()` 目前是全量重跑、不持久化每个文件的成败历史
-        （同"不做增量索引"的已知简化），这里只能报告"现在 Chroma 里有
-        多少页/多少个PDF的向量"这个当前状态，报不出"上一轮谁失败了"，
-        如需要这个信息应看 `reindex_knowledge` 那次调用自己返回的
-        failures 清单（当次可见，不持久化跨调用查询）。"""
+        当前 generation 的状态文件保留每个 PDF 的成功/部分成功/失败原因；
+        本方法汇总有效页数、PDF 数和失败列表，不加载模型。"""
         alive = self._handle is not None and self._handle.is_alive
         libraries: dict[str, dict] = {}
         if self._client is not None:
+            active_pairs = self._generations.active_pairs() if self._generations is not None else {}
+            for library_id, generation in active_pairs.items():
+                state = self._read_state(library_id, generation)
+                files = state.get("files", {})
+                if not isinstance(files, dict):
+                    continue
+                page_count = sum(
+                    len(record.get("page_ids", []))
+                    for record in files.values()
+                    if isinstance(record, dict) and record.get("status") in {"indexed", "partial"}
+                )
+                failures = [
+                    {"path": path, "reason": record.get("failure_reason", "未知失败")}
+                    for path, record in sorted(files.items())
+                    if isinstance(record, dict) and record.get("status") == "failed"
+                ]
+                libraries[library_id] = {
+                    "page_count": page_count,
+                    "pdf_count": len(files),
+                    "failures": failures,
+                }
             for coll in self._client.list_collections():
-                if not coll.name.startswith("visual_"):
+                if not coll.name.startswith("visual_") or coll.name in {
+                    _collection_name(library_id, generation) for library_id, generation in active_pairs.items()
+                }:
                     continue
                 library_id = coll.name[len("visual_"):]
                 metadatas = coll.get(include=["metadatas"])["metadatas"] or []
                 pdf_paths = {m["path"] for m in metadatas if m and m.get("path")}
-                libraries[library_id] = {"page_count": len(metadatas), "pdf_count": len(pdf_paths)}
+                libraries.setdefault(
+                    library_id,
+                    {"page_count": len(metadatas), "pdf_count": len(pdf_paths)},
+                )
         return {
             "enabled": self._enabled,
             "subprocess_alive": alive,
@@ -253,14 +587,20 @@ class VisualWemmPlugin:
         if not self._ensure_alive():
             self._logger.warning("WEMM子进程未运行，页级导航返回空结果")
             return []
-        try:
-            collection = self._client.get_collection(name=_collection_name(library_id))
-        except Exception:  # noqa: BLE001 - 这个库还没建过页级索引（比如没有PDF）是正常情况，不是错误
+        generation = self._generations.active(library_id) if self._generations is not None else None
+        state = self._read_state(library_id, generation or "legacy")
+        files = state.get("files", {})
+        if not isinstance(files, dict):
             return []
-        count = collection.count()
-        if count == 0:
+        active_ids = {
+            page_id
+            for record in files.values()
+            if isinstance(record, dict) and record.get("status") in {"indexed", "partial"}
+            for page_id in record.get("page_ids", [])
+        }
+        segments = [str(value) for value in state.get("segments", []) if value]
+        if not active_ids or not segments:
             return []
-
         try:
             result = self._handle.call("embed", {"kind": "text", "content": query, "dim": WEMM_DIM}, timeout=60.0)
         except SubprocessServiceError as exc:
@@ -269,21 +609,42 @@ class VisualWemmPlugin:
         if not result.get("ok"):
             self._logger.warning("WEMM查询编码失败：%s", result.get("error"))
             return []
-
-        hits = collection.query(
-            query_embeddings=[result["embedding"]], n_results=min(top_k, count), include=["metadatas", "distances"]
-        )
-        metadatas = hits.get("metadatas") or [[]]
-        distances = hits.get("distances") or [[]]
-        page_hits: list[PageHit] = []
-        for meta, distance in zip(metadatas[0], distances[0]):
-            page_hits.append(
-                PageHit(
-                    library_id=library_id,
-                    path=meta.get("path", ""),
-                    abs_path=meta.get("abs_path", ""),
-                    page_index=meta.get("page", 0),
-                    score=round(1.0 - float(distance), 4),  # cosine 距离 -> 相似度，对齐旧项目 wemm_retriever.py
+        merged: dict[str, tuple[dict, float]] = {}
+        for segment in segments:
+            try:
+                segment_name = None if segment == "legacy" else segment
+                collection = self._client.get_collection(name=_collection_name(library_id, segment_name))
+            except Exception:
+                continue
+            count = collection.count()
+            request = min(count, max(top_k * 4, 32))
+            while request > 0:
+                hits = collection.query(
+                    query_embeddings=[result["embedding"]],
+                    n_results=min(request, count),
+                    include=["metadatas", "distances"],
                 )
+                metadatas = hits.get("metadatas") or [[]]
+                distances = hits.get("distances") or [[]]
+                current_count = 0
+                for page_id, meta, distance in zip(hits.get("ids", [[]])[0], metadatas[0], distances[0]):
+                    if page_id not in active_ids:
+                        continue
+                    current_count += 1
+                    score = 1.0 - float(distance)
+                    previous = merged.get(page_id)
+                    if previous is None or score > previous[1]:
+                        merged[page_id] = (meta or {}, score)
+                if current_count >= top_k or request >= count:
+                    break
+                request = min(count, max(request * 2, top_k + 1))
+        return [
+            PageHit(
+                library_id=library_id,
+                path=str(meta.get("path", "")),
+                abs_path=str(meta.get("abs_path", "")),
+                page_index=int(meta.get("page", 0)),
+                score=round(score, 4),
             )
-        return page_hits
+            for _, (meta, score) in sorted(merged.items(), key=lambda item: item[1][1], reverse=True)[:top_k]
+        ]

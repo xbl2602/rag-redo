@@ -32,6 +32,7 @@ def extract(library_id: str, path: str, root: Path) -> ExtractedDocument:
             extracted_by="official-extractor-text",
             extractor_version=EXTRACTOR_VERSION,
             content_hash="",
+            failure_state="unreadable",
         )
 
     content_hash = _content_hash(data)
@@ -56,6 +57,7 @@ def extract(library_id: str, path: str, root: Path) -> ExtractedDocument:
             extracted_by="official-extractor-text",
             extractor_version=EXTRACTOR_VERSION,
             content_hash=content_hash,
+            failure_state="extract-failed",
         )
 
     if not text.strip():
@@ -67,6 +69,7 @@ def extract(library_id: str, path: str, root: Path) -> ExtractedDocument:
             extracted_by="official-extractor-text",
             extractor_version=EXTRACTOR_VERSION,
             content_hash=content_hash,
+            failure_state="empty",
         )
 
     return ExtractedDocument(

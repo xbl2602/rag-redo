@@ -21,7 +21,8 @@ import pymupdf4llm
 
 from core.contracts import ExtractedDocument
 
-EXTRACTOR_VERSION = "0.1.0"
+EXTRACTOR_VERSION = "0.2.0"
+_TEXT_PAGE_MIN_CHARS = 10
 PLUGIN_ID = "official-extractor-pdf-text"
 
 
@@ -32,7 +33,10 @@ def _content_hash(data: bytes) -> str:
 def _has_text_layer(path: Path) -> bool:
     doc = pymupdf.open(path)
     try:
-        return any(page.get_text().strip() for page in doc)
+        return all(
+            len(page.get_text("text").strip()) >= _TEXT_PAGE_MIN_CHARS
+            for page in doc
+        )
     finally:
         doc.close()
 
@@ -60,7 +64,7 @@ def extract(library_id: str, path: str, root: Path) -> ExtractedDocument:
 
     try:
         if not _has_text_layer(full_path):
-            return _fail(library_id, path, "scanned:no-text-layer——没有文字层，交给 OCR 插件处理", content_hash)
+            return _fail(library_id, path, "scanned", content_hash)
         text = pymupdf4llm.to_markdown(str(full_path))
     except Exception as exc:  # noqa: BLE001 - extractor 绝不抛异常，见模块 docstring
         return _fail(library_id, path, f"提取失败: {type(exc).__name__}: {exc}", content_hash)

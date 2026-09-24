@@ -7,12 +7,49 @@
 from __future__ import annotations
 
 import base64
+import time
 from typing import Any
 
 from core.pipeline import DEFAULT_CONFIDENCE_WARN_THRESHOLD, Pipeline, confidence_tier
 
 
 def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
+    def wait_for_initial_index(library_id: str, timeout: float = 600.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = pipeline.index_status(library_id)
+            if status is not None:
+                if status.get("stage") == "done":
+                    return
+                if status.get("stage") in {"failed", "cancelled"}:
+                    raise RuntimeError(status.get("error") or status.get("message") or "自动同步失败")
+            time.sleep(0.1)
+        raise TimeoutError(f"等待库「{library_id}」首次自动索引超时")
+
+    def ensure_agent_fresh(
+        libraries: str,
+        exclude: str,
+        allowed_by_library: dict[str, tuple[str, ...]],
+    ) -> list[str]:
+        stale = pipeline.stale_libraries(
+            libraries,
+            exclude=exclude,
+            format_allowlist=allowed_by_library,
+        )
+        refreshing: list[str] = []
+        for library_id in stale:
+            had_index = pipeline.has_index(library_id)
+            pipeline.start_index_library(
+                library_id,
+                source="mcp-auto-sync",
+                format_allowlist=allowed_by_library[library_id],
+            )
+            if had_index:
+                refreshing.append(library_id)
+            else:
+                wait_for_initial_index(library_id)
+        return refreshing
+
     @server.tool()
     def search_knowledge(
         query: str,
@@ -39,7 +76,8 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
 
         include_body=False 时只返回来源清单（路径/标题/库id，无正文），
         用于两阶段检索：先低成本枚举全量候选，再对命中少数用 read_document
-        精读——省去把大段无关正文传回来的token开销。
+        精读——省去把大段无关正文传回来的token开销。响应顶层 `advice` 是与
+        `results` 分离的批次建议，最多 2 条、纯规则、不会混进结果正文。
 
         实测过：MCP SDK（本项目锁定版本 2.2.0）的工具函数里裸抛异常
         （比如库名打错触发的 ValueError）不会被自动折叠成一个干净的
@@ -59,7 +97,22 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
             include_body: False 时只返回来源清单不含正文
         """
         try:
-            results = pipeline.search(libraries, query, top_k=top_k, exclude=exclude, folder=folder)
+            entries = lib_mgr.resolve_libraries(libraries, exclude)
+            allowed_by_library = {
+                entry.library_id: lib_mgr.agent_allowed_extensions(entry.library_id)
+                for entry in entries
+            }
+            refreshing = ensure_agent_fresh(libraries, exclude, allowed_by_library)
+            response = pipeline.search_with_advice(
+                libraries,
+                query,
+                top_k=top_k,
+                exclude=exclude,
+                folder=folder,
+                include_body=include_body,
+                format_allowlist=allowed_by_library,
+            )
+            results = response.results
         except Exception as exc:  # noqa: BLE001 - 见上方 docstring
             return {"ok": False, "error": str(exc)}
         warn_threshold = pipeline.runtime.settings.get(
@@ -67,12 +120,14 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         )
         return {
             "ok": True,
+            "advice": list(response.advice),
+            "refreshing": refreshing,
             "results": [
                 {
                     "library_id": r.library_id,
                     "path": r.path,
                     "heading": r.heading_breadcrumb,
-                    **({"text": r.text} if include_body else {}),
+                    **({"text": r.text, "backfilled": r.backfilled} if include_body else {}),
                     "confidence": round(r.confidence, 3),
                     "confidence_tier": confidence_tier(r.confidence, warn_threshold),
                     **({"note": f"低置信度 {r.confidence:.2f}，仅供参考"} if r.confidence < warn_threshold else {}),
@@ -103,6 +158,8 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
             top_k: 最多返回几条结果
         """
         try:
+            if ".pdf" not in lib_mgr.agent_allowed_extensions(library_id):
+                raise PermissionError("Agent 未获授权访问 PDF 页级视觉索引")
             hits = pipeline.navigate(library_id, query, top_k=top_k)
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
@@ -154,6 +211,10 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
             path: 库内相对路径（用 search_knowledge 的来源行/list_libraries 确认）
         """
         try:
+            allowed = set(lib_mgr.agent_allowed_extensions(library_id))
+            extension = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            if extension not in allowed:
+                raise PermissionError(f"Agent 未获授权读取格式 {extension or '(无后缀)'}")
             doc = pipeline.read_document(library_id, path)
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
@@ -176,7 +237,12 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
                        "近乎逐字重复"的才会被分进同一组
         """
         try:
-            groups_by_provider = pipeline.find_duplicates(library_id, threshold=threshold)
+            allowed = lib_mgr.agent_allowed_extensions(library_id)
+            groups_by_provider = pipeline.find_duplicates(
+                library_id,
+                threshold=threshold,
+                format_allowlist=allowed,
+            )
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "groups": groups_by_provider}
@@ -199,7 +265,23 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
             path: 库内相对路径，或不含扩展名的标题
         """
         try:
+            allowed = set(lib_mgr.agent_allowed_extensions(library_id))
             result = pipeline.note_relations(library_id, path)
+            if result.get("resolved"):
+                file_path = str(result.get("file") or "")
+                extension = "." + file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+                if extension not in allowed:
+                    return {"ok": False, "resolved": False, "file": None, "outlinks": [], "inlinks": []}
+                result["outlinks"] = [
+                    value
+                    for value in result.get("outlinks", [])
+                    if ("." + value.rsplit(".", 1)[-1].lower()) in allowed
+                ]
+                result["inlinks"] = [
+                    value
+                    for value in result.get("inlinks", [])
+                    if ("." + value.rsplit(".", 1)[-1].lower()) in allowed
+                ]
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
         return {"ok": True, **result}
@@ -292,20 +374,17 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         return result
 
     @server.tool()
-    def reindex_knowledge(library_id: str) -> dict[str, Any]:
-        """后台重建索引，立即返回（对齐 obsidian-rag 的 `reindex_knowledge`
-        "后台执行+立即返回"语义，2026-09-23 全面功能审计发现的缺口——
-        此前是完全同步阻塞，大库重建索引会让这次工具调用一直卡到全部
-        跑完才返回，AI 客户端也可能在这期间等到协议超时）。
-
-        真正想知道跑得怎么样——是不是还在跑、跑到第几个文件、有没有
-        卡死、最终成功/失败了几个文件——调 `index_status(library_id)`
-        轮询，本工具的返回值里没有这些信息（这是设计使然，不是遗漏：
-        任务这时候大概率还没跑完）。
+    def reindex_knowledge(library_id: str, full: bool = False) -> dict[str, Any]:
+        """由独立 worker 进程后台重建索引，立即返回启动结果；其中
+        `run_id` 标识本轮任务，`worker_pid` 是 worker 进程号。真正想知道
+        跑得怎么样——是不是还在跑、跑到第几个文件、有没有卡死、最终成功/
+        失败了几个文件——调 `index_status(library_id)` 轮询，本工具的返回
+        值不含这些结果。
 
         同一个库同一时刻只允许一个后台索引任务：重复调用会返回
         `started=False`，不是错误，也不会打断正在跑的那个任务——不同
-        库互不影响，可以同时各自跑一个。
+        库互不影响，可以同时各自跑一个。GUI 可以停止自己启动的任务；MCP
+        不提供 stop 工具，对齐旧项目的 16 工具集合。
 
         注：MCP SDK 对裸 `dict` 返回类型标注推不出结构化输出 schema
         （实测 `structured_content` 会是 None，只能从 content[0].text
@@ -313,19 +392,37 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         真实踩过的坑，不是随手加的类型标注。异常处理策略同
         search_knowledge，见其 docstring。
 
-        Phase 1 现状是全量重跑（不做"内容没变就跳过"的增量判断——虽然
-        ExtractedDocument 已经带 content_hash，真正的增量跳过逻辑要等
-        docs/LESSONS.md 第3条的版本号机制落地后再接，这里先如实说明，
-        不假装已经支持增量）。
+        默认按文件指纹和插件版本做增量索引；`full=true` 时忽略现有清单并完整重建。
 
         Args:
             library_id: 要重建索引的库的 id
+            full: 是否强制完整重建
         """
         try:
-            started, message = pipeline.start_index_library(library_id)
+            allowed = lib_mgr.agent_allowed_extensions(library_id)
+            if full:
+                result = pipeline.start_index_library(
+                    library_id,
+                    source="mcp",
+                    full=True,
+                    format_allowlist=allowed,
+                )
+            else:
+                result = pipeline.start_index_library(
+                    library_id,
+                    source="mcp",
+                    format_allowlist=allowed,
+                )
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "started": started, "message": message}
+        return {
+            "ok": True,
+            "started": result.started,
+            "message": result.message,
+            "run_id": result.run_id,
+            "worker_pid": result.worker_pid,
+            "full": full,
+        }
 
     @server.tool()
     def index_status(library_id: str) -> dict[str, Any]:
@@ -333,7 +430,7 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         适配成按库查询——本项目的 reindex_knowledge 本来就是单库粒度，
         不像 obsidian-rag 那样一次调用可能触及多个库）。配合
         reindex_knowledge 轮询用：`status.stage` 是 running/done/failed，
-        `status.health` 是心跳/进度健康判定（healthy/stalled_no_heartbeat/
+        `status.health` 是完整健康判定（healthy/orphaned/stalled_no_heartbeat/
         stalled_no_progress），从没跑过（本进程视角的）后台索引时
         `status` 为 `None`（不是错误——调用方自己决定"从没跑过"要怎么
         展示，同一般"查询不存在的资源返回空而不是报错"的约定）。
@@ -354,10 +451,8 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         索引上"的文件及原因——解决"什么文件转不到、为什么"，你看一眼就
         知道哪份文档没进库、卡在哪。只读，绝不触发重新索引或模型加载。
 
-        简化说明：rag-redo 每次都是全量重跑（不做增量索引），本工具因此
-        不判断"下一轮会不会自动重试"——反正下一轮本来就会重新试一遍全部
-        文件，这个问题在 rag-redo 里不成立，见 core/index_failures.py
-        模块 docstring。库存在但从没索引过时 `failures` 为 `None`
+        失败文件会按当前输入和插件/模型签名在下一轮自动重试；成功后从清单清除。
+        库存在但从没索引过时 `failures` 为 `None`
         （不是错误）；`failures` 为空列表则表示上次全部成功。
 
         Args:
@@ -365,6 +460,14 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         """
         try:
             result = pipeline.index_failures(library_id)
+            if result is not None:
+                allowed = set(lib_mgr.agent_allowed_extensions(library_id))
+                result = dict(result)
+                result["failures"] = [
+                    row
+                    for row in result.get("failures", [])
+                    if ("." + str(row.get("path", "")).rsplit(".", 1)[-1].lower()) in allowed
+                ]
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "result": result}
@@ -450,7 +553,11 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
             k: 采样代表片段数
         """
         try:
-            samples = pipeline.sample_library(library_id, k=k)
+            samples = pipeline.sample_library(
+                library_id,
+                k=k,
+                format_allowlist=lib_mgr.agent_allowed_extensions(library_id),
+            )
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
         if not samples:

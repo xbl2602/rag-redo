@@ -18,6 +18,7 @@ official-* 插件里，这个文件只是"胶水"，对应 docs/PLUGIN_SPEC.md �
 from __future__ import annotations
 
 import atexit
+import multiprocessing
 import os
 import sys
 from pathlib import Path
@@ -35,7 +36,10 @@ sys.path.insert(0, str(REPO_ROOT))
 #: 数据目录：理由和 GUI/MCP 共享同一份数据的说明，见 gui_main.py 里同名
 #: 常量的注释——这里不重复展开，两个入口必须保持完全一致的解析逻辑
 #: （同一份数据只能有一处权威路径判定，DATA_FLOW.md 规则4的体现）。
-if getattr(sys, "frozen", False):
+configured_data_root = os.environ.get("RAG_REDO_DATA_ROOT")
+if configured_data_root:
+    DATA_ROOT = Path(configured_data_root)
+elif getattr(sys, "frozen", False):
     DATA_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "RAG-Redo" / "data"
 else:
     DATA_ROOT = REPO_ROOT / "data"
@@ -70,6 +74,8 @@ REQUIRED_PLUGINS = [
     "official-dedup",
     "official-library-summary",
     "official-llm-openai-compatible",
+    "official-query-enhancer-hyde",
+    "official-result-advisor",
     "official-mcp-server",
 ]
 
@@ -119,4 +125,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()

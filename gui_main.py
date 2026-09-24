@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import multiprocessing
 import os
 import sys
 from pathlib import Path
@@ -33,7 +34,10 @@ sys.path.insert(0, str(REPO_ROOT))
 #: 别处共享目录）。GUI 和 MCP 两个冻结产物各自安装在不同文件夹（见
 #: installer/rag-redo.iss），但都会指向这同一个 DATA_ROOT，这样两边
 #: 操作的是同一批库，不是各自维护一份互不相通的数据。
-if getattr(sys, "frozen", False):
+configured_data_root = os.environ.get("RAG_REDO_DATA_ROOT")
+if configured_data_root:
+    DATA_ROOT = Path(configured_data_root)
+elif getattr(sys, "frozen", False):
     DATA_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "RAG-Redo" / "data"
 else:
     DATA_ROOT = REPO_ROOT / "data"
@@ -64,6 +68,8 @@ REQUIRED_PLUGINS = [
     "official-dedup",
     "official-library-summary",
     "official-llm-openai-compatible",
+    "official-query-enhancer-hyde",
+    "official-result-advisor",
     "official-gui-shell",
 ]
 
@@ -104,4 +110,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
