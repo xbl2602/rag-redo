@@ -39,13 +39,15 @@
       "status": "pass",
       "legacy_refs": [
         "obsidian-rag/server.py:111-137",
-        "obsidian-rag/index.py:2058-2066"
+        "obsidian-rag/index.py:2058-2066",
+        "obsidian-rag/wemm_indexer.py:183-190"
       ],
       "redo_refs": [
         "rag-redo/plugins/official-library-manager/official_library_manager/config.py:19-28",
         "rag-redo/plugins/official-library-manager/official_library_manager/config.py:103-118",
         "rag-redo/plugins/official-library-manager/official_library_manager/plugin.py:92-133",
         "rag-redo/core/index_progress.py:259-274",
+        "rag-redo/core/pipeline.py::Pipeline.index_library 冻结分支",
         "rag-redo/core/pipeline.py:371-430",
         "rag-redo/core/pipeline.py:1113-1310",
         "rag-redo/plugins/official-mcp-server/official_mcp_server/tools.py:62-71",
@@ -54,11 +56,13 @@
       "test_refs": [
         "rag-redo/plugins/official-library-manager/tests/test_config.py::TestLibraryConfigStore.test_agent_allowlist_cannot_be_pierced_by_explicit_selection",
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_agent_format_allowlist_freezes_unapproved_docx_until_authorized",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_agent_format_revocation_freezes_files_and_keeps_old_chunks",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_agent_format_revocation_freezes_pdf_visual_pages",
         "rag-redo/tests/test_index_progress.py::TestIndexWorkerManager.test_format_allowlist_crosses_process_boundary",
         "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_agent_read_document_blocks_docx_until_user_authorizes_format",
         "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_reindex_knowledge_returns_started_true_not_a_synchronous_report"
       ],
-      "acceptance": "Agent 默认只能处理 md/txt 和用户通过 agent_formats 批准的 pdf/docx；授权在显式路径裁决后再次硬过滤，并跨进程 worker、搜索候选、读取、导航、关系、去重、失败诊断和采样入口生效。",
+      "acceptance": "Agent 默认只能处理 md/txt 和用户通过 agent_formats 批准的 pdf/docx；授权在显式路径裁决后再次硬过滤，并跨进程 worker、搜索候选、读取、导航、关系、去重、失败诊断和采样入口生效。撤销授权（索引时未授权格式）= 冻结：保留既有条目与块（不裁剪不清理、不重渲染页），重新授权后原块立即可用，无需重新提取；无条目的未授权文件视同不存在待人类路径首建。",
       "blocker": ""
     },
     {
@@ -66,18 +70,26 @@
       "title": "搜索前自动同步",
       "status": "pass",
       "legacy_refs": [
-        "obsidian-rag/server.py:227-317"
+        "obsidian-rag/server.py:227-317",
+        "obsidian-rag/index.py:1486-1517"
       ],
       "redo_refs": [
+        "rag-redo/core/pipeline.py::Pipeline.library_freshness",
         "rag-redo/core/pipeline.py::Pipeline.stale_libraries",
         "rag-redo/plugins/official-mcp-server/official_mcp_server/tools.py::register_tools.ensure_agent_fresh"
       ],
       "test_refs": [
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_stale_libraries_detects_first_run_changes_additions_and_removals",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_missing_root_reports_missing_and_keeps_old_index_searchable",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_emptied_dir_reports_emptied_and_keeps_old_index_searchable",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_never_indexed_empty_library_is_converged_not_stale",
         "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_waits_for_first_index_before_returning",
-        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_starts_background_refresh_for_nonempty_library"
+        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_starts_background_refresh_for_nonempty_library",
+        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_skips_auto_sync_when_root_missing_keeps_old_results",
+        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_skips_auto_sync_when_dir_emptied_keeps_old_results",
+        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_degrades_to_old_index_when_auto_sync_fails"
       ],
-      "acceptance": "搜索前必须检测变化；空库首跑同步，非空库后台增量并可继续使用旧索引，不得让搜索悄悄使用过期数据。",
+      "acceptance": "搜索前必须检测变化；空库首跑同步，非空库后台增量并可继续使用旧索引，不得让搜索悄悄使用过期数据。库路径不存在（missing）与目录在但扫不到任何文件且旧索引有真实记录（emptied）必须跳过自动同步并保留旧索引（原因写入响应 notes）；同步本身失败时降级为旧索引检索+提示，不得让检索整体失败；从未索引过且目录为空是收敛态不触发重建。显式重建（GUI 完整重建/reindex_knowledge）无此保护，与旧项目一致。",
       "blocker": ""
     },
     {
@@ -86,21 +98,24 @@
       "status": "pass",
       "legacy_refs": [
         "obsidian-rag/index.py:114-159",
-        "obsidian-rag/index.py:2142-2157"
+        "obsidian-rag/index.py:2142-2148",
+        "obsidian-rag/index.py:2204-2206"
       ],
       "redo_refs": [
         "rag-redo/core/pipeline.py::normalize_failure_state",
         "rag-redo/core/pipeline.py::Pipeline._failure_record",
         "rag-redo/core/pipeline.py::Pipeline.failure_will_retry",
+        "rag-redo/core/pipeline.py::Pipeline.index_library deferred 分支",
         "rag-redo/core/index_progress.py::IndexProgress"
       ],
       "test_refs": [
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_empty_and_tbd_terminal_states_are_stable_until_content_changes",
         "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_stable_scanned_terminal_does_not_repeat_provider_work",
         "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_capability_change_retries_stable_scanned_terminal",
-        "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_deferred_is_not_a_terminal_failure_and_remains_stale"
+        "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_deferred_is_not_a_terminal_failure_and_remains_stale",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_deferred_keeps_previous_record_and_old_chunks_searchable"
       ],
-      "acceptance": "unreadable、empty、tbd、scanned、extract-failed 等终态可区分；稳定失败不重复消耗资源；能力签名变化和内容变化可重试；deferred 不得伪装成终态。",
+      "acceptance": "unreadable、empty、tbd、scanned、extract-failed 等终态可区分；稳定失败不重复消耗资源；能力签名变化和内容变化可重试；deferred 不得伪装成终态且不落 manifest 记录——保留旧条目与旧块继续服务（检索不受影响），文件与旧记录的差异驱动下一轮自动重试，恢复后重试成功。",
       "blocker": ""
     },
     {

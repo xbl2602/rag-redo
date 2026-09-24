@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping
 
-from .contracts import Chunk, DocumentContent, ExtractedDocument, GraphResponse, LibrarySummary, PageHit, QueryExpansion, SampledChunk, SearchAdviceInput, SearchResponse, SearchResult, SemanticGraphResponse, VisualPageState
+from .contracts import Chunk, DocumentContent, ExtractedDocument, GraphResponse, LibraryFreshness, LibrarySummary, PageHit, QueryExpansion, SampledChunk, SearchAdviceInput, SearchResponse, SearchResult, SemanticGraphResponse, VisualPageState
 from .graph import build_graph, select_semantic_edges
 from .extract_cache import ExtractCache
 from .index_failures import IndexFailuresStore
@@ -331,14 +331,13 @@ class Pipeline:
         reason: str,
         *,
         state: str | None = None,
-        deferred: bool = False,
     ) -> dict:
-        state = "deferred" if deferred else (state or normalize_failure_state(reason))
+        state = state or normalize_failure_state(reason)
         return {
             "size": plan["size"],
             "mtime_ns": plan["mtime_ns"],
             "content_hash": plan["content_hash"],
-            "status": "deferred" if deferred else "terminal",
+            "status": "terminal",
             "failure_state": state,
             "failure_reason": state,
             "failure_detail": str(reason) if str(reason) != state else None,
@@ -517,7 +516,7 @@ class Pipeline:
         files_done = 0
         chunks_done = 0
         plans: list[dict] = []
-        current_included_paths: set[str] = set()
+        current_alive_paths: set[str] = set()
 
         def _emit(
             phase: str,
@@ -543,11 +542,12 @@ class Pipeline:
 
         _emit("scanning", message=f"发现 {files_total} 个文件")
         for path, included, reason in included_files:
+            old_record = old_files.get(path, {})
             plan = {
                 "path": path,
                 "included": included,
                 "reason": reason,
-                "old": old_files.get(path, {}),
+                "old": old_record,
                 "size": -1,
                 "mtime_ns": -1,
                 "content_hash": "",
@@ -556,9 +556,22 @@ class Pipeline:
                 "action": "excluded" if not included else "added",
             }
             if not included:
+                if (
+                    format_allowlist is not None
+                    and old_record
+                    and ("." + path.rsplit(".", 1)[-1].lower()) not in {str(v).lower() for v in format_allowlist}
+                ):
+                    # Agent 未授权格式：冻结——对齐 obsidian-rag/index.py:2058-2066
+                    # （"保留既有条目与块（不裁剪不清理），零 I/O、不转换、不计
+                    # 变更"；无条目则视同不存在，待人类路径首建）。撤销授权不得
+                    # 把未授权文件当"已删除"清掉旧索引；记录原样保留（含旧
+                    # mtime），重新授权后 stat 未变 → unchanged，无需重新提取。
+                    plan["action"] = "frozen"
+                    plan["record"] = dict(old_record)
+                    current_alive_paths.add(path)
                 plans.append(plan)
                 continue
-            current_included_paths.add(path)
+            current_alive_paths.add(path)
             try:
                 stat = (root / path).stat()
                 plan["size"] = stat.st_size
@@ -619,7 +632,7 @@ class Pipeline:
             plan["needs_embed"] = plan["needs_chunks"]
             plans.append(plan)
 
-        removed_paths = set(old_files) - current_included_paths
+        removed_paths = set(old_files) - current_alive_paths
         report.removed = len(removed_paths)
         report.added = sum(1 for plan in plans if plan["action"] == "added")
         report.changed = sum(1 for plan in plans if plan["action"] in {"changed", "rebuilt"})
@@ -661,6 +674,15 @@ class Pipeline:
         if needs_extract_segment and generation not in extract_segments:
             extract_segments.append(generation)
 
+        def _drop_old_lexical_chunks(plan: dict) -> None:
+            """丢弃该文件的旧词法块——只允许在本轮结果已确定"不是 deferred"
+            的丢弃/替换点调用。对齐 obsidian-rag 的语义：deferred 文件的旧块
+            原样保留继续服务（index.py:2142-2148 "不动 meta"），终态失败与
+            成功重写才清掉旧块（旧项目由 meta[rel]["chunks"]=0 驱动清理）。"""
+            if lexical_current and plan["needs_chunks"]:
+                for chunk_id in plan["old"].get("chunk_ids", []):
+                    lexical.remove_chunk(library_id, chunk_id, generation=generation)
+
         for plan in plans:
             path = str(plan["path"])
             file_report = IndexFileReport(
@@ -672,7 +694,15 @@ class Pipeline:
             report.files.append(file_report)
             if not plan["included"]:
                 files_done += 1
-                _emit("file_complete", current_path=path, message=f"已跳过：{path}")
+                _emit(
+                    "file_complete",
+                    current_path=path,
+                    message=(
+                        f"已冻结（保留旧索引）：{path}"
+                        if plan["action"] == "frozen"
+                        else f"已跳过：{path}"
+                    ),
+                )
                 continue
             old = plan["old"]
             action = str(plan["action"])
@@ -692,6 +722,7 @@ class Pipeline:
                 continue
             if plan["fingerprint_error"]:
                 reason = str(plan["fingerprint_error"])
+                _drop_old_lexical_chunks(plan)
                 record = self._failure_record(plan, reason, state="unreadable")
                 plan["record"] = record
                 file_report.extract_failure = reason
@@ -701,9 +732,9 @@ class Pipeline:
                 _emit("file_complete", current_path=path, message=f"索引失败：{reason}")
                 continue
 
-            if lexical_current and plan["needs_chunks"]:
-                for chunk_id in old.get("chunk_ids", []):
-                    lexical.remove_chunk(library_id, chunk_id, generation=generation)
+            # 旧块的词法删除已迁移到各确定丢弃点（_drop_old_lexical_chunks）：
+            # 提前删除会把 deferred 文件的旧块从可检索集合里丢掉，违反
+            # obsidian-rag/index.py:2142-2148 的"不动 meta"语义。
             doc: ExtractedDocument | None = None
             if plan["needs_source"]:
                 if plan["action"] in {"unchanged", "rebuilt"} and plan["content_hash"] == old.get("content_hash"):
@@ -763,12 +794,29 @@ class Pipeline:
             if doc is None or doc.text is None:
                 reason = str(plan["fingerprint_error"] or (doc.failure_reason if doc else "无法读取提取缓存"))
                 is_deferred = reason.strip().lower() == "deferred" or reason.strip().lower().startswith("deferred:")
+                if is_deferred:
+                    # 对齐 obsidian-rag/index.py:2142-2148（R3b）：本地服务瞬态
+                    # 不可用 → 本轮跳过——不落终态、不动 manifest 记录、不计
+                    # changed；旧条目与旧块原样保留继续服务（检索不受影响），
+                    # 文件 stat 与旧记录的差异驱动下一轮 stale → 自动重试。
+                    # 无旧条目则视同本轮不存在（也不写记录），同旧项目。
+                    if plan["old"]:
+                        plan["record"] = dict(plan["old"])
+                    file_report.extract_failure = reason
+                    file_report.failure_state = "deferred"
+                    files_done += 1
+                    _emit(
+                        "file_complete",
+                        current_path=path,
+                        message="本轮延后：" + reason,
+                    )
+                    continue
                 state = str(doc.failure_state) if doc is not None and doc.failure_state else None
+                _drop_old_lexical_chunks(plan)
                 record = self._failure_record(
                     plan,
                     reason,
                     state=state,
-                    deferred=is_deferred,
                 )
                 plan["record"] = record
                 file_report.extract_failure = reason
@@ -778,7 +826,7 @@ class Pipeline:
                 _emit(
                     "file_complete",
                     current_path=path,
-                    message="本轮延后：" + reason if is_deferred else f"索引失败：{reason}",
+                    message=f"索引失败：{reason}",
                 )
                 continue
             if is_tbd_heavy(
@@ -786,6 +834,7 @@ class Pipeline:
                 float(self.runtime.settings.get("tbd_exclude_ratio", 0.1) or 0.0),
             ):
                 reason = "tbd"
+                _drop_old_lexical_chunks(plan)
                 record = self._failure_record(plan, reason, state="tbd")
                 record["content_hash"] = doc.content_hash or plan["content_hash"]
                 record["links"] = extract_wikilink_targets(doc.text)
@@ -821,6 +870,7 @@ class Pipeline:
                 section_texts.setdefault(chunk.section_id, chunk.section_text)
             if not chunks:
                 reason = "提取成功但没有产出任何chunk"
+                _drop_old_lexical_chunks(plan)
                 record = self._failure_record(plan, reason, state="empty")
                 record["content_hash"] = doc.content_hash or plan["content_hash"]
                 record["links"] = extract_wikilink_targets(doc.text)
@@ -837,6 +887,7 @@ class Pipeline:
             chunk_ids = [chunk.chunk_id for chunk in chunks]
             embed_vectors = [vector_by_id[chunk_id] for chunk_id in chunk_ids]
             _emit("writing", current_path=path, stall_grace_s=180.0, message=f"正在写入：{path}")
+            _drop_old_lexical_chunks(plan)
             vector_store.upsert(
                 library_id,
                 chunk_ids,
@@ -927,7 +978,7 @@ class Pipeline:
         manifest_files = {
             str(plan["path"]): dict(plan["record"])
             for plan in plans
-            if plan.get("included") and plan.get("record")
+            if plan.get("record") and (plan.get("included") or plan.get("action") == "frozen")
         }
         active_ids = self._active_chunk_ids({"files": manifest_files})
         compacted_state = bool(old_manifest and old_manifest.get("compacted", False))
@@ -990,11 +1041,21 @@ class Pipeline:
             extract_segments = compacted_extract_segments
             lexical_segments = compacted_lexical_segments
             compacted_state = True
-        pdf_paths = [str(plan["path"]) for plan in plans if plan.get("included") and str(plan["path"]).lower().endswith(".pdf")]
+        # 冻结（Agent 未授权）的 PDF 对齐 obsidian-rag/wemm_indexer.py:190
+        # （"仅处理这些格式的 PDF，其余冻结"）：保留在有效集合里（页不被
+        # 屏蔽），但不进 changed_paths（不重渲染）。
+        pdf_paths = [
+            str(plan["path"])
+            for plan in plans
+            if (plan.get("included") or plan.get("action") == "frozen")
+            and str(plan["path"]).lower().endswith(".pdf")
+        ]
         changed_pdf_paths = [
             str(plan["path"])
             for plan in plans
-            if plan.get("included") and str(plan["path"]).lower().endswith(".pdf") and plan.get("action") != "unchanged"
+            if plan.get("included")
+            and str(plan["path"]).lower().endswith(".pdf")
+            and plan.get("action") not in {"unchanged", "frozen"}
         ]
         _emit("visual", chunks_total=chunks_done, stall_grace_s=300.0, message="正在建立视觉索引")
         for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
@@ -1254,23 +1315,41 @@ class Pipeline:
         generation = self._generations.active(library_id)
         return generation is not None and self._manifest(library_id, generation) is not None
 
-    def stale_libraries(
+    def library_freshness(
         self,
         libraries: str = "all",
         *,
         exclude: str = "",
         format_allowlist: Mapping[str, tuple[str, ...]] | None = None,
-    ) -> list[str]:
+    ) -> dict[str, LibraryFreshness]:
+        """单库 freshness 扫描——对齐 obsidian-rag/index.py::kb_stale 返回的
+        (stale, stats) 形状：
+
+        - 库路径不存在（不是目录）→ stale 且 `missing=True`
+          （index.py:1506-1508）——"本轮看不到"不等于"确认删除"，消费方
+          （MCP 搜索前自动同步）据此跳过同步并保留旧索引；
+        - 目录存在但扫不到任何文件、而 manifest 有真实记录 → stale 且
+          `emptied=True`（index.py:1511-1517，2026-08-14 审计 F16：源文件
+          没放回去 ≠ 用户删光，同步 = 不可逆清空）；
+        - 从未索引过且扫不到任何文件 → 收敛态，不判 stale
+          （index.py:1522-1529），避免每轮无效重建。
+
+        显式触发的索引（GUI 完整重建、reindex_knowledge）没有这层保护，
+        与旧项目一致：用户明确要求重建时按字面执行。"""
         lib_mgr = self._singleton("library_manager")
         entries = lib_mgr.resolve_libraries(libraries or "all", exclude)
-        stale: list[str] = []
+        report: dict[str, LibraryFreshness] = {}
         for entry in entries:
             library_id = entry.library_id
+            root = Path(entry.root_path)
+            if not root.is_dir():
+                report[library_id] = LibraryFreshness(
+                    library_id=library_id, stale=True, missing=True
+                )
+                continue
             generation = self._generations.active(library_id)
             manifest = self._manifest(library_id, generation)
-            if generation is None or manifest is None:
-                stale.append(library_id)
-                continue
+            records = self._manifest_files(manifest) if manifest is not None else {}
             allowlist = (
                 format_allowlist.get(library_id, ())
                 if format_allowlist is not None
@@ -1284,12 +1363,23 @@ class Pipeline:
                     format_allowlist=allowlist,
                 )
             )
+            has_files = bool(decisions)
+            if generation is None or manifest is None:
+                # 旧项目 kb_stale：无 meta 时有文件=首跑待建；条目与文件双空=收敛
+                report[library_id] = LibraryFreshness(
+                    library_id=library_id, stale=has_files
+                )
+                continue
+            if not has_files and records:
+                report[library_id] = LibraryFreshness(
+                    library_id=library_id, stale=True, emptied=True
+                )
+                continue
             included = {
                 path: included
                 for path, included, _reason in decisions
                 if included
             }
-            records = self._manifest_files(manifest)
             allowed = (
                 {str(value).lower() for value in allowlist}
                 if allowlist is not None
@@ -1307,30 +1397,42 @@ class Pipeline:
                 if allowed is None
                 or ("." + path.rsplit(".", 1)[-1].lower()) in allowed
             }
-            if scoped_paths != record_paths:
-                stale.append(library_id)
-                continue
-            changed = False
-            root = Path(entry.root_path)
-            for path in scoped_paths:
-                record = records[path]
-                if self.failure_will_retry({"path": path, **record}):
-                    changed = True
-                    break
-                try:
-                    stat = (root / path).stat()
-                except OSError:
-                    changed = True
-                    break
-                if (
-                    stat.st_size != record.get("size")
-                    or stat.st_mtime_ns != record.get("mtime_ns")
-                ):
-                    changed = True
-                    break
-            if changed:
-                stale.append(library_id)
-        return stale
+            stale = scoped_paths != record_paths
+            if not stale:
+                for path in scoped_paths:
+                    record = records[path]
+                    if self.failure_will_retry({"path": path, **record}):
+                        stale = True
+                        break
+                    try:
+                        stat = (root / path).stat()
+                    except OSError:
+                        stale = True
+                        break
+                    if (
+                        stat.st_size != record.get("size")
+                        or stat.st_mtime_ns != record.get("mtime_ns")
+                    ):
+                        stale = True
+                        break
+            report[library_id] = LibraryFreshness(library_id=library_id, stale=stale)
+        return report
+
+    def stale_libraries(
+        self,
+        libraries: str = "all",
+        *,
+        exclude: str = "",
+        format_allowlist: Mapping[str, tuple[str, ...]] | None = None,
+    ) -> list[str]:
+        """`library_freshness` 的列表投影：只返回 stale 的库 id。"""
+        return [
+            info.library_id
+            for info in self.library_freshness(
+                libraries, exclude=exclude, format_allowlist=format_allowlist
+            ).values()
+            if info.stale
+        ]
 
     # ---- 查询态 --------------------------------------------------------
 

@@ -171,6 +171,20 @@ class VisualPageState:
 
 
 @dataclass(frozen=True)
+class LibraryFreshness:
+    """单库 freshness 扫描结果——对齐 obsidian-rag/index.py::kb_stale 返回的
+    (stale, stats) 形状。missing/emptied 标志的消费方（MCP 搜索前自动同步，
+    server.py:264-273）据此跳过同步并保留旧索引：库路径消失（临时挂载失败）
+    和"目录在但扫不到任何文件"（2026-08-14 审计 F16，源文件没放回去）都
+    不等于"用户确认删除"，而旧索引被清空是不可逆代价。"""
+
+    library_id: str
+    stale: bool
+    missing: bool = False
+    emptied: bool = False
+
+
+@dataclass(frozen=True)
 class GraphNode:
     node_id: str
     library_id: str

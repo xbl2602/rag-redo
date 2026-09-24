@@ -30,25 +30,51 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         libraries: str,
         exclude: str,
         allowed_by_library: dict[str, tuple[str, ...]],
-    ) -> list[str]:
-        stale = pipeline.stale_libraries(
+    ) -> tuple[list[str], list[str]]:
+        """搜索前自动同步——对齐 obsidian-rag/server.py::ensure_fresh 的门禁
+        与降级纪律：
+
+        - missing/emptied 跳过（server.py:264-273）：库路径不存在、或目录在但
+          扫不到任何文件而旧索引有真实记录时，"本轮看不到" ≠ "确认删除"，
+          同步 = 不可逆清空旧索引，必须跳过并把原因写进 notes；
+        - 任何一步同步失败都降级为"用旧索引检索 + 提示"（server.py:314-317），
+          绝不让检索整体失败。
+
+        返回 (refreshing, notes)：refreshing 是已转入后台增量更新的库（旧索
+        引先出结果）；notes 是给 AI 看的跳过/失败原因。"""
+        freshness = pipeline.library_freshness(
             libraries,
             exclude=exclude,
             format_allowlist=allowed_by_library,
         )
         refreshing: list[str] = []
-        for library_id in stale:
-            had_index = pipeline.has_index(library_id)
-            pipeline.start_index_library(
-                library_id,
-                source="mcp-auto-sync",
-                format_allowlist=allowed_by_library[library_id],
-            )
-            if had_index:
-                refreshing.append(library_id)
-            else:
-                wait_for_initial_index(library_id)
-        return refreshing
+        notes: list[str] = []
+        for library_id, info in freshness.items():
+            if not info.stale:
+                continue
+            if info.missing:
+                notes.append(f"{library_id} 路径不存在，跳过自动同步（保留旧索引）")
+                continue
+            if info.emptied:
+                notes.append(
+                    f"{library_id} 目录为空（扫不到任何文件），"
+                    f"跳过自动同步以免清空索引；确认源文件已放回该路径后可手动重建"
+                )
+                continue
+            try:
+                had_index = pipeline.has_index(library_id)
+                pipeline.start_index_library(
+                    library_id,
+                    source="mcp-auto-sync",
+                    format_allowlist=allowed_by_library[library_id],
+                )
+                if had_index:
+                    refreshing.append(library_id)
+                else:
+                    wait_for_initial_index(library_id)
+            except Exception as exc:  # noqa: BLE001 - 降级为旧索引检索，见 docstring
+                notes.append(f"{library_id} 自动更新索引失败（使用旧索引继续）：{exc}")
+        return refreshing, notes
 
     @server.tool()
     def search_knowledge(
@@ -77,7 +103,9 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         include_body=False 时只返回来源清单（路径/标题/库id，无正文），
         用于两阶段检索：先低成本枚举全量候选，再对命中少数用 read_document
         精读——省去把大段无关正文传回来的token开销。响应顶层 `advice` 是与
-        `results` 分离的批次建议，最多 2 条、纯规则、不会混进结果正文。
+        `results` 分离的批次建议，最多 2 条、纯规则、不会混进结果正文；
+        `notes` 是搜索前自动同步的跳过/失败原因（库路径不存在、目录为空、
+        同步失败降级等——这些场景下用旧索引继续检索，见返回值说明）。
 
         实测过：MCP SDK（本项目锁定版本 2.2.0）的工具函数里裸抛异常
         （比如库名打错触发的 ValueError）不会被自动折叠成一个干净的
@@ -102,7 +130,7 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
                 entry.library_id: lib_mgr.agent_allowed_extensions(entry.library_id)
                 for entry in entries
             }
-            refreshing = ensure_agent_fresh(libraries, exclude, allowed_by_library)
+            refreshing, notes = ensure_agent_fresh(libraries, exclude, allowed_by_library)
             response = pipeline.search_with_advice(
                 libraries,
                 query,
@@ -122,6 +150,7 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
             "ok": True,
             "advice": list(response.advice),
             "refreshing": refreshing,
+            "notes": notes,
             "results": [
                 {
                     "library_id": r.library_id,

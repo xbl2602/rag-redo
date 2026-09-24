@@ -230,6 +230,170 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         (self.vault / "new.md").unlink()
         self.assertEqual(self.pipeline.stale_libraries("all", format_allowlist=allowed), ["test-lib"])
 
+    def test_missing_root_reports_missing_and_keeps_old_index_searchable(self):
+        """对齐 obsidian-rag/index.py::kb_stale 的 missing 标志（1506-1508）与
+        server.py::ensure_fresh 的跳过同步（264-266）：库路径消失（临时挂载
+        失败的典型形态）必须报 missing——"本轮看不到"不等于"确认删除"，
+        旧索引清空是不可逆代价。旧块继续可检索，代数不变。"""
+        self.pipeline.index_library("test-lib")
+        generation_before = self.pipeline._generations.active("test-lib")
+        moved = self.vault.parent / "vault-detached"
+        self.vault.rename(moved)
+        try:
+            freshness = self.pipeline.library_freshness("test-lib")
+            self.assertTrue(freshness["test-lib"].stale)
+            self.assertTrue(freshness["test-lib"].missing)
+            self.assertFalse(freshness["test-lib"].emptied)
+            self.assertEqual(self.pipeline.stale_libraries("test-lib"), ["test-lib"])
+            self.assertTrue(self.pipeline.search("test-lib", "插件 架构"))
+        finally:
+            moved.rename(self.vault)
+        self.assertEqual(self.pipeline._generations.active("test-lib"), generation_before)
+
+    def test_emptied_dir_reports_emptied_and_keeps_old_index_searchable(self):
+        """对齐 obsidian-rag 2026-08-14 审计 F16（index.py:1511-1517）："目录
+        还在但一个文件都扫不到"几乎总是"源文件没放回去"而不是"用户真的删
+        光"——报 emptied，自动同步必须跳过以免清空索引，旧结果继续可检索。"""
+        self.pipeline.index_library("test-lib")
+        for md in self.vault.glob("*.md"):
+            md.unlink()
+        freshness = self.pipeline.library_freshness("test-lib")
+        self.assertTrue(freshness["test-lib"].stale)
+        self.assertTrue(freshness["test-lib"].emptied)
+        self.assertFalse(freshness["test-lib"].missing)
+        self.assertTrue(self.pipeline.search("test-lib", "插件 架构"))
+
+    def test_never_indexed_empty_library_is_converged_not_stale(self):
+        """对齐 obsidian-rag/index.py:1522-1529：从未索引过且扫不到任何文件 =
+        收敛态，不得每轮误报 stale 触发无效重建。"""
+        empty_vault = self.tmp / "empty-vault"
+        empty_vault.mkdir()
+        self.lib_mgr.store.add_library("empty-lib", "空库", str(empty_vault))
+        freshness = self.pipeline.library_freshness("empty-lib")
+        self.assertFalse(freshness["empty-lib"].stale)
+        self.assertFalse(freshness["empty-lib"].missing)
+        self.assertFalse(freshness["empty-lib"].emptied)
+        self.assertEqual(self.pipeline.stale_libraries("empty-lib"), [])
+
+    def test_deferred_keeps_previous_record_and_old_chunks_searchable(self):
+        """对齐 obsidian-rag/index.py:2142-2148（R3b）：本地服务瞬态不可用 →
+        本轮跳过——不落终态、不动 manifest 记录、不计 changed；旧条目与旧块
+        原样保留继续服务（检索不受影响），文件 stat 与旧记录的差异驱动下一轮
+        stale → 自动重试；服务恢复后重试成功、新内容可检索。"""
+        self.pipeline.index_library("test-lib")
+        old_record = self.pipeline._manifests.read(
+            "test-lib", self.pipeline._generations.active("test-lib")
+        )["files"]["plugin-notes.md"]
+        self.assertTrue(old_record["chunk_ids"])
+        (self.vault / "plugin-notes.md").write_text(
+            "# 插件架构笔记\n\n重写后的正文，内容完全不同。", encoding="utf-8"
+        )
+        text_extractor = self.runtime.plugins["official-extractor-text"].instance
+
+        def deferred_extract(library_id, path, root):
+            return ExtractedDocument(
+                library_id=library_id,
+                path=path,
+                text=None,
+                failure_reason="deferred",
+                extracted_by="official-extractor-text",
+                extractor_version="test",
+                content_hash="unused",
+                failure_state="deferred",
+            )
+
+        with patch.object(text_extractor, "extract", side_effect=deferred_extract):
+            report = self.pipeline.index_library("test-lib")
+        self.assertEqual(report.deferred, 1)
+        manifest = self.pipeline._manifests.read(
+            "test-lib", self.pipeline._generations.active("test-lib")
+        )
+        record = manifest["files"]["plugin-notes.md"]
+        self.assertEqual(record["chunk_ids"], old_record["chunk_ids"])
+        self.assertEqual(record["status"], "indexed")
+        self.assertEqual(record["mtime_ns"], old_record["mtime_ns"])
+        self.assertTrue(self.pipeline.stale_libraries("test-lib"))
+        results = self.pipeline.search("test-lib", "插件 架构")
+        self.assertTrue(results)
+        self.assertEqual(results[0].path, "plugin-notes.md")
+        report2 = self.pipeline.index_library("test-lib")
+        self.assertEqual(report2.changed, 1)
+        self.assertEqual(report2.succeeded, 2)
+        results2 = self.pipeline.search("test-lib", "插件 架构")
+        top = next(r for r in results2 if r.path == "plugin-notes.md")
+        self.assertIn("重写后的正文", top.text)
+
+    def test_agent_format_revocation_freezes_files_and_keeps_old_chunks(self):
+        """对齐 obsidian-rag/index.py:2058-2066：Agent 未授权格式 = 冻结——
+        保留既有条目与块（不裁剪不清理），零 I/O、不计变更；撤销授权不得把
+        未授权文件当"已删除"清掉旧索引，重新授权后原块立即可用，无需重新提取。"""
+        document = Document()
+        document.add_paragraph("Revocation freeze retention test body")
+        document.save(str(self.vault / "agent.docx"))
+        self.pipeline.index_library("test-lib", format_allowlist=(".md", ".txt", ".docx"))
+        indexed_record = self.pipeline._manifests.read(
+            "test-lib", self.pipeline._generations.active("test-lib")
+        )["files"]["agent.docx"]
+        self.assertEqual(indexed_record["status"], "indexed")
+
+        report = self.pipeline.index_library("test-lib", format_allowlist=(".md", ".txt"))
+        self.assertEqual(report.removed, 0)
+        frozen_record = self.pipeline._manifests.read(
+            "test-lib", self.pipeline._generations.active("test-lib")
+        )["files"]["agent.docx"]
+        self.assertEqual(frozen_record["chunk_ids"], indexed_record["chunk_ids"])
+        self.assertEqual(frozen_record["status"], "indexed")
+        results = self.pipeline.search("test-lib", "Revocation freeze retention")
+        self.assertTrue(any(r.path == "agent.docx" for r in results))
+
+        report2 = self.pipeline.index_library("test-lib", format_allowlist=(".md", ".txt", ".docx"))
+        self.assertEqual(report2.unchanged, 3, report2.files)
+        self.assertTrue(
+            self.pipeline.search("test-lib", "Revocation freeze retention")
+        )
+
+    def test_agent_format_revocation_freezes_pdf_visual_pages(self):
+        """对齐 obsidian-rag/wemm_indexer.py:190（"仅处理这些格式的 PDF，其余
+        冻结"）：被撤销授权的 PDF 保留在有效页集合里（不重渲染、不屏蔽），
+        重新授权后页级导航立即可用。"""
+        import pymupdf
+
+        pdf_doc = pymupdf.open()
+        page = pdf_doc.new_page()
+        page.insert_text((72, 72), "visual freeze pdf body")
+        pdf_doc.save(str(self.vault / "visual.pdf"))
+        pdf_doc.close()
+        visual_calls: list[tuple[list[str], list[str]]] = []
+
+        class _RecordingVisual:
+            def index_library(self, library_id, root, pdf_paths, *, generation,
+                              changed_paths, previous_generation):
+                visual_calls.append((list(pdf_paths), list(changed_paths)))
+
+        for allowlist in ((".md", ".txt", ".pdf"), (".md", ".txt")):
+            real_plugin = self.pipeline._plugin
+            real_providers_of = self.runtime.registry.providers_of
+
+            def _fake_providers(point, _real=real_providers_of):
+                # active_of 内部也会调 providers_of——只劫持 visual_index，
+                # 其他扩展点必须委托真实实现，否则 _singleton 全部拿到 fake
+                if point == "visual_index":
+                    return ["fake-visual"]
+                return _real(point)
+
+            def _fake_plugin(plugin_id, _recorder=_RecordingVisual(), _real=real_plugin):
+                if plugin_id == "fake-visual":
+                    return _recorder
+                return _real(plugin_id)
+
+            with (
+                patch.object(self.runtime.registry, "providers_of", side_effect=_fake_providers),
+                patch.object(self.pipeline, "_plugin", side_effect=_fake_plugin),
+            ):
+                self.pipeline.index_library("test-lib", format_allowlist=allowlist)
+        self.assertEqual(visual_calls[0], (["visual.pdf"], ["visual.pdf"]))
+        self.assertEqual(visual_calls[1], (["visual.pdf"], []))
+
     def test_index_then_search_finds_relevant_doc(self):
         report = self.pipeline.index_library("test-lib")
         self.assertEqual(report.succeeded, 2, f"应该两个文件都索引成功: {report.files}")

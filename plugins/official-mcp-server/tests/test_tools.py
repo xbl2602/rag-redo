@@ -28,6 +28,7 @@ for other_plugin_dir in (_REPO_ROOT / "plugins").glob("*"):
 
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 
+from core.contracts import LibraryFreshness  # noqa: E402
 from core.index_progress import IndexStartResult  # noqa: E402
 from core.pipeline import Pipeline  # noqa: E402
 from core.runtime import PluginRuntime  # noqa: E402
@@ -195,7 +196,11 @@ class TestMcpTools(TestMcpToolsAsyncBase):
     async def test_search_waits_for_first_index_before_returning(self):
         started: list[tuple[str, tuple[str, ...]]] = []
         with (
-            patch.object(self.pipeline, "stale_libraries", return_value=["test-lib"]),
+            patch.object(
+                self.pipeline,
+                "library_freshness",
+                return_value={"test-lib": LibraryFreshness(library_id="test-lib", stale=True)},
+            ),
             patch.object(self.pipeline, "has_index", return_value=False),
             patch.object(
                 self.pipeline,
@@ -220,7 +225,11 @@ class TestMcpTools(TestMcpToolsAsyncBase):
     async def test_search_starts_background_refresh_for_nonempty_library(self):
         await self._reindex_and_wait("test-lib")
         with (
-            patch.object(self.pipeline, "stale_libraries", return_value=["test-lib"]),
+            patch.object(
+                self.pipeline,
+                "library_freshness",
+                return_value={"test-lib": LibraryFreshness(library_id="test-lib", stale=True)},
+            ),
             patch.object(self.pipeline, "has_index", return_value=True),
             patch.object(self.pipeline, "start_index_library") as start,
         ):
@@ -231,6 +240,77 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertTrue(result.structured_content["results"])
         self.assertEqual(result.structured_content["refreshing"], ["test-lib"])
         start.assert_called_once()
+
+    async def test_search_skips_auto_sync_when_root_missing_keeps_old_results(self):
+        """对齐 obsidian-rag/server.py:264-266：库路径不存在 → 跳过自动同步
+        （保留旧索引）并把原因写进 notes——绝不能把临时挂载失败判成"文件
+        全部删除"然后清空旧索引；旧结果继续返回。"""
+        await self._reindex_and_wait("test-lib")
+        vault = self.tmp / "vault"
+        moved = self.tmp / "vault-detached"
+        vault.rename(moved)
+        try:
+            result = await self.server.call_tool(
+                "search_knowledge", {"query": "插件 架构", "libraries": "test-lib"}
+            )
+        finally:
+            moved.rename(vault)
+        payload = result.structured_content
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["results"], "路径消失后旧索引必须继续服务")
+        self.assertTrue(
+            any("路径不存在" in note and "跳过自动同步" in note for note in payload["notes"]),
+            payload["notes"],
+        )
+        self.assertEqual(payload["refreshing"], [])
+        generation = self.pipeline._generations.active("test-lib")
+        manifest = self.pipeline._manifests.read("test-lib", generation)
+        self.assertIn("notes.md", manifest["files"], "旧 manifest 不得被清空")
+
+    async def test_search_skips_auto_sync_when_dir_emptied_keeps_old_results(self):
+        """对齐 obsidian-rag/server.py:267-273（2026-08-14 审计 F16）：目录还在
+        但扫不到任何文件 → 跳过自动同步以免清空索引，旧结果继续返回。"""
+        await self._reindex_and_wait("test-lib")
+        vault = self.tmp / "vault"
+        for md in vault.glob("*.md"):
+            md.unlink()
+        result = await self.server.call_tool(
+            "search_knowledge", {"query": "插件 架构", "libraries": "test-lib"}
+        )
+        payload = result.structured_content
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["results"], "空目录不得清空旧索引")
+        self.assertTrue(
+            any("目录为空" in note and "跳过自动同步" in note for note in payload["notes"]),
+            payload["notes"],
+        )
+        generation = self.pipeline._generations.active("test-lib")
+        manifest = self.pipeline._manifests.read("test-lib", generation)
+        self.assertIn("notes.md", manifest["files"])
+
+    async def test_search_degrades_to_old_index_when_auto_sync_fails(self):
+        """对齐 obsidian-rag/server.py:314-317 的降级纪律：自动同步这一步失败
+        绝不能让检索整体失败——折叠成 notes 提示，用旧索引继续检索。"""
+        await self._reindex_and_wait("test-lib")
+        (self.tmp / "vault" / "new.md").write_text("# 新增\n\n新内容", encoding="utf-8")
+        with (
+            patch.object(self.pipeline, "has_index", return_value=True),
+            patch.object(
+                self.pipeline,
+                "start_index_library",
+                side_effect=RuntimeError("worker 启动失败"),
+            ),
+        ):
+            result = await self.server.call_tool(
+                "search_knowledge", {"query": "插件 架构", "libraries": "test-lib"}
+            )
+        payload = result.structured_content
+        self.assertTrue(payload["ok"], "同步失败不得拖垮检索")
+        self.assertTrue(payload["results"])
+        self.assertTrue(
+            any("自动更新索引失败" in note or "使用旧索引" in note for note in payload["notes"]),
+            payload["notes"],
+        )
 
     async def test_read_document_tool_reads_source_file_for_md(self):
         await self._reindex_and_wait("test-lib")
