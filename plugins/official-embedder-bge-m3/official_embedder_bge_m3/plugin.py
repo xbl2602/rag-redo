@@ -51,6 +51,11 @@ class EmbedderPlugin:
             self._idle_stop.set()
         self._idle_stop = None
         self._idle_thread = None
+        if self.embedder is not None:
+            try:
+                self.embedder.release_gpu_slot()
+            except Exception:  # noqa: BLE001 - 禁用收口失败不拖垮宿主，同守护线程的宽容纪律
+                ctx.logger.warning("BGE-M3插件禁用时归还GPU名额失败（忽略）", exc_info=True)
         ctx.logger.info("BGE-M3向量化插件已禁用")
 
     def on_unload(self, ctx):

@@ -100,12 +100,26 @@ class TestRealEncoderGpuArbitration(unittest.TestCase):
         arb.acquire("gpu:0", "official-visual-wemm", priority=10, on_preempt=lambda: preempted.append("wemm"), preempt_equal=True)
         encoder = _RealEncoder(resource_arbiter=arb)
         with patch("torch.cuda.is_available", return_value=True), patch(
-            "official_embedder_bge_m3.embed.gpu_arbiter.wait_for_vram", return_value=True
-        ):
+            "official_embedder_bge_m3.embed.gpu_arbiter.wait_for_vram",
+            side_effect=AssertionError("检索侧不得阻塞等待VRAM（对齐旧项目：wait 语义只属于 WEMM/MinerU 服务端）"),
+        ) as wait_spy:
             device = encoder._select_device()
         self.assertEqual(device, "cuda")
         self.assertEqual(preempted, ["wemm"])
         self.assertEqual(arb.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
+        wait_spy.assert_not_called()
+
+    def test_release_gpu_slot_returns_slot_to_arbiter(self):
+        """on_disable 的名额归还（对齐 rerank.py 模块 docstring 声明的既有
+        设计）：停用后名额必须回到仲裁器的"空闲"状态，否则被禁用的检索侧
+        会以高优先级永久占位，WEMM/OCR-local 再也抢不到。"""
+        arb = ResourceArbiter()
+        encoder = _RealEncoder(resource_arbiter=arb)
+        with patch("torch.cuda.is_available", return_value=True):
+            self.assertEqual(encoder._select_device(), "cuda")
+        self.assertEqual(arb.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
+        encoder.release_gpu_slot()
+        self.assertIsNone(arb.holder_of(GPU_RESOURCE_ID))
 
     def test_idle_check_unloads_model_after_timeout(self):
         encoder = _RealEncoder()

@@ -42,6 +42,11 @@ class RerankerPlugin:
             self._idle_stop.set()
         self._idle_stop = None
         self._idle_thread = None
+        if self.engine is not None:
+            try:
+                self.engine.release_gpu_slot()
+            except Exception:  # noqa: BLE001 - 禁用收口失败不拖垮宿主，同守护线程的宽容纪律
+                ctx.logger.warning("重排器禁用时归还GPU名额失败（忽略）", exc_info=True)
         ctx.logger.info("重排器已禁用")
 
     def on_unload(self, ctx):

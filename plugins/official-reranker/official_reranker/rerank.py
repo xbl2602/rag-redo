@@ -30,7 +30,6 @@ MODEL_VERSION = "BAAI/bge-reranker-v2-m3"
 GPU_RESOURCE_ID = "gpu:0"
 GPU_HOLDER_ID = "official-text-retrieval-gpu"  # 和 official-embedder-bge-m3 共用，见模块 docstring
 GPU_PRIORITY = 100
-MIN_VRAM_GB = 3.5
 IDLE_UNLOAD_SECONDS = 300
 
 
@@ -63,6 +62,9 @@ class _RealReranker:
             return self._model
 
     def _select_device(self) -> str:
+        """同 embed.py::_select_device 的对齐口径：拿到"gpu:0"名额后直接
+        加载，不做 VRAM 阻塞等待（旧项目检索侧从不阻塞等待，wait 语义
+        只属于 WEMM/MinerU 服务端）。"""
         try:
             import torch
 
@@ -79,8 +81,14 @@ class _RealReranker:
             )
             if not acquired:
                 return "cpu"
-        gpu_arbiter.wait_for_vram(MIN_VRAM_GB, timeout_s=900.0, log=self._log)
         return "cuda"
+
+    def release_gpu_slot(self) -> None:
+        """插件 on_disable 时调用——卸载模型并归还"gpu:0"名额，理由同
+        embed.py::_RealEncoder.release_gpu_slot。"""
+        self._unload()
+        if self._resource_arbiter is not None:
+            self._resource_arbiter.release(GPU_RESOURCE_ID, GPU_HOLDER_ID)
 
     def score(self, query: str, texts: list[str]) -> list[float]:
         with self._lock:
@@ -138,3 +146,10 @@ class RerankerEngine:
         check = getattr(self._reranker, "idle_check", None)
         if check is not None:
             check()
+
+    def release_gpu_slot(self) -> None:
+        """透传名额归还（on_disable 用）；注入的假 reranker 没有这个方法
+        时静默跳过，同 idle_check 的宽容语义。"""
+        release = getattr(self._reranker, "release_gpu_slot", None)
+        if release is not None:
+            release()

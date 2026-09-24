@@ -77,11 +77,24 @@ class TestRealRerankerGpuArbitration(unittest.TestCase):
         arb.acquire(GPU_RESOURCE_ID, GPU_HOLDER_ID, priority=100)  # 模拟 embedder 先加载过了
         reranker = _RealReranker(resource_arbiter=arb)
         with patch("torch.cuda.is_available", return_value=True), patch(
-            "official_reranker.rerank.gpu_arbiter.wait_for_vram", return_value=True
-        ):
+            "official_reranker.rerank.gpu_arbiter.wait_for_vram",
+            side_effect=AssertionError("检索侧不得阻塞等待VRAM（对齐旧项目：wait 语义只属于 WEMM/MinerU 服务端）"),
+        ) as wait_spy:
             device = reranker._select_device()
         self.assertEqual(device, "cuda")
         self.assertEqual(arb.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
+        wait_spy.assert_not_called()
+
+    def test_release_gpu_slot_returns_slot_to_arbiter(self):
+        """on_disable 的名额归还（rerank.py 模块 docstring 一直声称这个行为，
+        此前代码没实现——现在补齐并对齐）：停用后名额回到空闲状态。"""
+        arb = ResourceArbiter()
+        reranker = _RealReranker(resource_arbiter=arb)
+        with patch("torch.cuda.is_available", return_value=True):
+            self.assertEqual(reranker._select_device(), "cuda")
+        self.assertEqual(arb.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
+        reranker.release_gpu_slot()
+        self.assertIsNone(arb.holder_of(GPU_RESOURCE_ID))
 
     def test_idle_check_unloads_model_after_timeout(self):
         reranker = _RealReranker()

@@ -20,14 +20,18 @@
 优先级（8GB 卡上没法共存时，WEMM/MinerU 让路，不是反过来）；同时检索侧
 自己也会在空闲一段时间后主动卸载模型释放显存（默认300s，任何新调用会
 刷新这个计时，不需要额外的"是否有任务在跑"判定——见 IdleUnloadMixin 的
-用法说明）。这里用 `core.gpu_arbiter`（fail-open 的 VRAM 探测/等待）+
+用法说明）。这里用 `core.gpu_arbiter`（fail-open 的 VRAM 探测）+
 `core.resource_arbiter`（"gpu:0"名额仲裁，高优先级=100，压过
-official-visual-wemm/official-ocr-mineru-local 的10）实现，具体的"设备
-选择+空闲卸载"逻辑封装成 GpuAwareModel 基类，和 official-reranker/rerank.py
-共用同一份实现方式（因为插件之间不能互相 import，这个基类在两个插件里
-各自有一份，是刻意的小重复，不是遗漏——同 core/subprocess_service.py::
-resolve_plugin_python 的 docstring 提到的"跨插件隔离边界的小工具函数该
-复制不该硬造共享桥梁"这条先例）。
+official-visual-wemm/official-ocr-mineru-local 的10）实现。对齐 obsidian-rag
+检索侧的真实行为：拿到名额后直接加载，**不做 VRAM 阻塞等待**——旧项目里
+"等不到显存就放弃本条请求"的 wait 语义只属于 WEMM/MinerU 服务端
+（wemm_server.py:131-134 / mineru_server.py:124-127），检索侧是抢占式的
+（index.py::_vram_maybe_evict_wemm 是主动驱逐检查，不是阻塞等待）。
+具体的"设备选择+空闲卸载"逻辑封装成 GpuAwareModel 基类，和
+official-reranker/rerank.py 共用同一份实现方式（因为插件之间不能互相
+import，这个基类在两个插件里各自有一份，是刻意的小重复，不是遗漏——同
+core/subprocess_service.py::resolve_plugin_python 的 docstring 提到的
+"跨插件隔离边界的小工具函数该复制不该硬造共享桥梁"这条先例）。
 
 **已知的、刻意的简化**：旧项目对 CUDA 失败有一整套"冷却期+定时自动探测
 切回"的状态机（index.py `_cuda_cooldown_until`/`_try_switch_back_cuda`），
@@ -50,7 +54,6 @@ MODEL_VERSION = "BAAI/bge-m3"
 GPU_RESOURCE_ID = "gpu:0"
 GPU_HOLDER_ID = "official-text-retrieval-gpu"  # 和 official-reranker 共用同一个 holder_id，见模块 docstring
 GPU_PRIORITY = 100  # 检索侧优先，压过 WEMM/OCR-local 的10（对齐旧项目"检索优先抢占"）
-MIN_VRAM_GB = 3.5  # 对齐旧项目 gpu_arbiter.py::BGE_MIN_VRAM_GB
 IDLE_UNLOAD_SECONDS = 300  # 空闲卸载模型释放显存，对齐旧项目默认 gpu_idle_unload_seconds
 
 
@@ -94,10 +97,14 @@ class _RealEncoder:
 
     def _select_device(self) -> str:
         """有 CUDA 就优先用（大幅提速）；加载前先向资源仲裁器申请"gpu:0"
-        名额（高优先级，可能挤走正占着的 WEMM/OCR-local 子进程），再等
-        真实显存达标——两者都是 fail-open：仲裁/探测拿不到明确答案时不
-        阻塞，直接尝试用 CUDA；真的初始化失败再退回 CPU（单次降级，不
-        做冷却重试，见模块 docstring"已知的刻意简化"）。"""
+        名额（高优先级，可能挤走正占着的 WEMM/OCR-local 子进程）。对齐
+        obsidian-rag 检索侧（index.py::_vram_maybe_evict_wemm）的真实行为：
+        拿到名额后**直接加载，不做 VRAM 阻塞等待**——旧项目里 wait_for_vram
+        的"等不到就放弃本条请求"语义只属于低优先级的 WEMM/MinerU 服务端
+        （wemm_server.py:131-134 / mineru_server.py:124-127），检索侧是抢占
+        式的；仲裁/探测拿不到明确答案时不阻塞，直接尝试用 CUDA；真的初始化
+        失败再退回 CPU（单次降级，不做冷却重试，见模块 docstring"已知的
+        刻意简化"）。"""
         try:
             import torch
 
@@ -114,8 +121,16 @@ class _RealEncoder:
             )
             if not acquired:
                 return "cpu"
-        gpu_arbiter.wait_for_vram(MIN_VRAM_GB, timeout_s=900.0, log=self._log)
         return "cuda"
+
+    def release_gpu_slot(self) -> None:
+        """插件 on_disable 时调用——卸载模型并把"gpu:0"名额还给仲裁器。
+        名额的语义是"这个插件启用期间可能会用 GPU"（见 idle_check 的
+        docstring），插件停用后这个前提不再成立：被禁用的检索侧若仍以
+        高优先级持有名额，WEMM/OCR-local 就再也抢不到资源。"""
+        self._unload()
+        if self._resource_arbiter is not None:
+            self._resource_arbiter.release(GPU_RESOURCE_ID, GPU_HOLDER_ID)
 
     def encode(self, texts: list[str]) -> list[list[float]]:
         with self._lock:
@@ -175,3 +190,10 @@ class BGEM3Embedder:
         check = getattr(self._encoder, "idle_check", None)
         if check is not None:
             check()
+
+    def release_gpu_slot(self) -> None:
+        """透传给真实 encoder 的名额归还（on_disable 用）；注入的假 encoder
+        没有这个方法时静默跳过，同 idle_check 的宽容语义。"""
+        release = getattr(self._encoder, "release_gpu_slot", None)
+        if release is not None:
+            release()
