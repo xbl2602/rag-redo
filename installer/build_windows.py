@@ -82,6 +82,9 @@ set \"RAG_REDO_DATA_ROOT=%LOCALAPPDATA%\\RAG-Redo\\data\"
 3. MCP 客户端请使用 start-mcp.cmd 作为 command，并传入其完整路径。
 4. 用户数据保存在 %LOCALAPPDATA%\\RAG-Redo\\data，删除本文件夹不会删除索引数据。
 5. 首次使用模型功能可能需要下载模型；WEMM 首次启用会在插件目录建立独立环境。
+6. 本机 PDF OCR（MinerU）按设计复用机器上已有的 uv tool 环境：
+   先手动执行 uv tool install --python 3.12 -U "mineru[all]"，程序会自动探测；
+   不装也能用，混合 PDF 会保持 scanned 终态，或改用 MinerU 云端。
 """
     for filename, content in {
         "start-gui.cmd": gui,
@@ -92,6 +95,24 @@ set \"RAG_REDO_DATA_ROOT=%LOCALAPPDATA%\\RAG-Redo\\data\"
         (target / filename).write_text(content, encoding="utf-8", newline="")
 
 
+def _write_dependency_lock(target: Path) -> None:
+    """记录构建环境的依赖版本清单（ROADMAP Phase 4"最小运行时依赖清单"的
+    第一步）：便携包携带的是构建机当前 venv 的 site-packages，版本随构建机
+    浮动——没有这份清单，干净机出问题时无法还原"当时到底装了什么"。用
+    importlib.metadata 枚举（离线，不依赖子进程 pip）。体积优化（把清单
+    收敛到真实最小集）仍待干净机验收后进行。"""
+    from importlib import metadata
+
+    lines = sorted(
+        f"{dist.metadata['Name']}=={dist.version}"
+        for dist in metadata.distributions()
+        if dist.metadata["Name"]
+    )
+    (target / "requirements-lock.txt").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8", newline=""
+    )
+
+
 def build() -> Path:
     if OUTPUT_DIR.exists():
         shutil.rmtree(OUTPUT_DIR)
@@ -99,6 +120,7 @@ def build() -> Path:
     _copy_runtime(OUTPUT_DIR / "runtime" / "python")
     _copy_app(OUTPUT_DIR / "app")
     _write_launchers(OUTPUT_DIR)
+    _write_dependency_lock(OUTPUT_DIR)
     if OUTPUT_ZIP.exists():
         OUTPUT_ZIP.unlink()
     shutil.make_archive(str(OUTPUT_DIR), "zip", root_dir=OUTPUT_DIR.parent, base_dir=OUTPUT_DIR.name)

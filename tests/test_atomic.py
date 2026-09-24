@@ -58,6 +58,32 @@ class TestAtomicWrite(unittest.TestCase):
         self.assertEqual(calls["n"], 2)
         self.assertEqual(target.read_text(encoding="utf-8"), "after retry")
 
+    def test_unique_tmp_name_allows_concurrent_writers_to_same_target(self):
+        """同一目标文件被多线程并发写时，各线程用各自唯一命名的临时文件，
+        互不踩踏（index_progress 心跳/进度并发的真实场景）。"""
+        import threading
+
+        target = self.tmp / "concurrent.json"
+        errors: list[Exception] = []
+
+        def _worker(tag: str) -> None:
+            try:
+                for round_index in range(30):
+                    atomic_write_text(target, json.dumps({"tag": tag, "i": round_index}))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_worker, args=(f"t{index}",)) for index in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        data = json.loads(target.read_text(encoding="utf-8"))
+        self.assertIn(data["tag"], {"t0", "t1", "t2", "t3"})
+        residue = [path for path in self.tmp.glob("*.tmp")]
+        self.assertEqual(residue, [])
+
     def test_write_bytes_roundtrip(self):
         target = self.tmp / "archive.zip"
         atomic_write_bytes(target, b"PK\x03\x04 payload")

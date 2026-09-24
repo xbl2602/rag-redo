@@ -1,6 +1,6 @@
 # RAG REDO
 
-> A full architectural rewrite of a local semantic search system for Obsidian notes. **The core search pipeline works end to end, and the Windows installer has been verified with a real install/uninstall cycle** (see "Status" below). [中文 README](README.md)
+> A full architectural rewrite of a local semantic search system for Obsidian notes. **The core search pipeline works end to end, and Windows distribution is a self-contained portable ZIP** (see "Status" below). [中文 README](README.md)
 
 ## What this is
 
@@ -12,7 +12,7 @@ Phase 1 (text-search MVP) is implemented with real test coverage (350+ cases): 1
 
 `official-ocr-mineru-local` (on-device PDF OCR) is now wired to a real MinerU model — it detects and reuses an existing `uv tool install mineru[all]` environment on the machine (no re-downloading weights), and has been verified against real mixed Chinese/English scanned PDFs.
 
-**Not done yet**: the Windows installer can now really be installed and uninstalled (Inno Setup, `/CURRENTUSER` — no admin rights required; a real install/uninstall pass confirmed the Start Menu shortcut and registry entry are clean and that the user's indexed data survives uninstall — see [installer/README.md](installer/README.md)), but it hasn't been verified on a machine with no development tools installed (only tested on the build machine itself), and `official-visual-wemm`/`official-ocr-mineru-local` are currently unavailable in the packaged build (the frozen build is missing a standalone interpreter that `env_bootstrap`/external-tool detection needs — a known limitation); query-side HyDE augmentation (a feature that ran parallel to, and independent of, library summaries in the old project — discovered missing while investigating library summaries this round) hasn't been implemented.
+**Not done yet**: Windows distribution has switched to a portable ZIP with a bundled Python runtime (`installer/build_windows.py` — no PyInstaller/Inno Setup needed); it still has to be verified on a clean Windows machine without any development tools, and the package size can be slimmed further. On-device MinerU OCR (`official-ocr-mineru-local`) intentionally reuses an existing `uv tool install mineru[all]` environment instead of bundling one.
 
 Architecture docs:
 
@@ -25,7 +25,7 @@ Architecture docs:
 
 ## Try it now (from source; verified on both Linux and Windows)
 
-The Windows installer build has been verified (install/uninstall both work — see [installer/README.md](installer/README.md)), but it isn't published anywhere for direct download yet. To build one yourself: `.venv/Scripts/python.exe installer/build_windows.py`, then compile `installer/rag-redo.iss` with Inno Setup to get a `setup.exe`. The more common path below is source + a virtualenv. Commands are equivalent on Linux/Windows — swap `.venv/bin/` for `.venv\Scripts\`:
+There is no published download yet. To build the portable ZIP yourself: `.venv/Scripts/python.exe installer/build_windows.py` produces `dist/rag-redo-portable.zip` (bundled Python runtime, core, plugins and start scripts — unzip, double-click `start-gui.cmd`; see [installer/README.md](installer/README.md)). The more common path below is source + a virtualenv. Commands are equivalent on Linux/Windows — swap `.venv/bin/` for `.venv\Scripts\`:
 
 ```bash
 git clone <this-repo> rag-redo

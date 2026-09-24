@@ -18,10 +18,19 @@ save_registry（421-427 行）对 libraries.json 的 tmp+replace 原子写——
 from __future__ import annotations
 
 import os
+import threading
 import time
 from pathlib import Path
 
 _REPLACE_RETRY_DELAYS_S = (0.0, 0.01, 0.02)
+
+
+def _tmp_path_for(target: Path) -> Path:
+    # 唯一临时名（pid+线程id）：同一目标文件可能被同进程多线程或宿主/worker
+    # 双进程并发写入（index_progress 的心跳/进度就是真实场景）——固定 .tmp 名
+    # 会让并发写互相踩踏半截内容。对齐旧 resource_arbiter/index_progress 的
+    # 唯一命名先例。
+    return target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
 
 
 def _replace_with_retry(tmp_path: Path, target: Path) -> None:
@@ -40,12 +49,13 @@ def _replace_with_retry(tmp_path: Path, target: Path) -> None:
 
 def _atomic_write(target: Path, write) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target.with_name(target.name + ".tmp")
+    tmp_path = _tmp_path_for(target)
     try:
         write(tmp_path)
         _replace_with_retry(tmp_path, target)
     finally:
-        # 写入或替换失败时不留半截 .tmp 残骸（目标文件本身不受影响）
+        # 写入或替换失败时不留半截 .tmp 残骸（目标文件本身不受影响）；
+        # 只清自己这份唯一命名的临时文件，不碰并发写者的
         try:
             tmp_path.unlink()
         except FileNotFoundError:

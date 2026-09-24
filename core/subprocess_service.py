@@ -74,8 +74,10 @@ def _run_env_bootstrap(plugin_dir: Path, env_bootstrap: str, *, timeout: float, 
     要死死防住的场景，只是这次是被"能启动子进程"这个能力本身触发的自我
     复制，不是"启动了忘记收"。所以这里显式拒绝在冻结环境下尝试执行
     ——宁可插件启用失败、报错清楚，也不能让 fail-open 的退化路径变成
-    自我复制的进程炸弹。真正的修复（给冻结产物打包一份独立的、能当脚本
-    解释器用的便携 Python）是后续工作，还没做，见 docs/ROADMAP.md。"""
+    自我复制的进程炸弹。真正的修复（给冻结/便携产物打包一份独立的、能当
+    脚本解释器用的便携 Python，即下方 `_portable_python()` + 安装目录
+    runtime/python 约定）已经落地——便携 ZIP 构建已包含 runtime/python，
+    干净机验收仍是待办，见 docs/ROADMAP.md Phase 4。"""
     if getattr(sys, "frozen", False):
         python = _portable_python()
         if python is None:
