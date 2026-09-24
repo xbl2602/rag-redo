@@ -17,6 +17,7 @@ official-* 插件里，这个文件只是"胶水"，对应 docs/PLUGIN_SPEC.md �
 """
 from __future__ import annotations
 
+import atexit
 import os
 import sys
 from pathlib import Path
@@ -46,6 +47,7 @@ from mcp.server.mcpserver import MCPServer  # noqa: E402
 
 from core.pipeline import Pipeline  # noqa: E402
 from core.runtime import PluginRuntime  # noqa: E402
+from core.singleton import ProcessSingletonGuard  # noqa: E402
 
 #: MCP 工具实际需要的官方插件集——不含 GUI（gui-shell 目前还不存在，
 #: 就算存在，MCP 服务这条路径也用不上它，证明插件之间真的没有硬编码
@@ -92,6 +94,17 @@ def build_runtime() -> PluginRuntime:
 
 
 def main() -> None:
+    # 进程单例守卫（2026-09-23 全面功能审计发现的缺口，对齐 obsidian-rag
+    # singleton.py）：AI 工具用 stdio 方式拉起 MCP 服务时，观察到过启动后
+    # 短时间内连续拉起多个实例——双实例=两份 embedder/reranker 模型常驻
+    # +对同一个 data/ 目录的写竞争，是真实的资源浪费和数据风险。已有存活
+    # 实例时本进程直接谦让退出，不算错误。
+    guard = ProcessSingletonGuard(DATA_ROOT / "server.pid")
+    if not guard.acquire():
+        print("检测到已有 MCP 服务实例运行，本实例退出（单例守卫）。", file=sys.stderr)
+        sys.exit(0)
+    atexit.register(guard.release)
+
     runtime = build_runtime()
     pipeline = Pipeline(runtime)
     lib_mgr_plugin = runtime.plugins.get("official-library-manager")
