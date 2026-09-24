@@ -15,3 +15,4 @@ entry = "official_embedder_bge_m3.plugin:EmbedderPlugin"
 [permissions]
 network = true
 gpu = true
+filesystem = ["data_write"]

@@ -212,9 +212,20 @@ class _RealEncoder:
 
 
 class BGEM3Embedder:
-    def __init__(self, encoder: Encoder | None = None, *, resource_arbiter=None, logger=None) -> None:
+    def __init__(
+        self,
+        encoder: Encoder | None = None,
+        *,
+        resource_arbiter=None,
+        cooldown_gate: CudaCooldownGate | None = None,
+        logger=None,
+    ) -> None:
         # encoder=None 时用真实的（懒加载）；测试/CI 注入假 encoder。
-        self._encoder = encoder if encoder is not None else _RealEncoder(resource_arbiter=resource_arbiter, logger=logger)
+        self._encoder = (
+            encoder
+            if encoder is not None
+            else _RealEncoder(resource_arbiter=resource_arbiter, cooldown_gate=cooldown_gate, logger=logger)
+        )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:

@@ -157,8 +157,19 @@ class _RealReranker:
 
 
 class RerankerEngine:
-    def __init__(self, reranker: Reranker | None = None, *, resource_arbiter=None, logger=None) -> None:
-        self._reranker = reranker if reranker is not None else _RealReranker(resource_arbiter=resource_arbiter, logger=logger)
+    def __init__(
+        self,
+        reranker: Reranker | None = None,
+        *,
+        resource_arbiter=None,
+        cooldown_gate: CudaCooldownGate | None = None,
+        logger=None,
+    ) -> None:
+        self._reranker = (
+            reranker
+            if reranker is not None
+            else _RealReranker(resource_arbiter=resource_arbiter, cooldown_gate=cooldown_gate, logger=logger)
+        )
 
     def rerank(
         self, query: str, chunk_id_text_pairs: list[tuple[str, str]], top_k: int = 10

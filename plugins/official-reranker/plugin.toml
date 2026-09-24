@@ -15,3 +15,4 @@ entry = "official_reranker.plugin:RerankerPlugin"
 [permissions]
 network = true
 gpu = true
+filesystem = ["data_write"]
