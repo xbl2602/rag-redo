@@ -1932,20 +1932,54 @@ class Pipeline:
             raise PipelineError("当前 vector_store 实现不支持带格式门禁的采样")
         return vector_store.sample(library_id, k=k, generation=vector_segments[-1] if vector_segments else generation)
 
+    def library_content_fingerprint(self, library_id: str) -> str:
+        """库当前内容的指纹——逐字对齐 obsidian-rag/library_summary.py::
+        content_fingerprint（40-50 行）的算法：聚合全部已索引文件的
+        "相对路径:内容哈希"（排序后以 | 连接，sha256 截断 16 位），任何
+        增删改都会变化。旧项目的数据源是 meta 条目的 hash 字段，这里的
+        等价数据源是 per-file manifest 的 content_hash（两者都是"内容哈希"，
+        语义一致）。用于判断已生成的简介是否可能已过时，不参与采样。"""
+        generation = self._generations.active(library_id)
+        manifest = self._manifest(library_id, generation)
+        if manifest is None:
+            return ""
+        records = self._manifest_files(manifest)
+        parts = sorted(
+            f"{path}:{record.get('content_hash', '')}"
+            for path, record in records.items()
+            if record.get("content_hash")
+        )
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
     def propose_library_summary(self, library_id: str, text: str) -> dict:
         lib_mgr = self._singleton("library_manager")
         if lib_mgr.store.get(library_id) is None:
             raise KeyError(f"未知库: {library_id}")
-        return self._singleton("library_summary").propose(library_id, text)
+        # 对齐 obsidian-rag/server.py:508-509：AI 提交的简介在写入时刻
+        # 现算当前内容指纹一并落盘，is_stale 才有比对基准
+        fingerprint = self.library_content_fingerprint(library_id)
+        return self._singleton("library_summary").propose(library_id, text, fingerprint=fingerprint)
 
-    def set_library_summary_direct(self, library_id: str, text: str, *, source: str = "user") -> dict:
+    def set_library_summary_direct(
+        self,
+        library_id: str,
+        text: str,
+        *,
+        source: str = "user",
+        fingerprint: str | None = None,
+        model: str | None = None,
+    ) -> dict:
         """无条件写入，不经过写权限门禁——给"人类直接操作"这条路径用
         （GUI 手写编辑 / GUI"刷新简介"按钮），见 official-library-summary
-        插件 plugin.py::set_direct 的说明。"""
+        插件 plugin.py::set_direct 的说明。AI 刷新路径传入 fingerprint/model
+        （对齐旧项目 bridge.py:414）；用户手写不带指纹（对齐 bridge.py:356-365，
+        无指纹 = 不参与过时判定）。"""
         lib_mgr = self._singleton("library_manager")
         if lib_mgr.store.get(library_id) is None:
             raise KeyError(f"未知库: {library_id}")
-        return self._singleton("library_summary").set_direct(library_id, text, source=source)
+        return self._singleton("library_summary").set_direct(
+            library_id, text, source=source, fingerprint=fingerprint, model=model
+        )
 
     def apply_library_summary(self, library_id: str, proposal_id: str, confirmation_code: str) -> dict:
         lib_mgr = self._singleton("library_manager")
@@ -1953,12 +1987,14 @@ class Pipeline:
             raise KeyError(f"未知库: {library_id}")
         return self._singleton("library_summary").apply(library_id, proposal_id, confirmation_code)
 
-    def generate_library_summary(self, library_id: str, k: int = 20) -> tuple[str, str]:
+    def generate_library_summary(self, library_id: str, k: int = 20) -> tuple[str, str, str]:
         """采样 + 拼prompt + 依次尝试 llm_provider 链（按插件id字母序，
         同 `_extract()` 链式尝试 extractor:pdf 的既定模式），直到某个
-        provider 真的产出非空结果为止。返回 (生成的文本, 使用的provider
-        插件id)。**不落盘**——落盘是调用方决定要不要走
-        propose_library_summary() 的事，这里只负责"编排跨插件生成流程"。
+        provider 真的产出非空结果为止。返回 (生成的文本, 当前内容指纹,
+        使用的provider插件id)——对齐 obsidian-rag/library_summary.py::
+        generate_summary（225-247 行）的返回三元组，指纹供写入方一并落盘。
+        **不落盘**——落盘是调用方决定要不要走 propose_library_summary()/
+        set_direct() 的事，这里只负责"编排跨插件生成流程"。
         """
         lib_mgr = self._singleton("library_manager")
         cfg = lib_mgr.store.get(library_id)
@@ -1979,7 +2015,7 @@ class Pipeline:
             provider = self._plugin(plugin_id)
             text = provider.complete(system, user)
             if text:
-                return summary_plugin.finalize_text(text), plugin_id
+                return summary_plugin.finalize_text(text), self.library_content_fingerprint(library_id), plugin_id
         raise PipelineError("所有 llm_provider 均未能生成简介（服务不可用或返回为空，检查本地/云端LLM服务是否在线）")
 
     # ---- 导入导出 --------------------------------------------------------

@@ -1389,9 +1389,12 @@ class TestLibrarySummaryPipeline(unittest.TestCase):
             self.pipeline.sample_library("no-such-lib")
 
     def test_generate_library_summary_calls_llm_provider_chain_and_returns_text(self):
-        text, provider_id = self.pipeline.generate_library_summary("test-lib")
+        text, fingerprint, provider_id = self.pipeline.generate_library_summary("test-lib")
         self.assertEqual(provider_id, "official-llm-openai-compatible")
         self.assertEqual(text, self.fake_llm.response)
+        # 指纹对齐旧项目 content_fingerprint：全部已索引文件的 path:hash 聚合，
+        # 非空且随内容变化（这里校验存在性，变化性由指纹专项测试覆盖）
+        self.assertTrue(fingerprint)
         self.assertEqual(len(self.fake_llm.calls), 1)
         # prompt 里应该真的带上了采样到的文件名，不是空壳调用
         self.assertTrue(any(name in self.fake_llm.calls[0]["user"] for name in ("plugin-notes.md", "cooking.md")))
@@ -1408,6 +1411,14 @@ class TestLibrarySummaryPipeline(unittest.TestCase):
         summary = self.pipeline.get_library_summary("test-lib")
         self.assertEqual(summary.text, "一段AI生成的简介")
         self.assertEqual(summary.source, "ai")
+        # 对齐旧项目 server.py:508-509：AI 提交时指纹随写落盘（非空），
+        # 且内容未变时 is_stale=False、内容变化后 stale=True
+        self.assertTrue(summary.fingerprint)
+        self.assertFalse(
+            self.pipeline._singleton("library_summary").is_stale(
+                "test-lib", self.pipeline.library_content_fingerprint("test-lib")
+            )
+        )
 
     def test_propose_over_user_summary_requires_gate_confirmation(self):
         """完整端到端验证写权限门禁真的挡住了 AI 覆盖用户手写内容——

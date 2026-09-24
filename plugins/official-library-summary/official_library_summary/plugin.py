@@ -26,17 +26,17 @@ sample_library() 拿到的采样片段自己写一段话，再调用这个插件
 代笔，走 core/pipeline.py::generate_library_summary()，真的调一次配置好
 的 llm_provider。这个插件本身对这两条路径一视同仁，不知道调用方是哪一种。
 
-**内容指纹的简化**：旧项目 library_summary.py::content_fingerprint 聚合
-"全部已索引文件的相对路径:md5"来判断简介是否可能已过时；rag-redo 目前
-没有中心化暴露"某个库全部文件当前哈希"的查询接口，这里用"本次采样到的
-代表片段内容"算指纹作为务实的代理信号——库内容变化到足以影响最远点
-采样结果时，指纹大概率也会跟着变，效果上达到同样的"提示可能已过时"
-目的，但不是与旧项目完全等价的算法，不需要为了这一处单独设计一套新的
-跨插件"库全量内容哈希"查询契约——如实记录这个简化，不假装是同一个算法。
+**内容指纹**：对齐旧项目 library_summary.py::content_fingerprint 的精确
+算法——聚合"全部已索引文件的 相对路径:内容哈希"。旧项目数据源是 meta
+条目的 hash 字段；rag-redo 的等价数据源是 per-file manifest 的
+content_hash，指纹计算由编排层 core/pipeline.py::library_content_fingerprint
+完成（manifest 是编排层私有的，插件不读它），AI 提交（MCP propose /
+GUI AI 刷新）在写入时刻现算当前指纹一并落盘；用户手写（source=user）
+不带指纹——对齐旧项目 bridge.py:356-365 手写路径的行为（无指纹 =
+不参与过时判定）。此前版本用"采样片段内容哈希"做代理信号，是当时没有
+中心化"库全量文件哈希"查询接口时的务实替代，现已按原算法替换。
 """
 from __future__ import annotations
-
-import hashlib
 
 from core.contracts import LibrarySummary, SampledChunk
 from core.write_gate import WriteGateError
@@ -45,11 +45,6 @@ from .prompt import INSTRUCTIONS, build_prompt
 from .summary_store import SUMMARY_MAX_CHARS, SummaryStore
 
 PLUGIN_ID = "official-library-summary"
-
-
-def _content_fingerprint(samples: list[SampledChunk]) -> str:
-    parts = sorted(f"{s.path}:{s.heading}:{hashlib.sha256(s.text.encode('utf-8')).hexdigest()[:12]}" for s in samples)
-    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
 class LibrarySummaryPlugin:
@@ -93,9 +88,6 @@ class LibrarySummaryPlugin:
 
     def build_prompt(self, library_name: str, samples: list[SampledChunk]) -> tuple[str, str]:
         return INSTRUCTIONS, build_prompt(library_name, samples)
-
-    def content_fingerprint(self, samples: list[SampledChunk]) -> str:
-        return _content_fingerprint(samples)
 
     def finalize_text(self, text: str) -> str:
         return text.strip()[:SUMMARY_MAX_CHARS]

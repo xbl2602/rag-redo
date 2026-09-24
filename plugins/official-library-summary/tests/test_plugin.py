@@ -104,10 +104,13 @@ class TestLibrarySummaryPlugin(unittest.TestCase):
         self.assertIn("a.md", user)
         self.assertEqual(self.instance.finalize_text("  超长内容" * 200), self.instance.finalize_text("  超长内容" * 200)[:300])
 
-    def test_content_fingerprint_changes_when_samples_change(self):
-        samples_a = [SampledChunk(path="a.md", heading="", text="内容甲")]
-        samples_b = [SampledChunk(path="a.md", heading="", text="内容乙")]
-        self.assertNotEqual(self.instance.content_fingerprint(samples_a), self.instance.content_fingerprint(samples_b))
+    def test_propose_accepts_fingerprint_and_is_stale_compares_it(self):
+        """指纹的"计算"已归属编排层（core/pipeline.py::
+        library_content_fingerprint，manifest 全量 path:hash 聚合，对齐旧
+        项目 content_fingerprint 算法）——插件只负责存储与比对。"""
+        self.instance.propose("lib1", "简介", fingerprint="fp-current")
+        self.assertFalse(self.instance.is_stale("lib1", "fp-current"))
+        self.assertTrue(self.instance.is_stale("lib1", "fp-new"))
 
     def test_is_stale_true_when_fingerprint_differs(self):
         self.instance.propose("lib1", "简介", fingerprint="old-fp")

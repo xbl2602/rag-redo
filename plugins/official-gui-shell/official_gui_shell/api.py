@@ -327,8 +327,10 @@ class Api:
             current = self._pipeline.get_library_summary(library_id)
             if current.source == "user" and not force:
                 return {"ok": False, "needs_confirm": True}
-            text, provider_id = self._pipeline.generate_library_summary(library_id)
-            result = self._pipeline.set_library_summary_direct(library_id, text, source="ai")
+            text, fingerprint, provider_id = self._pipeline.generate_library_summary(library_id)
+            result = self._pipeline.set_library_summary_direct(
+                library_id, text, source="ai", fingerprint=fingerprint, model=provider_id
+            )
         except Exception as exc:  # noqa: BLE001 - 见模块 docstring
             return {"ok": False, "error": str(exc)}
         result["provider"] = provider_id
