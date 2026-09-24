@@ -41,8 +41,8 @@
 
 ## 当前进度
 
-- [ ] C1 全部测试套件保持全绿（持续验证项，每完成一个子任务后重跑；最近一次 `tests/run.py` 结果 36/36）
+- [x] C1 全部测试套件保持全绿（持续验证项，每完成一个子任务后重跑；最近一次 `tests/run.py` 结果 39/39，仍需在每个后续子任务后重跑确认不回归）
 - [x] C2 MCP 工具集对齐16个——全部16个 obsidian-rag 工具均已覆盖（list_libraries/get_selection/propose_selection_changes/apply_selection_changes/get_library_sample/propose_library_summary/apply_library_summary/note_relations/search_knowledge/reindex_knowledge/index_status/navigate_knowledge/read_document/find_duplicates/index_failures/wemm_status），另有 `export_library`/`import_library` 两个 rag-redo 独有额外工具。验证：`.venv/Scripts/python.exe -m unittest plugins.official-mcp-server.tests.test_tools -k test_tools_are_discoverable_with_schema` 通过。
 - [x] C3 后台索引 + index_status——`reindex_knowledge` 已改为调用 `Pipeline.start_index_library()` 后台执行+立即返回，新增 `index_status(library_id)` 工具查询真实进度/心跳健康；底层 `core/index_progress.py` 真实抓到并修复两个并发bug（`Path.write_text`非原子导致读到截断JSON、Windows下`os.replace`撞上并发读句柄的瞬时`PermissionError`）。验证：`.venv/Scripts/python.exe -m unittest plugins.official-mcp-server.tests.test_tools -k index_status` 2 用例通过。
 - [x] C4 wikilink 解析 + note_relations——新增 `core/note_relations.py`（逐字对齐 obsidian-rag `index.py::extract_wikilink_targets`/`resolve_note_relations` 的解析规则+"只存出链、入链现算"设计），`index_library()` 提取阶段顺手记录、新增 `note_relations` MCP 工具。验证：`.venv/Scripts/python.exe -m unittest plugins.official-mcp-server.tests.test_tools -k note_relations` 3 用例通过（含真实构造互链两篇笔记验证出链/入链）。
-- [ ] C5 ROADMAP.md 文档闭环
+- [ ] C5 ROADMAP.md 文档闭环——`docs/ROADMAP.md` 已更新（A/B/C类清单逐条标注✅已完成/⬜仍未做+新增汇总段落），**等待操作者人工通读确认名实相符**（C5 本身要求人工确认，不由我自行勾选）
