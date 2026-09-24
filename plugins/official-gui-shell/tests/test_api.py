@@ -131,6 +131,7 @@ class TestApi(unittest.TestCase):
         self.assertTrue(search_result["ok"])
         self.assertGreater(len(search_result["results"]), 0)
         self.assertEqual(search_result["results"][0]["path"], "notes.md")
+        self.assertIn("confidence_tier", search_result["results"][0])
 
     def test_reindex_unknown_library_returns_error_not_exception(self):
         result = self.api.reindex_library("no-such-lib")

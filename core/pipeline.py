@@ -26,6 +26,27 @@ from .runtime import PluginRuntime
 DEFAULT_FUSION_DENSE_WEIGHT = 1.0  # RRF 融合里"向量语义"这一路的权重，对齐 obsidian-rag/config.py 同名默认值
 DEFAULT_FUSION_BM25_WEIGHT = 1.0  # RRF 融合里"BM25关键词"这一路的权重，同上
 
+# 置信度分档 + 同篇结果封顶（2026-09-23 全面功能审计B类，对齐 obsidian-rag
+# retriever.py 的"问题54真分尺度重标定"一节）：DEFAULT_* 都是 obsidian-rag
+# config.py 里对应设置项的逐字默认值，真实值走 core/settings.py（GUI/MCP
+# 都能读同一份设置，不各自维护一份影子默认值）。
+CONF_TIER_STRONG = 0.75  # 置信度≥此值 → "高相关"（真分尺度，重排器自己的相关概率，非批内归一化）
+DEFAULT_CONFIDENCE_WARN_THRESHOLD = 0.30  # 低于此值 → "弱相关"，来源行标注"仅供参考"
+DEFAULT_CONFIDENCE_DROP_THRESHOLD = 0.0  # 低于此值直接丢弃不返回；0=关闭（obsidian-rag当前默认口径：给满top_k，只标注不丢弃）
+DEFAULT_MAX_CHUNKS_PER_FILE = 3  # 同一文件在最终结果里最多出现几条，防止单篇文档占满整个结果列表
+
+
+def confidence_tier(conf: float, warn_threshold: float) -> str:
+    """置信度 → 分档词（高相关/中相关/弱相关）。参数与比较都在真分尺度
+    （重排器自己的相关概率）上，对齐 obsidian-rag `retriever.py::_conf_tier`
+    的分档逻辑——`SearchResult.confidence` 已经是钳位后的原始概率，
+    这里只是加一层人类可读标签，不改变排序或过滤。"""
+    if conf >= CONF_TIER_STRONG:
+        return "高相关"
+    if conf >= warn_threshold:
+        return "中相关"
+    return "弱相关"
+
 
 class PipelineError(RuntimeError):
     """编排层缺少必要的已启用插件时抛出——这不是插件自己的失败折叠范畴
@@ -422,18 +443,37 @@ class Pipeline:
         if not reranked:
             return []
 
+        drop_threshold = self.runtime.settings.get("confidence_drop_threshold", DEFAULT_CONFIDENCE_DROP_THRESHOLD)
+        max_chunks_per_file = self.runtime.settings.get("max_chunks_per_file", DEFAULT_MAX_CHUNKS_PER_FILE)
+
         results: list[SearchResult] = []
+        per_file_count: dict[tuple[str, str], int] = {}
         for chunk_id, score in reranked:
+            confidence = max(0.0, min(1.0, float(score)))
+            if confidence < drop_threshold:
+                # 低置信护栏（drop）：噪音命中直接不返回，宁缺毋滥——对齐
+                # obsidian-rag 同名护栏，默认阈值0.0=关闭（给满top_k，只
+                # 标注不丢弃，是否收紧是产品决策，交给 confidence_drop_
+                # threshold 设置项，不在代码里硬编码收紧）。
+                continue
             record = records[chunk_id]
             meta = record["metadata"] or {}
+            file_key = (_chunk_library(chunk_id), meta.get("path", ""))
+            if per_file_count.get(file_key, 0) >= max_chunks_per_file:
+                # 同篇结果封顶：该文件的展示名额已满——对齐 obsidian-rag
+                # 的 max_chunks_per_file（防止单篇文档挤占整个结果列表），
+                # 被封顶掉的候选不占 top_k 名额，也不会被其他文件的候选
+                # 补位（候选池本来就已经是重排后的最终名次，跳过即可）。
+                continue
+            per_file_count[file_key] = per_file_count.get(file_key, 0) + 1
             results.append(
                 SearchResult(
                     chunk_id=chunk_id,
-                    library_id=_chunk_library(chunk_id),
-                    path=meta.get("path", ""),
+                    library_id=file_key[0],
+                    path=file_key[1],
                     heading_breadcrumb=meta.get("heading_breadcrumb", ""),
                     text=record["document"],
-                    confidence=max(0.0, min(1.0, float(score))),
+                    confidence=confidence,
                 )
             )
         return results

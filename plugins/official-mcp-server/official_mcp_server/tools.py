@@ -9,7 +9,7 @@ from __future__ import annotations
 import base64
 from typing import Any
 
-from core.pipeline import Pipeline
+from core.pipeline import DEFAULT_CONFIDENCE_WARN_THRESHOLD, Pipeline, confidence_tier
 
 
 def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
@@ -62,6 +62,9 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
             results = pipeline.search(libraries, query, top_k=top_k, exclude=exclude, folder=folder)
         except Exception as exc:  # noqa: BLE001 - 见上方 docstring
             return {"ok": False, "error": str(exc)}
+        warn_threshold = pipeline.runtime.settings.get(
+            "confidence_warn_threshold", DEFAULT_CONFIDENCE_WARN_THRESHOLD
+        )
         return {
             "ok": True,
             "results": [
@@ -71,6 +74,8 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
                     "heading": r.heading_breadcrumb,
                     **({"text": r.text} if include_body else {}),
                     "confidence": round(r.confidence, 3),
+                    "confidence_tier": confidence_tier(r.confidence, warn_threshold),
+                    **({"note": f"低置信度 {r.confidence:.2f}，仅供参考"} if r.confidence < warn_threshold else {}),
                 }
                 for r in results
             ],

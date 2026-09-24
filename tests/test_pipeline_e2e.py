@@ -22,7 +22,7 @@ for plugin_dir in (REPO_ROOT / "plugins").glob("*"):
     if plugin_dir.is_dir():
         sys.path.insert(0, str(plugin_dir))
 
-from core.pipeline import Pipeline  # noqa: E402
+from core.pipeline import Pipeline, confidence_tier  # noqa: E402
 from core.runtime import PluginRuntime, PluginState  # noqa: E402
 
 OFFICIAL_PHASE1_PLUGINS = [
@@ -58,6 +58,27 @@ class _DeterministicFakeReranker:
         # （demo-vault 那份测试真实踩到过，见 tests/test_demo_vault.py）。
         query_terms = query.split()
         return [sum(text.count(term) for term in query_terms) for text in texts]
+
+
+class TestConfidenceTier(unittest.TestCase):
+    """纯函数，不需要真实索引/检索基础设施——对齐 obsidian-rag
+    retriever.py::_conf_tier 的分档线（真分尺度，高相关线固定0.75）。"""
+
+    def test_at_or_above_strong_threshold_is_high(self):
+        self.assertEqual(confidence_tier(0.75, warn_threshold=0.30), "高相关")
+        self.assertEqual(confidence_tier(0.98, warn_threshold=0.30), "高相关")
+
+    def test_between_warn_and_strong_is_medium(self):
+        self.assertEqual(confidence_tier(0.50, warn_threshold=0.30), "中相关")
+
+    def test_below_warn_threshold_is_weak(self):
+        self.assertEqual(confidence_tier(0.10, warn_threshold=0.30), "弱相关")
+
+    def test_at_warn_threshold_is_medium_not_weak(self):
+        self.assertEqual(confidence_tier(0.30, warn_threshold=0.30), "中相关")
+
+    def test_different_warn_threshold_shifts_boundary(self):
+        self.assertEqual(confidence_tier(0.40, warn_threshold=0.50), "弱相关")
 
 
 class TestEndToEndSearchPipeline(unittest.TestCase):
@@ -180,6 +201,46 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         for r in results:
             self.assertGreaterEqual(r.confidence, 0.0)
             self.assertLessEqual(r.confidence, 1.0)
+
+    def test_max_chunks_per_file_caps_same_file_results(self):
+        """同篇结果封顶（对齐 obsidian-rag 的 max_chunks_per_file，2026-09-23
+        全面功能审计B类）：单篇文档命中很多块也不该挤占整个结果列表，
+        默认每篇最多3条。用5个独立小节都强命中同一关键词的文件构造。"""
+        big_vault = self.tmp / "big-vault"
+        big_vault.mkdir()
+        sections = "\n\n".join(f"## 第{i}节\n\n插件 插件 插件 架构相关内容第{i}节。" for i in range(1, 6))
+        (big_vault / "big.md").write_text(f"# 大文件\n\n{sections}", encoding="utf-8")
+        self.lib_mgr.store.add_library("big-lib", "大文件库", str(big_vault))
+
+        self.pipeline.index_library("big-lib")
+        results = self.pipeline.search("big-lib", "插件", top_k=10)
+        same_file_hits = [r for r in results if r.path == "big.md"]
+        self.assertGreaterEqual(len(same_file_hits), 1)
+        self.assertLessEqual(len(same_file_hits), 3, "默认 max_chunks_per_file=3，不该超过这个数")
+
+    def test_max_chunks_per_file_setting_overrides_default(self):
+        big_vault = self.tmp / "big-vault2"
+        big_vault.mkdir()
+        sections = "\n\n".join(f"## 第{i}节\n\n插件 插件 插件 架构相关内容第{i}节。" for i in range(1, 6))
+        (big_vault / "big.md").write_text(f"# 大文件\n\n{sections}", encoding="utf-8")
+        self.lib_mgr.store.add_library("big-lib2", "大文件库2", str(big_vault))
+        self.pipeline.index_library("big-lib2")
+
+        self.pipeline.runtime.settings.set("max_chunks_per_file", 1)
+        results = self.pipeline.search("big-lib2", "插件", top_k=10)
+        same_file_hits = [r for r in results if r.path == "big.md"]
+        self.assertEqual(len(same_file_hits), 1)
+
+    def test_confidence_drop_threshold_filters_low_confidence_results(self):
+        """置信度丢弃护栏默认关闭（0.0），显式调高后应该真的把低于阈值的
+        命中丢掉——对齐 obsidian-rag 的 confidence_drop_threshold。"""
+        self.pipeline.index_library("test-lib")
+        baseline = self.pipeline.search("test-lib", "插件 架构", top_k=10)
+        self.assertTrue(baseline)
+
+        self.pipeline.runtime.settings.set("confidence_drop_threshold", 1.1)  # 高于任何可能的置信度，全部丢弃
+        dropped = self.pipeline.search("test-lib", "插件 架构", top_k=10)
+        self.assertEqual(dropped, [])
 
     def test_bm25_search_survives_process_restart(self):
         """真实缺口回归测试：早期实现里 BM25 词法索引完全只活在内存里，

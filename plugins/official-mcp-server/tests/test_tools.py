@@ -209,6 +209,8 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertEqual(hits[0]["path"], "notes.md")
         self.assertEqual(hits[0]["library_id"], "test-lib")
         self.assertIn("confidence", hits[0])
+        self.assertIn("confidence_tier", hits[0])
+        self.assertIn(hits[0]["confidence_tier"], ("高相关", "中相关", "弱相关"))
 
     async def test_read_document_tool_reads_source_file_for_md(self):
         await self._reindex_and_wait("test-lib")

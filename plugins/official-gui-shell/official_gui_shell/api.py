@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from core.pipeline import Pipeline
+from core.pipeline import DEFAULT_CONFIDENCE_WARN_THRESHOLD, Pipeline, confidence_tier
 
 
 class Api:
@@ -77,6 +77,9 @@ class Api:
             results = self._pipeline.search(libraries, query, top_k=top_k, exclude=exclude, folder=folder)
         except Exception as exc:  # noqa: BLE001 - 见模块 docstring
             return {"ok": False, "error": str(exc)}
+        warn_threshold = self._pipeline.runtime.settings.get(
+            "confidence_warn_threshold", DEFAULT_CONFIDENCE_WARN_THRESHOLD
+        )
         return {
             "ok": True,
             "results": [
@@ -86,6 +89,7 @@ class Api:
                     "heading": r.heading_breadcrumb,
                     "text": r.text,
                     "confidence": round(r.confidence, 3),
+                    "confidence_tier": confidence_tier(r.confidence, warn_threshold),
                 }
                 for r in results
             ],
