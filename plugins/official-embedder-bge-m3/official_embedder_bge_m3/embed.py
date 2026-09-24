@@ -33,14 +33,16 @@ import，这个基类在两个插件里各自有一份，是刻意的小重复�
 core/subprocess_service.py::resolve_plugin_python 的 docstring 提到的
 "跨插件隔离边界的小工具函数该复制不该硬造共享桥梁"这条先例）。
 
-**已知的、刻意的简化**：旧项目对 CUDA 失败有一整套"冷却期+定时自动探测
-切回"的状态机（index.py `_cuda_cooldown_until`/`_try_switch_back_cuda`），
-这里只做"这次加载失败就退回 CPU"的单次降级，不做冷却计时器和后台自动
-切回线程——理由：这一层状态机是"CUDA 偶发失败后如何优雅恢复"这个更深的
-可靠性课题，和这一轮"不能让 WEMM/OCR-local 因为 bge-m3 常驻显存就永远
-抢不到资源"这个核心正确性目标不是同一个问题，仓促实现一个简化版反而可能
-引入新 bug；单次降级不会导致任何请求失败或卡死（CPU 编码变慢但能用），
-不是回归，只是没有做进一步的自愈优化。
+**CUDA 冷却期状态机（2026-09-25 按旧项目原行为补齐，消除此前"单次降级
+永不切回"的已知简化）**：CUDA 失败（初始化异常/连续慢批疑似共享显存溢出）
+→ 进入冷却期（默认 300s，设置项 `cuda_cooldown_seconds`，对齐旧项目
+config.py 同名项）+ 诊断落盘 device_state.json；冷却期内直接用 CPU，到期后
+毫秒级轻量探测（64MB 显存分配）通过才尝试 CUDA——显存恢复后最多等一个
+冷却期自动切回。状态机实现在 `core.gpu_arbiter.CudaCooldownGate`（embedder
+和 reranker 是同一个"检索侧 GPU 消费群体"，冷却/恢复状态理应一致），各
+语义对应旧项目 index.py 的 _cuda_probe/_cuda_ready/_cooldown_cuda/
+_report_device/fallback_to_cpu。慢批检测（单批 >30s 疑似 Windows WDDM
+共享显存溢出，连续两批主动降级）同样对齐旧项目 encode_safe。
 """
 from __future__ import annotations
 
@@ -49,12 +51,14 @@ import time
 from typing import Protocol
 
 from core import gpu_arbiter
+from core.gpu_arbiter import CudaCooldownGate
 
 MODEL_VERSION = "BAAI/bge-m3"
 GPU_RESOURCE_ID = "gpu:0"
 GPU_HOLDER_ID = "official-text-retrieval-gpu"  # 和 official-reranker 共用同一个 holder_id，见模块 docstring
 GPU_PRIORITY = 100  # 检索侧优先，压过 WEMM/OCR-local 的10（对齐旧项目"检索优先抢占"）
 IDLE_UNLOAD_SECONDS = 300  # 空闲卸载模型释放显存，对齐旧项目默认 gpu_idle_unload_seconds
+SLOW_BATCH_SECONDS = 30.0  # CUDA 单批编码超过此值视为疑似共享显存溢出（对齐旧项目 encode_safe）
 
 
 class Encoder(Protocol):
@@ -71,13 +75,16 @@ class _RealEncoder:
         model_name: str = MODEL_VERSION,
         *,
         resource_arbiter=None,
+        cooldown_gate: CudaCooldownGate | None = None,
         logger=None,
     ) -> None:
         self._model_name = model_name
         self._model = None
         self._resource_arbiter = resource_arbiter
+        self._cooldown_gate = cooldown_gate if cooldown_gate is not None else CudaCooldownGate()
         self._logger = logger
         self._last_use = time.time()
+        self._slow_batch_count = 0
         self._lock = threading.RLock()
 
     def _log(self, message: str) -> None:
@@ -90,8 +97,19 @@ class _RealEncoder:
                 from sentence_transformers import SentenceTransformer  # noqa: PLC0415 - 故意懒加载，见模块 docstring
 
                 device = self._select_device()
-                self._model = SentenceTransformer(self._model_name, device=device)
+                try:
+                    self._model = SentenceTransformer(self._model_name, device=device)
+                except Exception as exc:
+                    # 对齐旧项目 get_model：CUDA 初始化失败 → 冷却 + 降级 CPU
+                    # 重试一次（CPU 再失败才真的抛出）
+                    if device != "cuda":
+                        raise
+                    self._cooldown_gate.cooldown(str(exc))
+                    self._log(f"CUDA 初始化失败（{exc}），降级 CPU")
+                    device = "cpu"
+                    self._model = SentenceTransformer(self._model_name, device=device)
                 self._log(f"BGE-M3模型已加载（device={device}）")
+                self._cooldown_gate.report_device(device)
             self._last_use = time.time()
             return self._model
 
@@ -105,12 +123,9 @@ class _RealEncoder:
         式的；仲裁/探测拿不到明确答案时不阻塞，直接尝试用 CUDA；真的初始化
         失败再退回 CPU（单次降级，不做冷却重试，见模块 docstring"已知的
         刻意简化"）。"""
-        try:
-            import torch
-
-            if not torch.cuda.is_available():
-                return "cpu"
-        except Exception:  # noqa: BLE001
+        # 冷却期状态机取代裸 is_available：冷却期内直接 CPU，到期后轻量
+        # 探测通过才尝试 CUDA（对齐旧项目 _cuda_ready）
+        if not self._cooldown_gate.ready():
             return "cpu"
         if self._resource_arbiter is not None:
             acquired = self._resource_arbiter.acquire(
@@ -135,9 +150,31 @@ class _RealEncoder:
     def encode(self, texts: list[str]) -> list[list[float]]:
         with self._lock:
             model = self._ensure_loaded()
+            started = time.time()
             result = model.encode(texts, normalize_embeddings=True).tolist()
+            elapsed = time.time() - started
             self._last_use = time.time()
+            self._check_slow_batch(elapsed)
             return result
+
+    def _check_slow_batch(self, elapsed: float) -> None:
+        """Windows WDDM 显存溢出会静默排入共享显存而不报错，只能靠耗时识别：
+        单批 >SLOW_BATCH_SECONDS 告警，连续两批主动降级 CPU（对齐旧项目
+        encode_safe 的慢批检测）。降级 = 卸载模型 + 进入冷却，下一次调用经
+        _select_device 的冷却门自然落在 CPU 上。"""
+        if elapsed > SLOW_BATCH_SECONDS:
+            self._slow_batch_count += 1
+            self._log(
+                f"CUDA 单批编码耗时 {elapsed:.1f}s（>{SLOW_BATCH_SECONDS:.0f}s），"
+                f"疑似共享显存溢出（连续 {self._slow_batch_count} 次）"
+            )
+            if self._slow_batch_count >= 2:
+                self._log("连续慢批，主动降级 CPU，避免病态运行...")
+                self._cooldown_gate.cooldown("slow-batch")
+                self._unload()
+                self._slow_batch_count = 0
+        else:
+            self._slow_batch_count = 0
 
     def idle_check(self) -> None:
         """由插件的空闲卸载守护线程周期调用——空闲超过 IDLE_UNLOAD_SECONDS

@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 
 from core.contracts import Chunk, EmbeddingVector
+from core.gpu_arbiter import CudaCooldownGate
 
 from .embed import IDLE_UNLOAD_SECONDS, MODEL_VERSION, BGEM3Embedder, Encoder
 
@@ -29,7 +30,17 @@ class EmbedderPlugin:
         self._idle_thread: threading.Thread | None = None
 
     def on_load(self, ctx):
-        self.embedder = BGEM3Embedder(encoder=self._injected_encoder, resource_arbiter=ctx.resource_arbiter, logger=ctx.logger)
+        gate = CudaCooldownGate(
+            cooldown_seconds=ctx.settings.get("cuda_cooldown_seconds", 300),
+            log=ctx.logger.info,
+            state_file=ctx.storage.file("device_state.json", legacy="device_state.json"),
+        )
+        self.embedder = BGEM3Embedder(
+            encoder=self._injected_encoder,
+            resource_arbiter=ctx.resource_arbiter,
+            cooldown_gate=gate,
+            logger=ctx.logger,
+        )
         ctx.logger.info("BGE-M3向量化插件已加载（模型懒加载，首次编码时才真正下载/加载）")
 
     def on_enable(self, ctx):

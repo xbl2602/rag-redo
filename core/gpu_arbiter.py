@@ -34,6 +34,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+from .atomic import atomic_write_text
 
 # GPU 驻留变更总锁（对齐旧项目问题59的并发调度考虑）。
 #
@@ -127,3 +130,87 @@ def request_evict(url: str, timeout: float = 15.0) -> bool:
             return bool(json.loads(resp.read()).get("ok"))
     except Exception:  # noqa: BLE001
         return False
+
+
+class CudaCooldownGate:
+    """CUDA 冷却期状态机——逐字对齐 obsidian-rag/index.py 的
+    _cuda_probe（569-581）/ _cuda_ready（592-599）/ _cooldown_cuda
+    （602-606）/ _report_device（514-528）四个函数的语义。
+
+    旧项目对 CUDA 失败的处理不是"永久放弃"也不是"每批重试"：失败一次进
+    入冷却期（默认 300s，对齐旧项目 config.py::cuda_cooldown_seconds），
+    冷却期内直接用 CPU；到期后做一次**毫秒级轻量探测**（分配 64MB 显存），
+    探测通过才真正尝试 CUDA——显存恢复后最多等一个冷却期就自动切回，且
+    探测只分配小显存，自身不会 OOM。rag-redo 此前只做"单次降级 CPU、永不
+    切回"（embed.py/rerank.py 曾如实记录这个简化），2026-09-25 按旧项目
+    原行为补齐。放在 core 而不是某个插件里：embedder 和 reranker 是同一个
+    "检索侧 GPU 消费群体"（共用 GPU_HOLDER_ID，见 embed.py 模块 docstring），
+    冷却/恢复状态理应一致，且这个模块本来就是两个插件直接 import 的
+    领域工具层。
+
+    device_state 诊断落盘（可选）：对齐旧项目 DEVICE_STATE_FILE——成功就位
+    写 {"device", "healthy", "checked_at", "note"}，失败写
+    {"device", "failed_at", "reason"}，仅作诊断记录，不做门禁。embedder 和
+    reranker 共享同一个 device_state.json（同旧项目检索侧单一状态）。
+    """
+
+    PROBE_TENSOR_BYTES = 64 * 1024 * 1024  # 64MB：毫秒级分配，探测自身不会 OOM
+
+    def __init__(self, *, cooldown_seconds: float = 300.0, log=None, state_file=None) -> None:
+        self._cooldown_seconds = float(cooldown_seconds)
+        self._cooldown_until = 0.0
+        self._log = log if log is not None else (lambda message: None)
+        self._state_file = state_file
+
+    def probe(self) -> bool:
+        """轻量探测 GPU 可用性：分配 64MB 显存成功即视为可用（毫秒级，
+        失败返回 False）——逐字对齐旧项目 _cuda_probe。"""
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return False
+            tensor = torch.empty(self.PROBE_TENSOR_BYTES, dtype=torch.uint8, device="cuda")
+            del tensor
+            return True
+        except Exception:  # noqa: BLE001 - 探测失败 = 不可用，绝不抛
+            return False
+
+    def ready(self) -> bool:
+        """冷却期内直接返回 False（用 CPU）；到期后轻量探测，可用才尝试
+        CUDA——逐字对齐旧项目 _cuda_ready 的"无硬性窗口：显存恢复后最多
+        等一个冷却期自动切回"。"""
+        if time.time() < self._cooldown_until:
+            return False
+        if not self.probe():
+            self._cooldown_until = time.time() + self._cooldown_seconds
+            return False
+        return True
+
+    def cooldown(self, reason: str) -> None:
+        """CUDA 失败：进入冷却期 + 诊断落盘——对齐旧项目 _cooldown_cuda。"""
+        self._cooldown_until = time.time() + self._cooldown_seconds
+        self._write_state(
+            {"device": "cuda", "failed_at": time.time(), "reason": str(reason)[:200]}
+        )
+        self._log(f"CUDA 失败，进入 {self._cooldown_seconds}s 冷却（到期自动探测重试）：{reason}")
+
+    def report_device(self, device: str, note: str = "") -> None:
+        """模型成功就位后上报当前设备——对齐旧项目 _report_device；成功用
+        CUDA 会覆盖历史残留的失败记录，避免陈旧失败标记误导排查。"""
+        self._write_state(
+            {
+                "device": device,
+                "healthy": device == "cuda",
+                "checked_at": round(time.time(), 1),
+                "note": note,
+            }
+        )
+
+    def _write_state(self, state: dict) -> None:
+        if self._state_file is None:
+            return
+        try:
+            atomic_write_text(self._state_file, json.dumps(state, ensure_ascii=False))
+        except OSError:
+            pass  # 诊断写盘失败不影响任何主流程（对齐旧项目"写入失败忽略"）

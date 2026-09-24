@@ -43,6 +43,7 @@ SETTING_FIELD_META: dict[str, dict[str, Any]] = {
     "hyde_llm_api_key": {"label": "HyDE LLM API Key", "secret": True, "hint": "敏感信息，不进任何日志"},
     "hyde_llm_timeout_seconds": {"label": "HyDE 请求超时（秒）", "hint": ""},
     "hyde_llm_max_tokens": {"label": "HyDE 生成上限（token）", "hint": ""},
+    "cuda_cooldown_seconds": {"label": "CUDA 失败冷却期（秒）", "hint": "CUDA 失败后进入冷却，到期轻量探测自动切回（默认300，对齐旧项目同名配置）"},
 }
 
 

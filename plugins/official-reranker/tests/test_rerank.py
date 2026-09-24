@@ -58,6 +58,24 @@ class TestRealRerankerLazyLoading(unittest.TestCase):
                 reranker.score("q", ["a", "b"])
 
 
+class _StubGateReady:
+    """冷却门替身：始终 ready——真实 CudaCooldownGate.probe 在无 GPU 的测试机
+    上必然失败（64MB CUDA 分配），需要 CUDA 分支的测试用替身注入。"""
+
+    def ready(self):
+        return True
+
+    def cooldown(self, reason):
+        pass
+
+    def report_device(self, device, note=""):
+        pass
+
+
+def _stub_gate_ready():
+    return _StubGateReady()
+
+
 class TestRealRerankerGpuArbitration(unittest.TestCase):
     """GPU 生命周期管理回归测试，同 official-embedder-bge-m3/tests/
     test_embed.py::TestRealEncoderGpuArbitration 的覆盖点，这里不重复
@@ -75,7 +93,7 @@ class TestRealRerankerGpuArbitration(unittest.TestCase):
         不该互相驱逐（见 rerank.py 模块 docstring 的共享 holder_id 设计）。"""
         arb = ResourceArbiter()
         arb.acquire(GPU_RESOURCE_ID, GPU_HOLDER_ID, priority=100)  # 模拟 embedder 先加载过了
-        reranker = _RealReranker(resource_arbiter=arb)
+        reranker = _RealReranker(resource_arbiter=arb, cooldown_gate=_stub_gate_ready())
         with patch("torch.cuda.is_available", return_value=True), patch(
             "official_reranker.rerank.gpu_arbiter.wait_for_vram",
             side_effect=AssertionError("检索侧不得阻塞等待VRAM（对齐旧项目：wait 语义只属于 WEMM/MinerU 服务端）"),
@@ -89,7 +107,7 @@ class TestRealRerankerGpuArbitration(unittest.TestCase):
         """on_disable 的名额归还（rerank.py 模块 docstring 一直声称这个行为，
         此前代码没实现——现在补齐并对齐）：停用后名额回到空闲状态。"""
         arb = ResourceArbiter()
-        reranker = _RealReranker(resource_arbiter=arb)
+        reranker = _RealReranker(resource_arbiter=arb, cooldown_gate=_stub_gate_ready())
         with patch("torch.cuda.is_available", return_value=True):
             self.assertEqual(reranker._select_device(), "cuda")
         self.assertEqual(arb.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)

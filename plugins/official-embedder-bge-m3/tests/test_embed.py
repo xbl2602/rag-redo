@@ -79,6 +79,41 @@ class TestRealEncoderLazyLoading(unittest.TestCase):
                 encoder.encode(["test"])
 
 
+class _StubGateReady:
+    """冷却门替身：始终 ready——真实 CudaCooldownGate.probe 在无 GPU 的测试机
+    上必然失败（64MB CUDA 分配），需要 CUDA 分支的测试用替身注入。"""
+
+    def ready(self):
+        return True
+
+    def cooldown(self, reason):
+        pass
+
+    def report_device(self, device, note=""):
+        pass
+
+
+def _stub_gate_ready():
+    return _StubGateReady()
+
+
+class _StubRecordingGate:
+    """记录 cooldown/report 调用的冷却门替身（ready 恒 True）。"""
+
+    def __init__(self):
+        self.cooldowns: list[str] = []
+        self.reports: list[str] = []
+
+    def ready(self):
+        return True
+
+    def cooldown(self, reason):
+        self.cooldowns.append(reason)
+
+    def report_device(self, device, note=""):
+        self.reports.append(device)
+
+
 class TestRealEncoderGpuArbitration(unittest.TestCase):
     """GPU 生命周期管理回归测试（2026-09-23 补，按 obsidian-rag 真实行为
     移植，见 embed.py 模块 docstring）：设备选择、检索侧高优先级抢占、
@@ -98,7 +133,7 @@ class TestRealEncoderGpuArbitration(unittest.TestCase):
         arb = ResourceArbiter()
         preempted = []
         arb.acquire("gpu:0", "official-visual-wemm", priority=10, on_preempt=lambda: preempted.append("wemm"), preempt_equal=True)
-        encoder = _RealEncoder(resource_arbiter=arb)
+        encoder = _RealEncoder(resource_arbiter=arb, cooldown_gate=_stub_gate_ready())
         with patch("torch.cuda.is_available", return_value=True), patch(
             "official_embedder_bge_m3.embed.gpu_arbiter.wait_for_vram",
             side_effect=AssertionError("检索侧不得阻塞等待VRAM（对齐旧项目：wait 语义只属于 WEMM/MinerU 服务端）"),
@@ -109,12 +144,36 @@ class TestRealEncoderGpuArbitration(unittest.TestCase):
         self.assertEqual(arb.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
         wait_spy.assert_not_called()
 
+    def test_cuda_load_failure_enters_cooldown_and_degrades_to_cpu(self):
+        """对齐旧项目 get_model：CUDA 初始化失败 → 冷却 + 降级 CPU 重试一次
+        （CPU 再失败才真的抛出）；诊断里记录失败原因。"""
+        gate = _StubRecordingGate()
+        encoder = _RealEncoder(resource_arbiter=ResourceArbiter(), cooldown_gate=gate)
+
+        calls = []
+
+        def _fake_st(model_name, device):
+            calls.append(device)
+            if device == "cuda":
+                raise RuntimeError("CUDA out of memory")
+            return object()
+
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("sentence_transformers.SentenceTransformer", side_effect=_fake_st),
+        ):
+            model = encoder._ensure_loaded()
+        self.assertIsNotNone(model)
+        self.assertEqual(calls, ["cuda", "cpu"])
+        self.assertEqual(gate.cooldowns, ["CUDA out of memory"])
+        self.assertEqual(gate.reports, ["cpu"])
+
     def test_release_gpu_slot_returns_slot_to_arbiter(self):
         """on_disable 的名额归还（对齐 rerank.py 模块 docstring 声明的既有
         设计）：停用后名额必须回到仲裁器的"空闲"状态，否则被禁用的检索侧
         会以高优先级永久占位，WEMM/OCR-local 再也抢不到。"""
         arb = ResourceArbiter()
-        encoder = _RealEncoder(resource_arbiter=arb)
+        encoder = _RealEncoder(resource_arbiter=arb, cooldown_gate=_stub_gate_ready())
         with patch("torch.cuda.is_available", return_value=True):
             self.assertEqual(encoder._select_device(), "cuda")
         self.assertEqual(arb.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)

@@ -25,12 +25,14 @@ import time
 from typing import Protocol
 
 from core import gpu_arbiter
+from core.gpu_arbiter import CudaCooldownGate
 
 MODEL_VERSION = "BAAI/bge-reranker-v2-m3"
 GPU_RESOURCE_ID = "gpu:0"
 GPU_HOLDER_ID = "official-text-retrieval-gpu"  # 和 official-embedder-bge-m3 共用，见模块 docstring
 GPU_PRIORITY = 100
 IDLE_UNLOAD_SECONDS = 300
+SLOW_BATCH_SECONDS = 30.0  # 对齐旧项目 encode_safe 的慢批阈值
 
 
 class Reranker(Protocol):
@@ -38,12 +40,14 @@ class Reranker(Protocol):
 
 
 class _RealReranker:
-    def __init__(self, model_name: str = MODEL_VERSION, *, resource_arbiter=None, logger=None) -> None:
+    def __init__(self, model_name: str = MODEL_VERSION, *, resource_arbiter=None, cooldown_gate: CudaCooldownGate | None = None, logger=None) -> None:
         self._model_name = model_name
         self._model = None
         self._resource_arbiter = resource_arbiter
+        self._cooldown_gate = cooldown_gate if cooldown_gate is not None else CudaCooldownGate()
         self._logger = logger
         self._last_use = time.time()
+        self._slow_batch_count = 0
         self._lock = threading.RLock()
 
     def _log(self, message: str) -> None:
@@ -56,21 +60,26 @@ class _RealReranker:
                 from sentence_transformers import CrossEncoder  # noqa: PLC0415 - 故意懒加载
 
                 device = self._select_device()
-                self._model = CrossEncoder(self._model_name, device=device)
+                try:
+                    self._model = CrossEncoder(self._model_name, device=device)
+                except Exception as exc:
+                    # 对齐旧项目 get_model：CUDA 初始化失败 → 冷却 + 降级 CPU 重试一次
+                    if device != "cuda":
+                        raise
+                    self._cooldown_gate.cooldown(str(exc))
+                    self._log(f"CUDA 初始化失败（{exc}），降级 CPU")
+                    device = "cpu"
+                    self._model = CrossEncoder(self._model_name, device=device)
                 self._log(f"重排器模型已加载（device={device}）")
+                self._cooldown_gate.report_device(device)
             self._last_use = time.time()
             return self._model
 
     def _select_device(self) -> str:
-        """同 embed.py::_select_device 的对齐口径：拿到"gpu:0"名额后直接
-        加载，不做 VRAM 阻塞等待（旧项目检索侧从不阻塞等待，wait 语义
-        只属于 WEMM/MinerU 服务端）。"""
-        try:
-            import torch
-
-            if not torch.cuda.is_available():
-                return "cpu"
-        except Exception:  # noqa: BLE001
+        """同 embed.py::_select_device 的对齐口径：冷却期状态机取代裸
+        is_available；拿到"gpu:0"名额后直接加载，不做 VRAM 阻塞等待
+        （旧项目检索侧从不阻塞等待，wait 语义只属于 WEMM/MinerU 服务端）。"""
+        if not self._cooldown_gate.ready():
             return "cpu"
         if self._resource_arbiter is not None:
             acquired = self._resource_arbiter.acquire(
@@ -94,9 +103,29 @@ class _RealReranker:
         with self._lock:
             model = self._ensure_loaded()
             pairs = [[query, text] for text in texts]
+            started = time.time()
             result = list(model.predict(pairs))
+            elapsed = time.time() - started
             self._last_use = time.time()
+            self._check_slow_batch(elapsed)
             return result
+
+    def _check_slow_batch(self, elapsed: float) -> None:
+        """同 embed.py::_RealEncoder._check_slow_batch（对齐旧项目
+        encode_safe 慢批检测），连续两批慢批主动降级 CPU。"""
+        if elapsed > SLOW_BATCH_SECONDS:
+            self._slow_batch_count += 1
+            self._log(
+                f"CUDA 单批重排耗时 {elapsed:.1f}s（>{SLOW_BATCH_SECONDS:.0f}s），"
+                f"疑似共享显存溢出（连续 {self._slow_batch_count} 次）"
+            )
+            if self._slow_batch_count >= 2:
+                self._log("连续慢批，主动降级 CPU，避免病态运行...")
+                self._cooldown_gate.cooldown("slow-batch")
+                self._unload()
+                self._slow_batch_count = 0
+        else:
+            self._slow_batch_count = 0
 
     def idle_check(self) -> None:
         if IDLE_UNLOAD_SECONDS <= 0 or self._model is None:
