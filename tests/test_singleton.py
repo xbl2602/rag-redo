@@ -165,5 +165,55 @@ class TestProcessSingletonGuard(unittest.TestCase):
             guard.release()
 
 
+class TestGuiMainSingletonWiring(unittest.TestCase):
+    """gui_main.py::main 的单例守卫接线（对齐 obsidian-rag gui/app.py:46-69 /
+    guiweb/app.py:46-87——旧项目两个 GUI 入口都接了锁，rag-redo 此前只给
+    MCP 接了）。真实起子进程走 gui_main.main()：锁被占时必须在 build_runtime
+    之前谦让退出——用"运行标记文件是否被创建"区分，不真开 GUI 窗口。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.data_root = self.tmp / "data"
+        self.data_root.mkdir()
+        self.marker = self.tmp / "runtime-built.marker"
+
+    def _child_script(self, marker: Path) -> str:
+        return (
+            "import sys, os;"
+            "sys.path.insert(0, r'%s');"
+            "os.environ['RAG_REDO_DATA_ROOT'] = r'%s';"
+            "import gui_main;"
+            "gui_main.build_runtime = lambda: (open(r'%s', 'w').write('built'), None)[1];"
+            "import webview;"
+            "webview.start = lambda *a, **k: None;"
+            "gui_main.main();"
+            "print('CHILD_DONE')"
+        ) % (str(REPO_ROOT), str(self.data_root), str(marker))
+
+    def test_second_gui_instance_exits_before_building_runtime_while_first_holds(self):
+        guard = ProcessSingletonGuard(self.data_root / "gui.pid")
+        self.assertTrue(guard.acquire())
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", self._child_script(self.marker)],
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertFalse(self.marker.exists(), "守卫被占时不得执行 build_runtime")
+            self.assertIn("单例守卫", result.stderr)
+        finally:
+            guard.release()
+
+    def test_first_gui_instance_proceeds_to_build_runtime(self):
+        # 桩只负责写标记文件；标记写入后 main() 的后续真实构造（Pipeline
+        # 等）在桩环境下会失败退出——这不影响本测试：标记文件存在本身
+        # 就证明守卫没有拦截无冲突的首次启动。
+        result = subprocess.run(
+            [sys.executable, "-c", self._child_script(self.marker)],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertTrue(self.marker.exists(), "无既有实例时守卫应当放行，build_runtime 应被执行")
+
+
 if __name__ == "__main__":
     unittest.main()

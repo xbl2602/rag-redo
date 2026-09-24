@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import atexit
 import os
 import sys
 from pathlib import Path
@@ -49,6 +50,7 @@ import webview  # noqa: E402
 
 from core.pipeline import Pipeline  # noqa: E402
 from core.runtime import PluginRuntime  # noqa: E402
+from core.singleton import ProcessSingletonGuard  # noqa: E402
 
 REQUIRED_PLUGINS = [
     "official-extractor-text",
@@ -94,6 +96,17 @@ def build_runtime() -> PluginRuntime:
 
 
 def main() -> None:
+    # 进程单例守卫（对齐 obsidian-rag gui/app.py:46-69 与 guiweb/app.py:46-87
+    # 的 _acquire_singleton：两个 GUI 入口都有非阻塞文件锁，锁文件名区分
+    # 实例；MCP 侧同款守卫在 mcp_stdio.py::main）。双击两次/重复启动第二个
+    # GUI = 两份 embedder/reranker 模型常驻 + 对同一 data/ 目录的写竞争；
+    # 已有存活实例时本进程直接谦让退出，不算错误。
+    guard = ProcessSingletonGuard(DATA_ROOT / "gui.pid")
+    if not guard.acquire():
+        print("检测到已有 GUI 实例运行，本实例退出（单例守卫）。", file=sys.stderr)
+        sys.exit(0)
+    atexit.register(guard.release)
+
     runtime = build_runtime()
     pipeline = Pipeline(runtime)
     lib_mgr_plugin = runtime.plugins.get("official-library-manager")
