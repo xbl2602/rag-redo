@@ -15,6 +15,9 @@
 7. ~~多库并查检索选择+folder过滤+置信度真分尺度~~——**已完成（2026-09-23）**：对照 obsidian-rag/retriever.py::hybrid_search 逐项核对 `search_knowledge` 时发现的真实缺口（此前 ROADMAP 从未把这单独列为追踪项，不是遗漏了已知计划，是这轮对照审计才发现），见下方 Phase 1 状态段落。
 8. ~~全面功能审计（2026-09-23）发现的新缺口~~——**核心行为契约已全部完成（2026-09-24）**，见下方独立小节及其后续段落"操作者 `/goal` 锁定"完成所有！"后续完成情况"。仍未完成的是本地 Windows 干净机安装验收、GUI 真实渲染冒烟和打包体积优化，不是行为契约缺口。
 9. ~~完整文件级增量索引~~——**已完成（2026-09-24）**：per-file manifest + 分段 generation + 精确阶段失效 + 原子发布 + 无重算 compaction，文字/BM25/提取缓存/WEMM 页库全部接入；MCP/GUI 同时支持增量和显式完整重建。
+10. **业务 CLI 移植（顺延）**——旧项目有完整业务 CLI（`index.py:2441` 命令行索引、`library.py:700` 库注册管理、`import.py`/`export.py`、`dedup.py`），rag-redo 的 `core/cli.py` 只有插件管理命令（scan/status/load/enable/disable/unload），不是同一业务入口。操作者 2026-09-25 拍板低优先顺延：命令应为 Pipeline 编排层的薄封装（同 MCP/GUI 调同一服务层的纪律），不含新业务逻辑。
+11. **每插件导入隔离（登记）**——`core/runtime.py` 把插件目录加进 sys.path 才能加载入口模块，两个插件若有同名顶层模块会冲突；真实的每插件导入隔离（子进程内加载或独立命名空间）待有真实冲突案例再设计。
+12. **DataStore 深度封装（登记）**——StorageHandle 仍返回裸 Path（in_process 受信任插件定位下够用，见 core/datastore.py docstring 的边界说明）；`DataStore.write/read` 契约值机制已实现但生产数据流暂无调用方（插件通信走 Pipeline 编排）；`gui_main.py` 直传 lib_mgr 插件实例给 GUI Api 属有记录的薄封装层偏离。三者都是架构改进项，不是行为缺口。
 
 ## 2026-09-25 通宵行为对齐审计——报告核实与九项修复
 
