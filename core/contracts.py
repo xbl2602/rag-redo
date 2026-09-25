@@ -302,3 +302,4 @@ class DocumentContent:
     path: str
     text: str
     source: str  # "源文件直读"（.md/.txt 现读）| "提取缓存"（pdf/docx 等，来自上一次索引的提取结果）
+    abs_path: str = ""  # 源文件绝对路径——看图模型/用户要直读原 PDF 时用（旧项目抬头含绝对路径）

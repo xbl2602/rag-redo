@@ -91,6 +91,29 @@ class LibraryManagerPlugin:
             )
         return [by_id[n] for n in final]
 
+    def pending_agent_formats(self, library_id: str) -> dict[str, int]:
+        """已启用但未对 Agent 授权、且磁盘上确实存在文件的二进制格式 →
+        {格式: 文件数}——对齐 obsidian-rag/server.py::_pending_formats，
+        供 reindex_knowledge(allow_new_formats=true) 的授权流使用。"""
+        cfg = self.store.get(library_id)
+        if cfg is None:
+            raise KeyError(f"未知库: {library_id}")
+        allowed = set(self.agent_allowed_extensions(library_id))
+        text_exts = {".md", ".txt", ".markdown"}
+        pending: dict[str, int] = {}
+        for ext in cfg.enabled_extensions:
+            normalized = ext if ext.startswith(".") else f".{ext}"
+            if normalized in allowed or normalized in text_exts:
+                continue
+            count = sum(
+                1
+                for path, included, _reason in self.resolve_included_files(library_id)
+                if path.lower().endswith(normalized)
+            )
+            if count:
+                pending[normalized] = count
+        return pending
+
     def agent_allowed_extensions(self, library_id: str) -> tuple[str, ...]:
         cfg = self.store.get(library_id) if self.store is not None else None
         if cfg is None:

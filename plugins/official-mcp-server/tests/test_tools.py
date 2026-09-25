@@ -339,6 +339,31 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertTrue(allowed.structured_content["ok"])
         self.assertIn("private binary body", allowed.structured_content["text"])
 
+    async def test_reindex_allow_new_formats_authorization_flow(self):
+        """对齐旧项目 reindex_knowledge 的授权流（server.py:620-656）：未授权
+        格式先报告"待授权+文件数"；用户确认后携带 allow_new_formats=true →
+        持久化写入 agent_formats 并纳入本次索引。"""
+        document = Document()
+        document.add_paragraph("authorization flow body")
+        document.save(str(self.tmp / "vault" / "flow.docx"))
+        denied = await self.server.call_tool(
+            "reindex_knowledge", {"library_id": "test-lib"}
+        )
+        payload = denied.structured_content
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["waiting_formats"], {".docx": 1})
+        self.assertEqual(payload["approved_formats"], {})
+        self.assertIn("allow_new_formats=true", payload["message"])
+        self.assertEqual(self.lib_mgr.store.get("test-lib").agent_formats, [])
+        approved = await self.server.call_tool(
+            "reindex_knowledge",
+            {"library_id": "test-lib", "allow_new_formats": True},
+        )
+        payload = approved.structured_content
+        self.assertEqual(payload["approved_formats"], {".docx": 1})
+        self.assertEqual(payload["waiting_formats"], {})
+        self.assertEqual(self.lib_mgr.store.get("test-lib").agent_formats, [".docx"])
+
     async def test_read_document_tool_unknown_path_reports_error(self):
         await self._reindex_and_wait("test-lib")
         result = await self.server.call_tool(
@@ -798,6 +823,8 @@ class TestMcpTools(TestMcpToolsAsyncBase):
                 "run_id": "run-mcp-1",
                 "worker_pid": 4321,
                 "full": False,
+                "approved_formats": {},
+                "waiting_formats": {},
             },
         )
         start_index.assert_called_once_with(

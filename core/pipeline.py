@@ -1961,33 +1961,55 @@ class Pipeline:
         if lib_mgr.store.get(library_id) is None:
             raise KeyError(f"未知库: {library_id}")
 
-        matches = [f for f in lib_mgr.resolve_included_files(library_id) if f[0] == path]
+        decisions = lib_mgr.resolve_included_files(library_id)
+        matches = [f for f in decisions if f[0] == path]
+        if not matches and path and "." not in path:
+            # 标题回退（对齐旧 read_document）：path 不带扩展名时按文件名 stem
+            # 匹配——AI 从检索结果的 heading/标题过来时常常不知道真实扩展名
+            candidates = [
+                f
+                for f in decisions
+                if Path(f[0]).stem == path or f[0].rsplit(".", 1)[0] == path
+            ]
+            if len(candidates) == 1:
+                matches = candidates
+            elif len(candidates) > 1:
+                raise KeyError(
+                    f"标题 {path!r} 命中多个文件（{[c[0] for c in candidates]}），请带完整相对路径重试"
+                )
         if not matches:
             raise KeyError(f"库「{library_id}」里找不到文件: {path!r}")
         _, included, reason = matches[0]
         if not included:
             raise ValueError(f"「{path}」已被排除出检索范围（{reason}），拒绝读取")
+        resolved_path = matches[0][0]  # 标题回退命中时返回真实相对路径
 
-        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        ext = resolved_path.rsplit(".", 1)[-1].lower() if "." in resolved_path else ""
+        cfg = lib_mgr.store.get(library_id)
+        abs_path = Path(cfg.root_path) / resolved_path
         if ext in ("md", "txt", "markdown"):
-            cfg = lib_mgr.store.get(library_id)
-            full_path = Path(cfg.root_path) / path
             try:
-                text = full_path.read_text(encoding="utf-8", errors="replace")
+                text = abs_path.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
                 raise ValueError(f"读取源文件失败: {type(exc).__name__}: {exc}") from exc
-            return DocumentContent(library_id=library_id, path=path, text=text, source="源文件直读")
+            return DocumentContent(
+                library_id=library_id, path=resolved_path, text=text,
+                source="源文件直读", abs_path=str(abs_path),
+            )
 
         generation = self._generations.active(library_id)
         manifest = self._manifest(library_id, generation)
-        state = self._manifest_files(manifest).get(path)
+        state = self._manifest_files(manifest).get(resolved_path)
         if manifest is not None and (state is None or state.get("status") != "indexed"):
-            raise ValueError(f"「{path}」还没有被成功索引过，先调用 index_library 建好索引再重试")
+            raise ValueError(f"「{resolved_path}」还没有被成功索引过，先调用 index_library 建好索引再重试")
         segments = self._manifest_segments(manifest, "extract_segments", generation)
-        cached = self._read_extract_cache(library_id, path, segments)
+        cached = self._read_extract_cache(library_id, resolved_path, segments)
         if cached is None:
-            raise ValueError(f"「{path}」还没有被成功索引过，先调用 index_library 建好索引再重试")
-        return DocumentContent(library_id=library_id, path=path, text=cached, source="提取缓存")
+            raise ValueError(f"「{resolved_path}」还没有被成功索引过，先调用 index_library 建好索引再重试")
+        return DocumentContent(
+            library_id=library_id, path=resolved_path, text=cached,
+            source="提取缓存", abs_path=str(abs_path),
+        )
 
     def find_duplicates(
         self,

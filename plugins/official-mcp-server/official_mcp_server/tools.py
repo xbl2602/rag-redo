@@ -403,7 +403,11 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         return result
 
     @server.tool()
-    def reindex_knowledge(library_id: str, full: bool = False) -> dict[str, Any]:
+    def reindex_knowledge(
+        library_id: str,
+        full: bool = False,
+        allow_new_formats: bool = False,
+    ) -> dict[str, Any]:
         """由独立 worker 进程后台重建索引，立即返回启动结果；其中
         `run_id` 标识本轮任务，`worker_pid` 是 worker 进程号。真正想知道
         跑得怎么样——是不是还在跑、跑到第几个文件、有没有卡死、最终成功/
@@ -423,11 +427,26 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
 
         默认按文件指纹和插件版本做增量索引；`full=true` 时忽略现有清单并完整重建。
 
+        人机分权（对齐 obsidian-rag reindex_knowledge 的授权流）：已启用但对
+        Agent 未授权的二进制格式（pdf/docx 等）会被冻结在索引之外；`allow_new_formats=true`
+        表示用户已确认授权——把这些格式持久化写入 agent_formats（长期有效，GUI
+        可取消）并纳入本次索引。未获授权时不要传 true，先向用户确认。
+
         Args:
             library_id: 要重建索引的库的 id
             full: 是否强制完整重建
+            allow_new_formats: 用户已确认授权新格式（持久化写入 agent_formats）
         """
         try:
+            pending = lib_mgr.pending_agent_formats(library_id)
+            approved: dict[str, int] = {}
+            waiting: dict[str, int] = dict(pending)
+            if pending and allow_new_formats:
+                current = set(lib_mgr.agent_allowed_extensions(library_id))
+                merged = sorted(current | set(pending.keys()))
+                lib_mgr.store.set_agent_formats(library_id, [f for f in merged if f not in (".md", ".txt", ".markdown")])
+                approved = dict(pending)
+                waiting = {}
             allowed = lib_mgr.agent_allowed_extensions(library_id)
             if full:
                 result = pipeline.start_index_library(
@@ -444,13 +463,29 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
                 )
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
+        detail = ""
+        if approved:
+            detail = (
+                "已授权并纳入本次索引："
+                + "、".join(f"{fmt}×{count}" for fmt, count in sorted(approved.items()))
+                + "（长期有效，GUI 可取消）。"
+            )
+        elif waiting:
+            detail = (
+                "以下格式尚未获用户授权，本次不纳入："
+                + "、".join(f"{fmt}×{count}" for fmt, count in sorted(waiting.items()))
+                + "。如需纳入请先向用户确认，得到同意后携带 allow_new_formats=true 重试"
+                + "（将持久化授权）；或由用户在 GUI 库管理中操作。"
+            )
         return {
             "ok": True,
             "started": result.started,
-            "message": result.message,
+            "message": result.message + (f"\n{detail}" if detail else ""),
             "run_id": result.run_id,
             "worker_pid": result.worker_pid,
             "full": full,
+            "approved_formats": approved,
+            "waiting_formats": waiting,
         }
 
     @server.tool()
