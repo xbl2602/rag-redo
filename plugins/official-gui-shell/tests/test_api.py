@@ -414,6 +414,31 @@ class TestApi(unittest.TestCase):
         result = self.api.unset_setting("never-set")
         self.assertTrue(result["ok"])
 
+    def test_library_management_methods(self):
+        """G1 后端补齐（对齐旧 bridge.py 的库管理方法）：remove_library 注销、
+        get/set_library_config、dedup_run、wemm_status、open_path。"""
+        self.api.add_library("lib1", "测试库", str(self.vault))
+        cfg = self.api.get_library_config("lib1")
+        self.assertTrue(cfg["ok"])
+        self.assertEqual(cfg["config"]["library_id"], "lib1")
+        result = self.api.set_library_config("lib1", {"exclude_dirs": [".trash"], "bad_key": 1})
+        self.assertFalse(result["ok"], "非法键必须报错")
+        result = self.api.set_library_config("lib1", {"exclude_dirs": [".trash"]})
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.api._lib_mgr.store.get("lib1").exclude_dirs, [".trash"])
+        self.api._pipeline.index_library("lib1")
+        dedup = self.api.dedup_run("lib1")
+        self.assertTrue(dedup["ok"])
+        wemm = self.api.wemm_status()
+        self.assertTrue(wemm["ok"])
+        opened = self.api.open_path(str(self.vault))
+        self.assertTrue(opened["ok"])
+        missing = self.api.open_path(str(self.tmp / "no-such-dir"))
+        self.assertFalse(missing["ok"])
+        removed = self.api.remove_library("lib1")
+        self.assertTrue(removed["ok"])
+        self.assertIsNone(self.api._lib_mgr.store.get("lib1"))
+
     def test_batch_summary_refresh_background_and_poll(self):
         """对齐旧 guiweb/bridge.py::refresh_library_summaries_batch+poll：
         后台线程逐库生成，轮询读进度与结果，手写库跳过不阻塞批次。"""

@@ -415,6 +415,96 @@ class Api:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "library_id": new_id}
 
+    # ---- 库管理补齐（对齐旧 guiweb/bridge.py 的库管理方法）----
+
+    def remove_library(self, library_id: str, drop_data: bool = False) -> dict[str, Any]:
+        """注销库（对齐旧 bridge.py::remove_library）。drop_data=True 时
+        尽力删除该库的索引数据（向量 collection）；文件系统上的笔记与
+        core 管理的索引目录保留——"删除即不可恢复"的数据清理属于
+        旧项目问题49 的 prune 范畴，当前只做注销+尽力清理并如实报告。"""
+        try:
+            cfg = self._lib_mgr.store.get(library_id)
+            if cfg is None:
+                return {"ok": False, "error": f"未知库: {library_id}"}
+            dropped = []
+            if drop_data:
+                plugin_id = self._pipeline.runtime.registry.active_of("vector_store")
+                if plugin_id:
+                    store = self._pipeline._plugin(plugin_id)
+                    if hasattr(store, "delete_collection"):
+                        store.delete_collection(library_id)
+                        dropped.append("向量collection")
+            self._lib_mgr.store.remove_library(library_id)
+            note = "已从注册表移除；笔记文件与 core 索引目录保留" + (
+                f"（已清理：{'、'.join(dropped)}）" if dropped else ""
+            )
+            return {"ok": True, "note": note}
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring
+            return {"ok": False, "error": str(exc)}
+
+    def get_library_config(self, library_id: str) -> dict[str, Any]:
+        """返回某库的生效配置（对齐旧 bridge.py::get_library_config）。"""
+        try:
+            cfg = self._lib_mgr.store.get(library_id)
+            if cfg is None:
+                return {"ok": False, "error": f"未知库: {library_id}"}
+            from dataclasses import asdict
+
+            return {"ok": True, "config": asdict(cfg)}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    def set_library_config(self, library_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        """批量写库级配置（对齐旧 bridge.py::set_library_config）：
+        支持 new_file_default/enabled_extensions/exclude_dirs/exclude_files/
+        exclude_patterns/agent_formats；逐键校验，非法键报错不静默。"""
+        try:
+            allowed = {
+                "new_file_default", "enabled_extensions", "exclude_dirs",
+                "exclude_files", "exclude_patterns", "agent_formats",
+            }
+            unknown = set(updates) - allowed
+            if unknown:
+                return {"ok": False, "error": f"不支持的配置键: {sorted(unknown)}"}
+            if "agent_formats" in updates:
+                self._lib_mgr.store.set_agent_formats(library_id, list(updates["agent_formats"]))
+            rest = {k: v for k, v in updates.items() if k != "agent_formats"}
+            if rest:
+                self._lib_mgr.store.set_policy(library_id, **rest)
+            return {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    def dedup_run(self, library_id: str, threshold: float = 0.8) -> dict[str, Any]:
+        """近似去重分析（只读，对齐旧 bridge.py::dedup_run）。"""
+        try:
+            groups = self._pipeline.find_duplicates(library_id, threshold=threshold)
+            clusters = [g for groups in groups.values() for g in groups]
+            return {"ok": True, "clusters": clusters}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    def wemm_status(self) -> dict[str, Any]:
+        """页级视觉导航只读诊断（对齐旧 bridge.py::wemm_status）。"""
+        try:
+            return {"ok": True, "providers": self._pipeline.visual_status()}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    def open_path(self, path: str) -> dict[str, Any]:
+        """用系统默认程序打开任意本地路径（对齐旧 bridge.py::open_path，
+        "打开文件夹"按钮用）。"""
+        try:
+            target = Path(path)
+            if not target.exists():
+                return {"ok": False, "error": f"路径不存在: {path}"}
+            import os
+
+            os.startfile(str(target))  # noqa: S606 - Windows 打开资源管理器，仅本地 GUI
+            return {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
     def get_settings(self) -> dict[str, Any]:
         """返回 `{"values": {...}, "meta": {key: {label, hint, secret}}}`——
         对齐 obsidian-rag/guiweb/bridge.py::get_settings（801-820）一次把
