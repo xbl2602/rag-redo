@@ -75,9 +75,30 @@
 **仍登记的余项（按审计清单精确到条目）**：
 - sidecar 噪声清洗双轨（问题48 v10/v11：死图链/页码/样板行剥离）——扫描件语料质量，未移植。
 - MinerU 云端并行（问题35 cloud_jobs 线程池 + mineru_concurrency 三档）、批量提交（50文件/批）、token 失效响应体错误码（A0202/A0211）——吞吐行为未对齐。
-- 模型加载离线优先（问题56 local_files_only）/fp16/按显存自动批次（问题59-B4）——性能面未移植。
-- 勾选"按深度裁决"只实现一半（问题47附记2：更深的目录排除应赢过更浅的显式纳入）+ 同位置冲突拒绝；[块k/N] 在 MCP 输出透出；index_failures 中文释义标签；list_libraries 富行（blocks/last_indexed/过时标注）；wemm_status DPI/model/device 字段；get_library_sample title 汇总；navigate 多库参数；删除库数据回收（问题49 prune）；RRF k=2 旧评估集复核；pdf_text_backend 文字层送云端（TODO.md:299）；GUI 前端交互全面对齐（七视图/勾选树弹窗/图谱检索岛/节点拖拽/试验台/诊断视图/日志抽屉/主题切换/toast 等——四份审计报告里 GUI 节的完整清单为准，属多天前端工程）。
-- 无法无人值守执行、需要操作者：干净机验收、便携包体积优化、WEMM 独立环境从零引导（需联网）、检索质量与旧项目真实对比、GUI 真人交互冒烟、push。
+- 模型加载离线优先（问题56 local_files_only）/fp16——**已完成（2026-09-25 真库实测驱动）**：core/model_loading.py 承载旧 index.py::_load_pretrained 语义（local_files_only 优先、缺/坏回退联网、双失败抛清理指引）；embedder 按旧 _load_model fp16 优先+混拔回退 fp32；reranker 按旧 _get_reranker max_length=512+fp16+batch_size=16。**按显存自动批次（问题59-B4 的 encode_safe 收紧段）仍未移植**——fp16 后实测不再触发共享显存溢出，优先级降低但语义缺口仍在。
+- 勾选"按深度裁决"（问题47附记2）+ 同位置冲突拒绝——**已完成（2026-09-25 真库实测驱动，commit 5c844e9）**：selection.py 逐字移植旧 selection_hit/excluded_dir_depth/decide_included（最近显式赢、更深目录排除压较浅纳入、同位置打架排除站住、目录条目单部件子串语义）+ 旧 collect_md_files 中性分支（follow/include/exclude 三态、exclude_patterns 文件名前缀 startswith、exclude_files 精确名）；写路径提案侧事前拦截+set_selection 兜底拒绝；migrate 工具三态直传；测试镜像旧 test_selection.py 拍板用例。
+- 无法无人值守执行、需要操作者：干净机验收、便携包体积优化、WEMM 独立环境从零引导（需联网）、GUI 真人交互冒烟、push。~~检索质量与旧项目真实对比~~——**已完成（2026-09-25）**，见下节。
+
+## 2026-09-25 真库实测——与旧项目同库全链路验证
+
+> 操作者指示"用跟旧项目一样的库实测全套系统：全量/增量/部分选库索引、库配置、路径管理、文档类型管理、全检索，检查语义与执行问题和同步效果"。方法：注册旧项目 data/libraries.json 的全部 4 个库（Obsidian Vault 227 文件/agents 20/skills 16/LECTURE NOTE 18，逐库同步旧生效配置含选区与 agent_formats），每个环节与旧项目对照。全程断网（复用本地 HF 缓存模型），实测驱动修复 3 个真问题，47/47 套测试全绿。实测脚本沉淀在 tools/（register_real_libraries/compare_enumeration/search_probe_new/search_probe_old/compare_search/mutation_test/config_test），实测数据根 `data-real/`（gitignored，保持仓库 `data/` 不存在以满足测试隔离断言）。
+
+**环境问题（非代码缺陷）**：`.venv` 里装的是 CPU 版 torch（2.14.0+cpu）——CUDA 冷却门行为完全正确（探测失败→如实降级 CPU+device_state.json 诊断），但嵌入全程在 CPU 上跑（约 130 块/分钟，GPU 正常时应为数十倍）。不联网修复：两个项目同为 Python 3.14.6，从旧项目 venv 复制自包含的 torch 2.11.0+cu128（4.2GB）+torchgen/functorch/dist-info，并卸载误装的 torchvision 0.29.0+cpu（对着 torch 2.14 编译，transformers 一 import 就炸"Could not import module 'PreTrainedModel'"）。**部署纪律：rag-redo 的 Windows venv 必须装 cu128 版 torch，pip 默认源装的是 CPU 版。**
+
+**实测驱动修复的 3 个真问题**：
+1. **fp16/离线优先缺失 → 显存溢出 + 逐查询重载**：fp32 双模型常驻把 8GB 卡顶进 WDDM 共享显存溢出，单批重排分钟级→慢批检测降级 CPU，8 个查询 8~152 秒且重排器反复重载。按旧项目 2026-09-12 决策修复后（fp16+max_length=512+batch_size=16+离线优先），fp16 双模型共 2.6GB 显存、200 对重排 2.7 秒、单查询 1.1~1.4 秒（与旧项目同速）。
+2. **勾选裁决语义偏离**（问题47 完整落地，commit 5c844e9）：真实库里有 `session-`/`会话`/`MOC-` 前缀文件，旧语义是文件名前缀 startswith，此前的 fnmatch 实现会错误收录；更深的目录排除应压过较浅的显式纳入，此前只处理了同位置打架。
+3. **tbd 占位检查越界到二进制格式**：旧 index.py:1571 只对 md/txt 做 is_tbd_heavy；rag-redo 把含大量 [TBD] 的课程报告 docx（旧项目建了 182 块索引）误判 tbd 跳过。修复后 Vault 逐文件状态与旧项目完全同态（.md 判 tbd、~$ Word 锁文件 extract-failed、BACKUP.docx 正常入库）。
+
+**对齐验证结果**：
+- **文件枚举**：4 库 281 文件收录判定与旧项目 collect_md_files **零差异**（含选区/排除/前缀/子串/深度裁决全部语义）。
+- **全量索引**：agents 20/20、skills 16/16 成功；Vault 225 成功/2 失败与旧项目逐文件同态；LECTURE NOTE 4 md 成功 + 14 扫描版 PDF 折叠成结构化 `scanned` 终态（断网无 OCR 可用，无半份结果、无宿主异常——BC-01/04 语义实测通过）。
+- **检索对比**：8 个真实主题查询（火箭/SAF/奖学金/静力学/量纲/并行调度/GraphRAG/本地大模型），正文模式 top1 文件 **7/8 与旧项目一致**，md 语料（切块边界相同）多处逐位一致；唯一分歧的"静力学"题旧项目命中云端 OCR 过的扫描版 PDF（MinerU 云缓存），断网环境无法复现——属已登记环境缺口非代码缺陷。置信度真分尺度档位吻合（确定命中 0.84~0.98、模糊查询 0.03~0.3、噪音 <0.05）。
+- **增量索引**（skills 副本库实测）：no-op 复跑 0 重算；新增/修改/删除各精确命中 1 文件（BC-03/增量语义）。
+- **配置面**（副本库实测）：Agent 文档授权流（pdf 授权前 agent 视角拒绝+pending_agent_formats 报告、授权后可见，BC-02）；勾选提案→写门禁确认→生效→索引尊重排除（删除对应 4 文件的块）→恢复回补；同位置打架提案事前拒绝；export→import→dedup CLI 全链路通。
+- **速度对齐**：GPU 修复后 4 库全量索引约 3.5 分钟（CPU 时单 Vault 需 30+ 分钟），与旧项目同量级。
+
+**实测后仍未对齐/需操作者的**：扫描件内容质量依赖 MinerU 云端（断网不可复现，`pdf_text_backend` 文字层送云端与问题35并行度仍在余项清单）；encode_safe 按显存自动收紧批次（问题59-B4 剩余段）未移植；GUI 前端交互全面对齐仍是最大余项；便携包/干净机验收需操作者。
 
 ## 2026-09-23 全面功能审计——已发现、尚未实现的缺口
 
