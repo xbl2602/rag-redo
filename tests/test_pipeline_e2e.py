@@ -429,6 +429,51 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
             self.pipeline.search("test-lib", "插件 架构", top_k=5)
         self.assertGreaterEqual(spy.call_args.kwargs.get("top_k", spy.call_args.args[-1] if spy.call_args.args else 0), 200)
 
+    def test_wikilink_cleaning_and_frontmatter_anchors_enter_index_text(self):
+        """问题15/审计F9 + 问题18/审计F20 的两条索引文本决策：
+        ①wikilink 清洗——别名保留进索引文本、![[嵌入]]删除、原文链接抽取不受影响；
+        ②frontmatter title/tags + 文件名锚点拼进嵌入/BM25 文本、交付输出剥离前缀。
+        """
+        (self.vault / "anchor-notes.md").write_text(
+            "---\ntitle: 火箭发动机笔记\ntags: 航天\n---\n"
+            "# 火箭发动机笔记\n\n"
+            "这台机器参考了 [[概念/推进系统|推进原理]] 的设计。\n"
+            "![[图片.png]]\n"
+            "结构图见 [[推进系统# overview]]。\n",
+            encoding="utf-8",
+        )
+        report = self.pipeline.index_library("test-lib")
+        self.assertEqual(report.succeeded, 3, report.files)
+        generation = self.pipeline._generations.active("test-lib")
+        manifest = self.pipeline._manifests.read("test-lib", generation)
+        record = manifest["files"]["anchor-notes.md"]
+        self.assertEqual(
+            record["links"],
+            ["推进系统"],
+            "链接抽取取「目标」（剥路径/锚点/别名、跳过嵌入），且基于清洗前的原文",
+        )
+        # 向量库里存的文本带锚点前缀（文件名+title+tags+标题链）
+        vector_records = self.pipeline._vector_records(
+            "test-lib", list(record["chunk_ids"]),
+            self.pipeline._manifest_segments(manifest, "vector_segments", generation),
+        )
+        self.assertTrue(vector_records)
+        stored = next(iter(vector_records.values()))
+        self.assertIn("火箭发动机笔记", stored["document"])
+        self.assertIn("航天", stored["document"])
+        self.assertIn("anchor-notes", stored["document"])
+        self.assertIn("推进原理", stored["document"], "别名必须保留进索引文本")
+        self.assertNotIn("![[", stored["document"], "嵌入语法必须删除")
+        # 检索交付的正文剥离锚点前缀
+        results = self.pipeline.search("test-lib", "推进原理", top_k=5)
+        hit = next(r for r in results if r.path == "anchor-notes.md")
+        self.assertTrue(hit.text)
+        # 原文里的 [[...]] 已被清洗为可读文字：交付正文含别名、不含双链/嵌入语法
+        self.assertNotIn("[[", hit.text)
+        self.assertNotIn("![[", hit.text)
+        self.assertIn("推进原理", hit.text)
+        self.assertNotIn("图片.png", hit.text, "嵌入语法已从索引文本删除")
+
     def test_graph_reads_active_manifest_and_relations_without_loading_embedder(self):
         (self.vault / "plugin-notes.md").write_text(
             "# 插件架构笔记\n\n插件系统连接到 [[cooking]]。",

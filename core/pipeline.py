@@ -15,7 +15,7 @@ import hashlib
 import os
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclasses_replace
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -26,6 +26,7 @@ from .index_failures import IndexFailuresStore
 from .index_generation import INDEX_MANIFEST_VERSION, IndexGenerationStore, IndexManifestStore
 from .index_progress import IndexProgressEvent, IndexStartResult, IndexWorkerManager
 from .note_relations import NoteRelationsStore, extract_wikilink_targets
+from .text_cleaning import TEXT_PIPELINE_VERSION, build_anchor_context, clean_wikilinks, extract_frontmatter
 from .runtime import PluginRuntime, PluginState
 
 
@@ -110,6 +111,15 @@ def _norm_folder(folder: str) -> str:
     """规范化 folder 参数：去首尾空白与首尾斜杠，反斜杠统一成正斜杠——
     对齐 obsidian-rag/retriever.py::_norm_folder。"""
     return folder.strip().replace("\\", "/").strip("/").strip()
+
+
+def _strip_anchor_context(document: str, meta: dict) -> str:
+    """剥离索引期拼进块文本的锚点前缀（问题18 v6：ctx 只喂给嵌入/BM25/重排，
+    交付给用户的正文不带前缀——旧项目把 ctx 存 metadata 就是供输出剥离）。"""
+    ctx = str((meta or {}).get("ctx") or "")
+    if ctx and document.startswith(ctx + "\n"):
+        return document[len(ctx) + 1 :]
+    return document
 
 
 def _in_folder(path: str, folder: str) -> bool:
@@ -296,6 +306,10 @@ class Pipeline:
         for point in ("chunker", "embedder", "lexical_index", "vector_store"):
             plugin_id = self.runtime.registry.active_of(point)
             signatures[point] = [self._plugin_signature(plugin_id)] if plugin_id else []
+        # 索引文本管线（wikilink 清洗/锚点拼接，core/text_cleaning.py）：
+        # 不属于任何插件，但直接决定嵌入/BM25 的文本内容——逻辑升级必须
+        # 使旧 generation 失效，对齐旧项目 META_VERSION 机制
+        signatures["text_pipeline"] = [[str(TEXT_PIPELINE_VERSION)]]
         return signatures
 
     def _extraction_capability_signature(
@@ -497,7 +511,11 @@ class Pipeline:
                 if point.startswith("extractor:")
             )
         force_chunks = force_extract or (
-            old_manifest is not None and old_signatures.get("chunker") != signatures.get("chunker")
+            old_manifest is not None
+            and (
+                old_signatures.get("chunker") != signatures.get("chunker")
+                or old_signatures.get("text_pipeline") != signatures.get("text_pipeline")
+            )
         )
         force_embed = force_chunks or (
             old_manifest is not None
@@ -850,6 +868,22 @@ class Pipeline:
                 files_done += 1
                 _emit("file_complete", current_path=path, message="已跳过占位重文件：tbd")
                 continue
+            # ---- 索引文本管线（core/text_cleaning.py，对齐旧 _store_chunks 的
+            # 清洗顺序）——链接先从原文抽取（note_relations 的语义是读者看到的
+            # 原始链接，问题28），再拆 frontmatter、清洗 wikilink（问题15/F9）。
+            # 清洗只影响切块/嵌入/BM25 的文本；提取缓存与 read_document 交付的
+            # 原文不动（对齐旧项目"只动索引层"的决策）。
+            raw_text = doc.text or ""
+            raw_links = extract_wikilink_targets(raw_text)
+            source_ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            if source_ext in ("md", "txt", "markdown"):
+                front, body = extract_frontmatter(raw_text)
+            else:
+                front, body = {}, raw_text
+            index_text = clean_wikilinks(body)
+            doc_parts = [p for p in (Path(path).stem, front.get("title", ""), front.get("tags", "")) if p]
+            if index_text != raw_text:
+                doc = dataclasses_replace(doc, text=index_text)
             if not plan["needs_chunks"]:
                 record = dict(old)
                 record["size"] = plan["size"]
@@ -864,6 +898,16 @@ class Pipeline:
                 continue
 
             chunks = chunker.chunk(doc)
+            # 文件级锚点 + 标题链拼进每块文本（问题18/审计 F20 的 v6 决策）：
+            # 嵌入与 BM25 同受益；ctx 存 metadata 供检索输出剥离（旧项目同款）。
+            ctx_by_id: dict[str, str] = {}
+            for _chunk_index, _chunk in enumerate(chunks):
+                _ctx = build_anchor_context(doc_parts, _chunk.heading_breadcrumb)
+                if _ctx:
+                    ctx_by_id[_chunk.chunk_id] = _ctx
+                    chunks[_chunk_index] = dataclasses_replace(
+                        _chunk, text=_ctx + "\n" + _chunk.text
+                    )
             section_counts: dict[str, int] = {}
             section_headings: dict[str, str] = {}
             section_texts: dict[str, str] = {}
@@ -878,7 +922,7 @@ class Pipeline:
                 _drop_old_lexical_chunks(plan)
                 record = self._failure_record(plan, reason, state="empty")
                 record["content_hash"] = doc.content_hash or plan["content_hash"]
-                record["links"] = extract_wikilink_targets(doc.text)
+                record["links"] = raw_links
                 plan["record"] = record
                 file_report.extract_failure = reason
                 file_report.failure_state = "empty"
@@ -904,6 +948,7 @@ class Pipeline:
                         "heading_breadcrumb": chunk.heading_breadcrumb,
                         "chunk_index": chunk.chunk_index,
                         "section_id": chunk.section_id,
+                        "ctx": ctx_by_id.get(chunk.chunk_id, ""),
                     }
                     for chunk in chunks
                 ],
@@ -937,7 +982,7 @@ class Pipeline:
                     }
                     for section_id in section_counts
                 },
-                "links": extract_wikilink_targets(doc.text),
+                "links": raw_links,
             }
             plan["record"] = record
             file_report.extracted = True
@@ -1699,8 +1744,18 @@ class Pipeline:
             record = records.get(chunk_id)
             if record is None or not record["document"]:
                 continue
-            heading = (record["metadata"] or {}).get("heading_breadcrumb", "")
-            prefixed = f"{heading}\n{record['document']}" if heading and heading != "(无标题)" else record["document"]
+            meta_for_rerank = record["metadata"] or {}
+            if meta_for_rerank.get("ctx"):
+                # document 已带"文件名/title/tags/标题链"锚点前缀（问题18 v6），
+                # 重排器看到的就是存储文本，与旧项目一致，不再叠加面包屑
+                prefixed = record["document"]
+            else:
+                heading = meta_for_rerank.get("heading_breadcrumb", "")
+                prefixed = (
+                    heading + "\n" + record["document"]
+                    if heading and heading != "(无标题)"
+                    else record["document"]
+                )
             rerank_input.append((chunk_id, prefixed))
         if not rerank_input:
             return []
@@ -1803,7 +1858,7 @@ class Pipeline:
                     library_id=library_id,
                     path=path,
                     heading_breadcrumb=meta.get("heading_breadcrumb", ""),
-                    text=parent_text or record["document"],
+                    text=parent_text or _strip_anchor_context(record["document"], meta),
                     confidence=confidence,
                     backfilled=backfilled,
                 )
