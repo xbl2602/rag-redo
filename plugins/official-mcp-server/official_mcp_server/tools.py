@@ -156,7 +156,17 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
                     "library_id": r.library_id,
                     "path": r.path,
                     "heading": r.heading_breadcrumb,
-                    **({"text": r.text, "backfilled": r.backfilled} if include_body else {}),
+                    **(
+                        {
+                            "text": r.text,
+                            "backfilled": r.backfilled,
+                            "chunk_index": r.chunk_index,
+                            "total_chunks": r.total_chunks,
+                            "truncated": r.truncated,
+                        }
+                        if include_body
+                        else {}
+                    ),
                     "confidence": round(r.confidence, 3),
                     "confidence_tier": confidence_tier(r.confidence, warn_threshold),
                     **({"note": f"低置信度 {r.confidence:.2f}，仅供参考"} if r.confidence < warn_threshold else {}),
@@ -250,7 +260,9 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         return {"ok": True, "path": doc.path, "text": doc.text, "source": doc.source, "chars": len(doc.text)}
 
     @server.tool()
-    def find_duplicates(library_id: str, threshold: float = 0.7) -> dict[str, Any]:
+    def find_duplicates(library_id: str, threshold: float = 0.8) -> dict[str, Any]:
+        if not 0 < threshold <= 1:
+            return {"ok": False, "error": f"threshold 必须在 (0, 1] 区间，收到 {threshold!r}"}
         """近似重复文档检测（只读建议，绝不删除/移动文件）——对齐
         obsidian-rag 的 `find_duplicates` 工具：找出库内"内容几乎相同"
         的重复文档（同一课件多份拷贝、同一文档转出的多个副本），返回
@@ -262,7 +274,7 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
 
         Args:
             library_id: 要检测的库的 id
-            threshold: 相似度阈值（0~1，默认0.7），越高越严格，只有真正
+            threshold: 相似度阈值（0~1，默认0.8，对齐旧项目 DEDUP_THRESHOLD），越高越严格，只有真正
                        "近乎逐字重复"的才会被分进同一组
         """
         try:
@@ -288,6 +300,10 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         找不到再按标题匹配，标题在库内重名时任取其一，与 Obsidian 自身
         处理同名笔记的方式一样存在歧义。库从没建过索引、或指定的笔记
         不存在/无法解析，都返回 `resolved=False`（不是错误）。
+
+        Agent 格式授权在结果上生效（对齐 BC-02 的"关系入口生效"约定）：命中
+        的文件本身未授权 → `resolved=False`；出链/入链清单逐项按后缀过滤，
+        未授权格式的文件不会出现在关系清单里。
 
         Args:
             library_id: 笔记所在库的 id（用 list_libraries 查看有哪些库）
@@ -354,9 +370,14 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         """
         try:
             result = lib_mgr.get_selection(library_id)
+            policy = lib_mgr.store.get(library_id)
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, **result}
+        return {
+            "ok": True,
+            **result,
+            "new_file_default": policy.new_file_default if policy else "include",
+        }
 
     @server.tool()
     def propose_selection_changes(library_id: str, changes: list[dict]) -> dict[str, Any]:

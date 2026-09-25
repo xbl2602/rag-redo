@@ -404,6 +404,24 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         self.assertEqual(results[0].path, "plugin-notes.md")
         self.assertIn("插件", results[0].text)
 
+    def test_long_chunk_truncated_at_line_boundary_with_position(self):
+        """对齐旧 retriever.py::_truncate_at_line + 问题10 [块k/N]：超长块在
+        行边界收边截断并带标记，结果携带块位置。"""
+        long_body = chr(10).join(
+            f"这是第{i}行很长的内容，用来把这一块撑过两千字符的返回上限。" for i in range(80)
+        )
+        (self.vault / "long-notes.md").write_text(
+            "# 长文" + chr(10) + chr(10) + long_body, encoding="utf-8"
+        )
+        self.pipeline.index_library("test-lib")
+        results = self.pipeline.search("test-lib", "很长的内容", top_k=5)
+        hit = next(r for r in results if r.path == "long-notes.md")
+        self.assertTrue(hit.total_chunks >= 1)
+        self.assertGreaterEqual(hit.chunk_index, 0)
+        if hit.truncated:
+            self.assertIn("本块已截断", hit.text)
+            self.assertLessEqual(len(hit.text), 2100)
+
     def test_rerank_disabled_falls_back_to_pure_fusion(self):
         """对齐旧 retriever.py:627（rerank_enabled=False → 纯融合继续出结果）
         与 _merge_normalized 降级：置信度退回 RRF 双路一致度，检索绝不因

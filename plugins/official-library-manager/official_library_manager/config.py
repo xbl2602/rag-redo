@@ -28,9 +28,16 @@ class LibraryConfig:
     new_file_default: str = "include"  # "include" | "exclude"
     enabled_extensions: list[str] = field(default_factory=lambda: [".md", ".pdf", ".docx"])
     agent_formats: list[str] = field(default_factory=list)
-    exclude_dirs: list[str] = field(default_factory=list)
-    exclude_files: list[str] = field(default_factory=list)
-    exclude_patterns: list[str] = field(default_factory=list)
+    # 出厂排除默认集（对齐 obsidian-rag/config.py DEFAULTS，问题1/§4.2 索引
+    # 清洗）：.obsidian/.git 等系统目录和 AGENTS.md/会话日志被照常建库会造成
+    # 检索污染。仅"新建库未显式指定"时生效；已持久化的库配置不受影响。
+    exclude_dirs: list[str] = field(
+        default_factory=lambda: [".obsidian", ".smart-env", ".trash", ".git", "TEMP", "templates"]
+    )
+    exclude_files: list[str] = field(
+        default_factory=lambda: ["目录.md", "AGENTS.md", "LOG.md", "README.md"]
+    )
+    exclude_patterns: list[str] = field(default_factory=lambda: ["session-", "会话", ".tmp"])
 
 
 class LibraryConfigStore:

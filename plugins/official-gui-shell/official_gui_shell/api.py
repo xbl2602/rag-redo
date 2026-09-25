@@ -111,7 +111,7 @@ class Api:
         self,
         libraries: str,
         query: str,
-        top_k: int = 10,
+        top_k: int = 5,
         *,
         exclude: str = "",
         folder: str = "",

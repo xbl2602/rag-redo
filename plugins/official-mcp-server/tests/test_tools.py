@@ -382,8 +382,10 @@ class TestMcpTools(TestMcpToolsAsyncBase):
 
     async def test_find_duplicates_tool_detects_near_duplicate_files(self):
         vault = self.tmp / "vault"
+        # 完全相同的副本（相似度 1.0 > 默认阈值 0.8）；旧项目默认 0.8 下
+        # 0.77 相似度的"两处小改动"不算重复（dedup.py 实测校准记录）
         (vault / "notes-copy.md").write_text(
-            "# 插件架构（副本）\n\n这篇笔记讲插件系统的架构设计，一字不改的近似重复。",
+            "# 插件架构\n\n这篇笔记讲插件系统的架构设计，一字不改的近似重复。",
             encoding="utf-8",
         )
         (vault / "notes.md").write_text(

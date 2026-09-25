@@ -473,7 +473,7 @@ def _status_key(library_id: str) -> str:
 
 class IndexWorkerManager:
     HEARTBEAT_TIMEOUT_S = 15.0
-    STALL_TIMEOUT_S = 60.0
+    STALL_TIMEOUT_S = 25.0  # 对齐旧项目 config.py::stall_timeout（进度停滞判定，5×心跳间隔）
     ACK_TIMEOUT_S = 15.0
     HEARTBEAT_INTERVAL_S = 5.0
 
