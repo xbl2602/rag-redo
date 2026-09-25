@@ -13,10 +13,21 @@ from collections import deque
 
 
 class MineruCloudError(Exception):
-    def __init__(self, message: str, *, retryable: bool = False, token_invalid: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        token_invalid: bool = False,
+        gone: bool = False,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.token_invalid = token_invalid
+        # gone=True：远端任务确定不存在/响应不可解析（HTTP 404、非 JSON）——
+        # 对齐 obsidian-rag 问题36 的决策：轮询遇 404/非 JSON 判 gone 并清除
+        # 断点簿记，堵"永久续接一个不存在的任务"的死循环。
+        self.gone = gone
 
 
 class _RealHttpClient:
@@ -56,13 +67,14 @@ class _RealHttpClient:
                 f"HTTP {exc.code}",
                 retryable=retryable,
                 token_invalid=token_invalid,
+                gone=exc.code == 404,
             ) from exc
         except urllib.error.URLError as exc:
             raise MineruCloudError(f"网络错误: {type(exc).__name__}", retryable=True) from exc
         except (TimeoutError, OSError) as exc:
             raise MineruCloudError(f"网络错误: {type(exc).__name__}", retryable=True) from exc
         except json.JSONDecodeError as exc:
-            raise MineruCloudError("响应不是合法JSON") from exc
+            raise MineruCloudError("响应不是合法JSON", gone=True) from exc
         if not isinstance(payload, dict):
             raise MineruCloudError("响应不是JSON对象")
         return payload
@@ -118,6 +130,8 @@ class _RealHttpClient:
             try:
                 payload = self._json_request(request, timeout=30.0)
             except MineruCloudError as exc:
+                if exc.gone:
+                    return None, "gone", None
                 if exc.retryable:
                     time.sleep(1.0)
                     continue
