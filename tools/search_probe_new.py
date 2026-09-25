@@ -29,8 +29,8 @@ LIBS = "Obsidian Vault,agents,skills,LECTURE NOTE"
 def main() -> int:
     args = Namespace(
         plugins_dir=REPO_ROOT / "plugins",
-        state_file=REPO_ROOT / "data" / "plugins_state.json",
-        data_root=REPO_ROOT / "data",
+        state_file=REPO_ROOT / "data-real" / "plugins_state.json",
+        data_root=REPO_ROOT / "data-real",
     )
     runtime, pipeline = _boot_pipeline(args)
     out = {}

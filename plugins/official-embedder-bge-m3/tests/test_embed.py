@@ -146,13 +146,16 @@ class TestRealEncoderGpuArbitration(unittest.TestCase):
 
     def test_cuda_load_failure_enters_cooldown_and_degrades_to_cpu(self):
         """对齐旧项目 get_model：CUDA 初始化失败 → 冷却 + 降级 CPU 重试一次
-        （CPU 再失败才真的抛出）；诊断里记录失败原因。"""
+        （CPU 再失败才真的抛出）；诊断里记录失败原因。加载契约（2026-09-25
+        fp16 对齐后）：每设备先试 fp16、失败回退 fp32（旧 _load_model 的
+        两段尝试），CUDA 两段都失败才进冷却降 CPU。"""
         gate = _StubRecordingGate()
         encoder = _RealEncoder(resource_arbiter=ResourceArbiter(), cooldown_gate=gate)
 
         calls = []
 
-        def _fake_st(model_name, device):
+        def _fake_st(model_name, **kwargs):
+            device = kwargs["device"]
             calls.append(device)
             if device == "cuda":
                 raise RuntimeError("CUDA out of memory")
@@ -164,8 +167,15 @@ class TestRealEncoderGpuArbitration(unittest.TestCase):
         ):
             model = encoder._ensure_loaded()
         self.assertIsNotNone(model)
-        self.assertEqual(calls, ["cuda", "cpu"])
-        self.assertEqual(gate.cooldowns, ["CUDA out of memory"])
+        # 每设备至多 4 次尝试（离线优先 local→online × fp16→fp32，旧
+        # _load_pretrained 与 _load_model 两级回退的忠实展开），CUDA 全部
+        # 失败才进冷却降 CPU；CPU 上 fp16 加载成功但 object() 无 parameters
+        # → 混搭检查异常 → fp32 回退（旧 _load_model 对 fp32 回退不再检查）。
+        self.assertEqual(calls, ["cuda", "cuda", "cuda", "cuda", "cpu", "cpu"])
+        # 冷却原因携带加载失败的完整诊断（含根因），同 load_pretrained 的
+        # RuntimeError 包装格式
+        self.assertEqual(len(gate.cooldowns), 1)
+        self.assertIn("CUDA out of memory", gate.cooldowns[0])
         self.assertEqual(gate.reports, ["cpu"])
 
     def test_release_gpu_slot_returns_slot_to_arbiter(self):

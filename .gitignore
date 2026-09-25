@@ -17,3 +17,4 @@ plugins/*/env/
 Thumbs.db
 
 tmp_search_*.json
+data-real/

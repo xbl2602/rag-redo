@@ -85,7 +85,7 @@ LIBRARIES = [
 
 
 def main() -> int:
-    store = LibraryConfigStore(REPO_ROOT / "data" / "libraries.json")
+    store = LibraryConfigStore(REPO_ROOT / "data-real" / "libraries.json")
     for spec in LIBRARIES:
         if store.get(spec["library_id"]) is None:
             store.add_library(spec["library_id"], spec["name"], spec["root_path"])

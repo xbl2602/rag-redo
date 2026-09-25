@@ -16,15 +16,15 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from core.cli import _boot_pipeline  # noqa: E402
 
-MUT_ROOT = REPO_ROOT / "data" / "mutation-vault"
+MUT_ROOT = REPO_ROOT / "data-real" / "mutation-vault"
 LIB_ID = "mutation"
 
 
 def boot():
     args = Namespace(
         plugins_dir=REPO_ROOT / "plugins",
-        state_file=REPO_ROOT / "data" / "plugins_state.json",
-        data_root=REPO_ROOT / "data",
+        state_file=REPO_ROOT / "data-real" / "plugins_state.json",
+        data_root=REPO_ROOT / "data-real",
     )
     return _boot_pipeline(args)
 
@@ -45,7 +45,7 @@ def main() -> int:
         shutil.rmtree(MUT_ROOT)
     shutil.copytree(r"C:\Users\xbl26\.config\opencode\skills", MUT_ROOT)
 
-    pipeline = boot()
+    runtime, pipeline = boot()
     lib_mgr = pipeline._singleton("library_manager")
     if lib_mgr.store.get(LIB_ID) is None:
         lib_mgr.store.add_library(LIB_ID, "mutation", str(MUT_ROOT))

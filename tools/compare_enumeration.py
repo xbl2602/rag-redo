@@ -62,7 +62,7 @@ def main() -> int:
     )["libraries"]
     old_by_name = {e["name"]: e for e in old_registry}
 
-    store = LibraryConfigStore(REPO_ROOT / "data" / "libraries.json")
+    store = LibraryConfigStore(REPO_ROOT / "data-real" / "libraries.json")
     plugin = LibraryManagerPlugin()
     plugin.store = store
 
