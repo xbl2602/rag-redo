@@ -37,6 +37,9 @@ DEFAULT_FUSION_BM25_WEIGHT = 1.0  # RRF 融合里"BM25关键词"这一路的权�
 DEFAULT_DENSE_CANDIDATE_FACTOR = 8
 DEFAULT_DENSE_MIN_CANDIDATES = 200
 DEFAULT_RERANK_CANDIDATES = 50  # 送重排器的全局候选池大小（每库融合 top N 进入，对齐旧 rerank_candidates）
+DEFAULT_RETURN_CHUNK_LIMIT = 2000  # 检索返回给 LLM 的单块最大字符（对齐旧 config.py::return_chunk_limit）
+TRUNCATE_MARK = "… [本块已截断，完整内容见源文件]"  # 截断提示文案（对齐旧 config.py::truncate_mark）
+FOLD_WINDOW_FACTOR = 4  # 正文模式交付候选窗口倍数（同节折叠吃掉的候选由窗口补位，旧 retriever.py:29）
 
 # 置信度分档 + 同篇结果封顶（2026-09-23 全面功能审计B类，对齐 obsidian-rag
 # retriever.py 的"问题54真分尺度重标定"一节）：DEFAULT_* 都是 obsidian-rag
@@ -111,6 +114,23 @@ def _norm_folder(folder: str) -> str:
     """规范化 folder 参数：去首尾空白与首尾斜杠，反斜杠统一成正斜杠——
     对齐 obsidian-rag/retriever.py::_norm_folder。"""
     return folder.strip().replace("\\", "/").strip("/").strip()
+
+
+def _truncate_at_line(doc: str, limit: int, mark: str) -> tuple[str, bool]:
+    """返回截断：优先落在完整行边界（表格行/段落不拦腰切），最多 ±300 字符。
+
+    逐字移植 obsidian-rag/retriever.py::_truncate_at_line（282-297）：索引侧
+    对含表格的超长块"宁大勿断"整块保留（可 >2000），返回侧硬切会把表格行从
+    中间切断；改为在截断点附近找行尾/行首收边。"""
+    cut = doc[:limit]
+    nl = cut.rfind("\n")
+    if nl > 0 and limit - nl <= 300:
+        cut = doc[:nl]
+    else:
+        nxt = doc.find("\n", limit)
+        if nxt != -1 and nxt - limit <= 300:
+            cut = doc[:nxt]
+    return cut + "\n" + mark, True
 
 
 def _strip_anchor_context(document: str, meta: dict) -> str:
@@ -1718,6 +1738,7 @@ class Pipeline:
         # 批量取记录——vector_store.get_by_ids 是单库作用域的 API，不能跨库
         # 一次问完，但也不需要为每个 chunk_id 单独查一次。
         by_library: dict[str, list[str]] = {}
+        manifest_chunk_totals: dict[tuple[str, str], list] = {}
         for chunk_id in pool_ids:
             by_library.setdefault(_chunk_library(chunk_id), []).append(chunk_id)
         records: dict[str, dict] = {}
@@ -1727,11 +1748,14 @@ class Pipeline:
             manifest = self._manifest(library_id, generation)
             vector_segments = self._manifest_segments(manifest, "vector_segments", generation)
             records.update(self._vector_records(library_id, ids, vector_segments))
+            manifest_files_for_lib = self._manifest_files(manifest)
             sections_by_library[library_id] = {
                 path: dict(record.get("sections", {}))
-                for path, record in self._manifest_files(manifest).items()
+                for path, record in manifest_files_for_lib.items()
                 if record.get("status") == "indexed" and isinstance(record.get("sections"), dict)
             }
+            for path, record in manifest_files_for_lib.items():
+                manifest_chunk_totals[(library_id, path)] = record.get("chunk_ids", [])
 
         # 喂给重排器的文本前面带上标题面包屑——重排器只看纯段落正文的话，
         # 少了"这段话出自哪个标题/章节"这个人类读者天然会用到的判断依据，
@@ -1807,6 +1831,7 @@ class Pipeline:
         delivery_ids = merged[: top_k * fold_window_factor] if include_body else merged[:top_k]
 
         small_to_big = include_body and self.runtime.settings.get("small_to_big", True)
+        return_chunk_limit = self.runtime.settings.get("return_chunk_limit", DEFAULT_RETURN_CHUNK_LIMIT)
         results: list[SearchResult] = []
         per_file_count: dict[tuple[str, str], int] = {}
         emitted_sections: set[tuple[str, str, str]] = set()
@@ -1852,15 +1877,28 @@ class Pipeline:
                 per_file_count[file_key] = per_file_count.get(file_key, 0) + 1
             if backfilled:
                 emitted_sections.add(section_key)
+            delivered = _strip_anchor_context(record["document"], meta)
+            chunk_index = -1
+            try:
+                chunk_index = int(meta.get("chunk_index", -1))
+            except (TypeError, ValueError):
+                chunk_index = -1
+            total_chunks = len(record.get("chunk_ids") or manifest_chunk_totals.get((library_id, path), []))
+            truncated = False
+            if include_body and return_chunk_limit > 0 and len(delivered) > return_chunk_limit:
+                delivered, truncated = _truncate_at_line(delivered, return_chunk_limit, TRUNCATE_MARK)
             results.append(
                 SearchResult(
                     chunk_id=chunk_id,
                     library_id=library_id,
                     path=path,
                     heading_breadcrumb=meta.get("heading_breadcrumb", ""),
-                    text=parent_text or _strip_anchor_context(record["document"], meta),
+                    text=parent_text or delivered,
                     confidence=confidence,
                     backfilled=backfilled,
+                    chunk_index=chunk_index,
+                    total_chunks=total_chunks,
+                    truncated=truncated,
                 )
             )
         return results

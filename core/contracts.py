@@ -140,6 +140,9 @@ class SearchResult:
     text: str
     confidence: float  # 0~1，展示层按此分档（强/中/弱相关）
     backfilled: bool = False
+    chunk_index: int = -1  # 本块在该文件内的序号（0起），[块 k/N] 完整性标记的数据（问题10）
+    total_chunks: int = 0  # 该文件被索引的总块数
+    truncated: bool = False  # 正文是否因超过 return_chunk_limit 被行边界截断
     advice: tuple[str, ...] = ()
 
 
