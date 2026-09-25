@@ -15,3 +15,5 @@ plugins/*/env/
 # OS
 .DS_Store
 Thumbs.db
+
+tmp_search_*.json
