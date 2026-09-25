@@ -1,0 +1,362 @@
+{
+  "火箭飞行过程中的机动与控制": {
+    "elapsed_s": 20.95,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "30-Resources/Ideas/工程项目灵感来源.md",
+        "chunk": 2,
+        "total": 12,
+        "confidence": 0.4277,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/report_checklist.md",
+        "chunk": 3,
+        "total": 14,
+        "confidence": 0.2813,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/自平衡机器人-PID控制.md",
+        "chunk": 3,
+        "total": 4,
+        "confidence": 0.1334,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/report_questions.md",
+        "chunk": 5,
+        "total": 64,
+        "confidence": 0.1247,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/边缘AI手势控制器-TinyML.md",
+        "chunk": 4,
+        "total": 6,
+        "confidence": 0.105,
+        "truncated": false
+      }
+    ]
+  },
+  "可持续航空燃料的应用前景": {
+    "elapsed_s": 78.12,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 8,
+        "total": 11,
+        "confidence": 0.9769,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 0,
+        "total": 11,
+        "confidence": 0.9684,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 1,
+        "total": 11,
+        "confidence": 0.957,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/NIMP 2030.md",
+        "chunk": 5,
+        "total": 7,
+        "confidence": 0.2361,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/ICP 工业协作计划与本地化.md",
+        "chunk": 7,
+        "total": 8,
+        "confidence": 0.2243,
+        "truncated": false
+      }
+    ]
+  },
+  "奖学金申请需要准备哪些材料": {
+    "elapsed_s": 8.3,
+    "hits": [
+      {
+        "library": "skills",
+        "path": "brandkit/SKILL.md",
+        "chunk": 28,
+        "total": 64,
+        "confidence": 0.1494,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/附录/调研来源链附录.md",
+        "chunk": 14,
+        "total": 19,
+        "confidence": 0.1326,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 4,
+        "total": 7,
+        "confidence": 0.0749,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 5,
+        "total": 7,
+        "confidence": 0.0607,
+        "truncated": false
+      },
+      {
+        "library": "skills",
+        "path": "officecli/SKILL.md",
+        "chunk": 2,
+        "total": 72,
+        "confidence": 0.0282,
+        "truncated": false
+      }
+    ]
+  },
+  "静力学 压力测量装置": {
+    "elapsed_s": 44.23,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/report_questions.md",
+        "chunk": 7,
+        "total": 64,
+        "confidence": 0.0357,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/Ansys vs SolidWorks Simulation 对比.md",
+        "chunk": 1,
+        "total": 4,
+        "confidence": 0.0266,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/资源/工程学习资源清单.md",
+        "chunk": 1,
+        "total": 5,
+        "confidence": 0.0248,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 3,
+        "total": 6,
+        "confidence": 0.0142,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/ME认证-SixSigma与Ansys.md",
+        "chunk": 4,
+        "total": 7,
+        "confidence": 0.0108,
+        "truncated": false
+      }
+    ]
+  },
+  "量纲分析的基本步骤": {
+    "elapsed_s": 44.7,
+    "hits": [
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 6,
+        "total": 14,
+        "confidence": 0.584,
+        "truncated": false
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 9,
+        "total": 14,
+        "confidence": 0.5639,
+        "truncated": false
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 8,
+        "total": 14,
+        "confidence": 0.4357,
+        "truncated": false
+      },
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 3,
+        "total": 11,
+        "confidence": 0.2359,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "00-Inbox/AGENTS.md",
+        "chunk": 7,
+        "total": 22,
+        "confidence": 0.2291,
+        "truncated": false
+      }
+    ]
+  },
+  "并行任务调度 角色权限": {
+    "elapsed_s": 78.87,
+    "hits": [
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 0,
+        "total": 11,
+        "confidence": 0.3058,
+        "truncated": false
+      },
+      {
+        "library": "skills",
+        "path": "parallel-dispatch/SKILL.md",
+        "chunk": 3,
+        "total": 7,
+        "confidence": 0.1606,
+        "truncated": false
+      },
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 9,
+        "total": 11,
+        "confidence": 0.1458,
+        "truncated": false
+      },
+      {
+        "library": "skills",
+        "path": "audit-depth/agent-roles.md",
+        "chunk": 0,
+        "total": 8,
+        "confidence": 0.1332,
+        "truncated": false
+      },
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 8,
+        "total": 11,
+        "confidence": 0.0919,
+        "truncated": false
+      }
+    ]
+  },
+  "图检索增强架构解析": {
+    "elapsed_s": 152.07,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "chunk": 0,
+        "total": 3,
+        "confidence": 0.8941,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "chunk": 1,
+        "total": 3,
+        "confidence": 0.8179,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": 3,
+        "total": 14,
+        "confidence": 0.5904,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": 1,
+        "total": 14,
+        "confidence": 0.4975,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": 0,
+        "total": 14,
+        "confidence": 0.4508,
+        "truncated": false
+      }
+    ]
+  },
+  "本地大模型部署调优": {
+    "elapsed_s": 72.56,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "chunk": 2,
+        "total": 5,
+        "confidence": 0.8721,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "chunk": 4,
+        "total": 8,
+        "confidence": 0.8433,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "chunk": 4,
+        "total": 5,
+        "confidence": 0.8208,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "chunk": 2,
+        "total": 8,
+        "confidence": 0.7943,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/DeepSeek本地部署-RAGFlow个人知识库搭建.md",
+        "chunk": 3,
+        "total": 12,
+        "confidence": 0.7507,
+        "truncated": false
+      }
+    ]
+  }
+}

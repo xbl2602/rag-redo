@@ -26,6 +26,7 @@ from typing import Protocol
 
 from core import gpu_arbiter
 from core.gpu_arbiter import CudaCooldownGate
+from core.model_loading import load_pretrained
 
 MODEL_VERSION = "BAAI/bge-reranker-v2-m3"
 GPU_RESOURCE_ID = "gpu:0"
@@ -61,7 +62,7 @@ class _RealReranker:
 
                 device = self._select_device()
                 try:
-                    self._model = CrossEncoder(self._model_name, device=device)
+                    self._model = self._load_for_device(CrossEncoder, device)
                 except Exception as exc:
                     # 对齐旧项目 get_model：CUDA 初始化失败 → 冷却 + 降级 CPU 重试一次
                     if device != "cuda":
@@ -69,11 +70,23 @@ class _RealReranker:
                     self._cooldown_gate.cooldown(str(exc))
                     self._log(f"CUDA 初始化失败（{exc}），降级 CPU")
                     device = "cpu"
-                    self._model = CrossEncoder(self._model_name, device=device)
+                    self._model = self._load_for_device(CrossEncoder, device)
                 self._log(f"重排器模型已加载（device={device}）")
                 self._cooldown_gate.report_device(device)
             self._last_use = time.time()
             return self._model
+
+    def _load_for_device(self, factory, device: str):
+        """对齐旧 retriever.py::_get_reranker（2026-09-12 决策）：max_length=512
+        截断 + fp16 加载（显存/读盘减半，分数扰动经旧项目真库对比确认不影响
+        0.75/0.30 档位）；fp32 常驻会把 8GB 卡顶进 WDDM 共享显存溢出，实测
+        单批重排掉进分钟级。加载走 core.model_loading.load_pretrained 离线
+        优先（问题56），冷加载不再等 hub 联网核对。"""
+        return load_pretrained(
+            factory, self._model_name, log=self._log,
+            device=device, max_length=512,
+            model_kwargs={"torch_dtype": "float16"},
+        )
 
     def _select_device(self) -> str:
         """同 embed.py::_select_device 的对齐口径：冷却期状态机取代裸
@@ -104,7 +117,8 @@ class _RealReranker:
             model = self._ensure_loaded()
             pairs = [[query, text] for text in texts]
             started = time.time()
-            result = list(model.predict(pairs))
+            # batch_size=16 对齐旧 retriever.py:698 的 predict 调用
+            result = list(model.predict(pairs, batch_size=16))
             elapsed = time.time() - started
             self._last_use = time.time()
             self._check_slow_batch(elapsed)

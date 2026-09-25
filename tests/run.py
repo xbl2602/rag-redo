@@ -48,6 +48,7 @@ CORE_SUITES = [
     "test_extract_cache",
     "test_index_progress",
     "test_index_failures",
+    "test_model_loading",
     "test_note_relations",
     "test_graph",
     "test_singleton",

@@ -52,6 +52,7 @@ from typing import Protocol
 
 from core import gpu_arbiter
 from core.gpu_arbiter import CudaCooldownGate
+from core.model_loading import load_pretrained, param_dtype_mixed
 
 MODEL_VERSION = "BAAI/bge-m3"
 GPU_RESOURCE_ID = "gpu:0"
@@ -98,7 +99,7 @@ class _RealEncoder:
 
                 device = self._select_device()
                 try:
-                    self._model = SentenceTransformer(self._model_name, device=device)
+                    self._model = self._load_for_device(SentenceTransformer, device)
                 except Exception as exc:
                     # 对齐旧项目 get_model：CUDA 初始化失败 → 冷却 + 降级 CPU
                     # 重试一次（CPU 再失败才真的抛出）
@@ -107,11 +108,30 @@ class _RealEncoder:
                     self._cooldown_gate.cooldown(str(exc))
                     self._log(f"CUDA 初始化失败（{exc}），降级 CPU")
                     device = "cpu"
-                    self._model = SentenceTransformer(self._model_name, device=device)
+                    self._model = self._load_for_device(SentenceTransformer, device)
                 self._log(f"BGE-M3模型已加载（device={device}）")
                 self._cooldown_gate.report_device(device)
             self._last_use = time.time()
             return self._model
+
+    def _load_for_device(self, factory, device: str):
+        """对齐旧 index.py::_load_model：CUDA/CPU 均优先 fp16 减半显存
+        （8GB 卡防 Windows 共享显存溢出——fp32 双模型常驻必顶满 8GB 触发
+        WDDM 溢出，实测单批编码掉进分钟级），失败或参数 dtype 混搭回退
+        fp32。加载本身走 core.model_loading.load_pretrained 的离线优先
+        （问题56），不再触发 hub 联网核对。"""
+        try:
+            model = load_pretrained(
+                factory, self._model_name, log=self._log,
+                device=device, model_kwargs={"torch_dtype": "float16"},
+            )
+            if param_dtype_mixed(model):
+                self._log(f"{device} fp16 加载后参数 dtype 混搭（Half/Float 并存），回退 fp32")
+                raise RuntimeError("fp16 参数 dtype 混搭")
+            return model
+        except Exception as exc:
+            self._log(f"{device} fp16 加载失败，回退 fp32：{exc}")
+            return load_pretrained(factory, self._model_name, log=self._log, device=device)
 
     def _select_device(self) -> str:
         """有 CUDA 就优先用（大幅提速）；加载前先向资源仲裁器申请"gpu:0"
