@@ -414,6 +414,31 @@ class TestApi(unittest.TestCase):
         result = self.api.unset_setting("never-set")
         self.assertTrue(result["ok"])
 
+    def test_batch_summary_refresh_background_and_poll(self):
+        """对齐旧 guiweb/bridge.py::refresh_library_summaries_batch+poll：
+        后台线程逐库生成，轮询读进度与结果，手写库跳过不阻塞批次。"""
+        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.add_library("lib2", "第二库", str(self.vault))
+        self.api._pipeline.index_library("lib2")
+        self.api._pipeline.set_library_summary_direct("lib1", "手写简介", source="user")
+        result = self.api.refresh_library_summaries_batch(["lib1", "lib2"])
+        self.assertTrue(result["ok"])
+        deadline = __import__("time").monotonic() + 30
+        while __import__("time").monotonic() < deadline:
+            poll = self.api.refresh_library_summaries_poll()
+            if not poll["running"]:
+                break
+            __import__("time").sleep(0.05)
+        self.assertFalse(poll["running"])
+        self.assertEqual(poll["done"], poll["total"])
+        self.assertIn("lib1", poll["skipped"], "手写简介在 force=False 时跳过")
+        self.assertIn("lib2", poll["results"])
+        # lib2 生成失败的详细原因（假 LLM 环境下的可诊断性）
+        self.assertTrue(
+            poll["results"]["lib2"]["ok"],
+            poll["results"].get("lib2", {}).get("error", "no error field"),
+        )
+
     def test_settings_meta_marks_api_keys_secret(self):
         """对齐 obsidian-rag/gui/config_editor.py:168/278（secret 标志）与
         guiweb/bridge.py:813（元信息随值一起返回）：API key 类设置必须带

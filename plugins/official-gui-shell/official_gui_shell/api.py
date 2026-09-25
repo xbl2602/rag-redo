@@ -12,6 +12,8 @@ GUI 是零侵入观察者（继承旧项目架构红线，见 AGENTS.md 架构�
 """
 from __future__ import annotations
 
+import threading
+
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +60,8 @@ class Api:
     def __init__(self, pipeline: Pipeline, lib_mgr: Any) -> None:
         self._pipeline = pipeline
         self._lib_mgr = lib_mgr
+        self._summary_batch: dict | None = None
+        self._summary_batch_lock = threading.Lock()
 
     def list_libraries(self) -> list[dict[str, Any]]:
         return [
@@ -320,10 +324,8 @@ class Api:
         当前简介若是用户手写的且 force=False，不生成也不覆盖，返回
         `needs_confirm=True` 让前端二次确认后带 force=True 重试（同调查
         到的旧项目 guiweb/bridge.py::_run_summary_refresh_batch 的"先探测
-        再问要不要覆盖"逻辑）。
-
-        **已知的简化**：GUI 的后台任务+轮询目前只覆盖重建索引；摘要生成
-        本身仍是同步阻塞调用，调用方（前端）需要接受这次调用可能较慢。"""
+        再问要不要覆盖"逻辑）。批量场景用 `refresh_library_summaries_batch`
+        （后台线程+轮询，对齐旧 bridge.py 同名方法），单库刷新不再阻塞。"""
         try:
             current = self._pipeline.get_library_summary(library_id)
             if current.source == "user" and not force:
@@ -336,6 +338,70 @@ class Api:
             return {"ok": False, "error": str(exc)}
         result["provider"] = provider_id
         return result
+
+    # ---- 批量后台刷新简介（对齐旧 guiweb/bridge.py::refresh_library_summaries_batch
+    #      + refresh_library_summaries_poll：后台线程逐库生成，前端轮询进度；
+    #      用户手写的库不传 force 时跳过并报告 needs_confirm，不阻塞批次）----
+
+    def refresh_library_summaries_batch(self, names: list[str], force: bool = False) -> dict[str, Any]:
+        """启动一批库的 AI 简介后台刷新，立即返回（不阻塞 GUI）。逐库在
+        后台线程执行，结果经 `refresh_library_summaries_poll()` 轮询读取。
+        `force=True` 时连用户手写的简介也覆盖；False 时手写库跳过并记录
+        在 `skipped`（免打扰：同一批里用户已拒绝的库不再反复询问）。"""
+        with self._summary_batch_lock:
+            if self._summary_batch is not None and self._summary_batch["thread"].is_alive():
+                return {"ok": False, "error": "已有一个批量刷新任务在进行中"}
+            state = {
+                "names": list(names),
+                "force": force,
+                "done": 0,
+                "total": len(names),
+                "current": "",
+                "results": {},
+                "skipped": [],
+                "thread": None,
+            }
+            state["thread"] = threading.Thread(
+                target=self._summary_refresh_worker, args=(state,), daemon=True, name="summary-refresh-batch"
+            )
+            self._summary_batch = state
+        state["thread"].start()
+        return {"ok": True, "total": len(names)}
+
+    def _summary_refresh_worker(self, state: dict) -> None:
+        for library_id in state["names"]:
+            state["current"] = library_id
+            current = self._pipeline.get_library_summary(library_id)
+            if current.source == "user" and not state["force"]:
+                state["skipped"].append(library_id)
+            else:
+                try:
+                    text, fingerprint, provider_id = self._pipeline.generate_library_summary(library_id)
+                    self._pipeline.set_library_summary_direct(
+                        library_id, text, source="ai", fingerprint=fingerprint, model=provider_id
+                    )
+                    state["results"][library_id] = {"ok": True, "text": text, "provider": provider_id}
+                except Exception as exc:  # noqa: BLE001 - 单库失败不拖垮批次
+                    state["results"][library_id] = {"ok": False, "error": str(exc)}
+            state["done"] += 1
+        state["current"] = ""
+
+    def refresh_library_summaries_poll(self) -> dict[str, Any]:
+        """轮询批量刷新进度：`{running, done, total, current, results,
+        skipped}`——对齐旧 bridge.py 的同名轮询协议。"""
+        with self._summary_batch_lock:
+            state = self._summary_batch
+            if state is None:
+                return {"running": False, "done": 0, "total": 0, "current": "", "results": {}, "skipped": []}
+            running = state["thread"].is_alive()
+            return {
+                "running": running,
+                "done": state["done"],
+                "total": state["total"],
+                "current": state["current"],
+                "results": {k: dict(v) for k, v in state["results"].items()},
+                "skipped": list(state["skipped"]),
+            }
 
     def import_library(self, archive_path: str, root_path: str, library_id: str = "") -> dict[str, Any]:
         """从 export_library 写出的归档文件恢复一个库。library_id 留空
