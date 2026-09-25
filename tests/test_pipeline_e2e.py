@@ -404,6 +404,31 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         self.assertEqual(results[0].path, "plugin-notes.md")
         self.assertIn("插件", results[0].text)
 
+    def test_rerank_disabled_falls_back_to_pure_fusion(self):
+        """对齐旧 retriever.py:627（rerank_enabled=False → 纯融合继续出结果）
+        与 _merge_normalized 降级：置信度退回 RRF 双路一致度，检索绝不因
+        重排器缺席整体失败。"""
+        self.pipeline.index_library("test-lib")
+        self.runtime.settings.set("rerank_enabled", False)
+        try:
+            results = self.pipeline.search("test-lib", "插件 架构", top_k=5)
+            self.assertTrue(results, "纯融合降级必须仍能出结果")
+            self.assertTrue(all(0.0 <= r.confidence <= 1.0 for r in results))
+        finally:
+            self.runtime.settings.unset("rerank_enabled")
+
+    def test_dense_candidate_pool_respects_old_floor(self):
+        """对齐旧 retriever.py:640：候选池 = max(top_k×8, 200)——小 top_k 时
+        候选池不得静默缩水（此前 top_k*3 把 top_k=5 的池子缩到 15）。"""
+        self.pipeline.index_library("test-lib")
+        with patch.object(
+            self.pipeline._singleton("lexical_index"),
+            "search",
+            wraps=self.pipeline._singleton("lexical_index").search,
+        ) as spy:
+            self.pipeline.search("test-lib", "插件 架构", top_k=5)
+        self.assertGreaterEqual(spy.call_args.kwargs.get("top_k", spy.call_args.args[-1] if spy.call_args.args else 0), 200)
+
     def test_graph_reads_active_manifest_and_relations_without_loading_embedder(self):
         (self.vault / "plugin-notes.md").write_text(
             "# 插件架构笔记\n\n插件系统连接到 [[cooking]]。",

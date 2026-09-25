@@ -31,6 +31,11 @@ from .runtime import PluginRuntime, PluginState
 
 DEFAULT_FUSION_DENSE_WEIGHT = 1.0  # RRF 融合里"向量语义"这一路的权重，对齐 obsidian-rag/config.py 同名默认值
 DEFAULT_FUSION_BM25_WEIGHT = 1.0  # RRF 融合里"BM25关键词"这一路的权重，同上
+# 候选池尺度（对齐 obsidian-rag/config.py 同名键，2026-09-25 终审补齐——
+# 此前 top_k*3 的池子把默认 top_k=5 时的候选从旧的 200 静默缩到 15）
+DEFAULT_DENSE_CANDIDATE_FACTOR = 8
+DEFAULT_DENSE_MIN_CANDIDATES = 200
+DEFAULT_RERANK_CANDIDATES = 50  # 送重排器的全局候选池大小（每库融合 top N 进入，对齐旧 rerank_candidates）
 
 # 置信度分档 + 同篇结果封顶（2026-09-23 全面功能审计B类，对齐 obsidian-rag
 # retriever.py 的"问题54真分尺度重标定"一节）：DEFAULT_* 都是 obsidian-rag
@@ -1583,10 +1588,25 @@ class Pipeline:
         embedder = self._singleton("embedder")
         vector_store = self._singleton("vector_store")
         fusion = self._singleton("fusion")
-        reranker = self._singleton("reranker")
 
         folder_norm = _norm_folder(folder)
-        candidate_pool = top_k * 3
+        # 候选池尺度对齐 obsidian-rag/retriever.py:640（问题21/10）：每路
+        # dense_k = max(top_k × 8, 200)——无条件垫底 200 修"folder 小目录/
+        # 小库召回天花板"，此前 top_k*3 的实现把 top_k=5 时的候选池从旧
+        # 的 200 静默缩到 15，是检索召回最大的隐性回退（2026-09-25 终审）。
+        dense_candidate_factor = self.runtime.settings.get("dense_candidate_factor", DEFAULT_DENSE_CANDIDATE_FACTOR)
+        dense_min_candidates = self.runtime.settings.get("dense_min_candidates", DEFAULT_DENSE_MIN_CANDIDATES)
+        rerank_candidates = self.runtime.settings.get("rerank_candidates", DEFAULT_RERANK_CANDIDATES)
+        rerank_enabled = self.runtime.settings.get("rerank_enabled", True)
+        candidate_pool = max(top_k * dense_candidate_factor, dense_min_candidates)
+        # 重排可用性对齐旧 retriever.py:627（rerank_enabled/池为 0/插件加载
+        # 失败 → 纯融合降级继续出结果，绝不因重排器缺失让检索整体失败）。
+        reranker = None
+        if rerank_enabled and rerank_candidates > 0:
+            try:
+                reranker = self._singleton("reranker")
+            except PipelineError:
+                reranker = None
         (query_vector,) = embedder.embed_texts([query])
         # RRF 两路权重可调（core/settings.py 通用设置存储，2026-09-23 全面
         # 功能审计发现此前是死值——对齐 obsidian-rag/config.py 的
@@ -1596,6 +1616,7 @@ class Pipeline:
         bm25_weight = self.runtime.settings.get("fusion_bm25_weight", DEFAULT_FUSION_BM25_WEIGHT)
 
         pool_ids: list[str] = []
+        per_library_fused: list[list[tuple[str, float]]] = []
         for cfg in entries:
             library_id = cfg.library_id
             generation = self._generations.active(library_id)
@@ -1641,7 +1662,10 @@ class Pipeline:
             ]
             vector_ranked = [cid for cid, _ in vector_hits if _in_folder(_chunk_path(cid), folder_norm)]
             fused = fusion.fuse([lexical_ranked, vector_ranked], weights=[bm25_weight, dense_weight])
-            pool_ids.extend(chunk_id for chunk_id, _ in fused[: top_k * 2])
+            # 全量保序保留（含池外余量）：重排池取每库融合前 rerank_candidates
+            # 进全局精排，池外余量按各库融合序接在重排结果后（旧 retriever.py:681-696）。
+            per_library_fused.append(fused)
+            pool_ids.extend(chunk_id for chunk_id, _ in fused[:rerank_candidates])
         if not pool_ids:
             return []
 
@@ -1680,21 +1704,64 @@ class Pipeline:
             rerank_input.append((chunk_id, prefixed))
         if not rerank_input:
             return []
-        reranked = reranker.rerank(query, rerank_input, top_k=len(rerank_input))
-        if not reranked:
+
+        # 排序与置信度对齐旧 retriever.py:662-757：重排生效 → 全局精排序 +
+        # 重排器概率直接作置信度（只钳位不二次激活，问题54）；重排关闭/
+        # 失败 → 各库融合分按库内最高分归一化合并（_merge_normalized），
+        # 置信度退回 RRF 双路一致度（score/[(wd+wb)/(k+1)]，k=2）。
+        merged: list[str] = []
+        rr_conf: dict[str, float] = {}
+        if reranker is not None and rerank_input:
+            try:
+                reranked = reranker.rerank(query, rerank_input, top_k=len(rerank_input))
+                if reranked:
+                    rr_conf = {
+                        chunk_id: max(0.0, min(1.0, float(score)))
+                        for chunk_id, score in reranked
+                    }
+                    merged = [chunk_id for chunk_id, _ in reranked]
+                    for fused in per_library_fused:
+                        merged.extend(chunk_id for chunk_id, _ in fused[rerank_candidates:])
+            except Exception:
+                rr_conf = {}
+        if not merged:
+            normalized: list[tuple[str, float]] = []
+            for fused in per_library_fused:
+                best = max((score for _, score in fused), default=0.0)
+                normalized.extend(
+                    (chunk_id, score / best if best > 0 else 0.0) for chunk_id, score in fused
+                )
+            normalized.sort(key=lambda item: item[1], reverse=True)
+            merged = [chunk_id for chunk_id, _ in normalized]
+        # 退路置信度的分母：RRF 分上限 = (w_dense + w_bm25)/(k+1)（两路都
+        # 第一时），k 取融合插件同一常数 2。
+        rrf_max = (float(dense_weight) + float(bm25_weight)) / 3.0
+        rrf_scores: dict[str, float] = {
+            chunk_id: score for fused in per_library_fused for chunk_id, score in fused
+        }
+        if not merged:
             return []
 
         drop_threshold = self.runtime.settings.get("confidence_drop_threshold", DEFAULT_CONFIDENCE_DROP_THRESHOLD)
         max_chunks_per_file = self.runtime.settings.get("max_chunks_per_file", DEFAULT_MAX_CHUNKS_PER_FILE)
 
+        # 交付候选窗口对齐旧 retriever.py:29-41（FOLD_WINDOW_FACTOR=4）：
+        # 正文模式同节折叠会吃掉候选，窗口补位让被折叠名次之后的真正候选
+        # 进得来；list 模式不折叠不封顶，直接 top_k。
+        fold_window_factor = 4
+        delivery_ids = merged[: top_k * fold_window_factor] if include_body else merged[:top_k]
+
         small_to_big = include_body and self.runtime.settings.get("small_to_big", True)
         results: list[SearchResult] = []
         per_file_count: dict[tuple[str, str], int] = {}
         emitted_sections: set[tuple[str, str, str]] = set()
-        for chunk_id, score in reranked:
+        for chunk_id in delivery_ids:
             if len(results) >= top_k:
                 break
-            confidence = max(0.0, min(1.0, float(score)))
+            confidence = rr_conf.get(chunk_id)
+            if confidence is None:
+                raw = rrf_scores.get(chunk_id, 0.0)
+                confidence = min(1.0, raw / rrf_max) if rrf_max > 0 else 0.0
             if confidence < drop_threshold:
                 continue
             record = records.get(chunk_id)
