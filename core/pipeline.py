@@ -536,6 +536,16 @@ class Pipeline:
             raise KeyError(f"未知库: {library_id}")
         root = Path(cfg.root_path)
 
+        # Token 失效标志每轮索引复位（问题35：长驻进程跨轮次复用，旧
+        # index.py:1874-1878 在云端段开始时 mineru_token_reset() 同语义）
+        for provider_id in self.runtime.registry.providers_of("extractor:pdf"):
+            reset = getattr(self._plugin(provider_id), "reset_token_flag", None)
+            if reset is not None:
+                try:
+                    reset()
+                except Exception:
+                    pass
+
         chunker = self._singleton("chunker")
         embedder = self._singleton("embedder")
         lexical = self._singleton("lexical_index")

@@ -574,7 +574,7 @@ class TestMcpTools(TestMcpToolsAsyncBase):
 
     async def test_navigate_knowledge_unknown_library_reports_error_not_crash(self):
         result = await self.server.call_tool(
-            "navigate_knowledge", {"query": "x", "library_id": "no-such-lib"}
+            "navigate_knowledge", {"query": "x", "libraries": "no-such-lib"}
         )
         self.assertFalse(result.is_error)
         self.assertFalse(result.structured_content["ok"])

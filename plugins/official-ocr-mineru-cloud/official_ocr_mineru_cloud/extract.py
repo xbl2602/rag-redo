@@ -182,6 +182,11 @@ class MineruCloudExtractor:
             if not all(hasattr(self._client, name) for name in ("submit", "upload", "poll")):
                 text = self._retry_call(lambda: self._client.ocr(data, full_path.name))
             else:
+                token_check = getattr(self._client, "token_invalid", None)
+                if token_check is not None and token_check():
+                    # 同批已有任务发现 Token 失效（问题35）：本文件不发请求
+                    # 直接失败，不落断点簿记——下一轮索引自然重试
+                    return _fail(library_id, path, "extract-failed", content_hash, state="extract-failed")
                 pending = self._pending_match(str(full_path), content_hash)
                 if pending is None:
                     submitted = self._retry_call(

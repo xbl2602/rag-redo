@@ -27,7 +27,7 @@ class TestIndexFailuresStore(unittest.TestCase):
         self.store.write_library("lib1", succeeded=3, failures=failures)
         result = self.store.read("lib1")
         self.assertEqual(result["succeeded"], 3)
-        self.assertEqual(result["failures"], failures)
+        self.assertEqual(result["failures"], [{**row, "label": str(row["reason"])} for row in failures])
 
     def test_all_succeeded_reports_empty_failures_not_none(self):
         """全部成功和从没跑过是两种不同的状态——全部成功要能明确区分于
@@ -47,7 +47,10 @@ class TestIndexFailuresStore(unittest.TestCase):
     def test_different_libraries_are_isolated(self):
         self.store.write_library("lib1", succeeded=1, failures=[{"path": "a.pdf", "reason": "x"}])
         self.store.write_library("lib2", succeeded=9, failures=[])
-        self.assertEqual(self.store.read("lib1")["failures"], [{"path": "a.pdf", "reason": "x"}])
+        self.assertEqual(
+            self.store.read("lib1")["failures"],
+            [{"path": "a.pdf", "reason": "x", "label": "x"}],
+        )
         self.assertEqual(self.store.read("lib2")["failures"], [])
 
     def test_unknown_library_after_others_written_is_still_none(self):
