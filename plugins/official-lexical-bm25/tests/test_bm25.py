@@ -21,11 +21,14 @@ from official_lexical_bm25.plugin import LexicalBM25Plugin
 
 
 class TestTokenize(unittest.TestCase):
-    def test_chinese_is_segmented_not_char_by_char(self):
+    def test_chinese_dual_channel_word_plus_bigram(self):
+        """对齐旧项目双通道设计（retriever.py::tokenize，2026-08-13）：jieba
+        词级语义 + 中文 2-gram 兜底召回并集——专名被 jieba 切错时 bigram 仍能
+        命中，所以 token 数会多于字数（词+bigram 叠加），不是退化。"""
         tokens = tokenize("插件化架构设计")
-        # jieba 应该切出词而不是退化成逐字——至少要比总字数少（说明真的
-        # 分了词，不是纯 2-gram/逐字兜底）
-        self.assertLess(len(tokens), len("插件化架构设计"))
+        self.assertIn("插件", tokens)  # jieba 词级
+        self.assertIn("件化", tokens)  # 2-gram 兜底
+        self.assertGreater(len(tokens), len("插件化架构设计"))
 
     def test_english_lowercased(self):
         tokens = tokenize("RAG Redo Plugin")
