@@ -190,7 +190,7 @@ class LibraryManagerPlugin:
         cfg = self.store.get(library_id)
         if cfg is None:
             raise KeyError(f"未知库: {library_id}")
-        norm = normalize_selection_changes(changes)  # 非法项直接抛异常，整体拒绝
+        norm = normalize_selection_changes(changes, exclude_dirs=cfg.exclude_dirs)  # 非法项直接抛异常，整体拒绝
         ticket = self._write_gate.propose(f"变更库「{library_id}」的路径级勾选", {
             "library_id": library_id,
             "changes": norm,

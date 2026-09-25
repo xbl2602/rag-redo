@@ -70,20 +70,46 @@ class TestMigrateLibrariesJson(unittest.TestCase):
         reading = next(c for c in self.store.list_libraries() if c.name == "读书笔记")
         self.assertEqual(reading.enabled_extensions, [".md", ".pdf", ".docx"])
 
-    def test_old_follow_maps_to_new_include(self):
+    def test_old_three_states_pass_through_verbatim(self):
+        """三态直传（follow/include/exclude）——新架构判定语义已逐字对齐旧
+        collect_md_files 分支，不再做近似映射。"""
+        for state in ("follow", "include", "exclude"):
+            store = LibraryConfigStore(self.tmp / f"s-{state}.json")
+            migrate(store, OLD_REGISTRY["libraries"], global_selection_new_files=state)
+            for cfg in store.list_libraries():
+                self.assertEqual(cfg.new_file_default, state, state)
+
+    def test_agent_formats_migrated(self):
         migrate(self.store, OLD_REGISTRY["libraries"], global_selection_new_files="follow")
-        for cfg in self.store.list_libraries():
-            self.assertEqual(cfg.new_file_default, "include")
+        reading = next(c for c in self.store.list_libraries() if c.name == "读书笔记")
+        self.assertEqual(reading.agent_formats, [".pdf"])
 
-    def test_old_exclude_maps_to_new_exclude(self):
-        migrate(self.store, OLD_REGISTRY["libraries"], global_selection_new_files="exclude")
-        for cfg in self.store.list_libraries():
-            self.assertEqual(cfg.new_file_default, "exclude")
+    def test_per_library_exclude_overrides_migrated(self):
+        entries = [
+            {
+                "name": "工作笔记",
+                "path": "/a",
+                "exclude_dirs": ["私人"],
+                "exclude_files": ["目录.md"],
+                "exclude_patterns": ["session-"],
+            }
+        ]
+        migrate(self.store, entries, global_selection_new_files="follow")
+        cfg = self.store.list_libraries()[0]
+        self.assertEqual(cfg.exclude_dirs, ["私人"])
+        self.assertEqual(cfg.exclude_files, ["目录.md"])
+        self.assertEqual(cfg.exclude_patterns, ["session-"])
 
-    def test_old_include_maps_to_new_include(self):
-        migrate(self.store, OLD_REGISTRY["libraries"], global_selection_new_files="include")
-        for cfg in self.store.list_libraries():
-            self.assertEqual(cfg.new_file_default, "include")
+    def test_null_exclude_overrides_keep_factory_defaults(self):
+        """旧条目 null = 继承旧全局 config.json（本工具读不到）——保持新
+        架构出厂默认，不写成空列表（那会关掉全部默认排除）。"""
+        entries = [{"name": "工作笔记", "path": "/a", "exclude_dirs": None}]
+        migrate(self.store, entries, global_selection_new_files="follow")
+        cfg = self.store.list_libraries()[0]
+        self.assertEqual(
+            cfg.exclude_dirs,
+            [".obsidian", ".smart-env", ".trash", ".git", "TEMP", "templates"],
+        )
 
     def test_library_id_slugified_from_name(self):
         migrate(self.store, OLD_REGISTRY["libraries"], global_selection_new_files="follow")

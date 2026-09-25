@@ -25,7 +25,9 @@ class LibraryConfig:
     root_path: str
     selection_in: list[str] = field(default_factory=list)
     selection_out: list[str] = field(default_factory=list)
-    new_file_default: str = "include"  # "include" | "exclude"
+    # 中性文件默认归属（旧 config.selection_new_files 三态：follow/include/
+    # exclude，默认 follow=按该库格式开关判定）
+    new_file_default: str = "follow"
     enabled_extensions: list[str] = field(default_factory=lambda: [".md", ".pdf", ".docx"])
     agent_formats: list[str] = field(default_factory=list)
     # 出厂排除默认集（对齐 obsidian-rag/config.py DEFAULTS，问题1/§4.2 索引
@@ -104,6 +106,22 @@ class LibraryConfigStore:
             cfg.selection_in = selection_in
         if selection_out is not None:
             cfg.selection_out = selection_out
+        # 同位置打架最后兜底（旧 library.py::set_selection 问题47 用户拍板）：
+        # 纳入目标本身躺在目录排除名单里（字符串相等）= "存上但永远不生效"的
+        # 矛盾态，拒绝落盘。文件名/格式类规则不在此列——点具体文件属个别
+        # 例外，静默生效。MCP 提案侧已在 normalize_selection_changes 事前拦截。
+        blocked = {
+            str(e).replace("\\", "/").strip().strip("/")
+            for e in cfg.exclude_dirs
+            if str(e).strip().strip("/")
+        }
+        clash = sorted(r for r in cfg.selection_in if r in blocked)
+        if clash:
+            raise ValueError(
+                "勾选与排除名单打架（同位置矛盾）：%s 已在目录排除名单（exclude_dirs）里，"
+                "纳入不会生效。请先从排除名单移除（库配置 exclude_dirs，仅本库生效即可），"
+                "或改勾它下面的具体文件（个别例外直接生效，无需弹窗）。" % "、".join(clash)
+            )
         self._save()
         return cfg
 
@@ -126,6 +144,10 @@ class LibraryConfigStore:
         if cfg is None:
             raise KeyError(f"未知库: {library_id}")
         if new_file_default is not None:
+            if new_file_default not in ("follow", "include", "exclude"):
+                raise ValueError(
+                    f"非法中性默认值: {new_file_default!r}（只接受 follow/include/exclude）"
+                )
             cfg.new_file_default = new_file_default
         if enabled_extensions is not None:
             cfg.enabled_extensions = enabled_extensions

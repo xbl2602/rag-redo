@@ -20,22 +20,15 @@ embedding schema 不同，索引本身预期要全量重建（这是设计决策
   `DEFAULT_EXTENSIONS = ["md","pdf","docx"]`）→ enabled_extensions
   （新：带点，如 ".md"）
 - 全局 `selection_new_files`（旧项目这是全局配置项，不是逐库存的，默认值
-  "follow"）→ 逐库 `new_file_default`：对照旧项目 index.py 里
-  `collect_md_files` 的真实分支逻辑核对过——旧"follow"含义是"未勾选文件
-  按本库 extensions 列表过滤"，这和新架构"new_file_default=include 时依然
-  会过一遍 enabled_extensions"的语义完全一致，直接映射成新"include"；旧
-  "exclude"映射新"exclude"；旧"include"（更宽松，忽略本库 extensions、
-  只要是系统支持格式就收）没有直接等价物，退化映射成新"include"——如果你
-  确实用过这个更宽松的模式，迁移后请自己检查一下 enabled_extensions 列全
-  了没有
-- agent_formats（旧项目"AI 已获授权可写的二进制格式清单"）：**不迁移**——
-  新架构的 AI 写权限模型是通用的 WriteGate 两段式确认（见
-  core/write_gate.py），和旧项目"预先长期授权格式清单"是不同机制，没有
-  直接对应关系，迁移后按新流程重新授权
-- exclude_dirs/exclude_files/exclude_patterns/chunk_char_limit/
-  short_doc_char_limit/collection：**不迁移**——这些是旧项目的全局可覆盖
-  配置项，新架构对应概念（比如切块大小）目前是 official-chunker 插件的
-  模块级默认值，还没做成逐库可配置，真有这个需求时再补
+  "follow"）→ 逐库 `new_file_default`：三态同名词直传（follow/include/
+  exclude）——新架构的判定语义已逐字对齐旧 collect_md_files 分支（follow=
+  按本库 extensions 过滤；include=受支持格式一律纳入；exclude=一律排除），
+  不再做旧版工具的近似映射
+- agent_formats（旧"AI 已获准索引的二进制格式清单"）→ 同名直传（与
+  extensions 的交集语义由读取侧保证，两边一致）
+- exclude_dirs/exclude_files/exclude_patterns：条目里非 null 的逐库覆盖
+  直传；null（继承旧全局 config.json）保持新架构出厂默认——旧全局名单请
+  对照旧 config.json 自行核对（本工具只读 libraries.json，不读 config.json）
 
 用法：
     python tools/migrate_libraries_json.py <旧 libraries.json 路径> [选项]
@@ -106,10 +99,19 @@ def migrate(store: LibraryConfigStore, old_entries: list[dict], global_selection
 
         extensions = entry.get("extensions") or OLD_DEFAULT_EXTENSIONS
         enabled_extensions = [f".{ext.lstrip('.').lower()}" for ext in extensions]
-        new_default = "exclude" if global_selection_new_files == "exclude" else "include"
+        new_default = global_selection_new_files
 
         store.add_library(library_id, name, path)
-        store.set_policy(library_id, new_file_default=new_default, enabled_extensions=enabled_extensions)
+        store.set_policy(
+            library_id,
+            new_file_default=new_default,
+            enabled_extensions=enabled_extensions,
+            exclude_dirs=[str(d) for d in entry["exclude_dirs"]] if entry.get("exclude_dirs") is not None else None,
+            exclude_files=[str(f) for f in entry["exclude_files"]] if entry.get("exclude_files") is not None else None,
+            exclude_patterns=[str(p) for p in entry["exclude_patterns"]] if entry.get("exclude_patterns") is not None else None,
+        )
+        if entry.get("agent_formats"):
+            store.set_agent_formats(library_id, [str(f) for f in entry["agent_formats"]])
         cfg = store.set_selection(
             library_id,
             selection_in=sorted(entry.get("selection_in") or []),
@@ -121,11 +123,6 @@ def migrate(store: LibraryConfigStore, old_entries: list[dict], global_selection
             f"(纳入{len(cfg.selection_in)}条/排除{len(cfg.selection_out)}条规则，"
             f"格式={enabled_extensions}，新文件默认={new_default})"
         )
-        if entry.get("agent_formats"):
-            logs.append(
-                f"  [{name}] 旧库有 agent_formats 授权记录，新架构没有直接等价物，"
-                "不迁移——需要时请通过新的 WriteGate 流程重新授权"
-            )
 
     return logs
 

@@ -2324,7 +2324,7 @@ class Pipeline:
         )
         lib_mgr.store.set_policy(
             target_id,
-            new_file_default=manifest.get("new_file_default", "include"),
+            new_file_default=manifest.get("new_file_default", "follow"),
             enabled_extensions=manifest.get("enabled_extensions", [".md", ".pdf", ".docx"]),
             exclude_dirs=list(manifest.get("exclude_dirs", [])),
             exclude_files=list(manifest.get("exclude_files", [])),

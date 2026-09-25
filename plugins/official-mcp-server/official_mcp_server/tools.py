@@ -376,7 +376,7 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         return {
             "ok": True,
             **result,
-            "new_file_default": policy.new_file_default if policy else "include",
+            "new_file_default": policy.new_file_default if policy else "follow",
         }
 
     @server.tool()

@@ -96,6 +96,30 @@ class TestLibraryConfigStore(unittest.TestCase):
         self.assertEqual(cfg.new_file_default, "exclude")
         self.assertEqual(cfg.enabled_extensions, [".md", ".pdf", ".docx"])
 
+    def test_set_policy_rejects_unknown_default_value(self):
+        store = LibraryConfigStore(self.path)
+        store.add_library("lib1", "我的库", "/vaults/lib1")
+        with self.assertRaises(ValueError):
+            store.set_policy("lib1", new_file_default="maybe")
+        self.assertEqual(store.get("lib1").new_file_default, "follow")
+
+    def test_set_selection_refuses_same_place_conflict(self):
+        """同位置打架最后兜底（旧 library.py::set_selection 问题47）：纳入
+        目标本身在 exclude_dirs 里 → 拒绝落盘，注册表原样不动。"""
+        store = LibraryConfigStore(self.path)
+        store.add_library("lib1", "我的库", "/vaults/lib1")
+        store.set_policy("lib1", exclude_dirs=["私人"])
+        before = self.path.read_bytes()
+        with self.assertRaises(ValueError) as ctx:
+            store.set_selection("lib1", selection_in=["私人"], selection_out=[])
+        self.assertIn("exclude_dirs", str(ctx.exception))
+        self.assertEqual(self.path.read_bytes(), before)
+        # 非打架照常：out 方向 + 其下具体文件点名不受影响
+        store.set_selection("lib1", selection_in=["私人/账单.pdf"], selection_out=["私人"])
+        cfg = store.get("lib1")
+        self.assertEqual(cfg.selection_in, ["私人/账单.pdf"])
+        self.assertEqual(cfg.selection_out, ["私人"])
+
     def test_agent_formats_persist_and_reject_unknown_binary(self):
         store = LibraryConfigStore(self.path)
         store.add_library("lib1", "我的库", "/vaults/lib1")

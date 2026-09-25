@@ -1,22 +1,24 @@
 """library_manager 插件的核心判定逻辑：一个文件到底算不算在检索范围内。
 
-裁决优先级（针对旧 obsidian-rag 项目问题44/47附记2记录的真实场景，用全新
-代码重新设计实现——不是复制旧代码，具体实现细节可能不同，但要解决的问题
-一样）：
+裁决语义逐字对齐旧 obsidian-rag（library.py::decide_included 的"问题47
+用户拍板" + index.py::collect_md_files 的漏斗分支），2026-09-25 实测发现
+此前的重写版在真实库上会产出不同结果，按旧代码移植：
 
-1. 路径级显式规则（selection_in/selection_out）永远赢格式规则——格式/
-   后缀过滤是最弱的一层，显式路径选择可以静默穿透它。
-2. 显式规则之间"谁更具体谁赢"：精确文件匹配 > 祖先目录匹配；祖先目录
-   匹配里，路径段数越多（越深）越具体。文件点名可以穿透继承来的目录级
-   排除，反过来更具体的排除也能压过较浅的目录级纳入。
-3. 同一路径被纳入和排除规则以相同具体度同时命中（例如同一条路径字面
-   量地同时出现在两份名单里）时，排除赢——这是唯一的平局打破规则，安全
-   默认是不纳入。
-4. 都没有显式规则命中时，落到 new_file_default 这个库级默认值。本次
-   重写只提供 "include"/"exclude" 两态，不提供旧项目文档里提到的"跟随"
-   第三态——那需要额外的"父目录本身算不算被主动扫描过"上下文，从现有
-   文档描述反推不出精确语义，与其猜错不如先做两态说清楚，需要时再补
-   （这是一处已知的、刻意的简化，不是遗漏）。
+1. 路径级显式规则（selection_in/selection_out）永远赢文件名/格式规则——
+   显式勾选静默穿透目录继承排除、exclude_files/patterns、扩展名白名单。
+2. 显式规则之间"最近显式赢"：从文件自身逐级向上找第一个命中祖先（含自身），
+   同一层级 in/out 同时命中属非法状态（写路径已拦截），读侧 out 优先。
+3. 显式纳入 vs 目录排除：更具体（更深）的赢——文件自身的勾选压过它所在
+   目录的排除；反之更深的目录排除压过较浅的目录级纳入。同位置打架（纳入
+   目标本身字符串相等地躺在 exclude_dirs 里）排除站住（安全），写路径拒绝
+   新建此类状态。
+4. 目录排除是子串语义：条目 'TEMP' 命中任意路径部件含 'TEMP' 的位置（含
+   文件名部件，如 'MYTEMP notes.md'）——对齐旧 collect 漏斗逐字行为。
+5. 都没有显式规则命中时走中性默认 new_file_default（旧 selection_new_files
+   三态）：follow=按该库 enabled_extensions 格式开关判定（旧默认）；
+   include=受支持格式（md/txt/pdf/docx）一律纳入、可穿透 extensions 白名单；
+   exclude=中性文件一律排除。中性文件还要叠文件名排除（exclude_files 精确
+   名单 + exclude_patterns 文件名前缀匹配——旧语义是 startswith，不是通配）。
 
 唯一实现：本模块导出的 decide_included / collect_included_files 是这条
 规则的唯一权威实现——GUI 的勾选树展示、建索引时的文件枚举漏斗，都必须调
@@ -24,40 +26,73 @@
 """
 from __future__ import annotations
 
-import fnmatch
 import re
-from dataclasses import dataclass
 from typing import Literal, Sequence
 
-NewFileDefault = Literal["include", "exclude"]
+NewFileDefault = Literal["follow", "include", "exclude"]
 SELECTION_ACTIONS = ("in", "out", "neutral")
+# 受支持格式（旧 extractors.SUPPORTED_EXTS = TEXT_EXTS | BINARY_EXTS）
+SUPPORTED_EXTS = {"md", "txt", "pdf", "docx"}
 
 
-def _segments(path: str) -> tuple[str, ...]:
-    return tuple(p for p in path.replace("\\", "/").split("/") if p)
+def _norm_ex_dir_entries(ex_dirs: Sequence[str] | None) -> set[str]:
+    """目录排除条目归一集合（旧 library.py::norm_ex_dir_entries）。
+
+    注意 collect 漏斗侧是子串语义（条目 'TEMP' 会命中部件 'MYTEMP'），此处
+    只做字符串归一不改语义：同位置打架只认字符串相等，子串覆盖面走深度规则。
+    """
+    out: set[str] = set()
+    for e in (ex_dirs or ()):
+        s = str(e).replace("\\", "/").strip().strip("/")
+        if s:
+            out.add(s)
+    return out
 
 
-@dataclass(frozen=True)
-class _Match:
-    rule: str
-    specificity: int  # 越大越具体
+def _excluded_dir_depth(ex_dirs: Sequence[str] | None, rel: str) -> int:
+    """目录排除的最深命中深度（1-based；无命中 0）——旧
+    library.py::excluded_dir_depth。
 
-
-def _most_specific_match(path_segs: tuple[str, ...], rules: Sequence[str]) -> _Match | None:
-    """在 rules 里找和 path 最相关的一条：精确匹配文件本身，或者是 path 的
-    祖先目录。"""
-    best: _Match | None = None
-    for rule in rules:
-        rule_segs = _segments(rule)
-        if rule_segs == path_segs:
-            specificity = len(rule_segs) * 2 + 1  # 精确匹配永远最具体
-        elif len(rule_segs) < len(path_segs) and path_segs[: len(rule_segs)] == rule_segs:
-            specificity = len(rule_segs) * 2  # 祖先目录匹配
-        else:
-            continue
-        if best is None or specificity > best.specificity:
-            best = _Match(rule=rule, specificity=specificity)
+    匹配语义与 collect 漏斗逐字一致：条目为任一路径部件的子串即命中，取最深
+    的部件位置（部件含文件名本身）。单文件库根（无斜杠）depth=1。
+    """
+    best = 0
+    parts = str(rel).replace("\\", "/").strip("/").split("/")
+    entries = [s for s in (str(e).replace("\\", "/").strip().strip("/")
+                           for e in (ex_dirs or ())) if s]
+    if not entries:
+        return 0
+    for i, part in enumerate(parts, 1):
+        for en in entries:
+            if en in part:
+                best = i
+                break
     return best
+
+
+def _selection_hit(
+    sel_in: Sequence[str] | None, sel_out: Sequence[str] | None, rel: str
+) -> tuple[str | None, int, str]:
+    """最近显式命中 → (action, depth, prefix)；无命中 → (None, 0, "")——旧
+    library.py::selection_hit。
+
+    depth = 命中的前缀段数（文件自身 = 全长，最具体）。同一层级同时命中两表
+    属非法状态（写路径已防止），此处 out 优先（宁可少索引）。
+    """
+    sin = set(sel_in or ())
+    sout = set(sel_out or ())
+    parts = str(rel).replace("\\", "/").strip("/").split("/")
+    for i in range(len(parts), 0, -1):
+        pre = "/".join(parts[:i])
+        if pre in sout:
+            return ("out", i, pre)
+        if pre in sin:
+            return ("in", i, pre)
+    return (None, 0, "")
+
+
+def _rel_suffix(path: str) -> str:
+    return path.rsplit(".", 1)[-1].lower() if "." in path else ""
 
 
 def decide_included(
@@ -71,48 +106,46 @@ def decide_included(
     exclude_files: Sequence[str] | None = None,
     exclude_patterns: Sequence[str] | None = None,
 ) -> tuple[bool, str]:
-    """判定 path 算不算在检索范围内，返回 (included, reason)。"""
-    path_segs = _segments(path)
-    in_match = _most_specific_match(path_segs, selection_in)
-    out_match = _most_specific_match(path_segs, selection_out)
-    excluded_dirs = {_segments(value) for value in (exclude_dirs or ())}
-    directory_excluded = any(
-        rule and len(rule) < len(path_segs) and path_segs[: len(rule)] == rule
-        for rule in excluded_dirs
-    )
-    if in_match is not None and _segments(in_match.rule) in excluded_dirs:
-        return False, f"显式纳入目标同时位于排除目录：{in_match.rule}"
-    if in_match is None and out_match is None and directory_excluded:
-        return False, "命中排除目录"
+    """判定 path 算不算在检索范围内，返回 (included, reason)——语义为旧
+    library.py::decide_included + 旧 index.py::collect_md_files 中性分支的
+    合并（两处旧代码本就是同一条裁决的两半）。"""
+    action, dm, prefix = _selection_hit(selection_in, selection_out, path)
+    de = _excluded_dir_depth(exclude_dirs, path)
 
-    if in_match is None and out_match is None:
-        included = new_file_default == "include"
-        reason = f"没有显式规则命中，按库默认值（{new_file_default}）处理"
-    elif out_match is None or (in_match is not None and in_match.specificity > out_match.specificity):
-        assert in_match is not None
-        included, reason = True, f"显式纳入规则命中：{in_match.rule}"
-    elif in_match is None or out_match.specificity > in_match.specificity:
-        included, reason = False, f"显式排除规则命中：{out_match.rule}"
-    else:
-        included, reason = False, f"路径 {path!r} 同时被纳入和排除规则命中，按安全默认排除"
+    if action is None:
+        # 中性文件：目录排除（子串）→ 文件名名单 → 文件名前缀 → 中性默认
+        if de:
+            return False, "命中排除目录"
+        name = path.rsplit("/", 1)[-1]
+        if name in set(exclude_files or ()):
+            return False, f"命中排除文件名单：{name}"
+        patterns = [str(p) for p in (exclude_patterns or ())]
+        hit_pat = next((p for p in patterns if name.startswith(p)), None)
+        if hit_pat is not None:
+            return False, f"命中文件名前缀排除：{hit_pat}"
+        if new_file_default == "exclude":
+            return False, "中性默认=exclude（中性文件一律排除）"
+        suffix = _rel_suffix(path)
+        if new_file_default == "include":
+            if suffix not in SUPPORTED_EXTS:
+                return False, f"格式 {suffix or '(无后缀)'} 不在受支持格式内（中性默认=include）"
+            return True, "中性默认=include（受支持格式一律纳入）"
+        # follow（旧默认）：按该库格式开关判定
+        exts = {str(e).lower().lstrip(".") for e in (enabled_extensions or ())}
+        if suffix not in exts:
+            return False, f"格式 {suffix or '(无后缀)'} 不在库格式开关内"
+        return True, "中性跟随格式开关"
 
-    if in_match is None and out_match is None:
-        basename = path.rsplit("/", 1)[-1]
-        if basename in set(exclude_files or ()) or any(
-            fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(basename, pattern)
-            for pattern in (exclude_patterns or ())
-        ):
-            return False, "命中排除文件规则"
+    if action == "out":
+        return False, f"显式排除规则命中：{prefix}"
 
-    if included and enabled_extensions is not None:
-        ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
-        if ext not in enabled_extensions and in_match is None:
-            # 格式规则是最弱的一层：只有当前的"纳入"不是显式路径规则给的、
-            # 而是走到默认值这一步才会被格式过滤拦下；显式路径命中静默
-            # 穿透格式限制。
-            return False, f"格式 {ext or '(无后缀)'} 不在已启用格式列表内"
-
-    return included, reason
+    # action == "in"：显式勾选穿透一切（目录继承排除、文件名、格式白名单），
+    # 唯二例外：同位置打架（排除站住）与更深的目录排除。
+    if prefix in _norm_ex_dir_entries(exclude_dirs):
+        return False, f"同位置打架：{prefix} 同时在勾选纳入与目录排除名单，排除站住"
+    if de == 0 or dm > de:
+        return True, f"显式纳入规则命中：{prefix}"
+    return False, f"更深的目录排除压过较浅的纳入（排除深度{de} ≥ 勾选深度{dm}）"
 
 
 def collect_included_files(
@@ -149,11 +182,11 @@ def collect_included_files(
 
 # ---------------------------------------------------------------------------
 # 勾选变更（get_selection/propose_selection_changes/apply_selection_changes
-# 三个 MCP 工具的数据面，2026-09-23 全面功能审计发现的缺口B类）：判定逻辑
-# 上面早就有了（decide_included），缺的是"AI 想改这份配置"这条写路径本身
-# ——对齐 obsidian-rag library.py::norm_sel_path/set_selection 的校验与
-# 合并语义，写权限门禁部分复用 core/write_gate.py（在 plugin.py 里接线，
-# 这里只放纯函数）。
+# 三个 MCP 工具的数据面）：判定逻辑上面早就有了，缺的是"AI 想改这份配置"
+# 这条写路径本身——对齐 obsidian-rag library.py::norm_sel_path/set_selection
+# 与 selection_gate.py::normalize_changes 的校验、同位置拦截与合并语义，
+# 写权限门禁部分复用 core/write_gate.py（在 plugin.py 里接线，这里只放纯
+# 函数）。
 # ---------------------------------------------------------------------------
 
 
@@ -176,20 +209,34 @@ def norm_selection_path(path: object) -> str:
     return "/".join(part.strip() for part in parts)
 
 
-def normalize_selection_changes(changes: Sequence[dict] | None) -> list[dict]:
-    """校验+规范化一批勾选变更：路径合法、action 合法——整体通过或整体
-    拒绝（有一条非法就整体报错，不做"部分生效"）。"""
-    if not changes:
-        raise ValueError("changes 为空：至少提供一项 {path, action}")
+def normalize_selection_changes(
+    changes: Sequence[dict] | None, exclude_dirs: Sequence[str] | None = None
+) -> list[dict]:
+    """校验+规范化一批勾选变更：路径合法、action 合法、同位置矛盾事前拦截
+    （旧 selection_gate.py::normalize_changes 的"问题47 用户拍板"：action=in
+    且目标本身就在目录排除名单里（字符串相等，指名道姓）→ 直接拒绝并指引
+    先清排除，而不是等到 apply 才失败——确认码不应该花在注定无效的提案上。
+    文件名/格式类规则不在此列：点具体文件属个别例外，静默生效）。整体通过
+    或整体拒绝（有一条非法就整体报错，不做"部分生效"）。
+    """
+    blocked = _norm_ex_dir_entries(exclude_dirs)
     norm = []
-    for ch in changes:
+    for ch in (changes or ()):
         if not isinstance(ch, dict):
             raise ValueError(f"变更项必须是字典：{ch!r}")
         action = ch.get("action")
         if action not in SELECTION_ACTIONS:
             raise ValueError(f"非法 action：{action!r}（只接受 {'/'.join(SELECTION_ACTIONS)}）")
         path = norm_selection_path(ch.get("path"))
+        if action == "in" and path in blocked:
+            raise ValueError(
+                f"同位置矛盾已拒绝：{path} 本身就在目录排除名单（exclude_dirs）里，"
+                "纳入不会生效。请先用库配置去掉 exclude_dirs 中的这一项（仅本库生效即可，"
+                "不影响全局与其他库），再重新提案；或改勾它下面的具体文件（个别例外直接生效）。"
+            )
         norm.append({"path": path, "action": action})
+    if not norm:
+        raise ValueError("changes 为空：至少提供一项 {path, action}")
     return norm
 
 
