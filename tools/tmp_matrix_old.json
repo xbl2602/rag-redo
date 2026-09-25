@@ -1,0 +1,1734 @@
+{
+  "body_all|火箭飞行过程中的机动与控制": {
+    "elapsed_s": 18.58,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 99,
+        "confidence": 0.65
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 109,
+        "confidence": 0.57
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "30-Resources/Ideas/工程项目灵感来源.md",
+        "chunk": 2,
+        "confidence": 0.54
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/report_checklist.md",
+        "chunk": 3,
+        "confidence": 0.28
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/自平衡机器人-PID控制.md",
+        "chunk": 3,
+        "confidence": 0.14
+      }
+    ]
+  },
+  "body_all|可持续航空燃料的应用前景": {
+    "elapsed_s": 1.23,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 8,
+        "confidence": 0.98
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 0,
+        "confidence": 0.97
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 7,
+        "confidence": 0.95
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/ICP 工业协作计划与本地化.md",
+        "chunk": 7,
+        "confidence": 0.32
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/NIMP 2030.md",
+        "chunk": 5,
+        "confidence": 0.23
+      }
+    ]
+  },
+  "body_all|奖学金申请需要准备哪些材料": {
+    "elapsed_s": 1.28,
+    "hits": [
+      {
+        "library": "skills",
+        "path": "brandkit/SKILL.md",
+        "chunk": 27,
+        "confidence": 0.15
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/附录/调研来源链附录.md",
+        "chunk": 14,
+        "confidence": 0.09
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 4,
+        "confidence": 0.06
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 1,
+        "confidence": 0.03
+      },
+      {
+        "library": "skills",
+        "path": "officecli/SKILL.md",
+        "chunk": 2,
+        "confidence": 0.03
+      }
+    ]
+  },
+  "body_all|静力学 压力测量装置": {
+    "elapsed_s": 1.13,
+    "hits": [
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 109,
+        "confidence": 0.94
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 4 BERNOULLI EQUATION AND APPLICATIONS.pdf",
+        "chunk": 99,
+        "confidence": 0.85
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 82,
+        "confidence": 0.69
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 88,
+        "confidence": 0.6
+      }
+    ]
+  },
+  "body_all|量纲分析的基本步骤": {
+    "elapsed_s": 1.41,
+    "hits": [
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 30,
+        "confidence": 0.67
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 1).pdf",
+        "chunk": 25,
+        "confidence": 0.59
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 1).pdf",
+        "chunk": 9,
+        "confidence": 0.57
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 15,
+        "confidence": 0.49
+      }
+    ]
+  },
+  "body_all|并行任务调度 角色权限": {
+    "elapsed_s": 1.3,
+    "hits": [
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 0,
+        "confidence": 0.31
+      },
+      {
+        "library": "skills",
+        "path": "parallel-dispatch/SKILL.md",
+        "chunk": 3,
+        "confidence": 0.16
+      },
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 9,
+        "confidence": 0.15
+      },
+      {
+        "library": "skills",
+        "path": "audit-depth/agent-roles.md",
+        "chunk": 0,
+        "confidence": 0.13
+      },
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 8,
+        "confidence": 0.09
+      }
+    ]
+  },
+  "body_all|图检索增强架构解析": {
+    "elapsed_s": 1.23,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "chunk": 0,
+        "confidence": 0.84
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "chunk": 1,
+        "confidence": 0.7
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": 0,
+        "confidence": 0.43
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_all|本地大模型部署调优": {
+    "elapsed_s": 1.2,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "chunk": 2,
+        "confidence": 0.87
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/DeepSeek本地部署-RAGFlow个人知识库搭建.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "chunk": 4,
+        "confidence": 0.78
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_all|CFD 仿真工具选择策略": {
+    "elapsed_s": 1.38,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 119,
+        "confidence": 0.68
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 5,
+        "confidence": 0.63
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 4,
+        "confidence": 0.62
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/AI辅助CFD自动化.md",
+        "chunk": 2,
+        "confidence": 0.41
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "01-Meta/进度同步-访谈.md",
+        "chunk": 21,
+        "confidence": 0.33
+      }
+    ]
+  },
+  "body_all|表达能力与说服力提升": {
+    "elapsed_s": 1.14,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/心态与表达力.md",
+        "chunk": 2,
+        "confidence": 0.78
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/心态与表达力.md",
+        "chunk": 0,
+        "confidence": 0.58
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "list_all|火箭飞行过程中的机动与控制": {
+    "elapsed_s": 1.2,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 99,
+        "confidence": 0.65
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 96,
+        "confidence": 0.62
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 109,
+        "confidence": 0.57
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "30-Resources/Ideas/工程项目灵感来源.md",
+        "chunk": 2,
+        "confidence": 0.54
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 98,
+        "confidence": 0.4
+      }
+    ]
+  },
+  "list_all|可持续航空燃料的应用前景": {
+    "elapsed_s": 1.2,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 8,
+        "confidence": 0.98
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 0,
+        "confidence": 0.97
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 7,
+        "confidence": 0.95
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 1,
+        "confidence": 0.95
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 6,
+        "confidence": 0.93
+      }
+    ]
+  },
+  "list_all|奖学金申请需要准备哪些材料": {
+    "elapsed_s": 1.28,
+    "hits": [
+      {
+        "library": "skills",
+        "path": "brandkit/SKILL.md",
+        "chunk": 27,
+        "confidence": 0.15
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/附录/调研来源链附录.md",
+        "chunk": 14,
+        "confidence": 0.09
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 4,
+        "confidence": 0.06
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 1,
+        "confidence": 0.03
+      },
+      {
+        "library": "skills",
+        "path": "officecli/SKILL.md",
+        "chunk": 2,
+        "confidence": 0.03
+      }
+    ]
+  },
+  "list_all|静力学 压力测量装置": {
+    "elapsed_s": 1.13,
+    "hits": [
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 109,
+        "confidence": 0.94
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 108,
+        "confidence": 0.9
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 106,
+        "confidence": 0.9
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 116,
+        "confidence": 0.87
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 107,
+        "confidence": 0.86
+      }
+    ]
+  },
+  "list_all|量纲分析的基本步骤": {
+    "elapsed_s": 1.38,
+    "hits": [
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 30,
+        "confidence": 0.67
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 38,
+        "confidence": 0.67
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 26,
+        "confidence": 0.62
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 24,
+        "confidence": 0.6
+      }
+    ]
+  },
+  "list_all|并行任务调度 角色权限": {
+    "elapsed_s": 1.26,
+    "hits": [
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 0,
+        "confidence": 0.31
+      },
+      {
+        "library": "skills",
+        "path": "parallel-dispatch/SKILL.md",
+        "chunk": 3,
+        "confidence": 0.16
+      },
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 9,
+        "confidence": 0.15
+      },
+      {
+        "library": "skills",
+        "path": "audit-depth/agent-roles.md",
+        "chunk": 0,
+        "confidence": 0.13
+      },
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 8,
+        "confidence": 0.09
+      }
+    ]
+  },
+  "list_all|图检索增强架构解析": {
+    "elapsed_s": 1.23,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "chunk": 0,
+        "confidence": 0.84
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "chunk": 1,
+        "confidence": 0.7
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": 0,
+        "confidence": 0.43
+      }
+    ]
+  },
+  "list_all|本地大模型部署调优": {
+    "elapsed_s": 1.18,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "chunk": 2,
+        "confidence": 0.87
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/DeepSeek本地部署-RAGFlow个人知识库搭建.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "chunk": 4,
+        "confidence": 0.78
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "list_all|CFD 仿真工具选择策略": {
+    "elapsed_s": 1.37,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 119,
+        "confidence": 0.68
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 5,
+        "confidence": 0.63
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 4,
+        "confidence": 0.62
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/AI辅助CFD自动化.md",
+        "chunk": 2,
+        "confidence": 0.41
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 1,
+        "confidence": 0.37
+      }
+    ]
+  },
+  "list_all|表达能力与说服力提升": {
+    "elapsed_s": 1.16,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/心态与表达力.md",
+        "chunk": 2,
+        "confidence": 0.78
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/心态与表达力.md",
+        "chunk": 0,
+        "confidence": 0.58
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_folder_10Areas|火箭飞行过程中的机动与控制": {
+    "elapsed_s": 0.53,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/自平衡机器人-PID控制.md",
+        "chunk": 3,
+        "confidence": 0.14
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/边缘AI手势控制器-TinyML.md",
+        "chunk": 4,
+        "confidence": 0.07
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 3,
+        "confidence": 0.06
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/传感器融合姿态追踪-Kalman.md",
+        "chunk": 3,
+        "confidence": 0.05
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/报告/AI Agent 在航空航天工程中的应用-执行概要.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_folder_10Areas|可持续航空燃料的应用前景": {
+    "elapsed_s": 0.6,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 8,
+        "confidence": 0.98
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 0,
+        "confidence": 0.97
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 7,
+        "confidence": 0.95
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/ICP 工业协作计划与本地化.md",
+        "chunk": 7,
+        "confidence": 0.32
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/NIMP 2030.md",
+        "chunk": 5,
+        "confidence": 0.23
+      }
+    ]
+  },
+  "body_folder_10Areas|奖学金申请需要准备哪些材料": {
+    "elapsed_s": 0.54,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/附录/调研来源链附录.md",
+        "chunk": 14,
+        "confidence": 0.09
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 4,
+        "confidence": 0.06
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 1,
+        "confidence": 0.03
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/航天奖学金与导师计划.md",
+        "chunk": 2,
+        "confidence": 0.03
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/概念/JPA 服务训练体系与 eSILA.md",
+        "chunk": 5,
+        "confidence": 0.02
+      }
+    ]
+  },
+  "body_folder_10Areas|静力学 压力测量装置": {
+    "elapsed_s": 0.56,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/Ansys vs SolidWorks Simulation 对比.md",
+        "chunk": 1,
+        "confidence": 0.04
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 3,
+        "confidence": 0.01
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/液压机械手-流体动力.md",
+        "chunk": 1,
+        "confidence": 0.01
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/边缘AI手势控制器-TinyML.md",
+        "chunk": 4,
+        "confidence": 0.01
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/ME认证-SixSigma与Ansys.md",
+        "chunk": 4,
+        "confidence": 0.01
+      }
+    ]
+  },
+  "body_folder_10Areas|量纲分析的基本步骤": {
+    "elapsed_s": 0.58,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/AI Fundamentals 从LLM到RAG到Agent.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/小大检索-Small-to-Big.md",
+        "chunk": 4,
+        "confidence": 0.05
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/小大检索-Small-to-Big.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/AI Fundamentals 从LLM到RAG到Agent.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/DeepSeek本地部署-RAGFlow个人知识库搭建.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_folder_10Areas|并行任务调度 角色权限": {
+    "elapsed_s": 0.54,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工具/一人AI公司-270个AI角色开源项目.md",
+        "chunk": 1,
+        "confidence": 0.01
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/Agent运营手册-云Agent与自动化.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/Model-Routing 模型路由.md",
+        "chunk": 1,
+        "confidence": 0.01
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/Prime-Agent-单工具Agent范式.md",
+        "chunk": 3,
+        "confidence": 0.01
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/用 AI 变聪明的四步框架-DRAG 与智能健身房.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_folder_10Areas|图检索增强架构解析": {
+    "elapsed_s": 0.43,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "chunk": 0,
+        "confidence": 0.84
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "chunk": 1,
+        "confidence": 0.7
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": 0,
+        "confidence": 0.43
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_folder_10Areas|本地大模型部署调优": {
+    "elapsed_s": 0.48,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "chunk": 2,
+        "confidence": 0.87
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/DeepSeek本地部署-RAGFlow个人知识库搭建.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "chunk": 4,
+        "confidence": 0.78
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_folder_10Areas|CFD 仿真工具选择策略": {
+    "elapsed_s": 0.55,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 5,
+        "confidence": 0.63
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 4,
+        "confidence": 0.62
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/AI辅助CFD自动化.md",
+        "chunk": 2,
+        "confidence": 0.41
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/y+控制与壁面处理策略.md",
+        "chunk": 0,
+        "confidence": 0.29
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/AI辅助CFD自动化.md",
+        "chunk": 1,
+        "confidence": 0.29
+      }
+    ]
+  },
+  "body_folder_10Areas|表达能力与说服力提升": {
+    "elapsed_s": 0.53,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/心态与表达力.md",
+        "chunk": 2,
+        "confidence": 0.78
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/心态与表达力.md",
+        "chunk": 0,
+        "confidence": 0.58
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_two_libs|火箭飞行过程中的机动与控制": {
+    "elapsed_s": 0.67,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 99,
+        "confidence": 0.65
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 109,
+        "confidence": 0.57
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "30-Resources/Ideas/工程项目灵感来源.md",
+        "chunk": 2,
+        "confidence": 0.54
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/report_checklist.md",
+        "chunk": 3,
+        "confidence": 0.28
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/自平衡机器人-PID控制.md",
+        "chunk": 3,
+        "confidence": 0.14
+      }
+    ]
+  },
+  "body_two_libs|可持续航空燃料的应用前景": {
+    "elapsed_s": 0.78,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 8,
+        "confidence": 0.98
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 0,
+        "confidence": 0.97
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 7,
+        "confidence": 0.95
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/ICP 工业协作计划与本地化.md",
+        "chunk": 7,
+        "confidence": 0.32
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/NIMP 2030.md",
+        "chunk": 5,
+        "confidence": 0.23
+      }
+    ]
+  },
+  "body_two_libs|奖学金申请需要准备哪些材料": {
+    "elapsed_s": 0.7,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/附录/调研来源链附录.md",
+        "chunk": 14,
+        "confidence": 0.09
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 4,
+        "confidence": 0.06
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 1,
+        "confidence": 0.03
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/航天奖学金与导师计划.md",
+        "chunk": 2,
+        "confidence": 0.03
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/概念/JPA 服务训练体系与 eSILA.md",
+        "chunk": 5,
+        "confidence": 0.02
+      }
+    ]
+  },
+  "body_two_libs|静力学 压力测量装置": {
+    "elapsed_s": 0.72,
+    "hits": [
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 109,
+        "confidence": 0.94
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 4 BERNOULLI EQUATION AND APPLICATIONS.pdf",
+        "chunk": 99,
+        "confidence": 0.85
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 82,
+        "confidence": 0.69
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 88,
+        "confidence": 0.6
+      }
+    ]
+  },
+  "body_two_libs|量纲分析的基本步骤": {
+    "elapsed_s": 0.91,
+    "hits": [
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 30,
+        "confidence": 0.67
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 1).pdf",
+        "chunk": 25,
+        "confidence": 0.59
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 1).pdf",
+        "chunk": 9,
+        "confidence": 0.57
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 15,
+        "confidence": 0.49
+      }
+    ]
+  },
+  "body_two_libs|并行任务调度 角色权限": {
+    "elapsed_s": 0.75,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "AGENTS.md",
+        "chunk": 33,
+        "confidence": 0.03
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "01-Meta/原始规则.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工具/一人AI公司-270个AI角色开源项目.md",
+        "chunk": 1,
+        "confidence": 0.01
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": ".paizhang/logs/2026-09-18-整理文档-技术日志.md",
+        "chunk": 1,
+        "confidence": 0.01
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/Model-Routing 模型路由.md",
+        "chunk": 1,
+        "confidence": 0.01
+      }
+    ]
+  },
+  "body_two_libs|图检索增强架构解析": {
+    "elapsed_s": 0.73,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "chunk": 0,
+        "confidence": 0.84
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "chunk": 1,
+        "confidence": 0.7
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": 0,
+        "confidence": 0.43
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_two_libs|本地大模型部署调优": {
+    "elapsed_s": 0.71,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "chunk": 2,
+        "confidence": 0.87
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/DeepSeek本地部署-RAGFlow个人知识库搭建.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "chunk": 4,
+        "confidence": 0.78
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_two_libs|CFD 仿真工具选择策略": {
+    "elapsed_s": 0.72,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 119,
+        "confidence": 0.68
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 5,
+        "confidence": 0.63
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 4,
+        "confidence": 0.62
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/AI辅助CFD自动化.md",
+        "chunk": 2,
+        "confidence": 0.41
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "01-Meta/进度同步-访谈.md",
+        "chunk": 21,
+        "confidence": 0.33
+      }
+    ]
+  },
+  "body_two_libs|表达能力与说服力提升": {
+    "elapsed_s": 0.75,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/心态与表达力.md",
+        "chunk": 2,
+        "confidence": 0.78
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/心态与表达力.md",
+        "chunk": 0,
+        "confidence": 0.58
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_exclude_skills|火箭飞行过程中的机动与控制": {
+    "elapsed_s": 0.93,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 99,
+        "confidence": 0.65
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 109,
+        "confidence": 0.57
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "30-Resources/Ideas/工程项目灵感来源.md",
+        "chunk": 2,
+        "confidence": 0.54
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/report_checklist.md",
+        "chunk": 3,
+        "confidence": 0.28
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/自平衡机器人-PID控制.md",
+        "chunk": 3,
+        "confidence": 0.14
+      }
+    ]
+  },
+  "body_exclude_skills|可持续航空燃料的应用前景": {
+    "elapsed_s": 0.95,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 8,
+        "confidence": 0.98
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 0,
+        "confidence": 0.97
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "chunk": 7,
+        "confidence": 0.95
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/ICP 工业协作计划与本地化.md",
+        "chunk": 7,
+        "confidence": 0.32
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/NIMP 2030.md",
+        "chunk": 5,
+        "confidence": 0.23
+      }
+    ]
+  },
+  "body_exclude_skills|奖学金申请需要准备哪些材料": {
+    "elapsed_s": 0.98,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/附录/调研来源链附录.md",
+        "chunk": 14,
+        "confidence": 0.09
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 4,
+        "confidence": 0.06
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 1,
+        "confidence": 0.03
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/航天奖学金与导师计划.md",
+        "chunk": 2,
+        "confidence": 0.03
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/概念/JPA 服务训练体系与 eSILA.md",
+        "chunk": 5,
+        "confidence": 0.02
+      }
+    ]
+  },
+  "body_exclude_skills|静力学 压力测量装置": {
+    "elapsed_s": 0.94,
+    "hits": [
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 109,
+        "confidence": 0.94
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 4 BERNOULLI EQUATION AND APPLICATIONS.pdf",
+        "chunk": 99,
+        "confidence": 0.85
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 82,
+        "confidence": 0.69
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "chunk": 88,
+        "confidence": 0.6
+      }
+    ]
+  },
+  "body_exclude_skills|量纲分析的基本步骤": {
+    "elapsed_s": 1.1,
+    "hits": [
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 30,
+        "confidence": 0.67
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 1).pdf",
+        "chunk": 25,
+        "confidence": 0.59
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 1).pdf",
+        "chunk": 9,
+        "confidence": 0.57
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "chunk": 15,
+        "confidence": 0.49
+      }
+    ]
+  },
+  "body_exclude_skills|并行任务调度 角色权限": {
+    "elapsed_s": 0.96,
+    "hits": [
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 0,
+        "confidence": 0.31
+      },
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 9,
+        "confidence": 0.15
+      },
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "chunk": 8,
+        "confidence": 0.09
+      },
+      {
+        "library": "agents",
+        "path": "organizer.md",
+        "chunk": 2,
+        "confidence": 0.03
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "AGENTS.md",
+        "chunk": 33,
+        "confidence": 0.03
+      }
+    ]
+  },
+  "body_exclude_skills|图检索增强架构解析": {
+    "elapsed_s": 0.88,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "chunk": 0,
+        "confidence": 0.84
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "chunk": 1,
+        "confidence": 0.7
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": 0,
+        "confidence": 0.43
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_exclude_skills|本地大模型部署调优": {
+    "elapsed_s": 0.92,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "chunk": 2,
+        "confidence": 0.87
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/DeepSeek本地部署-RAGFlow个人知识库搭建.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "chunk": 4,
+        "confidence": 0.78
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  },
+  "body_exclude_skills|CFD 仿真工具选择策略": {
+    "elapsed_s": 0.99,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 119,
+        "confidence": 0.68
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 5,
+        "confidence": 0.63
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
+        "chunk": 4,
+        "confidence": 0.62
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/AI辅助CFD自动化.md",
+        "chunk": 2,
+        "confidence": 0.41
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "01-Meta/进度同步-访谈.md",
+        "chunk": 21,
+        "confidence": 0.33
+      }
+    ]
+  },
+  "body_exclude_skills|表达能力与说服力提升": {
+    "elapsed_s": 0.95,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/心态与表达力.md",
+        "chunk": 2,
+        "confidence": 0.78
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/心态与表达力.md",
+        "chunk": 0,
+        "confidence": 0.58
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/论点/沟通表达九习惯.md",
+        "chunk": null,
+        "confidence": null
+      }
+    ]
+  }
+}

@@ -15,7 +15,7 @@ import re
 # 索引文本管线版本：清洗/锚点逻辑变化时递增，index_library 的 text_pipeline
 # 签名随之变化，触发旧 generation 受控重切块/重嵌入（对齐旧项目 META_VERSION
 # 机制；此版本从 2 起——隐含的"1"是加入清洗与锚点之前的管线）。
-TEXT_PIPELINE_VERSION = 2
+TEXT_PIPELINE_VERSION = 3  # v3: 提取噪声清洗（问题48 v10/v11 双轨）——旧 META_VERSION 11 的对应物
 
 
 def _clean_scalar(s: str) -> str:
@@ -117,3 +117,143 @@ def build_anchor_context(doc_parts: list[str], heading_breadcrumb: str, *, separ
             seen.add(key)
             out.append(part)
     return " / ".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 提取噪声清洗（问题48 v10）+ MinerU sidecar 双轨（问题48附记 v11）——逐字
+# 移植旧 obsidian-rag/index.py::strip_*（1179-1311）。纯文本变换，无副作用。
+# 清洗链顺序固定：死图链 → [官方 sidecar 精确删] → 页码行 → 样板行（旧
+# index.py::_store_chunks 1934-1939：先剥图链避免重复图片路径行被误判样板；
+# sidecar 只精确删官方标注噪声，残差交给启发式兜底）。
+# ---------------------------------------------------------------------------
+
+
+
+# 页码行：带标记的必删（第12页 / Page 12 / - 12 -）；裸数字行（"12"）只有
+# "出现 ≥2 个互不相同的裸数字行"（分页信号）时才删——单个孤立数字行可能是
+# 正文内容（如单独成行的年份/编号），宁可漏删不断错。
+_PAGE_NUM_KEYWORD_RE = re.compile(r"^\s*(?:第\s*\d+\s*页|Page\s*\d+)\s*$",
+                                   re.IGNORECASE)
+_PAGE_NUM_DECORATED_RE = re.compile(r"^\s*[-–—_·•*]+\s*\d{1,4}\s*[-–—_·•*]+\s*$")
+_PAGE_NUM_BARE_RE = re.compile(r"^\s*\d{1,4}\s*$")
+
+# 样板行：同一文档内逐字重复 ≥3 次的"普通段落行"视为页眉/页脚/水印，全删。
+# 保守边界（只删普通段落行，其余一律不动）：标题行（# 开头）删它会连带丢掉
+# 切块标题路径；表格行（| 开头）长表头重复也保护；列表项/引用块可能是正文
+# 强调；短行（<4 字符）单节内合法重复不受影响；纯标点/分隔线不动。
+_BOILER_MIN_REPEATS = 3
+_BOILER_MIN_LEN = 4
+_BOILER_PUNCT_ONLY_RE = re.compile(r"^[\s\-\*_#>|~`]+$")
+_BOILER_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+_LIST_ITEM_RE = re.compile(r"^(\s*)([-*+]|\d+[.)])\s")
+
+# 死图链：![alt](src) 里 src 为本地/相对路径的，文件根本不存在（提取器只存
+# md 文本、图片全丢），留着是进向量的死引用。alt 非空留 alt 纯文本（仍是语义
+# 信号），alt 为空整段删；远端 http(s)/data: 图片是活的（可渲染），不动；
+# HTML <img> 同理取 alt。Obsidian ![[…]] 已由 clean_wikilinks 处理，不管。
+_MD_IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+_HTML_IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+_HTML_ALT_RE = re.compile(r"""alt\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))""",
+                           re.IGNORECASE)
+
+# MinerU 官方块标注的噪声类型——实测 schema 含
+# header/footer/page_number/table/text；只删这三类，表格与正文按官方认定保留。
+_SIDECAR_NOISE_TYPES = frozenset({"header", "footer", "page_number"})
+
+
+def strip_page_number_lines(text: str) -> str:
+    """删页码行。返回清洗后的文本。（旧 index.py:1188）"""
+    lines = text.splitlines()
+    bare = {l.strip() for l in lines if _PAGE_NUM_BARE_RE.match(l)}
+    pagination = len(bare) >= 2  # ≥2 个不同裸数字 = 分页，不是正文
+    out = []
+    for l in lines:
+        if _PAGE_NUM_KEYWORD_RE.match(l) or _PAGE_NUM_DECORATED_RE.match(l):
+            continue
+        if pagination and _PAGE_NUM_BARE_RE.match(l):
+            continue
+        out.append(l)
+    return "\n".join(out)
+
+
+def _boiler_candidate(line: str) -> str | None:
+    s = line.strip()
+    if len(s) < _BOILER_MIN_LEN or _BOILER_PUNCT_ONLY_RE.match(s):
+        return None
+    if s.startswith("#") or s.startswith("|") or s.startswith(">"):
+        return None
+    if _LIST_ITEM_RE.match(line):
+        return None
+    return s
+
+
+def strip_boilerplate_lines(text: str, min_repeats: int = _BOILER_MIN_REPEATS) -> str:
+    """删逐字重复的样板行（页眉/页脚/水印）。返回清洗后的文本。（旧 1227）"""
+    lines = text.splitlines()
+    counts: dict[str, int] = {}
+    cands: list[str | None] = []
+    in_fence = False
+    for l in lines:
+        if _BOILER_FENCE_RE.match(l):
+            in_fence = not in_fence
+            cands.append(None)
+            continue
+        if in_fence:
+            cands.append(None)
+            continue
+        c = _boiler_candidate(l)
+        cands.append(c)
+        if c is not None:
+            counts[c] = counts.get(c, 0) + 1
+    drop = {s for s, n in counts.items() if n >= min_repeats}
+    if not drop:
+        return text
+    return "\n".join(l for l, c in zip(lines, cands)
+                     if c is None or c not in drop)
+
+
+def _md_img_repl(m: "re.Match[str]") -> str:
+    alt = (m.group(1) or "").strip()
+    src = (m.group(2) or "").strip()
+    if src.lower().startswith(("http://", "https://", "data:")):
+        return m.group(0)  # 远端/内嵌图是活的，不动
+    return alt  # 本地相对路径已死：留 alt 或删整段
+
+
+def _html_img_repl(m: "re.Match[str]") -> str:
+    a = _HTML_ALT_RE.search(m.group(0))
+    alt = next((g for g in (a.group(2), a.group(3), a.group(4))
+                if g is not None), "") if a else ""
+    return alt.strip()
+
+
+def strip_dead_image_refs(text: str) -> str:
+    """剥离指向本地图片的死引用（保留 alt 文本与远端图）。返回清洗后的文本。（旧 1277）"""
+    text = _MD_IMG_RE.sub(_md_img_repl, text)
+    return _HTML_IMG_RE.sub(_html_img_repl, text)
+
+
+def strip_sidecar_noise(body: str, sidecar: object) -> str:
+    """按 MinerU 官方块标注精确删页眉/页脚/页码行（问题48附记，第二档治本）。
+
+    sidecar = MinerU 结果包 content_list.json 解析出的 list，每个元素
+    {type, text, page_idx, bbox}。只做「整行逐字相等」匹配：官方标
+    header/footer/page_number 的 text 在正文里恰好单独成行才删；标题行
+    （# 前缀）即使文本撞上也不删——那是 md 结构（标题路径进切块向量）；
+    表格行/正文/列表一律不动（官方没标噪声，绝不启发式越权）。只精确删、
+    绝不猜测：撞不中的残差噪声交给 strip_page_number_lines/strip_boilerplate_lines
+    启发式兜底。（旧 index.py:1288）
+    """
+    if not isinstance(sidecar, list) or not sidecar:
+        return body
+    noise: set[str] = set()
+    for b in sidecar:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") in _SIDECAR_NOISE_TYPES:
+            t = str(b.get("text") or "").strip()
+            if t:
+                noise.add(t)
+    if not noise:
+        return body
+    return "\n".join(l for l in body.splitlines() if l.strip() not in noise)

@@ -49,6 +49,7 @@ CORE_SUITES = [
     "test_index_progress",
     "test_index_failures",
     "test_model_loading",
+    "test_noise_cleaning",
     "test_note_relations",
     "test_graph",
     "test_singleton",

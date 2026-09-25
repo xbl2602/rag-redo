@@ -108,6 +108,23 @@ class MineruCloudExtractor:
         except OSError:
             pass
 
+    def read_sidecar(self, content_hash: str) -> list | None:
+        """读 MinerU 官方块标注 sidecar（问题48附记 v11 双轨，索引侧清洗用）。
+
+        返回 content_list 的 list，或 None（无 sidecar / 损坏 / 非 list——
+        老文件未重提故无 sidecar，索引侧走启发式回退）。绝不抛异常，
+        对齐旧 extractors.read_cache_sidecar 契约。"""
+        if self._sidecar_dir is None or not content_hash:
+            return None
+        try:
+            path = self._sidecar_dir / f"{content_hash}.json"
+            if not path.is_file():
+                return None
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else None
+        except (OSError, ValueError):
+            return None
+
     def _quota_add(self, pages: int) -> None:
         if self._quota_path is None:
             return

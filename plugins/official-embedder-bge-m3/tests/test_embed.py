@@ -205,5 +205,34 @@ class TestRealEncoderGpuArbitration(unittest.TestCase):
         self.assertIsNotNone(encoder._model)
 
 
+class TestAutoBatchSize(unittest.TestCase):
+    """显存自适应批次（问题59-B4，逐字对齐旧 index.py::_auto_batch_size）。"""
+
+    def _encoder(self):
+        return _RealEncoder(resource_arbiter=ResourceArbiter())
+
+    def test_desired_within_cap_passthrough_on_cpu(self):
+        enc = self._encoder()
+        self.assertEqual(enc._auto_batch_size(8), 8)
+        self.assertEqual(enc._auto_batch_size(32), 32)
+
+    def test_cuda_caps_at_8_and_tightens_to_4_when_vram_low(self):
+        enc = self._encoder()
+        enc._device = "cuda"
+        fake_info = lambda: (int(6.0 * 1024 ** 3), 8 * 1024 ** 3)  # noqa: E731
+        with patch("torch.cuda.mem_get_info", side_effect=lambda: fake_info()):
+            self.assertEqual(enc._auto_batch_size(32), 8)
+        low_info = lambda: (int(3.0 * 1024 ** 3), 8 * 1024 ** 3)  # noqa: E731
+        with patch("torch.cuda.mem_get_info", side_effect=lambda: low_info()):
+            self.assertEqual(enc._auto_batch_size(32), 4)
+
+    def test_probe_failure_falls_back_to_conservative_cap(self):
+        """探针失败按"显存未知"处理取保守上限 8（fail-open 铁律）。"""
+        enc = self._encoder()
+        enc._device = "cuda"
+        with patch("torch.cuda.mem_get_info", side_effect=RuntimeError("probe boom")):
+            self.assertEqual(enc._auto_batch_size(32), 8)
+
+
 if __name__ == "__main__":
     unittest.main()

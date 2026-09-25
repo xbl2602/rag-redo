@@ -26,7 +26,9 @@ from .index_failures import IndexFailuresStore
 from .index_generation import INDEX_MANIFEST_VERSION, IndexGenerationStore, IndexManifestStore
 from .index_progress import IndexProgressEvent, IndexStartResult, IndexWorkerManager
 from .note_relations import NoteRelationsStore, extract_wikilink_targets
-from .text_cleaning import TEXT_PIPELINE_VERSION, build_anchor_context, clean_wikilinks, extract_frontmatter
+from .text_cleaning import (TEXT_PIPELINE_VERSION, build_anchor_context, clean_wikilinks,
+                            extract_frontmatter, strip_boilerplate_lines, strip_dead_image_refs,
+                            strip_page_number_lines, strip_sidecar_noise)
 from .runtime import PluginRuntime, PluginState
 
 
@@ -219,6 +221,25 @@ class Pipeline:
         self._graph_semantic_cache: tuple[tuple[object, ...], SemanticGraphResponse] | None = None
 
     # ---- 插件解析 --------------------------------------------------------
+
+    def _read_sidecar(self, library_id: str, content_hash: str) -> list | None:
+        """读 MinerU 官方块标注 sidecar（问题48附记 v11 双轨清洗用）：按源
+        文件内容哈希向 OCR 插件查询。只有 MinerU 云端新提取过的文件才有
+        sidecar；老文件/其他后端读不到返回 None 自动跳过（同旧
+        read_cache_sidecar 契约：绝不抛异常，走启发式回退）。"""
+        if not content_hash:
+            return None
+        for plugin_id in sorted(self.runtime.registry.providers_of("extractor:pdf")):
+            fn = getattr(self._plugin(plugin_id), "read_sidecar", None)
+            if fn is None:
+                continue
+            try:
+                sidecar = fn(content_hash)
+            except Exception:
+                continue
+            if sidecar:
+                return sidecar
+        return None
 
     def _plugin(self, plugin_id: str):
         plugin = self.runtime.plugins.get(plugin_id)
@@ -908,6 +929,17 @@ class Pipeline:
             else:
                 front, body = {}, raw_text
             index_text = clean_wikilinks(body)
+            # 问题48 清洗链（顺序有讲究，逐字对齐旧 _store_chunks 1934-1939）：
+            # 死图链 → [官方 sidecar 精确删（仅 MinerU 云端提取过的文件有；
+            # 读不到自动跳过）] → 页码行 → 样板行。先剥图链（避免重复图片
+            # 路径行被误判成样板）；sidecar 只精确删官方标注的页眉/页脚/页码，
+            # 删不中的残差交给启发式兜底。纯文本变换，不影响终态判定。
+            index_text = strip_dead_image_refs(index_text)
+            _sidecar = self._read_sidecar(library_id, doc.content_hash or plan["content_hash"])
+            if _sidecar:
+                index_text = strip_sidecar_noise(index_text, _sidecar)
+            index_text = strip_page_number_lines(index_text)
+            index_text = strip_boilerplate_lines(index_text)
             doc_parts = [p for p in (Path(path).stem, front.get("title", ""), front.get("tags", "")) if p]
             if index_text != raw_text:
                 doc = dataclasses_replace(doc, text=index_text)

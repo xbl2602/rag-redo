@@ -60,6 +60,8 @@ GPU_HOLDER_ID = "official-text-retrieval-gpu"  # 和 official-reranker 共用同
 GPU_PRIORITY = 100  # 检索侧优先，压过 WEMM/OCR-local 的10（对齐旧项目"检索优先抢占"）
 IDLE_UNLOAD_SECONDS = 300  # 空闲卸载模型释放显存，对齐旧项目默认 gpu_idle_unload_seconds
 SLOW_BATCH_SECONDS = 30.0  # CUDA 单批编码超过此值视为疑似共享显存溢出（对齐旧项目 encode_safe）
+EMBED_BATCH_SIZE = 8     # 索引嵌入外层分批（旧 config.embed_batch_size 默认 8；逐批进度心跳+降低显存峰值）
+ENCODE_BATCH_SIZE = 32   # model.encode 的期望批次（旧 config.encode_batch_size；实际值经 _auto_batch_size 按显存收紧）
 
 
 class Encoder(Protocol):
@@ -86,6 +88,8 @@ class _RealEncoder:
         self._logger = logger
         self._last_use = time.time()
         self._slow_batch_count = 0
+        self._last_batch_cap: int | None = None  # 上次自动批次收紧值（仅变化时打日志，避免刷屏）
+        self._device = "cpu"
         self._lock = threading.RLock()
 
     def _log(self, message: str) -> None:
@@ -110,6 +114,7 @@ class _RealEncoder:
                     device = "cpu"
                     self._model = self._load_for_device(SentenceTransformer, device)
                 self._log(f"BGE-M3模型已加载（device={device}）")
+                self._device = device
                 self._cooldown_gate.report_device(device)
             self._last_use = time.time()
             return self._model
@@ -170,12 +175,52 @@ class _RealEncoder:
     def encode(self, texts: list[str]) -> list[list[float]]:
         with self._lock:
             model = self._ensure_loaded()
-            started = time.time()
-            result = model.encode(texts, normalize_embeddings=True).tolist()
-            elapsed = time.time() - started
+            out: list[list[float]] = []
+            # 外层按 embed_batch_size 分批（旧 index.py:2249：提供逐批进度
+            # 心跳并降低显存峰值），每批内 batch_size 走 _auto_batch_size
+            # 按当前可用显存二次收紧（问题59-B4）——慢批检测因此逐批生效，
+            # 与旧 encode_safe 的检测粒度一致。
+            for start in range(0, len(texts), EMBED_BATCH_SIZE):
+                sub = texts[start:start + EMBED_BATCH_SIZE]
+                started = time.time()
+                result = model.encode(
+                    sub, normalize_embeddings=True,
+                    batch_size=self._auto_batch_size(ENCODE_BATCH_SIZE),
+                )
+                elapsed = time.time() - started
+                self._check_slow_batch(elapsed)
+                out.extend(result.tolist() if hasattr(result, "tolist") else list(result))
             self._last_use = time.time()
-            self._check_slow_batch(elapsed)
-            return result
+            return out
+
+    def _auto_batch_size(self, desired: int) -> int:
+        """按当前可用显存自动收紧批次（防共享显存溢出），配置值仅作上限——
+        逐字对齐旧 index.py::_auto_batch_size（问题59-B4）。
+
+        2026-08-13 校准教训（旧注释原文）：不要用固定线性公式猜批次。实测
+        长块（~700 字符）下 attention 显存随 batch×seq² 暴涨，8GB 卡满载触发
+        WDDM 溢出排入系统 RAM。固定安全上限（8）+ 可用显存二次收紧，慢批
+        看门狗仍兜底。探针失败按"显存未知"处理取保守上限（fail-open 铁律：
+        探测失败绝不阻塞任何路径）。"""
+        if getattr(self, "_device", "cpu") != "cuda":
+            return desired
+        try:
+            import torch
+
+            free_gb = torch.cuda.mem_get_info()[0] / 1024 ** 3
+        except Exception as exc:  # noqa: BLE001 - 见 docstring：探针失败取保守上限
+            self._log(f"显存探针失败（{type(exc).__name__}），批次取保守上限：{exc}")
+            return min(8, desired)
+        cap = min(8, desired)  # 长块 bs=16 已近 6GB，固定 8 保安全
+        if free_gb < 4.5:
+            cap = min(cap, 4)  # 显存紧张再降
+        if desired > cap:
+            if cap != self._last_batch_cap:
+                self._log(f"可用显存 {free_gb:.1f}GB，批次 {desired} 收紧为 {cap}")
+            self._last_batch_cap = cap
+            return cap
+        self._last_batch_cap = None
+        return desired
 
     def _check_slow_batch(self, elapsed: float) -> None:
         """Windows WDDM 显存溢出会静默排入共享显存而不报错，只能靠耗时识别：
