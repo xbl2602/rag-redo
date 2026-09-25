@@ -47,6 +47,38 @@
 - **干净机验收与便携包体积优化**——需要无开发工具的真实机器，无法无人值守执行，仍待操作者。
 - 全量高频连跑下 core/test_index_progress 的两条子进程计时用例偶发抖动（单跑稳定、昨夜起点提交同样偶发，属项目已知的高频连跑子进程残留问题家族，见 Phase 4 记录），已通过并发唯一临时名修复消除一个潜在干扰源。
 
+## 2026-09-25 终审：四份穷举对照 + 决策记录挖掘——十七项修复
+
+> 操作者指示"全部做，看旧项目决策记录，确保真的对齐"。方法：四份穷举审计（旧 config.py 全部 63 键逐键对照、旧 server.py 全部 16 工具签名 diff、旧决策记录 TASK_LOG/TODO/docs 全量挖掘、旧 GUI bridge.py 39 方法+前端交互逐项对照），按影响排序修复，45/45 套测试全程全绿。
+
+**修复清单（按提交顺序）**：
+1. **检索核心四项静默偏离**：RRF k=60→2（旧刻意选择 TASK_LOG:920）；候选池 top_k×3→max(top_k×8, 200)（retriever.py:640，top_k=5 时 15→200）；重排池 rerank_candidates=50+池外余量接续（retriever.py:626）；新增 rerank_enabled 开关+各库归一化降级合并+RRF 一致度置信度（retriever.py:627/789）；交付窗口 top_k×4（FOLD_WINDOW_FACTOR）。
+2. **wikilink 清洗进索引文本**（问题15/审计F9）：core/text_cleaning.py 逐字移植——别名/目标词保留、路径锚点剥离、![[嵌入]]删除；链接先从原文抽取（关系语义不变）；text_pipeline 签名机制对齐旧 META_VERSION。
+3. **frontmatter 锚点进嵌入/BM25**（问题18/审计F20）：title/tags/文件名+标题链逐段去重拼进块文本，ctx 存 metadata 供交付剥离；重排器输入=存储文本。
+4. **return_chunk_limit 2000+行边界截断+[块 k/N]**（问题10）：_truncate_at_line 逐字移植（±300 行边界收边），SearchResult 新增 chunk_index/total_chunks/truncated。
+5. **出厂排除默认集**（问题1）：.obsidian/.smart-env/.trash/.git/TEMP/templates + 目录.md/AGENTS.md/LOG.md/README.md + session-/会话/.tmp（新建库默认，已持久化配置不受影响）。
+6. **切块器按旧语义重写**（问题8/9/18、审计F8）：H1-H3、围栏内#不算标题、表格宁大勿断+上下文绑定、列表项边界切、缩写保护、无 overlap、600 限制；CHUNKER_VERSION 0.3.0。
+7. **BM25 双通道**（问题21/审计F1）：jieba 滤停用词+中文 2-gram 兜底+英文 token（retriever.py::tokenize 逐字对齐）；INDEXER_VERSION 0.2.0。
+8. **MinerU 云端 404/非JSON→gone 清簿记**（问题36）：堵"永久续接不存在的任务"。
+9. **杂项阈值**：find_duplicates 0.8、stall_timeout 25、GUI top_k=5。
+10. **reindex_knowledge 补 allow_new_formats 授权流**（server.py:620-656）：pending_agent_formats 报告+确认后持久化 agent_formats——MCP 层授权流此前断裂。
+11. **read_document 补 abs_path+标题回退匹配**（旧抬头含绝对路径+标题匹配约定）。
+12. **业务 CLI 移植**（index/library/export/import/dedup 五个命令行入口，对齐 index.py:2441/library.py:700/export.py:258/import.py:212/dedup.py:235）——全部是 Pipeline 薄封装。
+13. **GUI 批量后台刷新简介+轮询**（bridge.py:367-420 协议），移除"同步阻塞"已知简化。
+14. **check_notes.py 移植**（D类，操作者确认）：规则/豁免集逐条一致，三个集成点适配。
+15. **GUI 后端补齐**：remove_library/get_library_config/set_library_config/dedup_run/wemm_status/open_path（bridge.py 可行子集）。
+16. **B3 核实为已对齐**：思考型模型 180s/2000 预算与 reasoning_content 处理本就对齐；旧 call_llm 本无独立冷却计时器（ROADMAP 旧备注不准确，CUDA 冷却已按旧状态机移植）。
+17. **B5 登记为有意设计**：GPU_HOLDER_ID 共享 holder 支持检索侧两模型共存+幂等续期（旧项目无插件禁用概念，引用计数属核心增强项）。
+
+**核实为与旧项目一致、不动的**：GUI 搜索无 freshness（旧 GUI 同）；Advisor 建议文案偏离（操作者已批准，见 BC-08）；selection_new_files 三态 follow 未移植（rag-redo 无旧式全局格式开关，格式门禁由 extractors/agent_formats 承担——登记为架构差异）。
+
+**仍登记的余项（按审计清单精确到条目）**：
+- sidecar 噪声清洗双轨（问题48 v10/v11：死图链/页码/样板行剥离）——扫描件语料质量，未移植。
+- MinerU 云端并行（问题35 cloud_jobs 线程池 + mineru_concurrency 三档）、批量提交（50文件/批）、token 失效响应体错误码（A0202/A0211）——吞吐行为未对齐。
+- 模型加载离线优先（问题56 local_files_only）/fp16/按显存自动批次（问题59-B4）——性能面未移植。
+- 勾选"按深度裁决"只实现一半（问题47附记2：更深的目录排除应赢过更浅的显式纳入）+ 同位置冲突拒绝；[块k/N] 在 MCP 输出透出；index_failures 中文释义标签；list_libraries 富行（blocks/last_indexed/过时标注）；wemm_status DPI/model/device 字段；get_library_sample title 汇总；navigate 多库参数；删除库数据回收（问题49 prune）；RRF k=2 旧评估集复核；pdf_text_backend 文字层送云端（TODO.md:299）；GUI 前端交互全面对齐（七视图/勾选树弹窗/图谱检索岛/节点拖拽/试验台/诊断视图/日志抽屉/主题切换/toast 等——四份审计报告里 GUI 节的完整清单为准，属多天前端工程）。
+- 无法无人值守执行、需要操作者：干净机验收、便携包体积优化、WEMM 独立环境从零引导（需联网）、检索质量与旧项目真实对比、GUI 真人交互冒烟、push。
+
 ## 2026-09-23 全面功能审计——已发现、尚未实现的缺口
 
 > 操作者要求"检查decision log/相关文档核对功能是否完整复刻"后的系统性核对结果。方法：`grep "@server.tool()"` 拿到 obsidian-rag 全部16个MCP工具的权威清单，逐个核对 rag-redo 当前实现；同时通读 `config.py` 全部 CFG 默认值、`singleton.py`、`guiweb/graph_data.py`+`semantic.py`。**这些都是这次才发现的真实缺口，不是已知计划里遗漏的执行细节**——此前的 FEATURE_TRIAGE.md 表格粒度停在"插件级"，从没有逐个核对过 MCP 工具级别和 CFG 配置项级别，这次审计把粒度下钻到了那两层。
