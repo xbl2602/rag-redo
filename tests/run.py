@@ -36,6 +36,7 @@ for _stream in (sys.stdout, sys.stderr):
 CORE_SUITES = [
     "test_agents_contract",
     "test_atomic",
+    "test_cli",
     "test_manifest",
     "test_plugin_manifests_sane",
     "test_registry",
