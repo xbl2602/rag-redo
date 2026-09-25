@@ -93,6 +93,14 @@ class ChromaVectorStorePlugin:
         assert self.store is not None
         return self.store.count(library_id, generation)
 
+    def list_collection_names(self) -> list[str]:
+        assert self.store is not None
+        return self.store.list_collection_names()
+
+    def delete_collection_by_name(self, name: str) -> None:
+        assert self.store is not None
+        self.store.delete_collection_by_name(name)
+
     def sample_records(self, records: dict[str, dict], k: int = 20) -> list[SampledChunk]:
         assert self.store is not None
         return [

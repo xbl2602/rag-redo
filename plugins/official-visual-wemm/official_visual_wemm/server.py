@@ -277,7 +277,24 @@ def _fake_embed(kind: str, content, dim: int) -> list[float]:
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/health":
-            self._json(200, {"ok": True})
+            # 不取 _ENGINE_LOCK：health 的职责是「服务活没活」，若在模型加载/
+            # 编码期间被锁挡住超时，检索方会误判「服务不可用」。快照读引用即可。
+            # model/dim/device 字段对齐旧 wemm_server.py /health（293-298）——
+            # wemm_status 的"看图服务存活：{model}，设备 {device}"行从这里取数。
+            ent = _engine
+            loaded = ent is not None
+            ent = ent or {}
+            try:
+                import torch as _torch
+
+                device = ent.get("device") or ("cuda" if _torch.cuda.is_available() else "cpu")
+            except Exception:  # noqa: BLE001 - health 绝不因诊断失败而失败
+                device = "unknown"
+            self._json(200, {"ok": True, "loaded": loaded,
+                             "model": ent.get("model_id") or WEMM_MODEL_DEFAULT,
+                             "dim": ent.get("dim") or WEMM_DIM_DEFAULT,
+                             "device": device,
+                             "supported_dims": ent.get("supported") or []})
         else:
             self._json(404, {"error": "not found"})
 

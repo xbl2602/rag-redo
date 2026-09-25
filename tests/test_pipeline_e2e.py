@@ -9,6 +9,7 @@ chunker/library-manager/bm25/chroma/rrf）全部走真实代码，不打折扣�
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sys
@@ -772,6 +773,34 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         self.assertFalse(
             (self.data_dir / "note_relations" / "generations" / "test-lib" / "first.json").exists()
         )
+
+    def test_prune_unreferenced_data_recovers_deleted_library_storage(self):
+        """问题49 全局回收（旧 index.py::prune_unreferenced_data）：从注册表
+        移除的库，其 manifests/失败诊断/关系/提取缓存目录与 Chroma 集合在下
+        一轮索引收尾时被回收；未删除的库原样保留（含旧 generation 的
+        deferred 语义数据绝不动）。"""
+        other = self.tmp / "other-vault"
+        other.mkdir()
+        (other / "other.md").write_text("# 其他库\n\n插件 架构 内容。", encoding="utf-8")
+        self.pipeline._singleton("library_manager").store.add_library("other-lib", "other-lib", str(other))
+        self.pipeline.index_library("other-lib", generation_id="only")
+        self.assertTrue((self.data_dir / "extracted" / "other-lib" / "only").exists())
+        collections_before = set(self.pipeline._singleton("vector_store").list_collection_names())
+        expected_collection = "libg_" + hashlib.sha256(b"other-lib\0only").hexdigest()[:40]
+        self.assertIn(expected_collection, collections_before)
+
+        # 注销库（只移出注册表，同旧 remove_library 默认不删数据）→ 下一轮
+        # 索引收尾的全局回收清掉它的全部目录残留。Chroma 集合不做按名清扫
+        # （deferred 语义保留旧 generation 集合，见 pipeline.prune 的注释）。
+        self.pipeline._singleton("library_manager").store.remove_library("other-lib")
+        self.pipeline.index_library("test-lib")
+        self.assertFalse((self.data_dir / "extracted" / "other-lib").exists())
+        self.assertFalse((self.data_dir / "index_manifests" / self.pipeline._manifests._key("other-lib")).exists())
+        self.assertFalse((self.data_dir / "note_relations" / "generations" / "other-lib").exists())
+        # 活库数据原样：test-lib 的向量仍可搜（deferred 语义不受回收影响）
+        self.assertTrue(self.pipeline.search("test-lib", "厨房 食谱", top_k=5))
+        # 活库数据原样：test-lib 的向量仍可搜（deferred 语义不受回收影响）
+        self.assertTrue(self.pipeline.search("test-lib", "厨房 食谱", top_k=5))
 
     def test_search_different_query_finds_different_doc(self):
         self.pipeline.index_library("test-lib")

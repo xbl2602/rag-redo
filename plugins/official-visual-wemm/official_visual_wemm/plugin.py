@@ -538,6 +538,7 @@ class VisualWemmPlugin:
         本方法汇总有效页数、PDF 数和失败列表，不加载模型。"""
         alive = self._handle is not None and self._handle.is_alive
         libraries: dict[str, dict] = {}
+        service = self._health_snapshot() if alive else None
         if self._client is not None:
             active_pairs = self._generations.active_pairs() if self._generations is not None else {}
             for library_id, generation in active_pairs.items():
@@ -575,8 +576,34 @@ class VisualWemmPlugin:
         return {
             "enabled": self._enabled,
             "subprocess_alive": alive,
+            # 渲染 DPI 与看图服务模型/设备（旧 wemm_status 的 DPI/model/device
+            # 字段；model/device 来自子进程 /health 快照，服务未运行时为 None）
+            "dpi": WEMM_RENDER_DPI,
+            "service": (
+                {"model": service.get("model"), "device": service.get("device"),
+                 "dim": service.get("dim")}
+                if isinstance(service, dict) else None
+            ),
             "libraries": libraries,
         }
+
+    def _health_snapshot(self) -> dict | None:
+        """只读 GET 子进程 /health（模型/设备快照）；任何失败返回 None——
+        状态诊断绝不因快照失败而失败，同旧 wemm_retriever.health 的容错
+        语义（超时 5s）。"""
+        if self._handle is None:
+            return None
+        try:
+            import json as _json
+            import urllib.request
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self._handle.port}/health", timeout=5.0
+            ) as response:
+                data = _json.loads(response.read().decode("utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
 
     # ---- 查询态 ----------------------------------------------------------
 

@@ -114,6 +114,21 @@ class ChromaVectorStore:
         except Exception:
             pass
 
+    def list_collection_names(self) -> list[str]:
+        """全部集合名（问题49 全局回收用：找出不属于任何已注册库的残留）。"""
+        try:
+            return [getattr(c, "name", c) for c in self._client.list_collections()]
+        except Exception:
+            return []
+
+    def delete_collection_by_name(self, name: str) -> None:
+        """按名删除集合（只用于全局回收的残留清理；任何失败静默吞掉，
+        同 delete_generation 的容错纪律——回收绝不能拖垮索引主流程）。"""
+        try:
+            self._client.delete_collection(name=name)
+        except Exception:
+            pass
+
     def query(
         self,
         library_id: str,

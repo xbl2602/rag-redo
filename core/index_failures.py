@@ -24,6 +24,18 @@ import re
 from .atomic import atomic_write_text
 from pathlib import Path
 
+# 终态 reason → 人类可读解释（索引失败溯源用）——逐字对齐旧
+# obsidian-rag/server.py::_TERMINAL_LABELS（866-873）。not-pdf 是 WEMM
+# 页库语境的额外键，不在索引五常量终态内，保留是为了报告兜底不漏。
+TERMINAL_LABELS = {
+    "unreadable": "无法读取（疑似损坏/无权限，指纹两轮才判稳）",
+    "extract-failed": "提取失败（损坏/加密/云端失败，可按需重试）",
+    "empty": "空内容（打开正常但没有可提取的正文）",
+    "tbd": "命中 [TBD] 占位（正文还没写完，写完会自动转正）",
+    "scanned": "扫描件待 OCR（后端 none 时跳过；开启 MinerU 云端后会自动重试）",
+    "not-pdf": "非 PDF（仅 WEMM 页库语境）",
+}
+
 
 class IndexFailuresStore:
     def __init__(self, root: Path) -> None:
@@ -58,14 +70,20 @@ class IndexFailuresStore:
             pass
 
     def read(self, library_id: str, generation: str | None = None) -> dict | None:
-        """返回 `{"succeeded": N, "failures": [{"path", "reason"}, ...]}`。
-        库从没索引过（没有诊断数据文件）时返回 `None`——调用方自己决定
-        怎么展示"从没跑过"和"跑过但全部成功"（`failures` 为空列表）的
-        区别。"""
+        """返回 `{"succeeded": N, "failures": [{"path", "reason", "label"}, ...]}`。
+        label 为 reason 的中文释义（旧 _TERMINAL_LABELS；未登记的 reason 回退
+        原串，绝不让失败原因无声消失）。库从没索引过（没有诊断数据文件）
+        时返回 `None`——调用方自己决定怎么展示"从没跑过"和"跑过但全部成功"
+        （`failures` 为空列表）的区别。"""
         path = self._path_for(library_id, generation)
         if not path.is_file():
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
+        if isinstance(data, dict):
+            for row in data.get("failures") or []:
+                if isinstance(row, dict) and row.get("reason") is not None:
+                    row["label"] = TERMINAL_LABELS.get(str(row["reason"]), str(row["reason"]))
+        return data

@@ -176,7 +176,8 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         }
 
     @server.tool()
-    def navigate_knowledge(query: str, library_id: str, top_k: int = 5) -> dict[str, Any]:
+    def navigate_knowledge(query: str, top_k: int = 5, libraries: str = "",
+                           exclude: str = "") -> dict[str, Any]:
         """页级视觉导航——独立于 search_knowledge 的"第二套检索"，把 PDF
         每一页渲染成图直接"看图"匹配，不依赖文字提取/OCR，扫描件、图表、
         公式密集的页面也能按页定位。用法建议：先用 search_knowledge 找
@@ -193,27 +194,36 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
 
         Args:
             query: 查询文本
-            library_id: 要搜索的库的 id（用 list_libraries 查看有哪些库）
             top_k: 最多返回几条结果
+            libraries: 库选择（空=全部库，"all"=全部库，"A,B" 多库并查；
+                先调 list_libraries 查看有哪些库）
+            exclude: 反选库名（做减法）
         """
         try:
-            if ".pdf" not in lib_mgr.agent_allowed_extensions(library_id):
-                raise PermissionError("Agent 未获授权访问 PDF 页级视觉索引")
-            hits = pipeline.navigate(library_id, query, top_k=top_k)
+            entries = lib_mgr.resolve_libraries(libraries or "all", exclude)
+            merged: list[dict[str, Any]] = []
+            skipped: list[str] = []
+            for entry in entries:
+                if ".pdf" not in lib_mgr.agent_allowed_extensions(entry.library_id):
+                    # 逐库授权判定（BC-02）：未授权 PDF 的库整库跳过，不是报错——
+                    # 同 search_knowledge 的"未授权文件不存在"语义在库级的投影
+                    skipped.append(entry.library_id)
+                    continue
+                for hit in pipeline.navigate(entry.library_id, query, top_k=top_k):
+                    merged.append({
+                        "library": entry.library_id,
+                        "path": hit.path,
+                        "abs_path": hit.abs_path,
+                        "page": hit.page_index + 1,  # 对外展示用1-based页码，符合人类阅读习惯
+                        "score": hit.score,
+                    })
+            merged.sort(key=lambda row: row["score"], reverse=True)
+            result: dict[str, Any] = {"ok": True, "results": merged[:top_k]}
+            if skipped:
+                result["skipped_libraries"] = skipped
+            return result
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
-        return {
-            "ok": True,
-            "results": [
-                {
-                    "path": h.path,
-                    "abs_path": h.abs_path,
-                    "page": h.page_index + 1,  # 对外展示用1-based页码，符合人类阅读习惯
-                    "score": h.score,
-                }
-                for h in hits
-            ],
-        }
 
     @server.tool()
     def wemm_status() -> dict[str, Any]:
@@ -333,29 +343,36 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
 
     @server.tool()
     def list_libraries() -> list[dict]:
-        """列出所有已注册的库及其基本信息，含每个库的简介（导航/澄清性质
-        的一段话，帮你在真正检索/通读全文之前先判断"这个库值不值得往这
-        查"——不是检索结果的替代品）。没有简介的库不代表没内容，只是还
-        没生成过；如果用户明确要求，先调用 get_library_sample 采样，自己
-        写一段，再用 propose_library_summary 提交。
+        """列出所有已注册的库及其富行信息（库名/路径/块数/最近索引/独立配置
+        覆盖/简介+过时标注，对齐旧 list_libraries 工具的 list_summary 数据
+        面），供 search_knowledge 的 libraries/exclude 参数选库。简介是导航/
+        澄清性质的一段话，帮你在真正检索/通读全文之前先判断"这个库值不值得
+        往这查"——不是检索结果的替代品。没有简介的库不代表没内容，只是还没
+        生成过；如果用户明确要求，先调用 get_library_sample 采样，自己写一段，
+        再用 propose_library_summary 提交。
 
         library_summary 是可选插件——关掉它之后 list_libraries 仍应正常
         工作，只是每条结果的 summary 字段一律是 None（同 AGENTS.md"关掉
         任意一个非必需插件，核心+MCP仍能正常工作"这条既有验收标准，不能
         因为新增了库摘要功能就让这条退化）。
         """
-        summary_available = pipeline.runtime.registry.active_of("library_summary") is not None
-        rows = []
-        for cfg in lib_mgr.store.list_libraries():
-            summary_text = pipeline.get_library_summary(cfg.library_id).text if summary_available else ""
-            rows.append(
-                {
-                    "library_id": cfg.library_id,
-                    "name": cfg.name,
-                    "root_path": cfg.root_path,
-                    "summary": summary_text or None,
-                }
-            )
+        rows = pipeline.library_rows()
+        for cfg, row in zip(lib_mgr.store.list_libraries(), rows):
+            # 独立配置覆盖（旧 list_summary 的 overrides：非 None 的逐库覆盖键）
+            overrides = {
+                key: value
+                for key, value in (
+                    ("selection_in", cfg.selection_in),
+                    ("selection_out", cfg.selection_out),
+                    ("enabled_extensions", cfg.enabled_extensions),
+                    ("agent_formats", cfg.agent_formats),
+                    ("exclude_dirs", cfg.exclude_dirs),
+                    ("exclude_files", cfg.exclude_files),
+                    ("exclude_patterns", cfg.exclude_patterns),
+                )
+                if value
+            }
+            row["overrides"] = overrides
         return rows
 
     @server.tool()

@@ -12,8 +12,10 @@ GUI/CLI/MCP 要"建索引"或"搜索"都应该调这个模块，不要在各自�
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
+import shutil
 import uuid
 from dataclasses import dataclass, field, replace as dataclasses_replace
 from pathlib import Path
@@ -51,6 +53,7 @@ CONF_TIER_STRONG = 0.75  # 置信度≥此值 → "高相关"（真分尺度，�
 DEFAULT_CONFIDENCE_WARN_THRESHOLD = 0.30  # 低于此值 → "弱相关"，来源行标注"仅供参考"
 DEFAULT_CONFIDENCE_DROP_THRESHOLD = 0.0  # 低于此值直接丢弃不返回；0=关闭（obsidian-rag当前默认口径：给满top_k，只标注不丢弃）
 DEFAULT_MAX_CHUNKS_PER_FILE = 3  # 同一文件在最终结果里最多出现几条，防止单篇文档占满整个结果列表
+IMPORT_UPSERT_BATCH = 500  # 导入时每批 upsert 的块数（旧 config.import_upsert_batch：拥塞小值减慢导入，较大值占内存）
 TERMINAL_FAILURE_STATES = frozenset({"unreadable", "empty", "tbd", "scanned", "extract-failed"})
 
 
@@ -1239,7 +1242,86 @@ class Pipeline:
         for candidate in sorted(candidates - keep_generations - referenced_generations):
             self.discard_index_generation(library_id, candidate)
             self._manifests.clear(library_id, candidate)
+        try:
+            self.prune_unreferenced_data()
+        except Exception as exc:  # noqa: BLE001 - 回收失败绝不影响索引结果（旧 2496-2499 同纪律）
+            logging.getLogger("rag_redo.core.pipeline").info("全局回收失败（忽略）：%s", exc)
         return report
+
+    def prune_unreferenced_data(self) -> tuple[int, int, int]:
+        """索引完成后一次性全局回收（问题49，用户拍板"全清，没用到就删"）——
+        对齐旧 index.py::prune_unreferenced_data（2307-2437）的职责范围，
+        按本项目的存储布局适配：
+
+        1. 已从注册表移除的库 → manifests/index_failures/generations/
+           extract_cache 下它的目录一并清（库级文件/块清理每轮索引已做，
+           这里只清"整个库都没了"的残留）；
+        2. 活跃 generation 的提取缓存孤儿 → 不在 `_index.json` 反查表里的
+           `<hash>.txt` 删除。
+        Chroma 集合不做按名清扫（理由见下方注释）。
+
+        幂等；任何单步失败只记日志、绝不抛，不影响索引主流程。
+        返回 (删缓存文件数, 删 collection 数, 删已删库目录数)。"""
+        lib_mgr = self._singleton("library_manager")
+        live_library_ids = {cfg.library_id for cfg in lib_mgr.store.list_libraries()}
+        # 各存储的目录命名规则不同，孤儿判定必须按各自的命名来——
+        # manifests 用 _key（安全名+哈希后缀）；failures/relations 用安全名；
+        # extract_cache 直接用原始库 id。用错一边会把活库目录误判成孤儿。
+        _safe = lambda library_id: re.sub(r"[^\w.-]", "_", library_id)  # noqa: E731
+        live_manifest_keys = {self._manifests._key(library_id) for library_id in live_library_ids}
+        live_safe_names = {_safe(library_id) for library_id in live_library_ids}
+
+        def _prune_orphan_dirs(root: Path, suffix: str, live_names: set[str]) -> int:
+            if not root.is_dir():
+                return 0
+            removed = 0
+            for child in root.iterdir():
+                if child.is_dir() and child.name not in live_names:
+                    shutil.rmtree(child, ignore_errors=True)
+                    removed += 1
+                    logging.getLogger("rag_redo.core.pipeline").info("全局回收：删已删库的%s目录 %s", suffix, child.name)
+            return removed
+
+        n_dirs = 0
+        n_dirs += _prune_orphan_dirs(self._manifests._root, "manifest", live_manifest_keys)
+        n_dirs += _prune_orphan_dirs(self._index_failures._root / "generations", "失败诊断", live_safe_names)
+        n_dirs += _prune_orphan_dirs(self._note_relations._root / "generations", "关系", live_safe_names)
+        n_dirs += _prune_orphan_dirs(self._extract_cache._root, "提取缓存", live_library_ids)
+
+        # 活跃 generation 的提取缓存孤儿（hash 不在反查表里）
+        n_cache = 0
+        for cfg in lib_mgr.store.list_libraries():
+            generation = self._generations.active(cfg.library_id)
+            if not generation:
+                continue
+            cache_dir = self._extract_cache._dir_for(cfg.library_id, generation)
+            index = self._extract_cache._load_index(cfg.library_id, generation)
+            if not cache_dir.is_dir():
+                continue
+            for file in cache_dir.iterdir():
+                if not file.is_file() or file.name == "_index.json":
+                    continue
+                stem = file.name.split(".")[0]
+                if stem not in index:
+                    try:
+                        file.unlink()
+                        n_cache += 1
+                    except OSError:
+                        pass
+
+        # Chroma 集合不做按名清扫——集合名 libg_<sha(库,generation)> 不可逆，
+        # 而 deferred/冻结语义刻意保留旧 generation 的集合（旧块的块 id 指向
+        # 它们，manifest 的 vector_segments 之外还有搜索池引用），按任何
+        # "keep 集"近似都会误删在用集合（实测打断增量重嵌/冻结可搜）。已知
+        # 生命周期（压缩、discard_index_generation）已精确管理集合；已删库的
+        # 集合残留属极窄场景，登记在 ROADMAP 而不是冒险清扫。
+
+        if n_cache or n_dirs:
+            logging.getLogger("rag_redo.core.pipeline").info(
+                "全局回收完成：删提取缓存孤儿 %d 个、已删库目录 %d 个",
+                n_cache, n_dirs,
+            )
+        return (n_cache, 0, n_dirs)
 
 
     def discard_index_generation(self, library_id: str, generation: str) -> None:
@@ -1280,6 +1362,55 @@ class Pipeline:
         if lib_mgr.store.get(library_id) is None:
             raise KeyError(f"未知库: {library_id}")
         return self._index_failures.read(library_id, self._generations.active(library_id))
+
+    def library_rows(self) -> list[dict]:
+        """list_libraries 的富行数据——对齐旧 library.py::list_summary
+        （622-656）：块数（向量库 count，collection 未创建=从未索引=0）与
+        最近索引时间（当前 generation manifest 文件的 mtime，从未=None）
+        都不加载模型。summary 深浅由 library_summary 插件是否存在决定
+        （可选插件缺席时 rows 仍完整，summary 一律 None）。"""
+        lib_mgr = self._singleton("library_manager")
+        vector_store = self._singleton("vector_store")
+        summary_plugin_id = self.runtime.registry.active_of("library_summary")
+        summary_plugin = self._plugin(summary_plugin_id) if summary_plugin_id else None
+        rows = []
+        for cfg in lib_mgr.store.list_libraries():
+            generation = self._generations.active(cfg.library_id)
+            try:
+                blocks = vector_store.count(cfg.library_id, generation=generation)
+            except Exception:
+                blocks = 0  # collection 未创建 = 从未索引（旧 list_summary 同语义）
+            last_indexed = None
+            if generation:
+                manifest_path = self._manifests._path_for(cfg.library_id, generation)
+                try:
+                    last_indexed = manifest_path.stat().st_mtime
+                except OSError:
+                    pass
+            summary = None
+            summary_stale = False
+            if summary_plugin is not None:
+                try:
+                    summary = summary_plugin.get(cfg.library_id)
+                except Exception:
+                    summary = None
+            if summary is not None and summary.text and summary.fingerprint:
+                try:
+                    summary_stale = summary_plugin.is_stale(
+                        cfg.library_id, self.library_content_fingerprint(cfg.library_id)
+                    )
+                except Exception:
+                    summary_stale = False
+            rows.append({
+                "library_id": cfg.library_id,
+                "name": cfg.name,
+                "root_path": cfg.root_path,
+                "blocks": blocks,
+                "last_indexed": last_indexed,
+                "summary": summary.text if (summary is not None and summary.text) else None,
+                "summary_stale": summary_stale,
+            })
+        return rows
 
     def note_relations(self, library_id: str, path: str) -> dict:
         """双链关系查询（对齐 obsidian-rag 的 `note_relations` 工具）：
@@ -2429,14 +2560,18 @@ class Pipeline:
 
         if remapped_vectors:
             chunk_ids = list(remapped_vectors)
-            vector_store.upsert(
-                target_id,
-                chunk_ids,
-                [remapped_vectors[cid]["embedding"] for cid in chunk_ids],
-                documents=[remapped_vectors[cid].get("document", "") for cid in chunk_ids],
-                metadatas=[remapped_vectors[cid].get("metadata", {}) for cid in chunk_ids],
-                generation=generation,
-            )
+            # 分批 upsert（旧 import.py:173-177 的 import_upsert_batch=500：
+            # 拥塞小值时减慢导入，较大值占用更多内存——流式攒满即写，尾批补写）
+            for start in range(0, len(chunk_ids), IMPORT_UPSERT_BATCH):
+                batch = chunk_ids[start : start + IMPORT_UPSERT_BATCH]
+                vector_store.upsert(
+                    target_id,
+                    batch,
+                    [remapped_vectors[cid]["embedding"] for cid in batch],
+                    documents=[remapped_vectors[cid].get("document", "") for cid in batch],
+                    metadatas=[remapped_vectors[cid].get("metadata", {}) for cid in batch],
+                    generation=generation,
+                )
 
         if hasattr(lexical, "import_state"):
             bm25_state = payload.get("bm25") or {}
