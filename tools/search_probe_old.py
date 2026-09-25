@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """实测：旧 obsidian-rag 检索输出（同一批查询），落盘 JSON 供对比。
 只读：跑旧项目检索（其自身索引），不改任何旧项目状态。
+
+旧 hybrid_search 返回的是整段 join 后的字符串（建议行打头，[来源] 行随后），
+按行切分解析。
 """
 from __future__ import annotations
 
@@ -11,7 +14,6 @@ import time
 from pathlib import Path
 
 OLD_ROOT = Path(r"C:\Users\xbl26\projects\obsidian-rag")
-OUT = OLD_ROOT / "tmp_search_old.json"  # 写到旧项目目录外的本文件
 OUT = Path(__file__).resolve().parent / "tmp_search_old.json"
 
 QUERIES = [
@@ -26,7 +28,9 @@ QUERIES = [
 ]
 LIBS = "Obsidian Vault,agents,skills,LECTURE NOTE"
 
-SRC_RE = re.compile(r"^\[来源\] (.+?)/(.+?) \(## (.*?)\)(?: \[块 (\d+)/(\d+)\])?")
+SRC_RE = re.compile(
+    r"^\[来源\] (.+?)/(.+?) \(## (.*?)\)(?: \[块 (\d+)/(\d+)\])?(?: \[置信度 ([0-9.]+)·([^\]]+)\])?"
+)
 
 
 def main() -> int:
@@ -39,28 +43,33 @@ def main() -> int:
     out = {}
     for q in QUERIES:
         t0 = time.time()
-        lines = hybrid_search(
-            q, top_k=5, libraries=LIBS, exclude="", include_body=False,
+        text = hybrid_search(
+            q, top_k=5, libraries=LIBS, exclude="", include_body=True,
             with_scores=True, small_to_big=True,
         )
         elapsed = time.time() - t0
-        hits = []
+        hits, advice = [], []
+        if isinstance(text, str):
+            lines = text.split("\n")
+        else:  # 防御：旧版本个别分支直接返回列表
+            lines = list(text)
         for line in lines:
             m = SRC_RE.match(line)
-            if not m:
-                continue
-            lib, path, heading, k, n = m.groups()
-            conf_m = re.search(r"置信度[:：]\s*([0-9.]+)", line)
-            hits.append({
-                "library": lib,
-                "path": path,
-                "heading": heading,
-                "chunk": int(k) - 1 if k else None,
-                "total": int(n) if n else None,
-                "confidence": float(conf_m.group(1)) if conf_m else None,
-                "raw": line,
-            })
-        out[q] = {"elapsed_s": round(elapsed, 2), "hits": hits}
+            if m:
+                lib, path, heading, k, n, conf, tier = m.groups()
+                hits.append({
+                    "library": lib,
+                    "path": path,
+                    "heading": heading,
+                    "chunk": int(k) - 1 if k else None,
+                    "total": int(n) if n else None,
+                    "confidence": float(conf) if conf else None,
+                    "tier": tier,
+                    "raw": line,
+                })
+            elif line.startswith("（") and line.endswith("）"):
+                advice.append(line[1:-1])
+        out[q] = {"elapsed_s": round(elapsed, 2), "hits": hits, "advice": advice}
         print(f"{q} -> {len(hits)} 条 ({elapsed:.1f}s)")
         for h in hits:
             print(f"  [{h['confidence']}] {h['library']}/{h['path']} 块{h['chunk']}")

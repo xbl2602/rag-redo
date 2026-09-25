@@ -1096,6 +1096,27 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
             {"empty.md": "empty"},
         )
 
+    def test_tbd_heavy_docx_is_indexed_not_skipped(self):
+        """tbd 占位检查只作用于纯文本格式——旧 index.py:1571 只对
+        TEXT_EXTS（md/txt）做 is_tbd_heavy，二进制格式（docx/pdf）的提取
+        文本里出现 [TBD] 是正常内容（课程报告模板实测场景：旧项目对同一份
+        docx 建了 182 块索引，.md 同款占位则判 tbd 跳过）。2026-09-25 真库
+        实测发现 rag-redo 漏了这条限定。"""
+        from docx import Document
+
+        docx_path = self.vault / "占位报告.docx"
+        document = Document()
+        document.add_heading("占位报告", level=1)
+        for i in range(12):
+            document.add_paragraph("[TBD]" if i % 3 == 0 else f"TODO — 待补第{i}节")
+        document.add_paragraph("结论部分也还是 TBD — 待写")
+        document.save(str(docx_path))
+        report = self.pipeline.index_library("test-lib")
+        states = {row.path: row.failure_state for row in report.files if row.failure_state}
+        self.assertNotIn("占位报告.docx", states, "docx 不做 tbd 检查，应正常建索引")
+        results = self.pipeline.search("test-lib", "占位报告 待补", top_k=5)
+        self.assertTrue(any(r.path == "占位报告.docx" for r in results))
+
 
 class TestExportImportLibrary(TestEndToEndSearchPipeline):
     """导出/导入是"把已建索引的库搬到另一台机器，不用重新跑一遍索引"的

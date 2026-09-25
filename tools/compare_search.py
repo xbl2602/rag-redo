@@ -13,7 +13,13 @@ HERE = Path(__file__).resolve().parent
 
 
 def load(name: str) -> dict:
-    data = json.loads((HERE / name).read_text(encoding="utf-8"))
+    # tmp_search_new.json 由 search_probe_new 写在仓库根；old 写在本目录
+    for candidate in (HERE / name, HERE.parent / name):
+        if candidate.exists():
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            break
+    else:
+        raise FileNotFoundError(name)
     return {q: [f"{h['library']}/{h['path']}#{h['chunk']}" for h in v["hits"]]
             for q, v in data.items()}
 

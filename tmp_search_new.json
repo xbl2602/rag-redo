@@ -1,13 +1,29 @@
 {
   "火箭飞行过程中的机动与控制": {
-    "elapsed_s": 20.95,
+    "elapsed_s": 15.62,
     "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 100,
+        "total": 183,
+        "confidence": 0.6474,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 110,
+        "total": 183,
+        "confidence": 0.5691,
+        "truncated": false
+      },
       {
         "library": "Obsidian Vault",
         "path": "30-Resources/Ideas/工程项目灵感来源.md",
         "chunk": 2,
         "total": 12,
-        "confidence": 0.4277,
+        "confidence": 0.4291,
         "truncated": false
       },
       {
@@ -15,7 +31,7 @@
         "path": "20-Projects/Summer-2026/ROCKETRY/报告/report_checklist.md",
         "chunk": 3,
         "total": 14,
-        "confidence": 0.2813,
+        "confidence": 0.2815,
         "truncated": false
       },
       {
@@ -25,34 +41,18 @@
         "total": 4,
         "confidence": 0.1334,
         "truncated": false
-      },
-      {
-        "library": "Obsidian Vault",
-        "path": "20-Projects/Summer-2026/ROCKETRY/报告/report_questions.md",
-        "chunk": 5,
-        "total": 64,
-        "confidence": 0.1247,
-        "truncated": false
-      },
-      {
-        "library": "Obsidian Vault",
-        "path": "10-Areas/Engineering/论点/边缘AI手势控制器-TinyML.md",
-        "chunk": 4,
-        "total": 6,
-        "confidence": 0.105,
-        "truncated": false
       }
     ]
   },
   "可持续航空燃料的应用前景": {
-    "elapsed_s": 78.12,
+    "elapsed_s": 1.34,
     "hits": [
       {
         "library": "Obsidian Vault",
         "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
         "chunk": 8,
         "total": 11,
-        "confidence": 0.9769,
+        "confidence": 0.977,
         "truncated": false
       },
       {
@@ -76,7 +76,7 @@
         "path": "10-Areas/Aerospace/概念/NIMP 2030.md",
         "chunk": 5,
         "total": 7,
-        "confidence": 0.2361,
+        "confidence": 0.2358,
         "truncated": false
       },
       {
@@ -84,13 +84,13 @@
         "path": "10-Areas/Aerospace/概念/ICP 工业协作计划与本地化.md",
         "chunk": 7,
         "total": 8,
-        "confidence": 0.2243,
+        "confidence": 0.2244,
         "truncated": false
       }
     ]
   },
   "奖学金申请需要准备哪些材料": {
-    "elapsed_s": 8.3,
+    "elapsed_s": 1.29,
     "hits": [
       {
         "library": "skills",
@@ -105,15 +105,7 @@
         "path": "10-Areas/Career/JPA PIDN 申诉/附录/调研来源链附录.md",
         "chunk": 14,
         "total": 19,
-        "confidence": 0.1326,
-        "truncated": false
-      },
-      {
-        "library": "Obsidian Vault",
-        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
-        "chunk": 4,
-        "total": 7,
-        "confidence": 0.0749,
+        "confidence": 0.1327,
         "truncated": false
       },
       {
@@ -121,28 +113,60 @@
         "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
         "chunk": 5,
         "total": 7,
-        "confidence": 0.0607,
+        "confidence": 0.0606,
         "truncated": false
       },
       {
-        "library": "skills",
-        "path": "officecli/SKILL.md",
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "chunk": 4,
+        "total": 7,
+        "confidence": 0.0396,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/申诉评审筛选框架.md",
         "chunk": 2,
-        "total": 72,
-        "confidence": 0.0282,
+        "total": 11,
+        "confidence": 0.0327,
         "truncated": false
       }
     ]
   },
   "静力学 压力测量装置": {
-    "elapsed_s": 44.23,
+    "elapsed_s": 1.13,
     "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 108,
+        "total": 183,
+        "confidence": 0.1873,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 24,
+        "total": 183,
+        "confidence": 0.1415,
+        "truncated": false
+      },
       {
         "library": "Obsidian Vault",
         "path": "20-Projects/Summer-2026/ROCKETRY/报告/report_questions.md",
         "chunk": 7,
         "total": 64,
-        "confidence": 0.0357,
+        "confidence": 0.0356,
+        "truncated": false
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "chunk": 127,
+        "total": 183,
+        "confidence": 0.0301,
         "truncated": false
       },
       {
@@ -152,42 +176,18 @@
         "total": 4,
         "confidence": 0.0266,
         "truncated": false
-      },
-      {
-        "library": "Obsidian Vault",
-        "path": "10-Areas/Engineering/资源/工程学习资源清单.md",
-        "chunk": 1,
-        "total": 5,
-        "confidence": 0.0248,
-        "truncated": false
-      },
-      {
-        "library": "Obsidian Vault",
-        "path": "10-Areas/Aerospace/学习/CFD免费工具-SimScale.md",
-        "chunk": 3,
-        "total": 6,
-        "confidence": 0.0142,
-        "truncated": false
-      },
-      {
-        "library": "Obsidian Vault",
-        "path": "10-Areas/Career/论点/ME认证-SixSigma与Ansys.md",
-        "chunk": 4,
-        "total": 7,
-        "confidence": 0.0108,
-        "truncated": false
       }
     ]
   },
   "量纲分析的基本步骤": {
-    "elapsed_s": 44.7,
+    "elapsed_s": 1.31,
     "hits": [
       {
         "library": "LECTURE NOTE",
         "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
         "chunk": 6,
         "total": 14,
-        "confidence": 0.584,
+        "confidence": 0.5842,
         "truncated": false
       },
       {
@@ -203,7 +203,7 @@
         "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
         "chunk": 8,
         "total": 14,
-        "confidence": 0.4357,
+        "confidence": 0.4353,
         "truncated": false
       },
       {
@@ -211,7 +211,7 @@
         "path": "paizhang.md",
         "chunk": 3,
         "total": 11,
-        "confidence": 0.2359,
+        "confidence": 0.2348,
         "truncated": false
       },
       {
@@ -219,20 +219,20 @@
         "path": "00-Inbox/AGENTS.md",
         "chunk": 7,
         "total": 22,
-        "confidence": 0.2291,
+        "confidence": 0.2287,
         "truncated": false
       }
     ]
   },
   "并行任务调度 角色权限": {
-    "elapsed_s": 78.87,
+    "elapsed_s": 1.3,
     "hits": [
       {
         "library": "agents",
         "path": "paizhang.md",
         "chunk": 0,
         "total": 11,
-        "confidence": 0.3058,
+        "confidence": 0.3057,
         "truncated": false
       },
       {
@@ -240,7 +240,7 @@
         "path": "parallel-dispatch/SKILL.md",
         "chunk": 3,
         "total": 7,
-        "confidence": 0.1606,
+        "confidence": 0.1607,
         "truncated": false
       },
       {
@@ -248,7 +248,7 @@
         "path": "paizhang.md",
         "chunk": 9,
         "total": 11,
-        "confidence": 0.1458,
+        "confidence": 0.1456,
         "truncated": false
       },
       {
@@ -256,7 +256,7 @@
         "path": "audit-depth/agent-roles.md",
         "chunk": 0,
         "total": 8,
-        "confidence": 0.1332,
+        "confidence": 0.1333,
         "truncated": false
       },
       {
@@ -270,14 +270,14 @@
     ]
   },
   "图检索增强架构解析": {
-    "elapsed_s": 152.07,
+    "elapsed_s": 1.29,
     "hits": [
       {
         "library": "Obsidian Vault",
         "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
         "chunk": 0,
         "total": 3,
-        "confidence": 0.8941,
+        "confidence": 0.8939,
         "truncated": false
       },
       {
@@ -285,7 +285,7 @@
         "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
         "chunk": 1,
         "total": 3,
-        "confidence": 0.8179,
+        "confidence": 0.8176,
         "truncated": false
       },
       {
@@ -293,7 +293,7 @@
         "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
         "chunk": 3,
         "total": 14,
-        "confidence": 0.5904,
+        "confidence": 0.5889,
         "truncated": false
       },
       {
@@ -301,7 +301,7 @@
         "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
         "chunk": 1,
         "total": 14,
-        "confidence": 0.4975,
+        "confidence": 0.4969,
         "truncated": false
       },
       {
@@ -309,20 +309,20 @@
         "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
         "chunk": 0,
         "total": 14,
-        "confidence": 0.4508,
+        "confidence": 0.4496,
         "truncated": false
       }
     ]
   },
   "本地大模型部署调优": {
-    "elapsed_s": 72.56,
+    "elapsed_s": 1.2,
     "hits": [
       {
         "library": "Obsidian Vault",
         "path": "10-Areas/AI/知识/模型量化与显存优化.md",
         "chunk": 2,
         "total": 5,
-        "confidence": 0.8721,
+        "confidence": 0.8719,
         "truncated": false
       },
       {
@@ -330,7 +330,7 @@
         "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
         "chunk": 4,
         "total": 8,
-        "confidence": 0.8433,
+        "confidence": 0.8434,
         "truncated": false
       },
       {
@@ -338,7 +338,7 @@
         "path": "10-Areas/AI/知识/模型量化与显存优化.md",
         "chunk": 4,
         "total": 5,
-        "confidence": 0.8208,
+        "confidence": 0.8205,
         "truncated": false
       },
       {
@@ -346,7 +346,7 @@
         "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
         "chunk": 2,
         "total": 8,
-        "confidence": 0.7943,
+        "confidence": 0.7945,
         "truncated": false
       },
       {
@@ -354,7 +354,7 @@
         "path": "10-Areas/AI/工作流/DeepSeek本地部署-RAGFlow个人知识库搭建.md",
         "chunk": 3,
         "total": 12,
-        "confidence": 0.7507,
+        "confidence": 0.7511,
         "truncated": false
       }
     ]

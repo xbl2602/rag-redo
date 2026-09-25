@@ -872,7 +872,14 @@ class Pipeline:
                     message=f"索引失败：{reason}",
                 )
                 continue
-            if is_tbd_heavy(
+            # tbd 占位检查只作用于纯文本格式（md/txt）——旧 index.py:1571
+            # `if suffix in TEXT_EXTS and is_tbd_heavy(...)`：二进制格式
+            # （docx/pdf）的提取文本里出现 [TBD] 占位是正常内容（如课程报告
+            # 模板），不做占位率跳过。2026-09-25 实测发现漏了这条限定，导致
+            # 旧项目正常建索引的 HEBAT3_Technical_Report_BACKUP.docx（182块）
+            # 在这里被误判 tbd 跳过。
+            ext_for_tbd = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            if ext_for_tbd in ("md", "txt") and is_tbd_heavy(
                 doc.text,
                 float(self.runtime.settings.get("tbd_exclude_ratio", 0.1) or 0.0),
             ):

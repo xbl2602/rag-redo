@@ -1,0 +1,466 @@
+{
+  "火箭飞行过程中的机动与控制": {
+    "elapsed_s": 64.46,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "heading": "Theoretical Background / Rocket Flight Mechanics",
+        "chunk": 99,
+        "total": 182,
+        "confidence": 0.65,
+        "tier": "中相关",
+        "raw": "[来源] Obsidian Vault/20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx (## Theoretical Background / Rocket Flight Mechanics) [块 100/182] [置信度 0.65·中相关] [已回填父节全文]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx",
+        "heading": "Theoretical Background / Center of Pressure and Static Stability",
+        "chunk": 109,
+        "total": 182,
+        "confidence": 0.57,
+        "tier": "中相关",
+        "raw": "[来源] Obsidian Vault/20-Projects/Summer-2026/ROCKETRY/报告/HEBAT3_Technical_Report_BACKUP.docx (## Theoretical Background / Center of Pressure and Static Stability) [块 110/182] [置信度 0.57·中相关] [已回填父节全文]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "30-Resources/Ideas/工程项目灵感来源.md",
+        "heading": "工程项目灵感来源 / 要点",
+        "chunk": 2,
+        "total": 12,
+        "confidence": 0.54,
+        "tier": "中相关",
+        "raw": "[来源] Obsidian Vault/30-Resources/Ideas/工程项目灵感来源.md (## 工程项目灵感来源 / 要点) [块 3/12] [置信度 0.54·中相关] [已回填父节全文]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "20-Projects/Summer-2026/ROCKETRY/报告/report_checklist.md",
+        "heading": "HEBAT 3.0 Technical Report — 进度检查清单 / Chapter 2: Theoretical Background",
+        "chunk": 3,
+        "total": 14,
+        "confidence": 0.28,
+        "tier": "弱相关",
+        "raw": "[来源] Obsidian Vault/20-Projects/Summer-2026/ROCKETRY/报告/report_checklist.md (## HEBAT 3.0 Technical Report — 进度检查清单 / Chapter 2: Theoretical Background) [块 4/14] [置信度 0.28·弱相关]（低置信度 0.28，仅供参考）"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Engineering/论点/自平衡机器人-PID控制.md",
+        "heading": "自平衡机器人-PID控制 / 延伸链接",
+        "chunk": 3,
+        "total": 4,
+        "confidence": 0.14,
+        "tier": "弱相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/Engineering/论点/自平衡机器人-PID控制.md (## 自平衡机器人-PID控制 / 延伸链接) [块 4/4] [置信度 0.14·弱相关]（低置信度 0.14，仅供参考）"
+      }
+    ],
+    "advice": [
+      "最高一条属中相关（0.65）：沾边但不是直答。建议用 read_document 看它的完整上下文，或把问题问得更具体再搜。",
+      "命中含 PDF/Word：read_document 可拿已提取的 Markdown 全文，图表或扫描页内容用 navigate_knowledge 看页。"
+    ]
+  },
+  "可持续航空燃料的应用前景": {
+    "elapsed_s": 1.18,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "heading": "SAF 可持续航空燃料与 UAS-AAM / 要点 / ASEAN hub for sustainable aviation 愿景、ESG 门槛与就业机会",
+        "chunk": 8,
+        "total": 11,
+        "confidence": 0.98,
+        "tier": "高相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md (## SAF 可持续航空燃料与 UAS-AAM / 要点 / ASEAN hub for sustainable aviation 愿景、ESG 门槛与就业机会) [块 9/11] [置信度 0.98·高相关] [已回填父节全文]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "heading": "SAF 可持续航空燃料与 UAS-AAM / 定义",
+        "chunk": 0,
+        "total": 11,
+        "confidence": 0.97,
+        "tier": "高相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md (## SAF 可持续航空燃料与 UAS-AAM / 定义) [块 1/11] [置信度 0.97·高相关]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md",
+        "heading": "SAF 可持续航空燃料与 UAS-AAM / 要点 / UAS 与 AAM：第 13 大马计划高影响战略 sector",
+        "chunk": 7,
+        "total": 11,
+        "confidence": 0.95,
+        "tier": "高相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md (## SAF 可持续航空燃料与 UAS-AAM / 要点 / UAS 与 AAM：第 13 大马计划高影响战略 sector) [块 8/11] [置信度 0.95·高相关] [已回填父节全文]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/ICP 工业协作计划与本地化.md",
+        "heading": "ICP 工业协作计划与本地化 / 延伸链接",
+        "chunk": 7,
+        "total": 8,
+        "confidence": 0.32,
+        "tier": "中相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/Aerospace/概念/ICP 工业协作计划与本地化.md (## ICP 工业协作计划与本地化 / 延伸链接) [块 8/8] [置信度 0.32·中相关]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Aerospace/概念/NIMP 2030.md",
+        "heading": "NIMP 2030 / 要点 / 与 MAIB 2030、RMK12/13 的关系",
+        "chunk": 5,
+        "total": 7,
+        "confidence": 0.23,
+        "tier": "弱相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/Aerospace/概念/NIMP 2030.md (## NIMP 2030 / 要点 / 与 MAIB 2030、RMK12/13 的关系) [块 6/7] [置信度 0.23·弱相关]（低置信度 0.23，仅供参考）"
+      }
+    ],
+    "advice": [
+      "多条高置信命中（3 条 ≥0.75，最高 0.98）说明该主题内容集中：把 top_k 调大（如 15~20）可拿到同一主题的更多小节与笔记。",
+      "命中集中在《SAF 可持续航空燃料与 UAS-AAM》（3/5 条）：想横向比较其它笔记，可传 exclude=\"10-Areas/Aerospace/概念/SAF 可持续航空燃料与 UAS-AAM.md\" 再搜一次，或把 top_k 调大。",
+      "同一文件最多展示 3 块、同一小节只交付一次全文，完整内容请打开源文件"
+    ]
+  },
+  "奖学金申请需要准备哪些材料": {
+    "elapsed_s": 1.23,
+    "hits": [
+      {
+        "library": "skills",
+        "path": "brandkit/SKILL.md",
+        "heading": "DEFAULT 3 × 3 PANEL SYSTEM / 7. Physical Application",
+        "chunk": 27,
+        "total": 63,
+        "confidence": 0.15,
+        "tier": "弱相关",
+        "raw": "[来源] skills/brandkit/SKILL.md (## DEFAULT 3 × 3 PANEL SYSTEM / 7. Physical Application) [块 28/63] [置信度 0.15·弱相关]（低置信度 0.15，仅供参考）"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/附录/调研来源链附录.md",
+        "heading": "调研来源链附录 / 申诉对标与语言源",
+        "chunk": 14,
+        "total": 19,
+        "confidence": 0.09,
+        "tier": "弱相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/Career/JPA PIDN 申诉/附录/调研来源链附录.md (## 调研来源链附录 / 申诉对标与语言源) [块 15/19] [置信度 0.09·弱相关]（低置信度 0.09，仅供参考） [已回填父节全文]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "heading": "奖学金投资回报论证 / 要点 / 候选论点打分与 100 字配额",
+        "chunk": 4,
+        "total": 7,
+        "confidence": 0.06,
+        "tier": "弱相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md (## 奖学金投资回报论证 / 要点 / 候选论点打分与 100 字配额) [块 5/7] [置信度 0.06·弱相关]（低置信度 0.06，仅供参考）"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md",
+        "heading": "奖学金投资回报论证 / 要点 / 投资人怕什么，我如何用证据对冲",
+        "chunk": 1,
+        "total": 7,
+        "confidence": 0.03,
+        "tier": "弱相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/Career/JPA PIDN 申诉/论点/奖学金投资回报论证.md (## 奖学金投资回报论证 / 要点 / 投资人怕什么，我如何用证据对冲) [块 2/7] [置信度 0.03·弱相关]（低置信度 0.03，仅供参考）"
+      },
+      {
+        "library": "skills",
+        "path": "officecli/SKILL.md",
+        "heading": "officecli / Strategy",
+        "chunk": 2,
+        "total": 72,
+        "confidence": 0.03,
+        "tier": "弱相关",
+        "raw": "[来源] skills/officecli/SKILL.md (## officecli / Strategy) [块 3/72] [置信度 0.03·弱相关]（低置信度 0.03，仅供参考）"
+      }
+    ],
+    "advice": [
+      "整批命中的相关度都偏低（最高 0.15）：以下结果仅供参考，库里可能没有直接答案。建议改用笔记里出现的原始术语重搜，或先传 include_body=false 枚举候选文件。",
+      "注意同名不同目录：「SKILL」下有 brandkit/SKILL.md（skills）；officecli/SKILL.md（skills） 是**两篇不同笔记**（标题一样、内容不同），引用与打开请用完整路径区分。"
+    ]
+  },
+  "静力学 压力测量装置": {
+    "elapsed_s": 1.12,
+    "hits": [
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "heading": "Other Pressure Measurement Devices",
+        "chunk": 109,
+        "total": 118,
+        "confidence": 0.94,
+        "tier": "高相关",
+        "raw": "[来源] LECTURE NOTE/FLUID MECHANICS_Hydrostatic Pressure.pdf (## Other Pressure Measurement Devices) [块 110/118] [置信度 0.94·高相关] [已回填父节全文]"
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 4 BERNOULLI EQUATION AND APPLICATIONS.pdf",
+        "heading": "Example 4.3",
+        "chunk": 99,
+        "total": 219,
+        "confidence": 0.85,
+        "tier": "高相关",
+        "raw": "[来源] LECTURE NOTE/CHAPTER 4 BERNOULLI EQUATION AND APPLICATIONS.pdf (## Example 4.3) [块 100/219] [置信度 0.85·高相关] [已回填父节全文]"
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "heading": "The Manometer",
+        "chunk": 82,
+        "total": 118,
+        "confidence": 0.69,
+        "tier": "中相关",
+        "raw": "[来源] LECTURE NOTE/FLUID MECHANICS_Hydrostatic Pressure.pdf (## The Manometer) [块 83/118] [置信度 0.69·中相关] [已回填父节全文]"
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "FLUID MECHANICS_Hydrostatic Pressure.pdf",
+        "heading": "EXAMPLE 3-5 Measuring Pressure with a Manometer",
+        "chunk": 88,
+        "total": 118,
+        "confidence": 0.6,
+        "tier": "中相关",
+        "raw": "[来源] LECTURE NOTE/FLUID MECHANICS_Hydrostatic Pressure.pdf (## EXAMPLE 3-5 Measuring Pressure with a Manometer) [块 89/118] [置信度 0.60·中相关] [已回填父节全文]"
+      }
+    ],
+    "advice": [
+      "命中含非笔记库（LECTURE NOTE）：那是 AI 配置/技能内容，不是你的笔记。只要笔记请传 libraries=\"Obsidian Vault\"。",
+      "命中集中在《FLUID MECHANICS_Hydrostatic Pressure》（3/4 条）：想横向比较其它笔记，可传 exclude=\"FLUID MECHANICS_Hydrostatic Pressure.pdf\" 再搜一次，或把 top_k 调大。",
+      "同一文件最多展示 3 块、同一小节只交付一次全文，完整内容请打开源文件"
+    ]
+  },
+  "量纲分析的基本步骤": {
+    "elapsed_s": 1.32,
+    "hits": [
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "heading": "Step 4: Choosing j repeating variables",
+        "chunk": 30,
+        "total": 46,
+        "confidence": 0.67,
+        "tier": "中相关",
+        "raw": "[来源] LECTURE NOTE/CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf (## Step 4: Choosing j repeating variables) [块 31/46] [置信度 0.67·中相关] [已回填父节全文]"
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "heading": "Step 6: Relationship between π’s, $\\boldsymbol { \\pi } _ { 1 } = \\mathsf { f } \\left( \\boldsymbol { \\pi } _ { 2 } , \\boldsymbol { \\pi } _ { 3 } \\right",
+        "chunk": null,
+        "total": null,
+        "confidence": null,
+        "tier": null,
+        "raw": "[来源] LECTURE NOTE/CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf (## Step 6: Relationship between π’s, $\\boldsymbol { \\pi } _ { 1 } = \\mathsf { f } \\left( \\boldsymbol { \\pi } _ { 2 } , \\boldsymbol { \\pi } _ { 3 } \\right)$) [块 46/46] [置信度 0.61·中相关]"
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 1).pdf",
+        "heading": "List of Quantities and Dimensions",
+        "chunk": 25,
+        "total": 27,
+        "confidence": 0.59,
+        "tier": "中相关",
+        "raw": "[来源] LECTURE NOTE/CHAPTER 7 Dimensional Analysis and Similarity (Part 1).pdf (## List of Quantities and Dimensions) [块 26/27] [置信度 0.59·中相关] [已回填父节全文]"
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 1).pdf",
+        "heading": "Introduction",
+        "chunk": 9,
+        "total": 27,
+        "confidence": 0.57,
+        "tier": "中相关",
+        "raw": "[来源] LECTURE NOTE/CHAPTER 7 Dimensional Analysis and Similarity (Part 1).pdf (## Introduction) [块 10/27] [置信度 0.57·中相关] [已回填父节全文]"
+      },
+      {
+        "library": "LECTURE NOTE",
+        "path": "CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf",
+        "heading": "The Method of Repeating Variables",
+        "chunk": 15,
+        "total": 46,
+        "confidence": 0.49,
+        "tier": "中相关",
+        "raw": "[来源] LECTURE NOTE/CHAPTER 7 Dimensional Analysis and Similarity (Part 4).pdf (## The Method of Repeating Variables) [块 16/46] [置信度 0.49·中相关]"
+      }
+    ],
+    "advice": [
+      "最高一条属中相关（0.67）：沾边但不是直答。建议用 read_document 看它的完整上下文，或把问题问得更具体再搜。",
+      "命中含非笔记库（LECTURE NOTE）：那是 AI 配置/技能内容，不是你的笔记。只要笔记请传 libraries=\"Obsidian Vault\"。"
+    ]
+  },
+  "并行任务调度 角色权限": {
+    "elapsed_s": 1.2,
+    "hits": [
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "heading": "",
+        "chunk": 0,
+        "total": 11,
+        "confidence": 0.31,
+        "tier": "中相关",
+        "raw": "[来源] agents/paizhang.md (## ) [块 1/11] [置信度 0.31·中相关]"
+      },
+      {
+        "library": "skills",
+        "path": "parallel-dispatch/SKILL.md",
+        "heading": "Parallel Dispatch Skill / 2. 并行分派 / 约束",
+        "chunk": 3,
+        "total": 7,
+        "confidence": 0.16,
+        "tier": "弱相关",
+        "raw": "[来源] skills/parallel-dispatch/SKILL.md (## Parallel Dispatch Skill / 2. 并行分派 / 约束) [块 4/7] [置信度 0.16·弱相关]（低置信度 0.16，仅供参考）"
+      },
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "heading": "可派发的 worker",
+        "chunk": 9,
+        "total": 11,
+        "confidence": 0.15,
+        "tier": "弱相关",
+        "raw": "[来源] agents/paizhang.md (## 可派发的 worker) [块 10/11] [置信度 0.15·弱相关]（低置信度 0.15，仅供参考）"
+      },
+      {
+        "library": "skills",
+        "path": "audit-depth/agent-roles.md",
+        "heading": "审计 Subagent 角色模板",
+        "chunk": 0,
+        "total": 8,
+        "confidence": 0.13,
+        "tier": "弱相关",
+        "raw": "[来源] skills/audit-depth/agent-roles.md (## 审计 Subagent 角色模板) [块 1/8] [置信度 0.13·弱相关]（低置信度 0.13，仅供参考）"
+      },
+      {
+        "library": "agents",
+        "path": "paizhang.md",
+        "heading": "升级判断（自知之明）",
+        "chunk": 8,
+        "total": 11,
+        "confidence": 0.09,
+        "tier": "弱相关",
+        "raw": "[来源] agents/paizhang.md (## 升级判断（自知之明）) [块 9/11] [置信度 0.09·弱相关]（低置信度 0.09，仅供参考）"
+      }
+    ],
+    "advice": [
+      "最高一条属中相关（0.31）：沾边但不是直答。建议用 read_document 看它的完整上下文，或把问题问得更具体再搜。",
+      "命中含非笔记库（agents、skills）：那是 AI 配置/技能内容，不是你的笔记。只要笔记请传 libraries=\"Obsidian Vault\"。"
+    ]
+  },
+  "图检索增强架构解析": {
+    "elapsed_s": 1.22,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "heading": "GraphRAG图检索增强 / 定义",
+        "chunk": 0,
+        "total": 3,
+        "confidence": 0.84,
+        "tier": "高相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/AI/知识/GraphRAG图检索增强.md (## GraphRAG图检索增强 / 定义) [块 1/3] [置信度 0.84·高相关]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/GraphRAG图检索增强.md",
+        "heading": "GraphRAG图检索增强 / 要点",
+        "chunk": 1,
+        "total": 3,
+        "confidence": 0.7,
+        "tier": "中相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/AI/知识/GraphRAG图检索增强.md (## GraphRAG图检索增强 / 要点) [块 2/3] [置信度 0.70·中相关]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "heading": "DeepSeek-V4.1-Flash-架构解析 / 要点 / 2",
+        "chunk": null,
+        "total": null,
+        "confidence": null,
+        "tier": null,
+        "raw": "[来源] Obsidian Vault/10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md (## DeepSeek-V4.1-Flash-架构解析 / 要点 / 2) CED：重新引入 encoder 的因果编解码器（YOCO 思路的改良版）) [块 6/14] [置信度 0.58·中相关] [已回填父节全文]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "heading": "DeepSeek-V4.1-Flash-架构解析 / 定义",
+        "chunk": 0,
+        "total": 14,
+        "confidence": 0.43,
+        "tier": "中相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md (## DeepSeek-V4.1-Flash-架构解析 / 定义) [块 1/14] [置信度 0.43·中相关]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md",
+        "heading": "DeepSeek-V4.1-Flash-架构解析 / 要点 / 1",
+        "chunk": null,
+        "total": null,
+        "confidence": null,
+        "tier": null,
+        "raw": "[来源] Obsidian Vault/10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md (## DeepSeek-V4.1-Flash-架构解析 / 要点 / 1) Engram：独立于主干网络的记忆模块) [块 3/14] [置信度 0.37·中相关] [已回填父节全文]"
+      }
+    ],
+    "advice": [
+      "只有 1 条真正相关（其余低于 0.30）：请只引用这一条；要更多上下文可用 read_document 读该篇全文。",
+      "命中集中在《DeepSeek-V4.1-Flash-架构解析》（3/5 条）：想横向比较其它笔记，可传 exclude=\"10-Areas/AI/知识/DeepSeek-V4.1-Flash-架构解析.md\" 再搜一次，或把 top_k 调大。"
+    ]
+  },
+  "本地大模型部署调优": {
+    "elapsed_s": 1.1,
+    "hits": [
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "heading": "模型量化与显存优化 / 要点",
+        "chunk": 2,
+        "total": 5,
+        "confidence": 0.87,
+        "tier": "高相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/AI/知识/模型量化与显存优化.md (## 模型量化与显存优化 / 要点) [块 3/5] [置信度 0.87·高相关] [已回填父节全文]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/DeepSeek本地部署-RAGFlow个人知识库搭建.md",
+        "heading": "DeepSeek本地部署-RAGFlow个人知识库搭建 / 要点 / 2",
+        "chunk": null,
+        "total": null,
+        "confidence": null,
+        "tier": null,
+        "raw": "[来源] Obsidian Vault/10-Areas/AI/工作流/DeepSeek本地部署-RAGFlow个人知识库搭建.md (## DeepSeek本地部署-RAGFlow个人知识库搭建 / 要点 / 2) RAG 与微调之分) [块 4/12] [置信度 0.78·高相关]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "heading": "本地大模型 8GB 显卡运行配置-Qwen 3.8 27B / 要点 / 4",
+        "chunk": null,
+        "total": null,
+        "confidence": null,
+        "tier": null,
+        "raw": "[来源] Obsidian Vault/10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md (## 本地大模型 8GB 显卡运行配置-Qwen 3.8 27B / 要点 / 4) Harness 选择与两个必踩的坑) [块 5/8] [置信度 0.78·高相关]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/知识/模型量化与显存优化.md",
+        "heading": "模型量化与显存优化 / 延伸链接",
+        "chunk": 4,
+        "total": 5,
+        "confidence": 0.78,
+        "tier": "高相关",
+        "raw": "[来源] Obsidian Vault/10-Areas/AI/知识/模型量化与显存优化.md (## 模型量化与显存优化 / 延伸链接) [块 5/5] [置信度 0.78·高相关]"
+      },
+      {
+        "library": "Obsidian Vault",
+        "path": "10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md",
+        "heading": "本地大模型 8GB 显卡运行配置-Qwen 3.8 27B / 要点 / 2",
+        "chunk": null,
+        "total": null,
+        "confidence": null,
+        "tier": null,
+        "raw": "[来源] Obsidian Vault/10-Areas/AI/工作流/本地大模型 8GB 显卡运行配置-Qwen 3.8 27B.md (## 本地大模型 8GB 显卡运行配置-Qwen 3.8 27B / 要点 / 2) 模型与显存参数) [块 3/8] [置信度 0.75·中相关]"
+      }
+    ],
+    "advice": [
+      "多条高置信命中（4 条 ≥0.75，最高 0.87）说明该主题内容集中：把 top_k 调大（如 15~20）可拿到同一主题的更多小节与笔记。",
+      "命中正文已按小节回填、且同一小节只交付一次：要看原文全文用 read_document，要看它连到哪些笔记用 note_relations。"
+    ]
+  }
+}
