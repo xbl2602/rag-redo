@@ -330,5 +330,209 @@ class TestVisualWemmPlugin(unittest.TestCase):
         self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "official-visual-wemm")
 
 
+class TestVisualWemmBackendGate(unittest.TestCase):
+    """缺陷 B 的复现组：`on_enable` 曾经在**没有任何开关判断**的情况下直接
+    抢 "gpu:0" 租约并拉起 WEMM 子进程——双击一次 GUI 就等于启动一个 5.1GB
+    常驻模型子进程，即使用户从没打开过任何 PDF、也没开过 WEMM。同一个
+    REQUIRED_PLUGINS 列表里另一个 subprocess_service 插件
+    (official-ocr-mineru-local) 就有 `is_active()` 门禁，两个门禁不一致。
+    门禁条件对齐 LEGACY obsidian-rag：`wemm_backend` 设置项取值
+    on/local 才算开（obsidian-rag/wemm_indexer.py:132、
+    obsidian-rag/wemm_retriever.py:37），默认 "on"
+    （obsidian-rag/config.py:122）。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._env_backup = os.environ.get("RAG_REDO_FAKE_WEMM")
+        os.environ["RAG_REDO_FAKE_WEMM"] = "1"
+        self._skip_backup = os.environ.get("RAG_REDO_SKIP_ENV_BOOTSTRAP")
+        os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = "1"
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self) -> None:
+        for key, backup in (("RAG_REDO_FAKE_WEMM", self._env_backup),
+                            ("RAG_REDO_SKIP_ENV_BOOTSTRAP", self._skip_backup)):
+            if backup is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = backup
+
+    def _runtime(self, name: str) -> PluginRuntime:
+        runtime = PluginRuntime(
+            REPO_ROOT / "plugins",
+            state_file=self.tmp / f"{name}-state.json",
+            data_dir=self.tmp / f"{name}-data",
+        )
+        runtime.scan()
+        runtime.load("official-visual-wemm")
+        return runtime
+
+    def test_backend_off_does_not_acquire_lease_and_does_not_start_subprocess(self):
+        runtime = self._runtime("off")
+        runtime.settings.set("wemm_backend", "off")
+        runtime.enable("official-visual-wemm")
+        self.addCleanup(runtime.disable, "official-visual-wemm")
+        instance = runtime.plugins["official-visual-wemm"].instance
+        self.assertFalse(instance.is_active())
+        self.assertIsNone(instance._handle)  # noqa: SLF001 - 确认没有子进程被拉起
+        self.assertIsNone(runtime.resource_arbiter.holder_of("gpu:0"))
+
+    def test_backend_local_counts_as_enabled(self):
+        runtime = self._runtime("local")
+        runtime.settings.set("wemm_backend", "local")
+        runtime.enable("official-visual-wemm")
+        self.addCleanup(runtime.disable, "official-visual-wemm")
+        instance = runtime.plugins["official-visual-wemm"].instance
+        self.assertTrue(instance.is_active())
+        self.assertEqual(runtime.resource_arbiter.holder_of("gpu:0"), "official-visual-wemm")
+
+    def test_turning_backend_on_takes_effect_without_restarting_the_app(self):
+        """用户在设置里把 WEMM 打开后**不重启**也必须能生效——"重启才生效"
+        会让用户以为功能坏了。门禁只在 on_enable 拦一次驻留，真正的
+        拉起发生在每次真正使用前（`_ensure_alive`/`_ensure_query_service`）
+        读的是设置存储的当前值。"""
+        runtime = self._runtime("toggle")
+        runtime.settings.set("wemm_backend", "off")
+        runtime.enable("official-visual-wemm")
+        self.addCleanup(runtime.disable, "official-visual-wemm")
+        instance = runtime.plugins["official-visual-wemm"].instance
+        self.assertIsNone(instance._handle)  # noqa: SLF001
+        self.assertIsNone(runtime.resource_arbiter.holder_of("gpu:0"))
+
+        runtime.settings.set("wemm_backend", "on")
+        self.assertTrue(instance.is_active())
+        self.assertTrue(instance._ensure_alive())  # noqa: SLF001
+        self.assertIsNotNone(instance._handle)  # noqa: SLF001
+        self.assertTrue(instance._handle.is_alive)  # noqa: SLF001
+        self.assertEqual(runtime.resource_arbiter.holder_of("gpu:0"), "official-visual-wemm")
+
+    def test_index_library_is_skipped_while_backend_is_off(self):
+        """LEGACY wemm_backend=off 时页索引是"静默跳过（零开销）"
+        （obsidian-rag/index.py:1842、docs/legacy/TASK_LOG.md:1818）——不
+        能因为用户在设置里关了 WEMM 就把 5.1GB 子进程又拉起来。"""
+        runtime = self._runtime("index-off")
+        runtime.settings.set("wemm_backend", "off")
+        runtime.enable("official-visual-wemm")
+        self.addCleanup(runtime.disable, "official-visual-wemm")
+        instance = runtime.plugins["official-visual-wemm"].instance
+        vault = self.tmp / "vault"
+        vault.mkdir()
+        _make_pdf(vault / "doc.pdf", ["第一页", "第二页"])
+        instance.index_library("lib1", vault, ["doc.pdf"])
+        self.assertIsNone(instance._handle)  # noqa: SLF001
+        self.assertIsNone(runtime.resource_arbiter.holder_of("gpu:0"))
+        self.assertEqual(instance._read_state("lib1", "legacy")["files"], {})  # noqa: SLF001
+
+
+class TestVisualWemmNavigateVeto(unittest.TestCase):
+    """缺陷 C 的复现组：`navigate` 在抢不到 GPU 租约时只 `return []` 并
+    打一行 warning，调用方（plugins/official-mcp-server 的
+    `navigate_knowledge`）拿到空列表照样回 `{"ok": True, "results": []}`——
+    与"确实没有匹配页"完全同形。LEGACY obsidian-rag/server.py:688-723 专门
+    处理过：拿不到锁/索引在跑 → 明确告诉调用方"这次没查"；**若看图服务已
+    经活着则跳过一切驻留变更直接查**（:712-716 注释原文大意："服务已在：
+    直接查，不拉起（拉起是驻留变更，veto 期一律不做）"）。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._env_backup = os.environ.get("RAG_REDO_FAKE_WEMM")
+        os.environ["RAG_REDO_FAKE_WEMM"] = "1"
+        self._skip_backup = os.environ.get("RAG_REDO_SKIP_ENV_BOOTSTRAP")
+        os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = "1"
+        self.addCleanup(self._restore_env)
+
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        _make_pdf(self.vault / "doc.pdf", ["第一页的内容 alpha", "第二页的内容 beta"])
+
+        self.rt = PluginRuntime(
+            REPO_ROOT / "plugins",
+            state_file=self.tmp / "plugins_state.json",
+            data_dir=self.tmp / "data",
+        )
+        self.rt.scan()
+        self.rt.load("official-visual-wemm")
+        self.rt.enable("official-visual-wemm")
+        self.instance = self.rt.plugins["official-visual-wemm"].instance
+        self.plugin_module = sys.modules[type(self.instance).__module__]
+        self.addCleanup(lambda: self.rt.disable("official-visual-wemm"))
+
+    def _restore_env(self) -> None:
+        for key, backup in (("RAG_REDO_FAKE_WEMM", self._env_backup),
+                            ("RAG_REDO_SKIP_ENV_BOOTSTRAP", self._skip_backup)):
+            if backup is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = backup
+
+    def test_veto_when_lease_is_taken_and_service_not_alive_is_distinguishable(self):
+        """租约被别人占着 + 服务没活着 → 必须是**可区分**的"这次没查"，
+        不是和"没有匹配页"同形的空列表。"""
+        self.instance.index_library("lib1", self.vault, ["doc.pdf"])
+        # 模拟"看图服务没活着"（空闲自退出后的常态）
+        self.instance._handle.stop()  # noqa: SLF001
+        self.assertFalse(self.instance._handle.is_alive)  # noqa: SLF001
+        # 让另一个 GPU 消费者以"抢不动"的优先级占住租约
+        self.assertTrue(
+            self.rt.resource_arbiter.acquire("gpu:0", "busy-indexer", priority=99)
+        )
+        self.addCleanup(self.rt.resource_arbiter.release, "gpu:0", "busy-indexer")
+
+        with self.assertRaises(self.plugin_module.VisualVetoError) as ctx:
+            self.instance.navigate("lib1", "查询")
+        self.assertEqual(ctx.exception.reason, "gpu-busy")
+        self.assertIn("索引任务进行中", str(ctx.exception))
+
+    def test_alive_service_is_queried_directly_without_any_residency_change(self):
+        """服务已活着 → 直接查，**不做任何驻留变更**（既不抢租约也不重新
+        拉起子进程）。LEGACY server.py:712-716 的降级路径。"""
+        self.instance.index_library("lib1", self.vault, ["doc.pdf"])
+        pid_before = self.instance._handle._process.pid  # noqa: SLF001
+        # 租约被别人占着（veto 条件成立），但服务活着——必须照查不误
+        self.assertTrue(
+            self.rt.resource_arbiter.acquire("gpu:0", "busy-indexer", priority=99)
+        )
+        self.addCleanup(self.rt.resource_arbiter.release, "gpu:0", "busy-indexer")
+        self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "busy-indexer")
+
+        with patch.object(
+            self.instance._resource_arbiter, "acquire", side_effect=AssertionError("veto 期不允许抢租约")
+        ):
+            hits = self.instance.navigate("lib1", "查询", top_k=5)
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(self.instance._handle._process.pid, pid_before)  # noqa: SLF001
+        # 租约归属没被这次查询改动
+        self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "busy-indexer")
+
+    def test_genuine_empty_result_is_still_a_plain_empty_list(self):
+        """"确实没有匹配页"必须仍然是普通空列表——可区分不等于所有空结果
+        都变异常。"""
+        self.instance.index_library("lib1", self.vault, ["doc.pdf"])
+        hits = self.instance.navigate("lib-never-indexed", "查询", top_k=5)
+        self.assertEqual(hits, [])
+
+    def test_backend_off_reports_distinguishable_reason(self):
+        self.rt.settings.set("wemm_backend", "off")
+        with self.assertRaises(self.plugin_module.VisualVetoError) as ctx:
+            self.instance.navigate("lib1", "查询")
+        self.assertEqual(ctx.exception.reason, "backend-off")
+        self.assertIn("wemm_backend", str(ctx.exception))
+
+    def test_status_reports_backend_and_log_file_path(self):
+        """LEGACY 的 wemm_status（obsidian-rag/server.py:965-991）明确把
+        开关状态和服务日志告诉用户/AI，navigate 拿不到租约时让人"去哪儿
+        看诊断"——这两项都在 status() 里。"""
+        self.instance.index_library("lib1", self.vault, ["doc.pdf"])
+        status = self.instance.status()
+        self.assertEqual(status["backend"], "on")
+        self.assertTrue(status["log_file"])
+        self.assertTrue(Path(status["log_file"]).name.endswith(".log"))
+        # 日志必须落在 data 根之下（架构红线：所有数据落在 data/ 目录），
+        # 不能跟着插件源码目录走（卸载便携包会连带删掉日志）。
+        self.assertTrue(str(status["log_file"]).startswith(str(self.tmp / "data")))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,27 @@ core/resource_arbiter.py::acquire 的 preempt_equal 参数说明）；②
 `gpu_arbiter.ensure_server` 的幂等语义）——子进程可能因为空闲自退出已经
 不在了，不这样做的话"空闲自退出省资源"这个优化会变成"用久了突然不工作"
 的真实回归。
+
+**启用门禁（2026-09-24 补齐，缺陷 B）**：`on_enable` 此前**无条件**抢
+"gpu:0" 租约并拉起子进程——双击一次 GUI 就等于启动一个 5.1GB 常驻模型
+子进程，即使用户从没打开过任何 PDF、也没开过 WEMM。同一个
+REQUIRED_PLUGINS 列表里另一个 subprocess_service 插件
+（official-ocr-mineru-local/plugin.py:144-154）就有 `is_active()` 门禁，
+两个门禁不一致。现在门禁条件对齐 LEGACY 的同名设置项 `wemm_backend`
+（obsidian-rag/config.py:122 默认 "on"；取值 on/local 才算开，见
+obsidian-rag/wemm_indexer.py:132、obsidian-rag/wemm_retriever.py:37），
+读的是 `ctx.settings` 通用设置存储——**用户改了设置不需要重启**，因为
+门禁只在 `on_enable` 拦一次"是否立刻抢租约"，真正的拉起发生在每次真正
+使用前读当前设置值。
+
+**navigate 的 veto 期语义（2026-09-24 补齐，缺陷 C）**：抢不到 GPU 租约
+时以前只 `return []`，调用方（official-mcp-server 的 `navigate_knowledge`）
+拿到空列表照样回 `{"ok": True, "results": []}`，与"确实没有匹配页"完全
+同形。LEGACY obsidian-rag/server.py:688-723 专门处理过：索引在跑/拿不到
+锁 → 明确告诉调用方"这次没查"；**若看图服务已经活着则跳过一切驻留变更
+直接查**（:712-716 注释原文大意："服务已在：直接查，不拉起（拉起是驻留
+变更，veto 期一律不做）"）。现在这两种情况用 `VisualVetoError` 区分，
+真正的"没有匹配页"仍然是普通空列表。
 """
 from __future__ import annotations
 
@@ -61,6 +82,41 @@ GPU_PRIORITY = 10  # 和 official-ocr-mineru-local 同一层级，互相抢占�
 WEMM_RENDER_DPI = 60  # 页图渲染 DPI，行为对齐旧项目 wemm_indexer.py 的默认值
 WEMM_DIM = 512  # 输出向量维度，行为对齐旧项目 config.py 的默认值
 VISUAL_INDEX_VERSION = "1"
+# LEGACY obsidian-rag/config.py:122 的 wemm_backend 默认值；on/local=开，
+# off=关（obsidian-rag/wemm_retriever.py:37 的同一套判定）。
+WEMM_BACKEND_DEFAULT = "on"
+WEMM_BACKEND_ON = ("on", "local")
+LOG_FILE_NAME = "wemm_server.log"  # 同名同落点语义：LEGACY data/wemm_server.log
+
+_VETO_GPU_BUSY = "gpu-busy"
+_VETO_BACKEND_OFF = "backend-off"
+_VETO_START_FAILED = "service-start-failed"
+_VETO_CALL_FAILED = "service-unavailable"
+
+
+class VisualVetoError(RuntimeError):
+    """`navigate` 这一次**没能查**（而不是"查了但没命中"）。
+
+    2026-09-24 补齐（缺陷 C）。以前这里只有一行 warning + `return []`，
+    调用方（official-mcp-server 的 `navigate_knowledge`）拿到的空列表与
+    "确实没有匹配页"完全同形，Agent 无从判断该重试还是该换查询。LEGACY
+    obsidian-rag/wemm_retriever.py 对每一种"没查到"都另外给一条中文原因
+    串（`return [], "WEMM 后端未开启（wemm_backend=off）"` 等），由
+    obsidian-rag/server.py:728-734 渲染成给用户看的话——这里把同一份
+    信息做成一个**带类型的异常**，`reason` 给程序判断，文案给人和 AI 看。
+
+    `reason` 取值：
+    - `backend-off`：用户在设置里关了 WEMM；
+    - `gpu-busy`：GPU 租约被别人占着（多半是索引在跑）且看图服务没活着，
+      本次不做任何驻留变更（LEGACY server.py:714-715）；
+    - `service-start-failed`：拿到租约但子进程拉不起来（LEGACY :721）；
+    - `service-unavailable`：子进程在，但这一次请求没打通（LEGACY
+      wemm_retriever.py:49）。
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _collection_name(library_id: str, generation: str | None = None) -> str:
@@ -84,6 +140,8 @@ class VisualWemmPlugin:
         self._state_root: Path | None = None
         self._resource_arbiter = None
         self._plugin_id = ""
+        self._settings = None
+        self._log_path: Path | None = None
 
     def on_load(self, ctx):
         storage_root = ctx.storage.directory("visual_wemm", legacy="visual_wemm")
@@ -95,6 +153,14 @@ class VisualWemmPlugin:
         )
         self._state_root = storage_root / "state"
         self._logger = ctx.logger
+        self._settings = ctx.settings
+        # 子进程输出（模型加载失败/端口冲突/socketserver 的 traceback）落到
+        # 本插件在 DATA_ROOT 下的数据目录，而不是插件源码目录——LEGACY
+        # obsidian-rag/gpu_arbiter.py:32 落 data/wemm_server.log
+        # （gpu_arbiter.py:241-252 用 `Popen(stdout=logf, stderr=logf)`
+        # 指向它），这里保持同一种"日志跟着数据根走、卸载便携包不会连带
+        # 删掉诊断信息"的行为（架构红线：所有数据落在 data/ 目录下）。
+        self._log_path = storage_root / LOG_FILE_NAME
         ctx.logger.info("WEMM页级视觉导航已加载")
 
     def on_enable(self, ctx):
@@ -105,6 +171,12 @@ class VisualWemmPlugin:
         self._runtime_command = ctx.runtime.command
         self._runtime_env_bootstrap = ctx.runtime.env_bootstrap
         self._enabled = True
+        if not self.is_active():
+            # 用户没开 WEMM：连租约都不抢、连子进程都不拉。对齐
+            # official-ocr-mineru-local/plugin.py:144-154 的同款门禁，以及
+            # LEGACY "wemm_backend off → 静默跳过（零开销）"。
+            self._logger.info("WEMM后端未开启（wemm_backend=%s），本轮不占用GPU、不拉起子进程", self.backend())
+            return
         acquired = ctx.resource_arbiter.acquire(
             GPU_RESOURCE_ID,
             ctx.plugin_id,
@@ -114,6 +186,26 @@ class VisualWemmPlugin:
         )
         if acquired:
             self._start_handle()
+
+    def backend(self) -> str:
+        """当前 WEMM 后端设置值（LEGACY obsidian-rag/config.py 的同名设置项
+        `wemm_backend`）。每次现读 `ctx.settings`，不缓存快照——长驻进程里
+        用户中途改设置必须立刻生效（LEGACY obsidian-rag/server.py:954-961
+        的 `_wemm_cfg()` 专门为此加了 `reload_config()`，同一个坑）。"""
+        if self._settings is None:
+            return WEMM_BACKEND_DEFAULT
+        return str(self._settings.get("wemm_backend", WEMM_BACKEND_DEFAULT) or WEMM_BACKEND_DEFAULT)
+
+    def is_active(self) -> bool:
+        """WEMM 后端是否已开启（取值 on/local）。判定口径与 LEGACY
+        obsidian-rag/wemm_retriever.py:37、wemm_indexer.py:132 完全一致。"""
+        return self.backend() in WEMM_BACKEND_ON
+
+    def log_file(self) -> str | None:
+        """子进程日志文件路径（只读诊断用，对齐 LEGACY
+        obsidian-rag/server.py:965 的 `wemm_status` 把
+        `data/wemm_server.log` 明确指给用户/AI 的做法）。"""
+        return str(self._log_path) if self._log_path is not None else None
 
     def on_disable(self, ctx):
         self._enabled = False
@@ -136,14 +228,27 @@ class VisualWemmPlugin:
         self._client = None
         self._generations = None
         self._state_root = None
+        self._settings = None
 
     def _start_handle(self) -> None:
         assert self._plugin_dir is not None and self._runtime_command is not None
         python = resolve_plugin_python(self._plugin_dir, env_bootstrap=self._runtime_env_bootstrap, logger=self._logger)
         command = tuple(arg.replace("{python}", python) for arg in self._runtime_command)
-        self._handle = SubprocessServiceHandle(command, health_check=self._runtime_health_check, cwd=self._plugin_dir)
+        self._handle = SubprocessServiceHandle(
+            command,
+            health_check=self._runtime_health_check,
+            cwd=self._plugin_dir,
+            log_path=self._log_path,
+        )
         self._handle.start()
-        self._logger.info("WEMM页级视觉导航子进程已启动（端口=%d）", self._handle.port)
+        if self._handle.log_file_error:
+            self._logger.warning(
+                "WEMM子进程日志文件打不开，本次输出不会落盘（服务本身不受影响）：%s",
+                self._handle.log_file_error,
+            )
+        self._logger.info(
+            "WEMM页级视觉导航子进程已启动（端口=%d，日志=%s）", self._handle.port, self.log_file() or "无（不落盘）"
+        )
 
     def _stop_handle(self) -> None:
         if self._handle is not None:
@@ -163,7 +268,10 @@ class VisualWemmPlugin:
                 pass
 
     def _ensure_alive(self) -> bool:
-        if not self._enabled:
+        """索引态的"确保子进程可用"：抢不到租约/拉不起来都只返回 False，由
+        调用方折叠成结构化失败终态（索引态永远不抛异常，见模块 docstring），
+        下一轮自动重试。查询态不走这里——见 `_ensure_query_service`。"""
+        if not self._enabled or not self.is_active():
             return False
         if self._resource_arbiter is not None and self._resource_arbiter.holder_of(GPU_RESOURCE_ID) != self._plugin_id:
             acquired = self._resource_arbiter.acquire(
@@ -183,6 +291,49 @@ class VisualWemmPlugin:
         except SubprocessServiceError as exc:
             self._logger.warning("WEMM子进程重新拉起失败：%s", exc)
             return False
+
+    def _ensure_query_service(self) -> None:
+        """查询态的"确保看图服务可用"，**失败一律抛 `VisualVetoError`**，
+        绝不静默退化成空列表（缺陷 C：调用方必须能区分"GPU 忙/服务不可用"
+        和"确实没有匹配页"）。
+
+        关键的一条降级路径（LEGACY obsidian-rag/server.py:712-716）：**服务
+        已经活着就直接查，不做任何驻留变更**——既不抢租约也不重新拉起子
+        进程。理由同 LEGACY 注释：拉起子进程是驻留变更，veto 期（索引正在
+        跑、显存正忙）一律不做；模型真需要重新加载时，子进程那一侧自己的
+        显存门槛等待会处理（server.py 的 `_wait_for_vram`）。
+
+        `on_enable` 只在"用户没开 WEMM"时跳过抢租约，所以用户中途把开关
+        打开后**不重启**也能在这里被正常拉起（每次现读设置，见 `backend()`）。"""
+        if not self.is_active():
+            raise VisualVetoError(
+                _VETO_BACKEND_OFF,
+                "（WEMM 视觉导航未开启：把设置里的 wemm_backend 设为 on/local 后重新调用本工具"
+                "——看图服务会按需自动拉起，页索引随 reindex_knowledge/自动同步自动建。）",
+            )
+        if self._handle is not None and self._handle.is_alive:
+            return  # 服务已在：直接查，不拉起、不抢租约
+        holder = self._resource_arbiter.holder_of(GPU_RESOURCE_ID) if self._resource_arbiter is not None else None
+        if holder is not None and holder != self._plugin_id:
+            acquired = self._resource_arbiter.acquire(
+                GPU_RESOURCE_ID,
+                self._plugin_id,
+                priority=GPU_PRIORITY,
+                on_preempt=self._soft_evict,
+                preempt_equal=True,
+            )
+            if not acquired:
+                raise VisualVetoError(
+                    _VETO_GPU_BUSY,
+                    "（索引任务进行中（或显存正忙），本次不抢占模型——"
+                    "页索引随索引自动同步，稍后重试即可。）",
+                )
+        if self._handle is not None and self._handle.is_alive:
+            return  # 抢占过程中把已停的服务顺手拉起来了（抢到了就直接用）
+        try:
+            self._start_handle()
+        except SubprocessServiceError as exc:
+            raise VisualVetoError(_VETO_START_FAILED, f"（看图服务拉起失败：{exc}）") from exc
 
     def _collection(self, library_id: str, generation: str | None = None):
         return self._client.get_or_create_collection(
@@ -235,6 +386,15 @@ class VisualWemmPlugin:
         changed_paths: list[str] | None = None,
         previous_generation: str | None = None,
     ) -> None:
+        if not self.is_active():
+            # LEGACY obsidian-rag/index.py:1842 与
+            # docs/legacy/TASK_LOG.md:1818 的原话："wemm_backend off →
+            # 静默跳过（零开销）"——用户没开这个能力时不能顺手把 5.1GB 子
+            # 进程拉起来，也不该留下"失败"记录冒充页索引失败。
+            self._logger.info(
+                "WEMM后端未开启（wemm_backend=%s），跳过页级索引（不落任何状态）", self.backend()
+            )
+            return
         generation_key = generation or "legacy"
         if previous_generation:
             state = self._read_state(library_id, previous_generation)
@@ -575,13 +735,23 @@ class VisualWemmPlugin:
                 )
         return {
             "enabled": self._enabled,
+            # 后端开关（LEGACY wemm_status 第一行就报 wemm_backend=off/on-local，
+            # obsidian-rag/server.py:977-982）——用户/AI 一眼能确认"我到底开没开"
+            "backend": self.backend(),
             "subprocess_alive": alive,
+            # 子进程日志路径：navigate 拿不到租约、服务拉不起来时让人"去哪儿
+            # 看诊断"（LEGACY gpu_arbiter.py:273-283/ obsidian-rag/server.py:965
+            # 明确把 data/wemm_server.log 指出来）
+            "log_file": self.log_file(),
             # 渲染 DPI 与看图服务模型/设备（旧 wemm_status 的 DPI/model/device
             # 字段；model/device 来自子进程 /health 快照，服务未运行时为 None）
             "dpi": WEMM_RENDER_DPI,
             "service": (
                 {"model": service.get("model"), "device": service.get("device"),
-                 "dim": service.get("dim")}
+                 "dim": service.get("dim"),
+                 # 模型此刻是否在显存里（服务存活 ≠ 模型常驻：空闲会自动卸载）——
+                 # GUI 全局快照的"看图模型常驻/空闲已卸载"就取这一位
+                 "loaded": bool(service.get("loaded"))}
                 if isinstance(service, dict) else None
             ),
             "libraries": libraries,
@@ -608,9 +778,17 @@ class VisualWemmPlugin:
     # ---- 查询态 ----------------------------------------------------------
 
     def navigate(self, library_id: str, query: str, top_k: int = 5) -> list[PageHit]:
-        if not self._ensure_alive():
-            self._logger.warning("WEMM子进程未运行，页级导航返回空结果")
+        """页级导航。返回**普通空列表**只意味着一件事："查了，但这一页确实
+        没有匹配"。任何"这次没能查"的情况（WEMM 后端没开、GPU 租约被别人
+        占着且服务没活着、服务拉不起来/请求没打通）都抛
+        `VisualVetoError`（缺陷 C）——调用方据此告诉用户"稍后重试"而不是
+        谎报"没找到"。"""
+        if not self._enabled:
+            # 插件本身没启用（用户没装/没启用这个插件）——同 official-mcp-
+            # server 里"未装该插件时 navigate_knowledge 返回空结果不是失败"
+            # 的承诺，保持原样返回空列表。
             return []
+        self._ensure_query_service()
         generation = self._generations.active(library_id) if self._generations is not None else None
         state = self._read_state(library_id, generation or "legacy")
         files = state.get("files", {})
@@ -629,10 +807,14 @@ class VisualWemmPlugin:
             result = self._handle.call("embed", {"kind": "text", "content": query, "dim": WEMM_DIM}, timeout=60.0)
         except SubprocessServiceError as exc:
             self._logger.warning("WEMM查询编码失败：%s", exc)
-            return []
+            raise VisualVetoError(
+                _VETO_CALL_FAILED, f"（WEMM 看图服务不可用：{type(exc).__name__}，可稍后重试）"
+            ) from exc
         if not result.get("ok"):
             self._logger.warning("WEMM查询编码失败：%s", result.get("error"))
-            return []
+            raise VisualVetoError(
+                _VETO_CALL_FAILED, f"（WEMM 查询编码失败：{result.get('error')}）"
+            )
         merged: dict[str, tuple[dict, float]] = {}
         for segment in segments:
             try:

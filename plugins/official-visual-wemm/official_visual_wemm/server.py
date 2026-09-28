@@ -32,6 +32,17 @@ plugin.py 的 GPU_PRIORITY 说明）。
 "为什么 subprocess_service 的 server.py 不直接 import core.*"的说明，
 这里的几个函数是 core/gpu_arbiter.py 对应函数的自包含副本（stdlib-only，
 故意重复，不是遗漏）。
+
+**本进程的输出去哪**：由父进程决定——`core/subprocess_service.py::
+SubprocessServiceHandle` 在 `Popen` 时就把本进程的 fd 1/2 指向插件在
+DATA_ROOT 下的真实日志文件（`data/visual_wemm/wemm_server.log`，父进程
+那侧是 `plugin.py::_start_handle` 传进去的 `log_path`），所以下面所有
+`print(..., file=sys.stderr)`、以及 `socketserver` 打到 stderr 的
+traceback，都会落在那个文件里而不是一个没人读的管道（对齐 LEGACY
+obsidian-rag/gpu_arbiter.py:241-252 的 `Popen(stdout=logf, stderr=logf)`
+——真实文件不会被"管道写满 64KB"卡死，这是本文件真机调试时踩过的坑的
+同一个根因）。父进程那一侧用 `plugin.py::status()` 的 `log_file` 字段把
+路径报给用户/AI（同 LEGACY `wemm_status` 指向 data/wemm_server.log）。
 """
 from __future__ import annotations
 
@@ -209,7 +220,14 @@ def _idle_exit_daemon() -> None:
         if WEMM_IDLE_EXIT_SECONDS <= 0 or _engine is not None or _active_requests > 0:
             continue
         if time.time() - _last_use > WEMM_IDLE_EXIT_SECONDS:
-            print(f"[wemm] idle {WEMM_IDLE_EXIT_SECONDS}s after unload -> process exit", file=sys.stderr)
+            print("[wemm] idle %ds after unload -> process exit" % WEMM_IDLE_EXIT_SECONDS, file=sys.stderr)
+            # os._exit 不走 Python 的正常退出流程，sys.stderr 里还缓冲着的
+            # 内容会被直接丢掉——那正是"为什么这个进程自己没了"这条最需要
+            # 留在日志里的诊断信息。刷一次再退。
+            try:
+                sys.stderr.flush()
+            except Exception:  # noqa: BLE001 - 刷盘失败绝不能挡住退出
+                pass
             os._exit(0)
 
 
