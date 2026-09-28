@@ -56,6 +56,7 @@ CORE_SUITES = [
     "test_runtime",
     "test_subprocess_service",
     "test_pipeline_e2e",
+    "test_pipeline_data_safety",
     "test_demo_vault",
 ]
 

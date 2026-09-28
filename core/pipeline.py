@@ -16,17 +16,20 @@ import logging
 import os
 import re
 import shutil
+import time
 import uuid
 from dataclasses import dataclass, field, replace as dataclasses_replace
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
-from .contracts import Chunk, DocumentContent, ExtractedDocument, GraphResponse, LibraryFreshness, LibrarySummary, PageHit, QueryExpansion, SampledChunk, SearchAdviceInput, SearchResponse, SearchResult, SemanticGraphResponse, VisualPageState
+from .contracts import Chunk, DocumentContent, ExtractedDocument, GraphResponse, LibraryFreshness, LibrarySummary, PageHit, PreviewExtraction, QueryExpansion, SampledChunk, SearchAdviceInput, SearchResponse, SearchResult, SemanticGraphResponse, VisualPageState
 from .graph import build_graph, select_semantic_edges
 from .extract_cache import ExtractCache
+from . import index_integrity
 from .index_failures import IndexFailuresStore
 from .index_generation import INDEX_MANIFEST_VERSION, IndexGenerationStore, IndexManifestStore
 from .index_progress import IndexProgressEvent, IndexStartResult, IndexWorkerManager
+from .library_key import library_storage_key
 from .note_relations import NoteRelationsStore, extract_wikilink_targets
 from .text_cleaning import (TEXT_PIPELINE_VERSION, build_anchor_context, clean_wikilinks,
                             extract_frontmatter, strip_boilerplate_lines, strip_dead_image_refs,
@@ -55,6 +58,34 @@ DEFAULT_CONFIDENCE_DROP_THRESHOLD = 0.0  # 低于此值直接丢弃不返回；0
 DEFAULT_MAX_CHUNKS_PER_FILE = 3  # 同一文件在最终结果里最多出现几条，防止单篇文档占满整个结果列表
 IMPORT_UPSERT_BATCH = 500  # 导入时每批 upsert 的块数（旧 config.import_upsert_batch：拥塞小值减慢导入，较大值占内存）
 TERMINAL_FAILURE_STATES = frozenset({"unreadable", "empty", "tbd", "scanned", "extract-failed"})
+#: IndexReport.skip_reason 的取值：库路径不存在，本轮整库跳过（保留现有索引）。
+#: 稳定 token，调用方按它分支，不要写自由文本。
+SKIP_MISSING_ROOT = "library-root-missing"
+
+#: 提取试验台（`Pipeline.preview_extract`）的后端覆盖名 → provider 插件 id。
+#: 键名沿用旧项目 guiweb/bridge.py::preview_start 的 `backend` 取值
+#: （None/"local"/"mineru-cloud"/"mineru-local"），值是本项目对应的插件 id——
+#: 旧项目的 "local" 指的是本机 PDF 解析，本项目对应
+#: official-extractor-pdf-text（读 PDF 文字层）。映射放在 core 而不是
+#: GUI：试验台和索引链路共用同一批 extractor provider，谁都不该自己认
+#: 后端名字。
+_PREVIEW_BACKEND_PLUGINS = {
+    "local": "official-extractor-pdf-text",
+    "mineru-cloud": "official-ocr-mineru-cloud",
+    "mineru-local": "official-ocr-mineru-local",
+}
+
+#: official-vector-store-chroma 建的集合命名前缀。`libg_` = 按 generation
+#: 分段；`lib_` = 无 generation 的老式命名；`libk_` = 库 id 本身不满足
+#: Chroma 集合名规则（中文/空格等）时走的哈希化命名，见
+#: `official-vector-store-chroma/.../store.py::chroma_collection_name`。
+#: 三个前缀都要认，漏一个就会把**正在使用**的集合当残留删掉。
+_VECTOR_COLLECTION_PREFIXES = ("libg_", "libk_", "lib_")
+
+
+def _is_rag_collection_name(name: str) -> bool:
+    """这个名字属于本项目的向量库命名空间吗（回收时只碰自己人）。"""
+    return name.startswith(_VECTOR_COLLECTION_PREFIXES)
 
 
 def is_tbd_heavy(content: str, ratio: float) -> bool:
@@ -96,6 +127,38 @@ class PipelineError(RuntimeError):
     """编排层缺少必要的已启用插件时抛出——这不是插件自己的失败折叠范畴
     （那是数据层面的"这个文件没收"），是"根本没法开始跑"的配置错误，
     调用方（GUI/CLI/MCP）应该展示成"请先启用 XX 插件"而不是笼统报错。"""
+
+
+@dataclass(frozen=True)
+class SearchDelivery:
+    """一次检索的**交付态**：结果本体 + "这一批是怎么交出来的"那几个信号。
+
+    为什么不把这几个计数塞进 `SearchResult`：它们是**整批**的属性，不是某
+    一条结果的属性——同一批里 20 条结果的 `capped`/`folded` 全都相同，让每
+    条结果各背一份是冗余，而且调用方几乎总是"整批一起看"。
+
+    为什么需要它们：旧项目 obsidian-rag/retriever.py:488-497 把 `capped` /
+    `folded` 一起传给 advice，并在封顶时追加尾注"（同一文件最多展示 N 块…
+    完整内容请打开源文件）"。少了这两个信号，agent 看到同一篇笔记占满 3 条
+    时会以为库里就这些内容，不知道后面还有被封顶掉的——这是用户可观察的
+    行为缺失，不是内部实现细节。
+    """
+
+    results: tuple[SearchResult, ...]
+    #: 触发了"同一文件最多 N 块"的封顶（对齐 retriever.py 的 `capped`）
+    capped: bool = False
+    #: 因"同一小节已交付过"被折叠掉的块数（对齐 `folded`）
+    folded: int = 0
+    #: 交付前进入过滤流程的候选块数。结果为空时用它区分"压根没候选"与
+    #: "有候选但全被置信度下限过滤"——两者的建议文案不同。
+    candidates: int = 0
+
+    def empty_reason(self) -> str | None:
+        """结果为空时的原因（喂给 `SearchAdviceInput.empty_reason`），
+        非空返回 None。对齐 retriever.py:479-483。"""
+        if self.results:
+            return None
+        return "all-below-drop-threshold" if self.candidates else "no-score"
 
 
 def _chunk_library(chunk_id: str) -> str:
@@ -179,6 +242,24 @@ class IndexReport:
     removed: int = 0
     unchanged: int = 0
     retried: int = 0
+    #: 本轮"整个库什么都没做"的单一原因（稳定可机读 token），None = 正常跑完。
+    #: 目前只有 SKIP_MISSING_ROOT 一种（库路径不存在，见 `index_library` 里
+    #: 对齐 obsidian-rag/index.py:1871-1873 的门禁）。
+    #:
+    #: **为什么不复用 `deferred`**：`deferred` 是**文件级**语义——"某个文件的
+    #: 提取服务瞬态不可用，本轮跳过、下轮重试"，由
+    #: `IndexFileReport.failure_state == "deferred"` 汇总而来，它的重试语义
+    #: 建立在"旧条目与旧块原样保留"之上（obsidian-rag/index.py:2142-2148）。
+    #: 库路径不存在是**库级前置条件不成立**："这一轮连枚举都没开始"，既没有
+    #: 任何文件参与，也没有"下轮自动重试"的责任——路径回来了自然就正常跑。
+    #: AGENTS.md §5 要求"瞬态服务不可用必须与永久失败区分"，把两者塞进同一个
+    #: 计数会让调用方无法回答"这轮到底有没有文件被推迟"，也会让
+    #: `deferred > 0` 触发"下轮一定重试"的错误预期。
+    skip_reason: str | None = None
+
+    @property
+    def skipped(self) -> bool:
+        return self.skip_reason is not None
 
     @property
     def succeeded(self) -> int:
@@ -285,6 +366,97 @@ class Pipeline:
                 return result
         assert last_result is not None
         return last_result
+
+    def preview_extract(self, path: str, *, backend: str = "") -> "PreviewExtraction":
+        """提取试验台：对**任意**本地文件跑一次提取，不写提取缓存、不落
+        generation、不碰任何索引数据，也不要求该文件在某个已注册库里。
+
+        `backend` 覆盖后端选择（`""`=跟随全局设置，与索引链路一致；
+        `"mineru-cloud"` / `"mineru-local"` / `"local"` 强制走指定后端）。
+        强制后端时绕开该 provider 的 `is_active()` 门禁——试验台的用途
+        恰恰是"在不改全局配置的前提下试一下这个后端"。
+
+        路由顺序复用 `_extract` 的 provider 链（`extractor:{ext}` 扩展点
+        顺序），不另写一份"试验台专用路由"：同一份格式→provider 映射只有
+        一处权威实现（docs/DATA_FLOW.md 规则4）。与索引链路的差别只有
+        三点，都在这里显式声明而不是隐式：①不查也不写提取缓存；②不要求
+        库上下文（library_id 传 `""`）；③`is_active()` 可被 backend 覆盖。
+
+        失败语义与索引链路一致：返回 `failure_reason` 终态字符串
+        （unreadable/empty/scanned/extract-failed/deferred/无 provider），
+        不抛异常——试验台要把"为什么没产出"如实显示给用户。
+        """
+        started = time.monotonic()
+        file_path = Path(path)
+        ext = file_path.suffix.lstrip(".").lower()
+        provider_ids = self.runtime.registry.providers_of(f"extractor:{ext}")
+        if not provider_ids:
+            return PreviewExtraction(
+                path=str(file_path),
+                ok=False,
+                markdown=None,
+                reason=f"没有插件能处理 .{ext} 格式",
+                route="-",
+                backend=backend,
+                elapsed=0.0,
+                chars=0,
+            )
+        forced = _PREVIEW_BACKEND_PLUGINS.get(backend) if backend else None
+        if backend and forced is None:
+            return PreviewExtraction(
+                path=str(file_path),
+                ok=False,
+                markdown=None,
+                reason=f"未知的试验台后端: {backend}",
+                route="-",
+                backend=backend,
+                elapsed=0.0,
+                chars=0,
+            )
+        if forced is not None and forced not in provider_ids:
+            return PreviewExtraction(
+                path=str(file_path),
+                ok=False,
+                markdown=None,
+                reason=f"后端 {backend} 不处理 .{ext} 格式",
+                route="-",
+                backend=backend,
+                elapsed=0.0,
+                chars=0,
+            )
+        last: ExtractedDocument | None = None
+        for plugin_id in sorted(provider_ids):
+            if forced is not None and plugin_id != forced:
+                continue
+            extractor = self._plugin(plugin_id)
+            if forced is None:
+                active = getattr(extractor, "is_active", None)
+                if callable(active) and not active():
+                    continue
+            result = extractor.extract("", str(file_path), file_path.parent)
+            last = result
+            if result.text is not None:
+                return PreviewExtraction(
+                    path=str(file_path),
+                    ok=True,
+                    markdown=result.text,
+                    reason="",
+                    route=f"extractor:{plugin_id}",
+                    backend=backend,
+                    elapsed=round(time.monotonic() - started, 3),
+                    chars=len(result.text),
+                )
+        assert last is not None
+        return PreviewExtraction(
+            path=str(file_path),
+            ok=False,
+            markdown=None,
+            reason=last.failure_reason or "提取管线未产出",
+            route=f"extractor:{sorted(provider_ids)[-1]}",
+            backend=backend,
+            elapsed=round(time.monotonic() - started, 3),
+            chars=0,
+        )
 
     def _manifest(self, library_id: str, generation: str | None = None) -> dict | None:
         if generation is None:
@@ -522,6 +694,7 @@ class Pipeline:
         *,
         generation_id: str | None = None,
         full: bool = False,
+        fresh_extract: bool = False,
         progress_callback: Callable[[IndexProgressEvent], None] | None = None,
         format_allowlist: tuple[str, ...] | None = None,
     ) -> IndexReport:
@@ -529,12 +702,34 @@ class Pipeline:
         一个文件时调用一次，供 `core/index_progress.py::IndexWorkerManager`
         在工作进程中上报进度。不传就是
         原有的纯同步调用，行为完全不变——GUI/测试目前都是这样直接调用，
-        不强制迁移到后台执行那条路径。"""
+        不强制迁移到后台执行那条路径。
+
+        `full` 对齐 obsidian-rag 的 `--full`（index.py:1891 `meta = {}`）：
+        所有文件重新切块+重嵌，但**仍然复用提取缓存**——所以拿它改切块粒度
+        不会重复烧 MinerU 配额。真正强制重新解析正文是 `fresh_extract`
+        （对齐 `--fresh-extract`，index.py:2450-2455）。"""
         lib_mgr = self._singleton("library_manager")
         cfg = lib_mgr.store.get(library_id)
         if cfg is None:
             raise KeyError(f"未知库: {library_id}")
         root = Path(cfg.root_path)
+
+        # 库路径门禁——对齐 obsidian-rag/index.py:1871-1873（`if not
+        # Path(vault).is_dir(): log(...); return`，"保留现有索引"）。放在
+        # 枚举之前、也放在 token 复位之前，与 LEGACY 的顺序一致。
+        # 没有这道门禁时：路径临时不可用（移动的 OneDrive 库、未挂载的网络
+        # 盘、盘符掉线）→ 枚举返回 [] → plans 为空 → manifest_files={} →
+        # **照样原子发布一个空 generation**，把整库索引一次性清空且不可逆。
+        # AGENTS.md §5「停止、异常或崩溃不能把半成品切换成当前索引」在这里
+        # 的具体形态就是"什么都没扫到"——它同样是一个不该被发布的半成品。
+        # 与 `library_freshness` 的 `missing=True`（index.py:1506-1508）是
+        # 同一件事的两道闸：freshness 决定"该不该自动同步"（不该），本门禁
+        # 兜住"有人显式/强行调了索引"（不许清空），两道闸不冲突。
+        if not root.is_dir():
+            logging.getLogger("rag_redo.core.pipeline").warning(
+                "库路径不存在，跳过索引（保留现有索引）：%s", root
+            )
+            return IndexReport(library_id=library_id, skip_reason=SKIP_MISSING_ROOT)
 
         # Token 失效标志每轮索引复位（问题35：长驻进程跨轮次复用，旧
         # index.py:1874-1878 在云端段开始时 mineru_token_reset() 同语义）
@@ -557,14 +752,69 @@ class Pipeline:
         old_files = self._manifest_files(old_manifest)
         signatures = self._pipeline_signatures()
         old_signatures = old_manifest.get("signatures", {}) if old_manifest else {}
-        force_extract = full
+
+        # ---- 一致性自愈（对齐 obsidian-rag/index.py:1903-1910）------------
+        # manifest 记的期望块数与向量库实际块数对不上时，增量路径"指纹全命中
+        # → 没有新块可写"根本修不了缺失的块（LEGACY 注释原话），必须按全量
+        # 重建处理。覆盖 LEGACY 点名的两类场景：--full 中途被杀在清库窗口
+        # （count==0）、Chroma 被外部工具/清理/磁盘故障破坏（此前会陷入
+        # 「每轮判 stale → 每轮修不了」的死循环）。全终态库期望 0 块，
+        # 0==0 不误伤（判定逻辑见 core/index_integrity.py，与
+        # `library_freshness` 共用同一份实现）。
+        # full=True 时不判：整库重建本来就会把所有块重写一遍，多这一次 count
+        # 探测纯属浪费（LEGACY 1903 行 `if not full and meta` 同条件）。
+        rebuild_all = False
+        if old_manifest is not None and not full:
+            integrity_segments = self._manifest_segments(
+                old_manifest, "vector_segments", previous
+            )
+            integrity_actual = index_integrity.count_store_chunks(
+                lambda segment: vector_store.count(library_id, generation=segment),
+                integrity_segments,
+            )
+            drift = index_integrity.rebuild_reason(
+                old_manifest,
+                actual_chunk_count=integrity_actual,
+            )
+            if drift is not None:
+                logging.getLogger("rag_redo.core.pipeline").warning(
+                    "一致性校验失败（%s）：manifest 期望 %d 块 vs 向量库实际 %s 块，"
+                    "增量无法修复，自动转全量重建",
+                    drift,
+                    index_integrity.expected_chunk_count(old_manifest),
+                    "未知" if integrity_actual is None else integrity_actual,
+                )
+                rebuild_all = True
+
+        # ---- 三个 force_* 的关系（缺陷3，对齐 LEGACY 的两段语义）----------
+        # LEGACY 里 `--full`（index.py:1891）与切块逻辑升级
+        # （index.py:1893-1895 `meta.pop("_version") != META_VERSION` → 同样
+        # `meta = {}`）都只是**丢掉旧条目表**，每个文件仍然走
+        # `extract_to_markdown`，而它第一件事就是查提取缓存
+        # （extractors.py:341-343 命中即秒回）。所以这两种重建都可以用来改
+        # 切块粒度/换提取器而**不重复烧 MinerU 配额**；真正"当作缓存不存在"
+        # 的只有 `--fresh-extract`（index.py:2450-2455 先 purge 缓存再索引）。
+        # 三个变量因此必须是：
+        #   force_extract = fresh_extract or 提取能力签名变化
+        #       —— "本轮每个文件都要重新走一遍提取入口"。它是 LEGACY 那个
+        #          `meta = {}` 的等价物：**只清空写盘链**（本轮往哪个 segment
+        #          写），**不清空查找链**（可以从哪些 segment 读）——缓存命中
+        #          时这次"重新提取"零成本，这才是"改切块粒度不烧配额"能成立
+        #          的原因。真正清空查找链的只有 fresh_extract（见下方清空点）。
+        #   force_chunks  = full or rebuild_all or force_extract or
+        #                   切块器/文本管线签名变化
+        #       —— full 与一致性自愈是"重切块 + 重嵌"（`full` 漏掉这一项会让
+        #          `--full` 变成"什么也不做"，嵌入器一次都不被调用：LEGACY
+        #          `meta = {}` 之后每个文件必然重新切块重嵌）。
+        #   force_embed   = force_chunks or 嵌入器/向量库签名变化
+        force_extract = fresh_extract
         if old_manifest is not None:
             force_extract = force_extract or any(
                 old_signatures.get(point) != signatures.get(point)
                 for point in signatures
                 if point.startswith("extractor:")
             )
-        force_chunks = force_extract or (
+        force_chunks = full or rebuild_all or force_extract or (
             old_manifest is not None
             and (
                 old_signatures.get("chunker") != signatures.get("chunker")
@@ -579,6 +829,9 @@ class Pipeline:
             )
         )
         force_lexical = old_manifest is not None and old_signatures.get("lexical_index") != signatures.get("lexical_index")
+        # 一致性自愈触发时按 full 的口径重试终态条目（LEGACY `meta = {}` 之后
+        # 每个文件都会被重新走到）；`full` 用户显式要求的重建同理。
+        rebuild_terminals = rebuild_all or full
 
         report = IndexReport(library_id=library_id)
         included_files = (
@@ -693,7 +946,7 @@ class Pipeline:
                         and not capability_changed
                         and str(old.get("capability_signature") or "") == str(plan["capability_signature"])
                     )
-                    if full or old.get("status") == "deferred" or not stable_terminal:
+                    if rebuild_terminals or old.get("status") == "deferred" or not stable_terminal:
                         plan["action"] = "retried"
                     elif same_stat or plan["content_hash"] == old.get("content_hash"):
                         plan["action"] = "unchanged"
@@ -718,12 +971,36 @@ class Pipeline:
 
         vector_segments = self._manifest_segments(old_manifest, "vector_segments", previous)
         extract_segments = self._manifest_segments(old_manifest, "extract_segments", previous)
+        # 三条链，各管一件事，别再合并成一条（合并过一次，代价就是
+        # `full` 变成"什么也不做"）：
+        #   cache_segments   —— 查找用：本轮可以从哪些 segment 读提取缓存。
+        #   extract_segments —— 写盘用：本轮往哪些 segment 写提取缓存。
+        #   extract_carry    —— 压缩用：本轮压缩后哪些 segment 的正文仍然
+        #                        有效、必须被搬进 `{generation}-compact`。
+        # 三者的差别只在 force_extract / fresh_extract 上体现，且顺序固定为
+        # "老 → 新"（压缩段按倒序搬，同 route 只搬最新那份）。
         cache_segments = list(extract_segments)
+        extract_carry = list(extract_segments)
+        vector_carry = list(vector_segments)
         lexical_segments = self._manifest_segments(old_manifest, "lexical_segments", previous)
         if force_embed:
+            # 写盘链从零开始（本轮只写进 `generation`），但**老段仍留在
+            # `vector_carry` 里当压缩的读源**：deferred 语义要求旧块原样保留
+            # 继续服务（index.py:2142-2148 "不动 meta"），而这一轮被 deferred
+            # 跳过的文件一个新块都没写，它的块只在老集合里——压缩时若只从
+            # 写盘链搬，这些块会静默从检索里消失（记录还写着 indexed，用户
+            # 却再也搜不到自己刚建的库）。
             vector_segments = []
         if force_extract:
+            # LEGACY `meta = {}` 的等价物：写盘链从零开始（本轮只写进
+            # `generation`），但**查找链原样保留**——deferred/冻结文件的旧
+            # 正文还得继续服务（index.py:2142-2148 "不动 meta"），已经重新
+            # 提取成功的文件也会把新正文写进本轮 segment（压缩时新正文优先）。
             extract_segments = []
+        if fresh_extract:
+            # 全项目唯一"当作提取缓存不存在"的地方：清掉查找链，保证真的
+            # 重新解析正文（对齐 LEGACY --fresh-extract 先 purge 缓存）。
+            cache_segments = []
         needs_vector_segment = any(plan.get("needs_embed") for plan in plans)
         needs_extract_segment = any(plan.get("needs_source") for plan in plans)
         lexical_changed = force_lexical or bool(removed_paths) or any(
@@ -846,7 +1123,13 @@ class Pipeline:
                         )
 
             else:
-                cached = self._read_extract_cache(library_id, path, extract_segments)
+                # "内容没变、只是要重新切块/重嵌"（full、一致性自愈、嵌入器
+                # 或切块器签名变化）——对齐 LEGACY：`--full` 下每个文件仍然
+                # 走 `extract_to_markdown`，而它先查提取缓存
+                # （extractors.py:341-343 命中即秒回），所以改切块粒度不会
+                # 重复烧 MinerU 配额。读的是 `cache_segments`（查找用链），
+                # `fresh_extract` 已经把它清空，这里必然落空并真的重解析。
+                cached = self._read_extract_cache(library_id, path, cache_segments)
                 if cached is not None:
                     doc = ExtractedDocument(
                         library_id=library_id,
@@ -1111,9 +1394,25 @@ class Pipeline:
         )
         if compaction_due:
             compact_segment = f"{generation}-compact"
+            # 压缩的读源是"老段 + 本轮段"（倒序合并 = 新块覆盖同 id 的老块），
+            # 不是写盘链 `vector_segments`：force_embed（full / 一致性自愈 /
+            # 嵌入器或切块器签名变化）会把写盘链清空到只剩本轮 generation，
+            # 而这一轮被 deferred 跳过的文件一个新块都没写，它的块只在老集合
+            # 里——只从写盘链搬，这些块会静默从检索里消失（记录仍写着
+            # indexed，用户却再也搜不到自己刚建的库）。同理，正文来源用
+            # `extract_carry` 而不是 `extract_segments`（force_extract 会把
+            # 写盘链清空），否则 read_document 看不到 deferred 文件的正文。
+            vector_source: list[str] = []
+            for segment in (*vector_carry, *vector_segments):
+                if segment and segment not in vector_source:
+                    vector_source.append(segment)
+            extract_source: list[str] = []
+            for segment in (*extract_carry, *extract_segments):
+                if segment and segment not in extract_source:
+                    extract_source.append(segment)
             if active_ids:
                 _emit("writing", stall_grace_s=180.0, message="正在压缩向量索引")
-                rows = self._vector_rows(library_id, vector_segments, active_ids)
+                rows = self._vector_rows(library_id, vector_source, active_ids)
                 compact_ids = sorted(rows)
                 for start in range(0, len(compact_ids), 1000):
                     batch = compact_ids[start : start + 1000]
@@ -1135,7 +1434,7 @@ class Pipeline:
                 if record.get("status") != "indexed":
                     continue
                 seen_routes: set[str] = set()
-                for segment in reversed(extract_segments):
+                for segment in reversed(extract_source):
                     for text, route in self._extract_cache.iter_entries(library_id, path, segment):
                         route_key = route or "legacy"
                         if route_key in seen_routes:
@@ -1267,19 +1566,21 @@ class Pipeline:
            extract_cache 下它的目录一并清（库级文件/块清理每轮索引已做，
            这里只清"整个库都没了"的残留）；
         2. 活跃 generation 的提取缓存孤儿 → 不在 `_index.json` 反查表里的
-           `<hash>.txt` 删除。
-        Chroma 集合不做按名清扫（理由见下方注释）。
+           `<hash>.txt` 删除；
+        3. 向量库残留集合 → `libg_*` / `lib_*` 里既不属于任何在册库、
+           也不被任何在册库保留的 generation/segment 引用的删掉
+           （判定见 `_prune_stale_collections`）。
 
         幂等；任何单步失败只记日志、绝不抛，不影响索引主流程。
         返回 (删缓存文件数, 删 collection 数, 删已删库目录数)。"""
         lib_mgr = self._singleton("library_manager")
         live_library_ids = {cfg.library_id for cfg in lib_mgr.store.list_libraries()}
         # 各存储的目录命名规则不同，孤儿判定必须按各自的命名来——
-        # manifests 用 _key（安全名+哈希后缀）；failures/relations 用安全名；
-        # extract_cache 直接用原始库 id。用错一边会把活库目录误判成孤儿。
-        _safe = lambda library_id: re.sub(r"[^\w.-]", "_", library_id)  # noqa: E731
+        # manifests / failures / relations 用 `library_storage_key`
+        # （安全名+哈希后缀，core/library_key.py）；extract_cache 直接用
+        # 原始库 id。用错一边会把活库目录误判成孤儿。
         live_manifest_keys = {self._manifests._key(library_id) for library_id in live_library_ids}
-        live_safe_names = {_safe(library_id) for library_id in live_library_ids}
+        live_safe_names = {library_storage_key(library_id) for library_id in live_library_ids}
 
         def _prune_orphan_dirs(root: Path, suffix: str, live_names: set[str]) -> int:
             if not root.is_dir():
@@ -1319,19 +1620,144 @@ class Pipeline:
                     except OSError:
                         pass
 
-        # Chroma 集合不做按名清扫——集合名 libg_<sha(库,generation)> 不可逆，
-        # 而 deferred/冻结语义刻意保留旧 generation 的集合（旧块的块 id 指向
-        # 它们，manifest 的 vector_segments 之外还有搜索池引用），按任何
-        # "keep 集"近似都会误删在用集合（实测打断增量重嵌/冻结可搜）。已知
-        # 生命周期（压缩、discard_index_generation）已精确管理集合；已删库的
-        # 集合残留属极窄场景，登记在 ROADMAP 而不是冒险清扫。
+        n_collections = self._prune_stale_collections(live_library_ids)
 
-        if n_cache or n_dirs:
+        if n_cache or n_dirs or n_collections:
             logging.getLogger("rag_redo.core.pipeline").info(
-                "全局回收完成：删提取缓存孤儿 %d 个、已删库目录 %d 个",
-                n_cache, n_dirs,
+                "全局回收完成：删提取缓存孤儿 %d 个、残留集合 %d 个、已删库目录 %d 个",
+                n_cache, n_collections, n_dirs,
             )
-        return (n_cache, 0, n_dirs)
+        return (n_cache, n_collections, n_dirs)
+
+    def _live_generations(self, library_id: str) -> set[str]:
+        """这个库当前**必须留着数据**的 generation/segment 名集合。
+
+        判定范围严格照抄 `index_library()` 收尾那段"谁还在被引用"的算法
+        （manifest 分段 + generation 指针 history + 压缩段），
+        再加一条**在途**保护：
+
+        - manifest 分段：`self._manifests.list_generations()` 列出的每个
+          generation 的 `vector_segments`/`lexical_segments`/`extract_segments`
+          ——deferred 与 Agent 冻结语义刻意让**旧** generation 的集合继续
+          在用（被冻结文件的旧块只在旧集合里），只看 active 会误删。
+        - generation 指针的 active + history：搜索只读 active，但收尾清理
+          （`index_library` 末尾的 `candidates - keep - referenced`）会把
+          history 也留着，回收必须跟它一致。
+        - `-compact` 后缀：压缩把活跃块搬进 `{generation}-compact` 段并删掉
+          原段（`index_library` 的 compacted_vector_segment 分支），两个名字
+          都要在存活集合里。
+        - **在途 run**：`index_progress` 里 stage 仍是 starting/running 的
+          worker 正在往 `libg_<sha(库,run_id)>` 写，此刻它还没有 manifest
+          （manifest 在索引最末尾才原子发布），只按 manifest 判就会把另一个
+          进程正在写的集合删掉——worker 的 run_id 就是它用的 generation_id
+          （`core/index_progress.py:415-418` 传的 `generation_id=run_id`）。
+        """
+        generations: set[str] = set()
+        active = self._generations.active(library_id)
+        if active:
+            generations.add(active)
+        generations.update(self._generations.history(library_id))
+        for generation in self._manifests.list_generations(library_id):
+            generations.add(generation)
+            manifest = self._manifests.read(library_id, generation)
+            for field in ("vector_segments", "lexical_segments", "extract_segments"):
+                values = manifest.get(field, []) if manifest else []
+                if isinstance(values, list):
+                    generations.update(str(value) for value in values if value)
+        try:
+            status = self._index_progress.status(library_id)
+        except Exception:
+            status = None
+        if isinstance(status, dict) and status.get("stage") in {"starting", "running"}:
+            run_id = str(status.get("run_id") or "")
+            if run_id:
+                generations.add(run_id)
+        return generations
+
+    def _prune_stale_collections(self, live_library_ids: set[str]) -> int:
+        """清扫向量库残留集合（对齐 obsidian-rag/index.py:2404-2432）。
+
+        **判定"可删"的确切规则**（缺一不可）：
+        1. 名字以 `libg_` / `libk_` / `lib_` 开头——只动 official-vector-store-chroma
+           自己建的命名空间。别的插件/别的库共用同一个 Chroma 目录时，
+           不属于我们的集合一律不碰。视觉页库（WEMM）用的是**另一个
+           Chroma 目录**（`plugins/official-visual-wemm/.../plugin.py:148-150`
+           的 `visual_wemm/chroma`）和自己的 `visual_`/`visualg_` 命名空间，
+           根本不会出现在这里的清单里，也就不在核心的回收职责内。
+        2. 且它不在任何在册库的存活集合里（由插件的 `collection_name_for`
+           正向算出来的全集）。
+
+        **正向枚举解决了"名字不可逆"这个老问题**：当年放弃清扫的理由是
+        集合名 `libg_<sha256(库id, generation)>` 反推不出库 id。这里根本
+        不反推——哈希是单向的，那就从"库 id + generation"**正向算**出名字
+        （`_live_generations` 已经知道每个在册库还留着哪些代），再拿名字去
+        和实际清单求差集。反推是走不通的，正推是白送的。
+        """
+        vector_store = self._singleton("vector_store")
+        list_names = getattr(vector_store, "list_collection_names", None)
+        delete_by_name = getattr(vector_store, "delete_collection_by_name", None)
+        if not callable(list_names) or not callable(delete_by_name):
+            # 存储插件不支持按名清扫（自定义 vector_store 实现）——降级为
+            # 不删，绝不猜接口（AGENTS.md §4.4：命名空间只由 DataStore 发）。
+            logging.getLogger("rag_redo.core.pipeline").info(
+                "全局回收：当前 vector_store 不支持按名清扫，跳过集合回收"
+            )
+            return 0
+        keep: set[str] = set()
+
+        # 集合名算法归 official-vector-store-chroma 所有（它才是真正
+        # 调 Chroma 的人，也只有它知道 Chroma 的集合名合法化规则——见
+        # store.py::chroma_collection_name）。这里过去自己复算了一遍
+        # `f"lib_{library_id}"`，属于 AGENTS.md §4.5 明令禁止的"同一个业务
+        # 判断两个权威实现"：插件一侧把中文库 id 合法化成 `libk_<sha>` 之后，
+        # 这里的白名单还只会算 `lib_中文`，于是回收会把一个**正在使用的**
+        # 集合当成残留删掉——用户可观察的数据丢失。问插件要名字，两边永远
+        # 一致；自定义 store 实现没提供这个方法就退回旧算法并记日志。
+        name_for = getattr(vector_store, "collection_name_for", None)
+        if not callable(name_for):
+            logging.getLogger("rag_redo.core.pipeline").info(
+                "全局回收：当前 vector_store 不提供 collection_name_for，"
+                "存活白名单退回旧算法（可能与插件实际命名不一致）"
+            )
+
+            def _segment_collection(library_id: str, segment: str) -> str:
+                digest = hashlib.sha256(
+                    f"{library_id}\0{segment}".encode("utf-8")
+                ).hexdigest()[:40]
+                return f"libg_{digest}"
+
+            def _plain_collection(library_id: str) -> str:
+                return f"lib_{library_id}"
+
+        else:
+
+            def _segment_collection(library_id: str, segment: str) -> str:
+                return str(name_for(library_id, segment))
+
+            def _plain_collection(library_id: str) -> str:
+                return str(name_for(library_id, None))
+
+        for library_id in sorted(live_library_ids):
+            # 无 generation 的集合：官方 Chroma store 在 generation 解析为空
+            # 时用它（`lib_<库id>`，库 id 不合法时是 `libk_<sha>`），必须
+            # 一起保住。
+            keep.add(_plain_collection(library_id))
+            for segment in self._live_generations(library_id):
+                keep.add(_segment_collection(library_id, segment))
+                keep.add(_segment_collection(library_id, f"{segment}-compact"))
+        removed = 0
+        try:
+            names = set(list_names())
+        except Exception as exc:  # noqa: BLE001 - 回收失败绝不影响索引结果
+            logging.getLogger("rag_redo.core.pipeline").info("全局回收：列集合失败（忽略）：%s", exc)
+            return 0
+        for name in sorted(names):
+            if name in keep or not _is_rag_collection_name(name):
+                continue
+            delete_by_name(name)
+            removed += 1
+            logging.getLogger("rag_redo.core.pipeline").info("全局回收：删残留集合 %s", name)
+        return removed
 
 
     def discard_index_generation(self, library_id: str, generation: str) -> None:
@@ -1422,6 +1848,39 @@ class Pipeline:
             })
         return rows
 
+    def index_stats(self, library_id: str) -> dict:
+        """某个库当前生效 generation 的只读统计（GUI 全局快照的权威数据源）。
+
+        返回 `{files, chunks, indexed_at, state}`：
+        - `files` = manifest 里记录的**全部**文件数——含已落终态（empty/tbd/scanned/
+          unreadable…）与失败的文件，因为它们同样是"这一轮见过并处理过的文件"。口径同旧
+          项目 `gui/store.py::meta_stats_for`（数 meta 里全部 dict 条目，失败条目也在
+          meta 里）。想要"成功入库了几个"看 `index_failures(...)["succeeded"]`；
+        - `chunks` = 生效的块 id 数；
+        - `indexed_at` = manifest 文件 mtime（从未索引=None）；
+        - `state` = `none`（没有生效 generation）/ `ok`。
+
+        不加载模型、不碰向量库——全部来自 manifest 文件，所以每秒轮询一次
+        的 GUI 快照不会因为反复调用而把 BGE/reranker 拖进显存。
+        """
+        generation = self._generations.active(library_id)
+        if not generation:
+            return {"files": 0, "chunks": 0, "indexed_at": None, "state": "none"}
+        manifest = self._manifests.read(library_id, generation)
+        if manifest is None:
+            return {"files": 0, "chunks": 0, "indexed_at": None, "state": "none"}
+        indexed_at: float | None
+        try:
+            indexed_at = self._manifests._path_for(library_id, generation).stat().st_mtime
+        except OSError:
+            indexed_at = None
+        return {
+            "files": len(manifest.get("files") or ()),
+            "chunks": len(manifest.get("active_chunk_ids") or ()),
+            "indexed_at": indexed_at,
+            "state": "ok",
+        }
+
     def note_relations(self, library_id: str, path: str) -> dict:
         """双链关系查询（对齐 obsidian-rag 的 `note_relations` 工具）：
         给定笔记标识（库内相对路径，或不含扩展名的标题），返回其出链
@@ -1438,6 +1897,25 @@ class Pipeline:
             raise KeyError(f"未知库: {library_id}")
         return self._note_relations.resolve(library_id, path, self._generations.active(library_id))
 
+    def visual_page_states(self, library_id: str) -> tuple[VisualPageState, ...]:
+        """某库当前 generation 里，全部 `visual_index` 提供者已建的**逐 PDF 页级状态**
+        （只读，不加载模型、不拉起服务）。图谱的页节点和 GUI 的"WEMM 页库状态"表都吃这份
+        数据；没有视觉提供者 / 库没有生效 generation → 空元组。单个提供者读失败只跳过
+        它自己，不让整份诊断失败。"""
+        generation = self._generations.active(library_id)
+        if not generation:
+            return ()
+        states: list[VisualPageState] = []
+        for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
+            try:
+                visual = self._plugin(plugin_id)
+                page_reader = getattr(visual, "graph_page_states", None)
+                generated = page_reader(library_id, generation) if callable(page_reader) else ()
+                states.extend(state for state in generated if isinstance(state, VisualPageState))
+            except Exception:
+                continue
+        return tuple(states)
+
     def graph(self, libraries: str = "all") -> GraphResponse:
         lib_mgr = self._singleton("library_manager")
         entries = lib_mgr.resolve_libraries(libraries or "all")
@@ -1451,16 +1929,7 @@ class Pipeline:
             manifests[library_id] = self._manifest(library_id, generation)
             relation_edges[library_id] = self._note_relations.resolved_edges(library_id, generation)
             included_files[library_id] = tuple(lib_mgr.resolve_included_files(library_id))
-            states: list[VisualPageState] = []
-            for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
-                try:
-                    visual = self._plugin(plugin_id)
-                    page_reader = getattr(visual, "graph_page_states", None)
-                    generated = page_reader(library_id, generation) if generation and callable(page_reader) else ()
-                    states.extend(state for state in generated if isinstance(state, VisualPageState))
-                except Exception:
-                    continue
-            page_states[library_id] = tuple(states)
+            page_states[library_id] = self.visual_page_states(library_id)
         return build_graph(
             library_ids=library_ids,
             manifests=manifests,
@@ -1582,12 +2051,21 @@ class Pipeline:
           `emptied=True`（index.py:1511-1517，2026-08-14 审计 F16：源文件
           没放回去 ≠ 用户删光，同步 = 不可逆清空）；
         - 从未索引过且扫不到任何文件 → 收敛态，不判 stale
-          （index.py:1522-1529），避免每轮无效重建。
+          （index.py:1522-1529），避免每轮无效重建；
+        - 能力签名升级（切块/嵌入/提取/存储插件的 `index_signature()` 变了）
+          → stale（index.py:1518-1519 的 `version_upgrade`，本项目的
+          `META_VERSION` 等价物是 manifest 里的 `signatures` 段）——升级后
+          检索前的自动同步必须自己发现并重建，而不是等用户察觉后手动
+          `--full`；
+        - manifest 期望块数 > 向量库实际块数（块被外部动库/清理/磁盘故障
+          弄丢）→ stale（index.py:1592-1597），让"增量修不了"的缺口走
+          全量重建自愈，而不是卡在「每轮判 stale → 每轮修不了」。
 
         显式触发的索引（GUI 完整重建、reindex_knowledge）没有这层保护，
         与旧项目一致：用户明确要求重建时按字面执行。"""
         lib_mgr = self._singleton("library_manager")
         entries = lib_mgr.resolve_libraries(libraries or "all", exclude)
+        signatures = self._pipeline_signatures()
         report: dict[str, LibraryFreshness] = {}
         for entry in entries:
             library_id = entry.library_id
@@ -1624,6 +2102,12 @@ class Pipeline:
                 report[library_id] = LibraryFreshness(
                     library_id=library_id, stale=True, emptied=True
                 )
+                continue
+            # 签名升级自愈（LEGACY index.py:1518-1519 先于逐文件比较返回）——
+            # 旧索引是旧逻辑产的，逐文件 stat 全命中也会被判"没变化"，所以
+            # 这条必须在文件比较之前短路。
+            if index_integrity.rebuild_reason(manifest, signatures=signatures):
+                report[library_id] = LibraryFreshness(library_id=library_id, stale=True)
                 continue
             included = {
                 path: included
@@ -1665,6 +2149,23 @@ class Pipeline:
                     ):
                         stale = True
                         break
+            if not stale:
+                # 一致性自愈（LEGACY index.py:1592-1597 放在逐文件比较**之后**
+                # 或进 stale，而不是提前返回——它是对"已经算出来没变化"这个
+                # 结论的额外否决项）。探测失败（count 抛异常）→ 判不出漂移 →
+                # fail-open 放行，同 LEGACY `_chroma_count` 返回 None 的处理。
+                vector_store = self._singleton("vector_store")
+                segments = self._manifest_segments(manifest, "vector_segments", generation)
+                actual = index_integrity.count_store_chunks(
+                    lambda segment: vector_store.count(library_id, generation=segment),
+                    segments,
+                )
+                stale = (
+                    index_integrity.consistency_drift(
+                        index_integrity.expected_chunk_count(manifest), actual
+                    )
+                    is not None
+                )
             report[library_id] = LibraryFreshness(library_id=library_id, stale=stale)
         return report
 
@@ -1697,6 +2198,34 @@ class Pipeline:
         include_body: bool = True,
         format_allowlist: tuple[str, ...] | Mapping[str, tuple[str, ...]] | None = None,
     ) -> list[SearchResult]:
+        return list(self.search_delivery(
+            libraries,
+            query,
+            top_k=top_k,
+            exclude=exclude,
+            folder=folder,
+            include_body=include_body,
+            format_allowlist=format_allowlist,
+        ).results)
+
+    def search_delivery(
+        self,
+        libraries: str,
+        query: str,
+        *,
+        top_k: int = 10,
+        exclude: str = "",
+        folder: str = "",
+        include_body: bool = True,
+        format_allowlist: tuple[str, ...] | Mapping[str, tuple[str, ...]] | None = None,
+    ) -> SearchDelivery:
+        """"交出结果的这一批是怎么交出来的"——结果 + 封顶/折叠/候选计数。
+
+        `search()` 是它的薄封装（只要结果本体）。两者分开而不是给 `search()`
+        加个 `return_delivery=False` 开关：调用方要么要列表要么要交付态，
+        布尔开关会让两个返回类型在签名里不可见，读代码的人得翻实现才知道
+        这次拿到的到底是啥。
+        """
         first = self._search_once(
             libraries,
             query,
@@ -1706,7 +2235,7 @@ class Pipeline:
             include_body=include_body,
             format_allowlist=format_allowlist,
         )
-        top_confidence = first[0].confidence if first else None
+        top_confidence = first.results[0].confidence if first.results else None
         for plugin_id in sorted(self.runtime.registry.providers_of("query_enhancer")):
             try:
                 enhancer = self._plugin(plugin_id)
@@ -1726,8 +2255,10 @@ class Pipeline:
                 )
             except Exception:
                 continue
-            first_confidence = first[0].confidence if first else -1.0
-            second_confidence = second[0].confidence if second else -1.0
+            first_confidence = first.results[0].confidence if first.results else -1.0
+            second_confidence = second.results[0].confidence if second.results else -1.0
+            # 连带交付态一起选：HyDE 换了查询语句，候选集/封顶/折叠计数都是
+            # 那一支的，不能拿 first 的计数去描述 second 的结果。
             return second if second_confidence > first_confidence else first
         return first
 
@@ -1742,7 +2273,7 @@ class Pipeline:
         include_body: bool = True,
         format_allowlist: tuple[str, ...] | Mapping[str, tuple[str, ...]] | None = None,
     ) -> SearchResponse:
-        results = self.search(
+        delivery = self.search_delivery(
             libraries,
             query,
             top_k=top_k,
@@ -1752,7 +2283,7 @@ class Pipeline:
             format_allowlist=format_allowlist,
         )
         request = SearchAdviceInput(
-            results=tuple(results),
+            results=delivery.results,
             query=query,
             mode="body" if include_body else "list",
             top_k=top_k,
@@ -1767,6 +2298,9 @@ class Pipeline:
                 )
             ),
             strong_threshold=CONF_TIER_STRONG,
+            capped=delivery.capped,
+            folded=delivery.folded,
+            empty_reason=delivery.empty_reason(),
         )
         advice: list[str] = []
         for plugin_id in sorted(self.runtime.registry.providers_of("result_advisor")):
@@ -1784,19 +2318,19 @@ class Pipeline:
                     break
             if len(advice) >= 2:
                 break
-        return SearchResponse(results=tuple(results), advice=tuple(advice))
+        return SearchResponse(results=delivery.results, advice=tuple(advice))
 
     def _search_once(
         self,
         libraries: str,
         query: str,
         *,
-        top_k: int = 10,
-        exclude: str = "",
-        folder: str = "",
-        include_body: bool = True,
-        format_allowlist: tuple[str, ...] | Mapping[str, tuple[str, ...]] | None = None,
-    ) -> list[SearchResult]:
+        top_k: int,
+        exclude: str,
+        folder: str,
+        include_body: bool,
+        format_allowlist: tuple[str, ...] | Mapping[str, tuple[str, ...]] | None,
+    ) -> SearchDelivery:
         """混合检索：词法 BM25 + 向量 + 每库 RRF 融合 → 跨库候选池 → 全局
         重排 → 装配 SearchResult。
 
@@ -1912,7 +2446,7 @@ class Pipeline:
             per_library_fused.append(fused)
             pool_ids.extend(chunk_id for chunk_id, _ in fused[:rerank_candidates])
         if not pool_ids:
-            return []
+            return SearchDelivery(results=())
 
         # chunk_id 全局唯一且自带 library_id（见 _chunk_library），按库分组
         # 批量取记录——vector_store.get_by_ids 是单库作用域的 API，不能跨库
@@ -1962,7 +2496,7 @@ class Pipeline:
                 )
             rerank_input.append((chunk_id, prefixed))
         if not rerank_input:
-            return []
+            return SearchDelivery(results=(), candidates=len(pool_ids))
 
         # 排序与置信度对齐旧 retriever.py:662-757：重排生效 → 全局精排序 +
         # 重排器概率直接作置信度（只钳位不二次激活，问题54）；重排关闭/
@@ -1999,7 +2533,7 @@ class Pipeline:
             chunk_id: score for fused in per_library_fused for chunk_id, score in fused
         }
         if not merged:
-            return []
+            return SearchDelivery(results=(), candidates=0)
 
         drop_threshold = self.runtime.settings.get("confidence_drop_threshold", DEFAULT_CONFIDENCE_DROP_THRESHOLD)
         max_chunks_per_file = self.runtime.settings.get("max_chunks_per_file", DEFAULT_MAX_CHUNKS_PER_FILE)
@@ -2015,6 +2549,12 @@ class Pipeline:
         results: list[SearchResult] = []
         per_file_count: dict[tuple[str, str], int] = {}
         emitted_sections: set[tuple[str, str, str]] = set()
+        # 封顶/折叠计数（对齐 obsidian-rag/retriever.py 传给 advice 的
+        # `capped` / `folded`）。这两个信号以前在 `_search_once` 里算出来
+        # 却无处可去，交付层直接返回结果本体，把"这一批被封顶/折叠过"这个
+        # 用户可观察的事实连同计数一起丢掉了。
+        capped = False
+        folded = 0
         for chunk_id in delivery_ids:
             if len(results) >= top_k:
                 break
@@ -2050,8 +2590,10 @@ class Pipeline:
                     backfilled = True
             section_key = (library_id, path, section_id)
             if backfilled and section_key in emitted_sections:
+                folded += 1
                 continue
             if include_body and per_file_count.get(file_key, 0) >= max_chunks_per_file:
+                capped = True
                 continue
             if include_body:
                 per_file_count[file_key] = per_file_count.get(file_key, 0) + 1
@@ -2081,7 +2623,12 @@ class Pipeline:
                     truncated=truncated,
                 )
             )
-        return results
+        return SearchDelivery(
+            results=tuple(results),
+            capped=capped,
+            folded=folded,
+            candidates=len(merged),
+        )
 
     # ---- 页级视觉导航（独立于 search() 的"第二检索系统"）-------------------
 
@@ -2195,27 +2742,120 @@ class Pipeline:
         self,
         library_id: str,
         *,
-        threshold: float = 0.7,
+        threshold: float = 0.8,
         format_allowlist: tuple[str, ...] | None = None,
     ) -> dict[str, list[list[str]]]:
         """近似重复检测（只读建议，绝不自动删/移动文件）——对齐
-        obsidian-rag 的 `find_duplicates` MCP 工具（2026-09-23 全面功能
-        审计发现的缺口）：找出库内"内容几乎相同"的重复文档（同一课件多份
-        拷贝、文档转出的多个副本），比较的是"上一次成功索引时的提取正文"
-        （`core/extract_cache.py`），不产生新向量、不改索引、不触发重新
-        提取。
+        obsidian-rag 的 `find_duplicates`（server.py:828-850 / dedup.py:119）。
 
-        `dedup` 是多值扩展点（同 `visual_index`）——遍历全部已启用的
-        提供者，各自独立现算一遍，按 plugin_id 汇总返回，不做跨提供者
-        合并（不同去重算法给出的分组语义上互相独立，同 `navigate()`
-        "不同视觉模型不混叠"的原则）。没有被成功索引过的文件不参与比较
-        （同 obsidian-rag"未提取的文件跳过"的做法）。
+        返回形状是 `{dedup 插件 id: [[相对路径, ...], ...]}`：**单库**视角。
+        多库并查走 `find_duplicates_multi`（旧项目的 `find_duplicates` 本来
+        就支持逗号分隔多库与 "all"，MCP 工具直接调那个）。
+
+        阈值默认 **0.8**，对齐旧项目 `dedup.py:34 DEFAULT_THRESHOLD`。原来这里
+        是 0.7，而 MCP 工具的默认值是 0.8——同一件事两个默认值，走 GUI 和走
+        对话给出的重复组会不一样，排查时根本看不出是阈值差。
         """
+        report = self.find_duplicates_multi(
+            [library_id], threshold=threshold, format_allowlist=format_allowlist
+        )
+        return report[library_id]["groups"]
+
+    def find_duplicates_multi(
+        self,
+        library_ids: Sequence[str],
+        *,
+        threshold: float = 0.8,
+        format_allowlist: tuple[str, ...] | Mapping[str, tuple[str, ...]] | None = None,
+    ) -> dict[str, dict[str, object]]:
+        """多库近似重复检测——对齐 obsidian-rag/server.py:842-853（逗号分隔或
+        "all" 逐库各跑一遍、逐库出一段报告）。
+
+        返回 `{库 id: {"groups": {插件 id: [[路径,...]]}, "scanned": N,
+        "skipped": N}}`。`skipped` 是"跳过了多少个拿不到正文的文件"——旧项目
+        明确会报这个数（server.py:833「未提取的文件会跳过并计数」），少了它，
+        一份"零重复组"的报告就分不清是真的没有重复，还是因为全部文件都没提取
+        正文而压根没比较过。
+
+        **`format_allowlist` 的两种形态**（与 `search`/`library_freshness` 同一约定）：
+        单个后缀元组 = 每个库都用同一份；**映射 `{库 id: 后缀元组}`** = 每个库用自己的
+        Agent 授权格式。多库调用必须传映射——各库授权的二进制格式各不相同，拿第一个库的
+        授权去套全部库、或干脆不过滤，都会把某个库**未授权**格式的文件名和重复关系泄露
+        给 Agent（BC-02）。映射里缺失的库 fail-closed：视为一个格式都没授权。
+        """
+        results: dict[str, dict[str, object]] = {}
+        for library_id in library_ids:
+            groups, scanned, skipped = self._find_duplicates_one(
+                library_id,
+                threshold=threshold,
+                format_allowlist=self._allowlist_for(library_id, format_allowlist),
+            )
+            results[library_id] = {"groups": groups, "scanned": scanned, "skipped": skipped}
+        return results
+
+    @staticmethod
+    def _allowlist_for(
+        library_id: str,
+        spec: tuple[str, ...] | Mapping[str, tuple[str, ...]] | None,
+    ) -> tuple[str, ...] | None:
+        """把"单个元组 / 每库映射 / 不过滤"三种传法解析成某一个库该用的后缀元组。"""
+        if isinstance(spec, Mapping):
+            return tuple(spec.get(library_id, ()))
+        return spec
+
+    def find_duplicate_links(
+        self,
+        library_id: str,
+        *,
+        threshold: float = 0.8,
+        format_allowlist: tuple[str, ...] | None = None,
+    ) -> dict[str, object]:
+        """单库近似重复的**成对**结果——GUI 近似去重面板要"有多像"，分组给不出这个数。
+
+        返回 `{"links": [(路径a, 路径b, 相似度), ...], "scanned": N, "skipped": N}`，
+        `scanned`/`skipped` 口径同 `find_duplicates_multi`。读正文、过滤授权格式的规则
+        与分组版**共用同一个 `_dedup_texts`**，不各写一遍。"""
+        texts, skipped = self._dedup_texts(library_id, format_allowlist)
+        links: dict[tuple[str, str], float] = {}
+        for plugin_id in sorted(self.runtime.registry.providers_of("dedup")):
+            reader = getattr(self._plugin(plugin_id), "find_duplicate_links_in_texts", None)
+            if reader is None:
+                continue
+            for a, b, sim in reader(texts, threshold=threshold):
+                links[(a, b)] = max(sim, links.get((a, b), 0.0))
+        ordered = sorted(
+            ((a, b, sim) for (a, b), sim in links.items()),
+            key=lambda item: (-item[2], item[0], item[1]),
+        )
+        return {"links": ordered, "scanned": len(texts), "skipped": skipped}
+
+    def _find_duplicates_one(
+        self,
+        library_id: str,
+        *,
+        threshold: float,
+        format_allowlist: tuple[str, ...] | None,
+    ) -> tuple[dict[str, list[list[str]]], int, int]:
+        texts, skipped = self._dedup_texts(library_id, format_allowlist)
+        groups: dict[str, list[list[str]]] = {}
+        for plugin_id in sorted(self.runtime.registry.providers_of("dedup")):
+            dedup_plugin = self._plugin(plugin_id)
+            groups[plugin_id] = dedup_plugin.find_duplicates_in_texts(
+                texts, threshold=threshold
+            )
+        return groups, len(texts), skipped
+
+    def _dedup_texts(
+        self,
+        library_id: str,
+        format_allowlist: tuple[str, ...] | None,
+    ) -> tuple[dict[str, str], int]:
+        """去重要比对的正文集合：`(路径 → 正文, 拿不到正文而跳过的文件数)`。"""
         lib_mgr = self._singleton("library_manager")
         if lib_mgr.store.get(library_id) is None:
             raise KeyError(f"未知库: {library_id}")
 
-        texts: dict[str, str] = {}
+        cfg = lib_mgr.store.get(library_id)
         generation = self._generations.active(library_id)
         manifest = self._manifest(library_id, generation)
         states = self._manifest_files(manifest)
@@ -2232,16 +2872,32 @@ class Pipeline:
                 for path in paths
                 if ("." + path.rsplit(".", 1)[-1].lower()) in allowed
             }
-        for path in paths:
-            text = self._read_extract_cache(library_id, path, segments)
-            if text is not None:
-                texts[path] = text
+        texts: dict[str, str] = {}
+        skipped = 0
+        for path in sorted(paths):
+            # `.md`/`.txt`/`.markdown` 现读磁盘，对齐旧 dedup.py:106-117 的
+            # `_read_text`：这些格式的正文就是文件本身，没有"提取"这回事，
+            # 去读提取缓存等于把"用户刚改完但还没重新索引"的笔记按旧内容比较。
+            # 读不到（文件已删/权限）再退回提取缓存，仍然没有才跳过。
+            text = self._read_plain_text(Path(cfg.root_path) / path)
+            if text is None:
+                text = self._read_extract_cache(library_id, path, segments)
+            if text is None:
+                skipped += 1
+                continue
+            texts[path] = text
+        return texts, skipped
 
-        result: dict[str, list[list[str]]] = {}
-        for plugin_id in sorted(self.runtime.registry.providers_of("dedup")):
-            dedup_plugin = self._plugin(plugin_id)
-            result[plugin_id] = dedup_plugin.find_duplicates_in_texts(texts, threshold=threshold)
-        return result
+    @staticmethod
+    def _read_plain_text(path: Path) -> str | None:
+        """纯文本正文直读；不是 md/txt 或读不到返回 None（绝不抛异常——
+        与 extractor 契约同一条纪律：单文件失败不该让整次去重失败）。"""
+        if path.suffix.lower() not in {".md", ".txt", ".markdown"}:
+            return None
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
 
     # ---- 库摘要（library_summary/llm_provider 扩展点，Phase 3）-----------
     #
@@ -2469,6 +3125,141 @@ class Pipeline:
             visual=visual_states or None,
         )
 
+    # ---- 导入的 AI 写入门禁 ----------------------------------------------
+    #
+    # import_library 是"影响范围最大"的写入之一：它会**注册一个新库**，并在
+    # root_path 指向的目录上落一整套索引。而 root_path 是调用方自己给的任意
+    # 本机绝对路径。同一个编排层里 apply_selection_changes /
+    # apply_library_summary 都走 core/write_gate.py 的两段式确认，唯独这条
+    # 入口完全裸奔——agent 不经用户任何确认就能往任意目录注册一个库。按
+    # AGENTS.md 架构红线 6 收口。
+    #
+    # 人类路径（GUI 里点、CLI 里敲）仍然无条件走 import_library()：门禁保护
+    # 的是"AI 触发的、影响范围较大或不可逆的写入"，不是全部写入路径
+    # （core/write_gate.py 模块 docstring 原话）。
+
+    def inspect_import(
+        self,
+        archive_bytes: bytes,
+        *,
+        root_path: str,
+        library_id: str | None = None,
+    ) -> dict:
+        """只读预检：解包 → 全量校验 → 算出导入计划，**一个字节都不写**。
+
+        存在的意义是让两段式门禁的"提案"阶段有东西可讲：用户必须能在给确认
+        码之前看清"会往哪写、注册一个什么库、恢复多少块、包里有哪些坑"。
+        校验失败在这里就抛出，绝不带着一个坏包去做提案。
+        """
+        lib_mgr = self._singleton("library_manager")
+        archive_codec = self._singleton("archive_codec")
+        payload = archive_codec.unpack(archive_bytes)
+        target_id = library_id or payload["manifest"]["library_id"]
+        plan = archive_codec.import_plan(payload, target_id, root_path=root_path)
+        manifest = payload["manifest"]
+        # 归档里带了 Agent 二进制授权时不恢复（见 import_library 内的
+        # 注释），但必须让提案把这事说出来，否则等于静默吞掉一份授权。
+        agent_formats = [str(x) for x in (manifest.get("agent_formats") or [])]
+        return {
+            "target_id": target_id,
+            "library_name": plan.library_name,
+            "root_path": str(Path(root_path).expanduser().resolve()),
+            "chunk_count": len(plan.active_chunk_ids),
+            "file_count": len(plan.source_files),
+            "source_files_included": bool(plan.source_files_included),
+            "missing_source_files": list(plan.missing_source_files),
+            "agent_formats_in_archive": agent_formats,
+            "notices": list(plan.notices),
+            "target_exists": lib_mgr.store.get(target_id) is not None,
+        }
+
+    def propose_import_library(
+        self,
+        archive_bytes: bytes,
+        *,
+        root_path: str,
+        library_id: str | None = None,
+    ) -> dict:
+        """第一段：只生成待确认提案，**零副作用**（不注册库、不写任何数据）。
+
+        返回 applied=False + 提案号 + 6 位确认码 + 给人看的后果描述；把
+        proposal_id 与 confirmation_code 一起交回 apply_import_library 才会
+        真正写入。硬编码门禁，无任何配置可绕过。
+        """
+        summary = self.inspect_import(
+            archive_bytes, root_path=root_path, library_id=library_id
+        )
+        # 顺手清掉过期未确认的提案（write_gate 不自带后台定时器，由核心在
+        # propose 之前主动 sweep，见 core/write_gate.py::sweep_expired）。
+        self.runtime.write_gate.sweep_expired()
+        ticket = self.runtime.write_gate.propose(
+            f"导入库「{summary['library_name']}」→ {summary['root_path']}",
+            {
+                "archive_bytes": archive_bytes,
+                "root_path": root_path,
+                "library_id": library_id,
+            },
+        )
+        return {
+            "applied": False,
+            "proposal_id": ticket.proposal_id,
+            "confirmation_code": ticket.confirmation_code,
+            "expires_at": ticket.expires_at,
+            "summary": summary,
+            "message": self._import_proposal_message(summary),
+        }
+
+    def apply_import_library(self, proposal_id: str, confirmation_code: str) -> dict:
+        """第二段：校验提案号 + 确认码，通过才真正执行导入。"""
+        from .write_gate import WriteGateError  # 局部导入：只在出错路径需要
+
+        try:
+            pending = self.runtime.write_gate.confirm(proposal_id, confirmation_code)
+        except WriteGateError as exc:
+            raise PipelineError(f"导入提案未通过门禁：{exc}") from exc
+        new_id = self.import_library(
+            pending["archive_bytes"],
+            root_path=pending["root_path"],
+            library_id=pending.get("library_id"),
+        )
+        return {"applied": True, "library_id": new_id}
+
+    @staticmethod
+    def _import_proposal_message(summary: dict) -> str:
+        """把预检结果拼成一句人话——用户要靠它判断要不要给确认码，所以
+        "会往哪写""注册什么""恢复多少"必须都在，不能只给个确认码让人盲签。"""
+        lines = [
+            f"将把归档恢复成一个新库：「{summary['library_name']}」(id={summary['target_id']})，"
+            f"根目录 {summary['root_path']}，共 {summary['chunk_count']} 个向量块 / "
+            f"{summary['file_count']} 个文件条目，不重新跑嵌入。",
+        ]
+        if summary["target_exists"]:
+            lines.append(
+                f"⚠ 目标 id「{summary['target_id']}」已存在，导入会**直接拒绝**、不会覆盖——"
+                f"如需覆盖请先删除旧库，或换一个 library_id。"
+            )
+        if not summary["source_files_included"]:
+            lines.append(
+                "包内不含笔记正文，恢复出的目录是空壳：需要你把笔记文件自己放到那个目录，"
+                "否则搜索不到内容（不会自动把文件拉进来）。"
+            )
+        if summary["missing_source_files"]:
+            lines.append(
+                "以下源文件在目标目录缺失："
+                + "、".join(summary["missing_source_files"][:5])
+                + ("…" if len(summary["missing_source_files"]) > 5 else "")
+            )
+        if summary["agent_formats_in_archive"]:
+            lines.append(
+                "⚠ 包里带着 Agent 二进制格式授权 "
+                + "、".join(summary["agent_formats_in_archive"])
+                + "，但**不会随导入恢复**——归档无签名，无法证明这份授权是你批准的。"
+                "导入完成后需要你到 GUI 里手动勾选授权，否则 agent 索引不了这些二进制文件。"
+            )
+        for notice in summary["notices"]:
+            lines.append(f"· {notice}")
+        return "\n".join(lines)
+
     def import_library(self, archive_bytes: bytes, *, root_path: str, library_id: str | None = None) -> str:
         """把 export_library 产出的归档恢复成一个新库，返回恢复出的
         library_id。
@@ -2483,6 +3274,12 @@ class Pipeline:
         的两步操作，不是这个方法悄悄替用户做的决定（同 AGENTS.md"宁可
         诚实空缺，不产出拼接半成品"原则：部分覆盖导致的新旧数据混杂比
         直接拒绝更难排查）。
+
+        **调用方须知**：这是无条件执行的底层入口，AI 触发的调用必须先走
+        propose_import_library()/apply_import_library() 的两段式确认（红线
+        6），不要从 MCP/GUI 的 AI 路径直接调这里。另外本方法**不恢复归档里
+        的 agent_formats**（原因见函数体内注释），需要 agent 索引二进制格式
+        时由用户在 GUI 里手动授权。
         """
         lib_mgr = self._singleton("library_manager")
         lexical = self._singleton("lexical_index")
@@ -2496,7 +3293,16 @@ class Pipeline:
         if lib_mgr.store.get(target_id) is not None:
             raise ValueError(f"库 {target_id!r} 已存在，导入会拒绝覆盖——请先删除旧库，或换一个 library_id")
 
-        lib_mgr.store.add_library(target_id, manifest["name"], root_path)
+        # 目标目录可能还不存在（"恢复到一个新位置"是导入的正常用法），对齐
+        # obsidian-rag/import.py:246-249：先 mkdir 再注册，且注册时不要求
+        # 目录已存在（require_existing_dir=False）。注意归档里**不含笔记正文**，
+        # 建出来的目录是空壳——自动同步会判定"文件全删"从而不予自愈，
+        # 必须靠 archive 里的源文件清单给出提示（见 official-import-export）。
+        target_root = Path(root_path)
+        target_root.mkdir(parents=True, exist_ok=True)
+        lib_mgr.store.add_library(
+            target_id, manifest["name"], str(target_root), require_existing_dir=False
+        )
         lib_mgr.store.set_selection(
             target_id,
             selection_in=manifest.get("selection_in", []),
@@ -2510,7 +3316,23 @@ class Pipeline:
             exclude_files=list(manifest.get("exclude_files", [])),
             exclude_patterns=list(manifest.get("exclude_patterns", [])),
         )
-        lib_mgr.store.set_agent_formats(target_id, list(manifest.get("agent_formats", [])))
+        # **故意不恢复 agent_formats**（AGENTS.md 架构红线 6）。归档是
+        # base64 传进来的无签名数据包，`archive.verify()` 校验的是结构/校验
+        # 和/条目完整性，不证明"这份授权清单是用户批准的"。原来的写法等于
+        # 把"归档内容 == 用户已批准"当成前提，于是：agent 自己造一个
+        # `agent_formats:[".pdf",".docx"]` 的包 → import_library → 再
+        # reindex_knowledge，就完成了"自我授权二进制格式 + 驱动全量索引"，
+        # 全程不需要用户点一次确认。授权只能由用户自己在 GUI 里勾。
+        # 归档里带了授权时在这里明说，让调用方（CLI/GUI/MCP）能提示用户
+        # "需手动授权"，而不是静默丢弃。
+        dropped_agent_formats = [str(x) for x in (manifest.get("agent_formats") or [])]
+        if dropped_agent_formats:
+            logging.getLogger("rag_redo.core.pipeline").warning(
+                "导入库 %s：归档里的 Agent 二进制格式授权 %s 未随导入恢复——"
+                "归档无签名，无法证明是用户批准的，需要用户在 GUI 里手动授权",
+                target_id,
+                "、".join(dropped_agent_formats),
+            )
 
         generation = uuid.uuid4().hex
         source_manifest = payload.get("index_manifest") or {}

@@ -155,6 +155,20 @@ class SearchAdviceInput:
     default_libraries: tuple[str, ...]
     warn_threshold: float
     strong_threshold: float
+    #: 本次交付是否触发了"同一文件最多 N 块"的封顶。对齐 obsidian-rag
+    #: retriever.py:494-497 的尾注"（同一文件最多展示 N 块…完整内容请打开
+    #: 源文件）"——没有这个信号，agent 看到"同一篇笔记占了 3 条"时会以为
+    #: 库里只有 3 个相关内容，不知道后面还有被封顶掉的。
+    capped: bool = False
+    #: 本次交付有多少块因"同一小节已交付过"被折叠掉。对齐 retriever.py:489
+    #: 传给 advice 的 `folded` 计数；LEGACY 的 advice.py:158 用它触发
+    #: "正文已按小节回填"的提示（`folded > 0 or any(backfilled)`）。
+    folded: int = 0
+    #: 结果为空时的原因，决定建议给哪一套文案。None = 非空结果。对齐
+    #: retriever.py:479-483 的两分支：检索到了东西但全被置信度下限过滤
+    #: 掉（"all-below-drop-threshold"）与压根没检索到任何候选（"no-score"）
+    #: 对用户的下一步动作完全不同，不能都报"未找到"。
+    empty_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -303,3 +317,27 @@ class DocumentContent:
     text: str
     source: str  # "源文件直读"（.md/.txt 现读）| "提取缓存"（pdf/docx 等，来自上一次索引的提取结果）
     abs_path: str = ""  # 源文件绝对路径——看图模型/用户要直读原 PDF 时用（旧项目抬头含绝对路径）
+
+
+@dataclass(frozen=True)
+class PreviewExtraction:
+    """`Pipeline.preview_extract` 的返回形状——提取试验台（GUI 诊断视图
+    "提取试验台"页签）对单个本地文件跑一次提取的结果。
+
+    这是**只读诊断**产物：不写提取缓存、不落 generation、不进任何索引数据，
+    也不要求该文件属于某个已注册库（`path` 是任意本地路径）。与
+    `ExtractedDocument` 的区别就是"没有库上下文、没有缓存副作用"。
+
+    `reason` 复用索引链路的终态词汇（`""`=有产出；非空 ∈
+    unreadable/empty/scanned/extract-failed/deferred/无 provider），
+    让 GUI 能用同一套文案解释"为什么这个文件没产出"。
+    """
+
+    path: str
+    ok: bool
+    markdown: str | None
+    reason: str
+    route: str  # 实际命中的 provider（"extractor:<plugin_id>"）或 "-"
+    backend: str  # 请求的后端覆盖（""=跟随全局设置）
+    elapsed: float
+    chars: int

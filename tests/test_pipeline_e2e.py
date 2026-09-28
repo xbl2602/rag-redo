@@ -28,7 +28,7 @@ for plugin_dir in (REPO_ROOT / "plugins").glob("*"):
 
 from core.contracts import ExtractedDocument, SearchResult
 from core.index_progress import IndexStartResult
-from core.pipeline import Pipeline, confidence_tier  # noqa: E402
+from core.pipeline import Pipeline, PipelineError, SearchDelivery, confidence_tier  # noqa: E402
 from core.runtime import PluginRuntime, PluginState  # noqa: E402
 
 OFFICIAL_PHASE1_PLUGINS = [
@@ -84,6 +84,16 @@ class _FailingHydeClient:
 
 
 class _PathRankedReranker:
+    """整个替换 reranker 插件的 `engine`，所以要带上插件收口路径会调的两个入口（空操作）：
+    缺 `release_gpu_slot` 时，每次禁用插件都会记一条带回溯的"归还GPU名额失败"警告
+    （2026-09-28 审计 A20）。"""
+
+    def idle_check(self) -> None:
+        return None
+
+    def release_gpu_slot(self) -> None:
+        return None
+
     def rerank(self, query, chunk_id_text_pairs, top_k=10):
         long_chunks = [pair for pair in chunk_id_text_pairs if ":long.md:" in pair[0]]
         other_chunks = [pair for pair in chunk_id_text_pairs if ":long.md:" not in pair[0]]
@@ -594,18 +604,84 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
 
     def test_search_advice_uses_separate_response_channel(self):
         result = SearchResult("c1", "test-lib", "low.md", "低", "正文", 0.1)
-        with patch.object(self.pipeline, "_search_once", return_value=[result]):
+        with patch.object(self.pipeline, "_search_once", return_value=SearchDelivery(tuple([result]))):
             response = self.pipeline.search_with_advice("test-lib", "低")
         self.assertIsInstance(response.results, tuple)
         self.assertTrue(response.advice)
         self.assertLessEqual(len(response.advice), 2)
         self.assertEqual(response.results[0].advice, ())
 
+    def _make_long_file_library(self) -> str:
+        """建一个只有一篇长笔记的库——封顶/折叠信号要靠"同一文件多块"才
+        触发，现有 fixture 的两个短笔记切不出那么多块。"""
+        vault = self.tmp / "long-vault"
+        vault.mkdir(exist_ok=True)
+        body = "\n\n".join(f"## 第{i}节\n\n这是第{i}节的独有内容 marker{i}。" for i in range(6))
+        (vault / "长笔记.md").write_text(f"# 长笔记\n\n{body}\n", encoding="utf-8")
+        self.lib_mgr.store.add_library("long-lib", "长库", str(vault))
+        self.pipeline.index_library("long-lib")
+        return "long-lib"
+
+    def test_delivery_reports_capped_and_folded(self):
+        """封顶/折叠信号以前在 `_search_once` 里算出来却随结果本体一起丢掉，
+        建议层与渲染层完全看不到——用户看到同一篇笔记占满 N 条却不知道后面
+        还有被封顶的内容。"""
+        library_id = self._make_long_file_library()
+        self.runtime.settings.set("max_chunks_per_file", 2)
+        delivery = self.pipeline.search_delivery(library_id, "第3节", top_k=5)
+        self.assertTrue(delivery.results)
+        counts: dict[str, int] = {}
+        for result in delivery.results:
+            counts[result.path] = counts.get(result.path, 0) + 1
+        self.assertTrue(
+            all(count <= 2 for count in counts.values()), counts
+        )
+        self.assertTrue(delivery.capped, "同一文件封顶被触发时 capped 必须为 True")
+        self.assertGreater(delivery.candidates, len(delivery.results))
+        # 空结果原因在非空时必须是 None
+        self.assertIsNone(delivery.empty_reason())
+
+    def test_capped_advice_reaches_search_response(self):
+        library_id = self._make_long_file_library()
+        self.runtime.settings.set("max_chunks_per_file", 1)
+        response = self.pipeline.search_with_advice(library_id, "第2节", top_k=5)
+        self.assertTrue(response.results)
+        self.assertTrue(
+            any("最多展示" in line for line in response.advice), response.advice
+        )
+
+    def test_empty_reason_distinguishes_threshold_filtered_from_no_candidate(self):
+        """两种空结果必须可区分（对齐 obsidian-rag/retriever.py:479-483）：
+        "有候选但全被置信度下限滤掉"和"压根没候选"给调用方的下一步动作不同。"""
+        self.pipeline.index_library("test-lib")
+        # 1) 有候选但全被过滤：把下限抬到 1.0 以上
+        self.runtime.settings.set("confidence_drop_threshold", 1.01)
+        filtered = self.pipeline.search_delivery("test-lib", "插件 架构", top_k=5)
+        self.assertEqual(filtered.results, ())
+        self.assertEqual(filtered.empty_reason(), "all-below-drop-threshold")
+        advice = self.pipeline.search_with_advice("test-lib", "插件 架构", top_k=5).advice
+        self.assertTrue(any("低于置信度下限" in line for line in advice), advice)
+        self.runtime.settings.set("confidence_drop_threshold", 0.0)
+
+        # 2) 压根没有候选。用一个不存在的 folder 把候选集清空——不能靠"查个
+        #    库里没有的词"：假编码器的稠密检索对任何查询都会返回全部块（向量
+        #    侧恒有候选），那种情况下 merged 非空，只会走到分支 1。
+        empty = self.pipeline.search_delivery(
+            "test-lib", "插件 架构", top_k=5, folder="不存在的目录/zzz"
+        )
+        self.assertEqual(empty.results, ())
+        self.assertEqual(empty.candidates, 0)
+        self.assertEqual(empty.empty_reason(), "no-score")
+        advice = self.pipeline.search_with_advice(
+            "test-lib", "插件 架构", top_k=5, folder="不存在的目录/zzz"
+        ).advice
+        self.assertTrue(any("未找到相关内容" in line for line in advice), advice)
+
     def test_hyde_disabled_uses_one_search(self):
         first = [SearchResult("c1", "test-lib", "first.md", "first", "first", 0.2)]
         enhancer = self.runtime.plugins["official-query-enhancer-hyde"].instance
         enhancer._client = _FakeHydeClient()
-        with patch.object(self.pipeline, "_search_once", return_value=first) as search_mock:
+        with patch.object(self.pipeline, "_search_once", return_value=SearchDelivery(tuple(first))) as search_mock:
             results = self.pipeline.search("test-lib", "能力")
         self.assertEqual(results, first)
         self.assertEqual(search_mock.call_count, 1)
@@ -618,7 +694,7 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         enhancer._client = _FakeHydeClient("假设文档正文")
         first = [SearchResult("c1", "test-lib", "first.md", "first", "first", 0.2)]
         second = [SearchResult("c2", "test-lib", "second.md", "second", "second", 0.8)]
-        with patch.object(self.pipeline, "_search_once", side_effect=[first, second]) as search_mock:
+        with patch.object(self.pipeline, "_search_once", side_effect=[SearchDelivery(tuple(first)), SearchDelivery(tuple(second))]) as search_mock:
             results = self.pipeline.search("test-lib", "能力")
         self.assertEqual(results, second)
         self.assertEqual(search_mock.call_count, 2)
@@ -631,13 +707,13 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         first = [SearchResult("c1", "test-lib", "first.md", "first", "first", 0.4)]
         enhancer._client = _FailingHydeClient()
         with self.assertLogs(level="WARNING"):
-            with patch.object(self.pipeline, "_search_once", return_value=first) as search_mock:
+            with patch.object(self.pipeline, "_search_once", return_value=SearchDelivery(tuple(first))) as search_mock:
                 self.assertEqual(self.pipeline.search("test-lib", "能力"), first)
         self.assertEqual(search_mock.call_count, 1)
 
         enhancer._client = _FakeHydeClient("更差的查询")
         worse = [SearchResult("c2", "test-lib", "worse.md", "worse", "worse", 0.3)]
-        with patch.object(self.pipeline, "_search_once", side_effect=[first, worse]) as search_mock:
+        with patch.object(self.pipeline, "_search_once", side_effect=[SearchDelivery(tuple(first)), SearchDelivery(tuple(worse))]) as search_mock:
             self.assertEqual(self.pipeline.search("test-lib", "能力"), first)
         self.assertEqual(search_mock.call_count, 2)
 
@@ -1125,6 +1201,26 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
             {"empty.md": "empty"},
         )
 
+    def test_index_stats_files_counts_every_file_seen_including_terminal_ones(self):
+        """GUI 库卡片/KPI 的"文件数"口径（同旧项目 `gui/store.py::meta_stats_for`：数 meta 里
+        全部条目，落了终态的空文件也在）：1 个 empty + 2 个成功 → `files == 3`；"成功入库几个"
+        另由 `index_failures()["succeeded"]` 给出（== 2）。两个口径各有出处，不能互相冒充。"""
+        (self.vault / "empty.md").write_text("   \n", encoding="utf-8")
+        report = self.pipeline.index_library("test-lib")
+        self.assertEqual((report.succeeded, report.failed), (2, 1))
+        stats = self.pipeline.index_stats("test-lib")
+        self.assertEqual(stats["state"], "ok")
+        self.assertEqual(stats["files"], 3)
+        self.assertGreater(stats["chunks"], 0)
+        self.assertIsNotNone(stats["indexed_at"])
+        self.assertEqual(self.pipeline.index_failures("test-lib")["succeeded"], 2)
+
+    def test_index_stats_of_a_never_indexed_library_is_all_zero(self):
+        self.assertEqual(
+            self.pipeline.index_stats("test-lib"),
+            {"files": 0, "chunks": 0, "indexed_at": None, "state": "none"},
+        )
+
     def test_tbd_heavy_docx_is_indexed_not_skipped(self):
         """tbd 占位检查只作用于纯文本格式——旧 index.py:1571 只对
         TEXT_EXTS（md/txt）做 is_tbd_heavy，二进制格式（docx/pdf）的提取
@@ -1185,7 +1281,12 @@ class TestExportImportLibrary(TestEndToEndSearchPipeline):
         self.assertTrue(before)
 
         archive = self.pipeline.export_library("test-lib")
-        new_id = self.pipeline.import_library(archive, root_path="/new/machine/vault", library_id="test-lib-restored")
+        # 导入目标目录要真实存在：add_library 现在对齐
+        # obsidian-rag/library.py:489-491 要求 resolve 后是已存在的目录
+        # （旧项目由 import.py:248 先 mkdir 再 add_library）。
+        target = self.tmp / "restored-vault"
+        target.mkdir()
+        new_id = self.pipeline.import_library(archive, root_path=str(target), library_id="test-lib-restored")
         self.assertEqual(new_id, "test-lib-restored")
 
         after = self.pipeline.search("test-lib-restored", "插件 架构", top_k=5)
@@ -1206,7 +1307,12 @@ class TestExportImportLibrary(TestEndToEndSearchPipeline):
         (self.vault / "empty.md").write_text("", encoding="utf-8")
         self.pipeline.index_library("test-lib")
         archive = self.pipeline.export_library("test-lib")
-        self.pipeline.import_library(archive, root_path=str(self.vault), library_id="restored-failures")
+        # 导入到**另一个**真实目录：注册表现在拒绝把同一目录注册成两个库
+        # （对齐 obsidian-rag/library.py:497-498），而 test-lib 已经占着
+        # self.vault。
+        target = self.tmp / "restored-failures-vault"
+        target.mkdir()
+        self.pipeline.import_library(archive, root_path=str(target), library_id="restored-failures")
         manifest = self.pipeline._manifest(
             "restored-failures", self.pipeline._generations.active("restored-failures")
         )
@@ -1219,12 +1325,19 @@ class TestExportImportLibrary(TestEndToEndSearchPipeline):
         archive = self.pipeline.export_library("test-lib")
         self.lib_mgr.store.remove_library("test-lib")
 
-        new_id = self.pipeline.import_library(archive, root_path="/new/machine/vault")
+        target = self.tmp / "restored-vault"
+        target.mkdir()
+        new_id = self.pipeline.import_library(archive, root_path=str(target))
         self.assertEqual(new_id, "test-lib")
         self.assertIsNotNone(self.lib_mgr.store.get("test-lib"))
 
     def test_import_carries_over_selection_and_policy(self):
-        self.lib_mgr.store.set_selection("test-lib", selection_out=["cooking.md"])
+        # 中性默认=exclude 时，没被点名的既有文件也算"中性"→全部排除，所以
+        # 必须显式勾选一篇才有东西可导出（导出插件对 0 块的库直接拒绝，那条
+        # 拒绝是对的：空包会被用户当备份存下来）。
+        self.lib_mgr.store.set_selection(
+            "test-lib", selection_in=["plugin-notes.md"], selection_out=["cooking.md"]
+        )
         self.lib_mgr.store.set_policy(
             "test-lib",
             new_file_default="exclude",
@@ -1233,20 +1346,93 @@ class TestExportImportLibrary(TestEndToEndSearchPipeline):
             exclude_files=["secret.txt"],
             exclude_patterns=["*.tmp"],
         )
+        # 对齐 obsidian-rag library.py:578-590 / server.py 的 set_config 拦截：
+        # 未在 enabled_extensions 里启用的格式**无法授权**。原先这里是直接写
+        # 进去的，等于造出一个"授权了但永远不生效"的矛盾态——单一事实来源是
+        # 格式开关（library.py:473 注释原话："用户在 extensions 里取消某格式
+        # 时，授权自动随之失效"）。所以这里断言的是"被拒 + 注册表原样不动"，
+        # 而不是原来那个"直传 .pdf/.docx 也照收"。
+        with self.assertRaises(ValueError) as ctx:
+            self.lib_mgr.store.set_agent_formats("test-lib", [".pdf", ".docx"])
+        self.assertIn("enabled_extensions", str(ctx.exception))
+        self.assertEqual(self.lib_mgr.store.get("test-lib").agent_formats, [])
+        # 开启格式后授权才成立。**但授权不会随导入恢复**（AGENTS.md 架构
+        # 红线 6）：归档是 agent 自己就能造出来的无签名 base64 包，从里面
+        # 恢复 agent_formats 等于让它给自己授权二进制格式、再驱动一次全量
+        # 索引，全程不需要用户点一次确认。原来这里断言的是"授权跟着导入带
+        # 过去"，现在断言"不带过去、且注册表保持空"。
+        self.lib_mgr.store.set_policy("test-lib", enabled_extensions=[".md", ".pdf", ".docx"])
         self.lib_mgr.store.set_agent_formats("test-lib", [".pdf", ".docx"])
         self.pipeline.index_library("test-lib")
         archive = self.pipeline.export_library("test-lib")
 
-        self.pipeline.import_library(archive, root_path="/new/machine/vault", library_id="test-lib-2")
+        # 导入目标目录必须是真实存在的目录（add_library 起对齐
+        # obsidian-rag/library.py:489-491 的 is_dir 校验；旧项目是
+        # import.py:248 先 mkdir 再 add_library）。同时 add_library 现在存的是
+        # resolve 之后的绝对路径，所以断言也跟着换成解析后的形式。
+        target = self.tmp / "restored-vault"
+        target.mkdir()
+        self.pipeline.import_library(archive, root_path=str(target), library_id="test-lib-2")
         cfg = self.lib_mgr.store.get("test-lib-2")
         self.assertEqual(cfg.selection_out, ["cooking.md"])
         self.assertEqual(cfg.new_file_default, "exclude")
-        self.assertEqual(cfg.enabled_extensions, [".md"])
+        self.assertEqual(cfg.enabled_extensions, [".md", ".pdf", ".docx"])
         self.assertEqual(cfg.exclude_dirs, ["private"])
         self.assertEqual(cfg.exclude_files, ["secret.txt"])
         self.assertEqual(cfg.exclude_patterns, ["*.tmp"])
-        self.assertEqual(cfg.agent_formats, [".pdf", ".docx"])
-        self.assertEqual(cfg.root_path, "/new/machine/vault")
+        self.assertEqual(cfg.agent_formats, [])
+        self.assertEqual(cfg.root_path, str(target.resolve()))
+
+    def test_import_preflight_is_read_only_and_reports_agent_formats(self):
+        """inspect_import 供两段式门禁的提案阶段用：一个字节都不能写，
+        并且必须把"包里的授权不会恢复"这件事讲给用户听。"""
+        self.lib_mgr.store.set_policy("test-lib", enabled_extensions=[".md", ".pdf", ".docx"])
+        self.lib_mgr.store.set_agent_formats("test-lib", [".pdf", ".docx"])
+        self.pipeline.index_library("test-lib")
+        archive = self.pipeline.export_library("test-lib")
+        target = self.tmp / "preflight-vault"
+        target.mkdir()
+
+        summary = self.pipeline.inspect_import(archive, root_path=str(target), library_id="preflight-lib")
+        self.assertEqual(summary["target_id"], "preflight-lib")
+        self.assertEqual(summary["agent_formats_in_archive"], [".pdf", ".docx"])
+        self.assertGreater(summary["chunk_count"], 0)
+        self.assertFalse(summary["target_exists"])
+        # 只读：预检之后库还没被注册
+        self.assertIsNone(self.lib_mgr.store.get("preflight-lib"))
+
+        message = self.pipeline._import_proposal_message(summary)
+        self.assertIn("不会随导入恢复", message)
+        self.assertIn(".pdf", message)
+
+    def test_import_two_stage_gate_requires_confirmation(self):
+        """AI 触发的导入必须两段式；未确认 / 码错 / 重放都不许写入。"""
+        self.pipeline.index_library("test-lib")
+        archive = self.pipeline.export_library("test-lib")
+        target = self.tmp / "gated-vault"
+        target.mkdir()
+
+        ticket = self.pipeline.propose_import_library(
+            archive, root_path=str(target), library_id="gated-lib"
+        )
+        self.assertFalse(ticket["applied"])
+        self.assertRegex(ticket["confirmation_code"], r"^\d{6}$")
+        self.assertIsNone(self.lib_mgr.store.get("gated-lib"))
+
+        with self.assertRaises(PipelineError):
+            self.pipeline.apply_import_library(ticket["proposal_id"], "000000")
+        self.assertIsNone(self.lib_mgr.store.get("gated-lib"))
+
+        result = self.pipeline.apply_import_library(
+            ticket["proposal_id"], ticket["confirmation_code"]
+        )
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["library_id"], "gated-lib")
+        self.assertIsNotNone(self.lib_mgr.store.get("gated-lib"))
+
+        # 一次性：同一对提案号+确认码不能重放
+        with self.assertRaises(PipelineError):
+            self.pipeline.apply_import_library(ticket["proposal_id"], ticket["confirmation_code"])
 
     def test_import_rejects_existing_library_id(self):
         self.pipeline.index_library("test-lib")
@@ -1261,7 +1447,9 @@ class TestExportImportLibrary(TestEndToEndSearchPipeline):
         里只有一条测过持久化。"""
         self.pipeline.index_library("test-lib")
         archive = self.pipeline.export_library("test-lib")
-        self.pipeline.import_library(archive, root_path="/new/machine/vault", library_id="test-lib-restored")
+        target = self.tmp / "restored-vault"
+        target.mkdir()
+        self.pipeline.import_library(archive, root_path=str(target), library_id="test-lib-restored")
         before = self.pipeline.search("test-lib-restored", "插件 架构", top_k=5)
 
         _restarted_runtime, restarted_pipeline = self._build_runtime()
@@ -1538,8 +1726,10 @@ class TestLibrarySummaryPipeline(unittest.TestCase):
         self.assertTrue(any(name in self.fake_llm.calls[0]["user"] for name in ("plugin-notes.md", "cooking.md")))
 
     def test_generate_library_summary_on_unindexed_library_raises_clear_error(self):
-        self.lib_mgr.store.add_library("empty-lib", "空库", str(self.tmp / "empty"))
+        # 目录必须先建好再注册：add_library 对齐 obsidian-rag/library.py:489-491
+        # 要求库根 resolve 后是已存在的目录。
         (self.tmp / "empty").mkdir()
+        self.lib_mgr.store.add_library("empty-lib", "空库", str(self.tmp / "empty"))
         with self.assertRaises(Exception):
             self.pipeline.generate_library_summary("empty-lib")
 
