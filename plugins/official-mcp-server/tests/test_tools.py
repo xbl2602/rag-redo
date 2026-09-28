@@ -393,24 +393,130 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         )
         await self._reindex_and_wait("test-lib")
 
-        result = await self.server.call_tool("find_duplicates", {"library_id": "test-lib"})
+        result = await self.server.call_tool("find_duplicates", {"libraries": "test-lib"})
         self.assertFalse(result.is_error)
         payload = result.structured_content
         self.assertTrue(payload["ok"])
-        groups = payload["groups"]["official-dedup"]
+        report = payload["libraries"]["test-lib"]
+        groups = report["groups"]["official-dedup"]
         self.assertEqual(len(groups), 1)
         self.assertEqual(set(groups[0]), {"notes.md", "notes-copy.md"})
+        # 拿不到正文的文件必须计数上报，否则"零重复组"分不清是真没重复还是
+        # 压根没比较过（旧项目 server.py:833 明确"跳过并计数"）
+        self.assertEqual(report["skipped"], 0)
+        self.assertGreater(report["scanned"], 0)
+
+    async def test_find_duplicates_tool_defaults_to_all_libraries(self):
+        """旧项目 `find_duplicates(library="")` = 全部注册库（server.py:842），
+        本工具的默认必须一样，不能默认成"什么都查不到"。"""
+        await self._reindex_and_wait("test-lib")
+        result = await self.server.call_tool("find_duplicates", {})
+        self.assertFalse(result.is_error)
+        payload = result.structured_content
+        self.assertTrue(payload["ok"])
+        self.assertIn("test-lib", payload["libraries"])
+
+    async def test_find_duplicates_tool_rejects_bad_threshold(self):
+        result = await self.server.call_tool("find_duplicates", {"threshold": 1.5})
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+        self.assertIn("threshold", result.structured_content["error"])
+
+    async def test_find_duplicates_has_a_docstring(self):
+        """守卫：docstring 曾经被写在参数校验 `if` 之后，等于**没有**
+        docstring——MCP schema 里这个工具就没有 description，而 agent 运行时
+        唯一读的就是 docstring（它恰好是当时唯一没有 description 的工具）。
+        钉住它，防止再被挪到函数体后面。"""
+        tool = {t.name: t for t in await self.server.list_tools()}["find_duplicates"]
+        self.assertTrue(tool.description)
+        self.assertIn("threshold", tool.description)
+        self.assertIn("libraries", tool.description)
 
     async def test_find_duplicates_tool_no_duplicates_returns_empty_groups(self):
         await self._reindex_and_wait("test-lib")
-        result = await self.server.call_tool("find_duplicates", {"library_id": "test-lib"})
+        result = await self.server.call_tool("find_duplicates", {"libraries": "test-lib"})
         self.assertFalse(result.is_error)
-        self.assertEqual(result.structured_content["groups"]["official-dedup"], [])
+        report = result.structured_content["libraries"]["test-lib"]
+        self.assertEqual(report["groups"]["official-dedup"], [])
 
     async def test_find_duplicates_tool_unknown_library_reports_error(self):
-        result = await self.server.call_tool("find_duplicates", {"library_id": "no-such-lib"})
+        result = await self.server.call_tool("find_duplicates", {"libraries": "no-such-lib"})
         self.assertFalse(result.is_error)
         self.assertFalse(result.structured_content["ok"])
+
+    def _write_docx_pair(self, directory: Path, stem: str, text: str) -> None:
+        """同一段正文写成两份 docx（`<stem>.docx` 与 `<stem>-copy.docx`）：内容逐字相同，
+        提取出的正文相似度 1.0，一定会被判成近似重复组。"""
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in (f"{stem}.docx", f"{stem}-copy.docx"):
+            document = Document()
+            document.add_paragraph(text)
+            document.save(str(directory / name))
+
+    async def test_find_duplicates_never_leaks_unauthorized_formats_across_libraries(self):
+        """BC-02：Agent 默认只能处理 md/txt，pdf/docx 需要用户逐库批准。此前多库调用
+        （含默认 `libraries=""`）不做任何格式过滤——某个库**没批准**的 docx 文件名和
+        "这两份是重复的"这条信息会原样交给 Agent，而且没有任何报错提醒。
+
+        场景：`test-lib` 没批准 docx，里面有一对重复的 docx（保密）和一对重复的 md；
+        `docx-lib` 批准了 docx，里面也有一对重复的 docx（应当出现）。"""
+        vault = self.tmp / "vault"
+        secret_text = "保密内容，这份文档只有用户本人能看，Agent 不该知道它存在。" * 4
+        self._write_docx_pair(vault, "secret", secret_text)
+        note = "# 公开笔记\n\n这是一篇公开的笔记，两份一字不差。" * 3
+        (vault / "public-a.md").write_text(note, encoding="utf-8")
+        (vault / "public-b.md").write_text(note, encoding="utf-8")
+
+        docx_vault = self.tmp / "docx-vault"
+        self._write_docx_pair(docx_vault, "approved", "已批准的内容，用户允许 Agent 读取这类文档。" * 4)
+        self.lib_mgr.store.add_library("docx-lib", "有授权的库", str(docx_vault))
+        self.lib_mgr.store.set_agent_formats("docx-lib", [".docx"])
+
+        await self._reindex_and_wait("test-lib")
+        await self._reindex_and_wait("docx-lib")
+
+        # 前提自检：两个库里的 docx 确实都被索引、也确实是重复的（否则下面"不出现"是空话）
+        allowed_test = set(self.lib_mgr.agent_allowed_extensions("test-lib"))
+        allowed_docx = set(self.lib_mgr.agent_allowed_extensions("docx-lib"))
+        self.assertNotIn(".docx", allowed_test)
+        self.assertIn(".docx", allowed_docx)
+        unfiltered = self.pipeline.find_duplicates_multi(["test-lib", "docx-lib"])
+        self.assertTrue(
+            any("secret" in path for group in unfiltered["test-lib"]["groups"]["official-dedup"] for path in group),
+            "前提不成立：未过滤时 test-lib 应当能检出保密 docx 对",
+        )
+
+        for arguments in ({}, {"libraries": "all"}, {"libraries": "test-lib,docx-lib"}, {"libraries": "test-lib"}):
+            with self.subTest(arguments=arguments):
+                result = await self.server.call_tool("find_duplicates", arguments)
+                self.assertFalse(result.is_error)
+                payload = result.structured_content
+                self.assertTrue(payload["ok"], payload)
+                test_report = payload["libraries"]["test-lib"]
+                test_groups = test_report["groups"]["official-dedup"]
+                self.assertEqual(
+                    [sorted(group) for group in test_groups],
+                    [["public-a.md", "public-b.md"]],
+                    "未批准 docx 的库只能报出 md 重复组",
+                )
+                self.assertNotIn("secret", str(test_report), "未授权格式的文件名不得出现在返回里")
+                self.assertNotIn(".docx", str(test_report))
+                if "docx-lib" in payload["libraries"]:
+                    docx_groups = payload["libraries"]["docx-lib"]["groups"]["official-dedup"]
+                    self.assertEqual(
+                        [sorted(group) for group in docx_groups],
+                        [["approved-copy.docx", "approved.docx"]],
+                        "批准了 docx 的库照常报出 docx 重复组",
+                    )
+
+    async def test_find_duplicates_multi_allowlist_mapping_is_fail_closed(self):
+        """映射里缺失的库视为一个格式都没授权（fail-closed），而不是不过滤。"""
+        await self._reindex_and_wait("test-lib")
+        report = self.pipeline.find_duplicates_multi(
+            ["test-lib"], format_allowlist={"another-lib": (".md",)}
+        )
+        self.assertEqual(report["test-lib"]["scanned"], 0)
+        self.assertEqual(report["test-lib"]["groups"]["official-dedup"], [])
 
     async def test_note_relations_tool_resolves_mutual_wikilinks(self):
         vault = self.tmp / "vault"
@@ -678,6 +784,32 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertIn("folder", search_tool.input_schema["properties"])
         self.assertIn("include_body", search_tool.input_schema["properties"])
 
+    async def _import_via_gate(self, archive_base64, root_path, library_id=""):
+        """走完整两段式门禁导入一个库，返回 (apply 的调用结果, 提案 payload)。"""
+        propose = await self.server.call_tool(
+            "import_library",
+            {
+                "archive_base64": archive_base64,
+                "root_path": root_path,
+                "library_id": library_id,
+            },
+        )
+        self.assertFalse(propose.is_error)
+        ticket = propose.structured_content
+        self.assertTrue(ticket["ok"])
+        self.assertFalse(ticket["applied"])
+        applied = await self.server.call_tool(
+            "import_library",
+            {
+                "archive_base64": archive_base64,
+                "root_path": root_path,
+                "library_id": library_id,
+                "proposal_id": ticket["proposal_id"],
+                "confirmation_code": ticket["confirmation_code"],
+            },
+        )
+        return applied, ticket
+
     async def test_export_then_import_library_round_trips_search_results(self):
         await self._reindex_and_wait("test-lib")
         before = await self.server.call_tool("search_knowledge", {"query": "插件 架构", "libraries": "test-lib"})
@@ -689,18 +821,18 @@ class TestMcpTools(TestMcpToolsAsyncBase):
         self.assertTrue(export_payload["ok"])
         self.assertIn("archive_base64", export_payload)
 
-        import_result = await self.server.call_tool(
-            "import_library",
-            {
-                "archive_base64": export_payload["archive_base64"],
-                "root_path": "/new/machine/vault",
-                "library_id": "test-lib-restored",
-            },
+        # 导入是 AI 触发的写操作，必须两段式：先提案、拿到用户确认的确认码
+        # 才真正写入（AGENTS.md 架构红线 6）。
+        import_result, ticket = await self._import_via_gate(
+            export_payload["archive_base64"], "/new/machine/vault", "test-lib-restored"
         )
         self.assertFalse(import_result.is_error)
         import_payload = import_result.structured_content
         self.assertTrue(import_payload["ok"])
+        self.assertTrue(import_payload["applied"])
         self.assertEqual(import_payload["library_id"], "test-lib-restored")
+        self.assertIn("test-lib-restored", ticket["message"])
+        self.assertIn("向量块", ticket["message"])
 
         after = await self.server.call_tool(
             "search_knowledge", {"query": "插件 架构", "libraries": "test-lib-restored"}
@@ -711,6 +843,101 @@ class TestMcpTools(TestMcpToolsAsyncBase):
             [r["path"] for r in after.structured_content["results"]],
         )
 
+    async def test_import_proposal_has_no_side_effect_and_needs_confirmation(self):
+        """未确认的提案必须零副作用——这是门禁的全部意义，不能只是"建议"。"""
+        await self._reindex_and_wait("test-lib")
+        export_result = await self.server.call_tool("export_library", {"library_id": "test-lib"})
+        libs = await self.server.call_tool("list_libraries", {})
+        before_ids = {lib["library_id"] for lib in libs.structured_content["result"]}
+
+        propose = await self.server.call_tool(
+            "import_library",
+            {
+                "archive_base64": export_result.structured_content["archive_base64"],
+                "root_path": "/new/machine/vault",
+                "library_id": "test-lib-unconfirmed",
+            },
+        )
+        ticket = propose.structured_content
+        self.assertFalse(ticket["applied"])
+        self.assertIn("proposal_id", ticket)
+        self.assertRegex(ticket["confirmation_code"], r"^\d{6}$")
+
+        # 提案之后库还没被注册，检索它必然失败
+        libs_after = await self.server.call_tool("list_libraries", {})
+        after_ids = {lib["library_id"] for lib in libs_after.structured_content["result"]}
+        self.assertEqual(before_ids, after_ids)
+        self.assertNotIn("test-lib-unconfirmed", after_ids)
+
+    async def test_import_rejects_wrong_confirmation_code(self):
+        await self._reindex_and_wait("test-lib")
+        export_result = await self.server.call_tool("export_library", {"library_id": "test-lib"})
+        archive_b64 = export_result.structured_content["archive_base64"]
+        propose = await self.server.call_tool(
+            "import_library",
+            {"archive_base64": archive_b64, "root_path": "/new/machine/vault", "library_id": "test-lib-badcode"},
+        )
+        ticket = propose.structured_content
+        wrong = "000000" if ticket["confirmation_code"] != "000000" else "111111"
+        result = await self.server.call_tool(
+            "import_library",
+            {
+                "archive_base64": archive_b64,
+                "root_path": "/new/machine/vault",
+                "library_id": "test-lib-badcode",
+                "proposal_id": ticket["proposal_id"],
+                "confirmation_code": wrong,
+            },
+        )
+        self.assertFalse(result.is_error)
+        self.assertFalse(result.structured_content["ok"])
+        self.assertIn("确认码", result.structured_content["error"])
+        libs = await self.server.call_tool("list_libraries", {})
+        ids = {lib["library_id"] for lib in libs.structured_content["result"]}
+        self.assertNotIn("test-lib-badcode", ids)
+
+    async def test_import_proposal_is_single_use(self):
+        await self._reindex_and_wait("test-lib")
+        export_result = await self.server.call_tool("export_library", {"library_id": "test-lib"})
+        archive_b64 = export_result.structured_content["archive_base64"]
+        propose = await self.server.call_tool(
+            "import_library",
+            {"archive_base64": archive_b64, "root_path": "/new/machine/vault", "library_id": "test-lib-once"},
+        )
+        ticket = propose.structured_content
+        payload = {
+            "archive_base64": archive_b64,
+            "root_path": "/new/machine/vault",
+            "library_id": "test-lib-once",
+            "proposal_id": ticket["proposal_id"],
+            "confirmation_code": ticket["confirmation_code"],
+        }
+        first = await self.server.call_tool("import_library", payload)
+        self.assertTrue(first.structured_content["applied"])
+        replay = await self.server.call_tool("import_library", payload)
+        self.assertFalse(replay.structured_content["ok"])
+
+    async def test_import_does_not_restore_agent_formats_from_archive(self):
+        """归档是 agent 自己能造的无签名包：从里面恢复 agent_formats 等于
+        Agent 给自己授权二进制格式（AGENTS.md 架构红线 6）。提案必须把这件事
+        说出来，执行后注册表里也必须仍然是空的。"""
+        await self._reindex_and_wait("test-lib")
+        self.lib_mgr.store.set_policy(
+            "test-lib", enabled_extensions=[".md", ".pdf", ".docx"]
+        )
+        self.lib_mgr.store.set_agent_formats("test-lib", [".pdf", ".docx"])
+        export_result = await self.server.call_tool("export_library", {"library_id": "test-lib"})
+        archive_b64 = export_result.structured_content["archive_base64"]
+        self.lib_mgr.store.set_agent_formats("test-lib", [])
+
+        applied, ticket = await self._import_via_gate(archive_b64, "/new/machine/vault", "test-lib-noauth")
+        self.assertTrue(applied.structured_content["applied"])
+        self.assertIn(".pdf", ticket["summary"]["agent_formats_in_archive"])
+        self.assertIn("不会随导入恢复", ticket["message"])
+        self.assertEqual(
+            self.lib_mgr.store.get("test-lib-noauth").agent_formats, []
+        )
+
     async def test_export_unknown_library_reports_error_not_crash(self):
         result = await self.server.call_tool("export_library", {"library_id": "no-such-lib"})
         self.assertFalse(result.is_error)
@@ -719,16 +946,17 @@ class TestMcpTools(TestMcpToolsAsyncBase):
     async def test_import_rejects_existing_library_id(self):
         await self._reindex_and_wait("test-lib")
         export_result = await self.server.call_tool("export_library", {"library_id": "test-lib"})
-        result = await self.server.call_tool(
-            "import_library",
-            {
-                "archive_base64": export_result.structured_content["archive_base64"],
-                "root_path": "/new/machine/vault",
-                "library_id": "test-lib",
-            },
+        # 提案阶段不拒绝（还没写任何东西），但必须把"会直接拒绝"讲清楚；
+        # 真正的拒绝发生在 apply 那一刻——落盘前最后一道闸。
+        applied, ticket = await self._import_via_gate(
+            export_result.structured_content["archive_base64"], "/new/machine/vault", "test-lib"
         )
-        self.assertFalse(result.is_error)
-        self.assertFalse(result.structured_content["ok"])
+        self.assertTrue(ticket["summary"]["target_exists"])
+        self.assertIn("已存在", ticket["message"])
+        self.assertFalse(applied.is_error)
+        self.assertFalse(applied.structured_content["ok"])
+        # 旧库没被动过
+        self.assertIsNotNone(self.lib_mgr.store.get("test-lib"))
 
     async def test_list_libraries_includes_summary_field(self):
         result = await self.server.call_tool("list_libraries", {})

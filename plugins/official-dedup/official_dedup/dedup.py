@@ -112,5 +112,24 @@ class DedupIndex:
 
         return [sorted(g) for g in groups.values() if len(g) >= 2]
 
+    def find_duplicate_links(self) -> list[tuple[str, str, float]]:
+        """近似重复的**成对**关系 `(a, b, 相似度)`（`a < b`，每对只出现一次）。
+
+        分组（`find_duplicate_groups`）只回答"这几篇互相近似"，成对相似度回答"近似到
+        什么程度"——GUI 近似去重面板按相似度着色、排序，旧项目 `dedup.py` 的
+        `links=[(relA, relB, jaccard)]` 就是这份数据。相似度是 MinHash 估计的
+        Jaccard，取 3 位小数；按相似度从高到低、再按路径排序，输出稳定可复现。"""
+        links: dict[tuple[str, str], float] = {}
+        for doc_id in self._minhashes:
+            for other in self.similar_to(doc_id):
+                pair = (doc_id, other) if doc_id < other else (other, doc_id)
+                if pair in links:
+                    continue
+                links[pair] = round(float(self._minhashes[pair[0]].jaccard(self._minhashes[pair[1]])), 3)
+        return sorted(
+            ((a, b, sim) for (a, b), sim in links.items()),
+            key=lambda item: (-item[2], item[0], item[1]),
+        )
+
     def count(self) -> int:
         return len(self._minhashes)

@@ -43,16 +43,31 @@ class DedupPlugin:
             return []
         return self.indexes[library_id].find_duplicate_groups()
 
-    def find_duplicates_in_texts(self, texts: dict[str, str], *, threshold: float = 0.7) -> list[list[str]]:
+    def find_duplicates_in_texts(self, texts: dict[str, str], *, threshold: float = 0.8) -> list[list[str]]:
         """对给定的一批 (doc_id → 正文) **现场计算**近似重复分组，用完
         即弃的临时 `DedupIndex`，完全不碰 `add_document`/`find_duplicate_
         groups` 那条常驻索引路径——两者互不干扰。对齐 obsidian-rag
         `find_duplicates` MCP 工具"只读建议、按需现算、不产生向量、不改
         索引"的语义（见该工具 docstring）：调用方（`core/pipeline.py`）
-        从提取结果缓存里现读整批文档正文传进来，这个插件只负责"给一批
-        文本、告诉我哪些近似重复"这一件事，不关心文本从哪来、也不负责
-        缓存/持久化它们。"""
+        读取正文传进来（md/txt 现读磁盘、pdf/docx 读提取缓存），这个插件
+        只负责"给一批文本、告诉我哪些近似重复"这一件事，不关心文本从哪来、
+        也不负责缓存/持久化它们。
+
+        默认阈值 0.8 = `DedupIndex.threshold` 的默认 = 旧项目
+        `dedup.py:34 DEFAULT_THRESHOLD`。三条入口（pipeline / MCP / 本方法）
+        必须是同一个值，否则同一批文档走不同入口会给出不同的重复组。
+        """
         index = DedupIndex(threshold=threshold)
         for doc_id, text in texts.items():
             index.add(doc_id, text)
         return index.find_duplicate_groups()
+
+    def find_duplicate_links_in_texts(
+        self, texts: dict[str, str], *, threshold: float = 0.8
+    ) -> list[tuple[str, str, float]]:
+        """同 `find_duplicates_in_texts`（现算、用完即弃、只读），但返回**成对**相似度
+        `(a, b, jaccard)`——GUI 近似去重面板需要"有多像"，分组结果给不出这个数。"""
+        index = DedupIndex(threshold=threshold)
+        for doc_id, text in texts.items():
+            index.add(doc_id, text)
+        return index.find_duplicate_links()

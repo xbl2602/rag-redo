@@ -12,6 +12,19 @@ from typing import Any
 
 from core.pipeline import DEFAULT_CONFIDENCE_WARN_THRESHOLD, Pipeline, confidence_tier
 
+#: 视觉检索插件"现在不能查"的原因码集合（official-visual-wemm 的
+#: VisualVetoError.reason）。这与"这一库查失败了"是两回事：前者整条视觉
+#: 检索面都不可用，必须整体返回 veto 响应让 agent 知道"等一会儿/去查
+#: wemm_status"，后者只影响一个库、其余库照常返回。
+#:
+#: 这里是**按值**识别而不是 import 那个异常类：`core/runtime.py` 的
+#: `_validate_import_boundary` 明确禁止 MCP 插件 import 其它插件的模块
+#: （official_visual_wemm 不在允许清单里，直接 INVALID）。所以只能鸭子类型
+#: 取 `exc.reason`——见 navigate_knowledge 里的用法。
+_VISUAL_VETO_REASONS = frozenset(
+    {"gpu-busy", "backend-off", "service-start-failed", "service-unavailable"}
+)
+
 
 def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
     def wait_for_initial_index(library_id: str, timeout: float = 600.0) -> None:
@@ -156,17 +169,17 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
                     "library_id": r.library_id,
                     "path": r.path,
                     "heading": r.heading_breadcrumb,
-                    **(
-                        {
-                            "text": r.text,
-                            "backfilled": r.backfilled,
-                            "chunk_index": r.chunk_index,
-                            "total_chunks": r.total_chunks,
-                            "truncated": r.truncated,
-                        }
-                        if include_body
-                        else {}
-                    ),
+                    # 块位置信息**与 include_body 无关**，两种模式都必须给。
+                    # 清单模式（include_body=false）以前只回来源行，agent 就无法
+                    # 判断第 1 条和第 5 条是相邻还是隔了很远——而这恰恰是
+                    # "只列来源不列正文"这个模式存在的意义。旧项目
+                    # retriever.py:426-427 两种模式都追加 [块 k/N]，旧
+                    # advice.py:30,38 还把它当作"清单模式不做折叠/封顶"的
+                    # 完整性提示。
+                    "chunk_index": r.chunk_index,
+                    "total_chunks": r.total_chunks,
+                    "truncated": r.truncated,
+                    **({"text": r.text, "backfilled": r.backfilled} if include_body else {}),
                     "confidence": round(r.confidence, 3),
                     "confidence_tier": confidence_tier(r.confidence, warn_threshold),
                     **({"note": f"低置信度 {r.confidence:.2f}，仅供参考"} if r.confidence < warn_threshold else {}),
@@ -192,6 +205,14 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         不要拿两边的分数互相排序。异常处理策略同 search_knowledge：绝不
         裸抛，折叠成 {"ok": False, "error": ...}。
 
+        两种"拿不到结果"要分清：
+        - **veto**（ok=true、veto=true、带 reason）：整条视觉检索现在不可用，
+          原因是 GPU 正忙/后端没开/看图服务没起来/暂时连不上。这时
+          **不要换查询词重试**——那不是查询的问题。等索引任务结束，或用
+          wemm_status 看 backend/log_file 排查。
+        - **部分库失败**（ok=true、带 note）：多库并查时个别库查不了，其余
+          库的结果照常返回。
+
         Args:
             query: 查询文本
             top_k: 最多返回几条结果
@@ -203,13 +224,40 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
             entries = lib_mgr.resolve_libraries(libraries or "all", exclude)
             merged: list[dict[str, Any]] = []
             skipped: list[str] = []
+            failed: list[str] = []
             for entry in entries:
                 if ".pdf" not in lib_mgr.agent_allowed_extensions(entry.library_id):
                     # 逐库授权判定（BC-02）：未授权 PDF 的库整库跳过，不是报错——
                     # 同 search_knowledge 的"未授权文件不存在"语义在库级的投影
                     skipped.append(entry.library_id)
                     continue
-                for hit in pipeline.navigate(entry.library_id, query, top_k=top_k):
+                try:
+                    hits = pipeline.navigate(entry.library_id, query, top_k=top_k)
+                except Exception as exc:  # noqa: BLE001
+                    # 逐库隔离（对齐旧 wemm_retriever.py::wemm_search 的
+                    # errs 累积继续 + server.py:738-739 的"部分库查询异常"
+                    # 括注）：一个库挂掉不该让整次多库检索归零。
+                    #
+                    # 但 veto 语义不同——"GPU 正忙""后端没开""服务拉不起来"
+                    # 说的是"现在整条视觉检索都不可用"，不是"这一库失败"。
+                    # 那种情况必须整体冒泡成 veto 响应，否则 agent 会以为
+                    # 真的没有匹配页面，转而去改查询词反复重试。
+                    #
+                    # **必须鸭子类型取 reason**：`core/runtime.py`
+                    # 的 `_validate_import_boundary` 会判定
+                    # `import official_visual_wemm` 跨插件，直接 INVALID。
+                    reason = getattr(exc, "reason", None)
+                    if reason in _VISUAL_VETO_REASONS:
+                        return {
+                            "ok": True,
+                            "veto": True,
+                            "reason": reason,
+                            "message": str(exc),
+                            "results": [],
+                        }
+                    failed.append(f"{entry.library_id}: {exc}")
+                    continue
+                for hit in hits:
                     merged.append({
                         "library": entry.library_id,
                         "path": hit.path,
@@ -221,6 +269,9 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
             result: dict[str, Any] = {"ok": True, "results": merged[:top_k]}
             if skipped:
                 result["skipped_libraries"] = skipped
+            if failed:
+                result["partial_errors"] = failed
+                result["note"] = "部分库查询异常：" + "；".join(failed)
             return result
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
@@ -270,33 +321,43 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         return {"ok": True, "path": doc.path, "text": doc.text, "source": doc.source, "chars": len(doc.text)}
 
     @server.tool()
-    def find_duplicates(library_id: str, threshold: float = 0.8) -> dict[str, Any]:
-        if not 0 < threshold <= 1:
-            return {"ok": False, "error": f"threshold 必须在 (0, 1] 区间，收到 {threshold!r}"}
+    def find_duplicates(libraries: str = "", threshold: float = 0.8) -> dict[str, Any]:
         """近似重复文档检测（只读建议，绝不删除/移动文件）——对齐
-        obsidian-rag 的 `find_duplicates` 工具：找出库内"内容几乎相同"
-        的重复文档（同一课件多份拷贝、同一文档转出的多个副本），返回
-        重复组，由你决定是否清理/合并，避免检索反复命中同一段内容。
+        obsidian-rag 的 `find_duplicates` 工具：找出"内容几乎相同"的重复
+        文档（同一课件多份拷贝、同一文档转出的多个副本），返回重复组，由
+        你决定是否清理/合并，避免检索反复命中同一段内容。
 
-        比较的是提取出的文字内容（文本级 MinHash+LSH，不是语义相似度），
-        只统计已经被成功索引过的文件——还没索引过的文件不参与比较，
-        先 reindex_knowledge 建好索引再调用本工具才有意义。
+        比较的是文字内容（文本级 MinHash+LSH，不是语义相似度），不产生
+        向量、不改索引、不触发重新提取：`.md`/`.txt` 现读磁盘，其余格式读
+        上一次索引留下的提取正文，**未提取的文件会跳过并计数**
+        （`skipped`）。所以先 reindex_knowledge 建好索引再调本工具才有意义。
+        返回里的 `skipped` 很大时（比如等于文件总数）说明压根没比较过，别把
+        "零重复组"当成"确认没有重复"。
 
         Args:
-            library_id: 要检测的库的 id
-            threshold: 相似度阈值（0~1，默认0.8，对齐旧项目 DEDUP_THRESHOLD），越高越严格，只有真正
-                       "近乎逐字重复"的才会被分进同一组
+            libraries: 库选择。留空或 "all" = 全部已注册库；"A,B" = 多库并查
+                （逐库各给一份报告）。先调 list_libraries 看有哪些库。
+            threshold: 相似度阈值（0~1，默认 0.8，对齐旧项目
+                DEDUP_THRESHOLD），越高越严格，只有真正"近乎逐字重复"的才会
+                被分进同一组
         """
+        if not 0 < threshold <= 1:
+            return {"ok": False, "error": f"threshold 必须在 (0, 1] 区间，收到 {threshold!r}"}
         try:
-            allowed = lib_mgr.agent_allowed_extensions(library_id)
-            groups_by_provider = pipeline.find_duplicates(
-                library_id,
+            entries = lib_mgr.resolve_libraries(libraries or "all")
+            # 每个库各用自己的 Agent 授权格式（BC-02）：不能由调用方猜"取第一个库的"或
+            # "多库就不过滤"——那会把某个库未授权格式的文件名与重复关系泄露给 Agent。
+            reports = pipeline.find_duplicates_multi(
+                [entry.library_id for entry in entries],
                 threshold=threshold,
-                format_allowlist=allowed,
+                format_allowlist={
+                    entry.library_id: lib_mgr.agent_allowed_extensions(entry.library_id)
+                    for entry in entries
+                },
             )
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "groups": groups_by_provider}
+        return {"ok": True, "libraries": reports}
 
     @server.tool()
     def note_relations(library_id: str, path: str) -> dict[str, Any]:
@@ -597,8 +658,31 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         }
 
     @server.tool()
-    def import_library(archive_base64: str, root_path: str, library_id: str = "") -> dict[str, Any]:
-        """从 export_library 产出的归档恢复一个库，不重新索引。
+    def import_library(
+        archive_base64: str,
+        root_path: str,
+        library_id: str = "",
+        proposal_id: str = "",
+        confirmation_code: str = "",
+    ) -> dict[str, Any]:
+        """从 export_library 产出的归档恢复一个库，不重新跑嵌入。
+
+        ⚠ 本工具是**两段式硬门禁**，未经用户确认绝不写入——这是 AGENTS.md
+        架构红线 6，无任何配置可绕过。原因是它的破坏面：它会注册一个新库，
+        而 root_path 是**你**给的任意本机绝对路径。所以必须按下面两步走，
+        跳过第一步直接带确认码调用是无效的：
+
+        第一步（提案，不写任何东西）：只传 archive_base64 + root_path
+        [+ library_id] 调用本工具。返回 applied=False，以及
+        - proposal_id：提案号，原样带回第二步
+        - confirmation_code：6 位数字确认码，**必须念给用户听**
+        - message：这次导入的后果说明（会往哪个目录写、注册什么库、恢复
+          多少块、包里有哪些坑）。请把它**完整展示给用户**，拿到用户明确
+          同意后再进行第二步。
+
+        第二步（执行）：带上第一步的 proposal_id 与**用户确认过的**
+        confirmation_code 再调一次本工具，才会真正写入。确认码错误/过期/
+        已用过都会被拒。未经用户同意就编一个确认码传进来是严重违规。
 
         root_path 必填——归档里不带原始机器上的路径（那个路径在新机器上
         通常没有意义），必须显式告诉这台机器"这些笔记文件现在在哪"，见
@@ -606,17 +690,35 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         ""）则沿用归档里记录的原始 library_id；如果目标 id 已经存在，会
         报错而不是覆盖——需要覆盖的话，先手动删除旧库。
 
+        另外：包里的 Agent 二进制格式授权（agent_formats）**不会**随导入
+        恢复。归档是 base64 传进来的无签名数据，无法证明那份授权清单是用户
+        批准的；恢复它等于让你自己给自己授权二进制格式。导入后如果需要
+        agent 索引 pdf/docx，请让用户在 GUI 里手动勾选授权。
+
         Args:
             archive_base64: export_library 返回的 archive_base64 字段内容
             root_path: 这些笔记文件在这台机器上的真实目录路径
             library_id: 恢复出的库用哪个 id；留空则沿用归档里的原始 id
+            proposal_id: 第一步返回的提案号；第二步必填
+            confirmation_code: 用户确认后提供的 6 位数字确认码；第二步必填
         """
         try:
             archive_bytes = base64.b64decode(archive_base64)
-            new_id = pipeline.import_library(archive_bytes, root_path=root_path, library_id=library_id or None)
+            if not proposal_id or not confirmation_code:
+                return {
+                    "ok": True,
+                    **pipeline.propose_import_library(
+                        archive_bytes,
+                        root_path=root_path,
+                        library_id=library_id or None,
+                    ),
+                }
+            return {
+                "ok": True,
+                **pipeline.apply_import_library(proposal_id, confirmation_code),
+            }
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "library_id": new_id}
 
     # -----------------------------------------------------------------
     # 库简介（Phase 3）：导航/澄清性质的一段话，帮你在真正检索/通读全文
