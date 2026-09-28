@@ -95,6 +95,56 @@ def _rel_suffix(path: str) -> str:
     return path.rsplit(".", 1)[-1].lower() if "." in path else ""
 
 
+def explicit_verdict(
+    selection_in: Sequence[str] | None,
+    selection_out: Sequence[str] | None,
+    exclude_dirs: Sequence[str] | None,
+    path: str,
+) -> tuple[str | None, bool, str]:
+    """谁具体听谁的（旧 library.py::decide_included，问题47 用户拍板）——
+    返回 `(verdict, tie, reason)`：
+
+    - `verdict`：`"in"` / `"out"` / `None`。`None` = 既没有显式规则、也没有
+      目录排除命中的**中性**路径，交给文件名/格式规则继续判；
+    - `tie`：仅"同位置打架"（勾选纳入的目标本身字符串相等地躺在目录排除名单里）
+      时为 True，排除站住；
+    - `reason`：给 `decide_included` 拼"为什么没收"的人话。
+
+    单独导出是因为**勾选树的展示**和**建索引的文件漏斗**必须吃同一份裁决：
+    树上显示入库、索引时却没收录，正是"显示≠实际"的撕裂。两处都从这里取
+    显式部分，不各写一遍深度比较。
+    """
+    action, dm, prefix = _selection_hit(selection_in, selection_out, path)
+    de = _excluded_dir_depth(exclude_dirs, path)
+    if action is None:
+        return ("out", False, "命中排除目录") if de else (None, False, "")
+    if action == "out":
+        return "out", False, f"显式排除规则命中：{prefix}"
+    # action == "in"：显式勾选穿透一切（目录继承排除、文件名、格式白名单），
+    # 唯二例外：同位置打架（排除站住）与更深的目录排除。
+    if prefix in _norm_ex_dir_entries(exclude_dirs):
+        return "out", True, f"同位置打架：{prefix} 同时在勾选纳入与目录排除名单，排除站住"
+    if de == 0 or dm > de:
+        return "in", False, f"显式纳入规则命中：{prefix}"
+    return "out", False, f"更深的目录排除压过较浅的纳入（排除深度{de} ≥ 勾选深度{dm}）"
+
+
+def selection_explicit(
+    selection_in: Sequence[str] | None, selection_out: Sequence[str] | None, path: str
+) -> str | None:
+    """`path` 自己或最近祖先的显式勾选态：`"in"` / `"out"` / `None`（旧
+    library.py::resolve_selection）。勾选树用它标注"显式"徽记。"""
+    return _selection_hit(selection_in, selection_out, path)[0]
+
+
+def dir_self_blocked(exclude_dirs: Sequence[str] | None, path: str) -> bool:
+    """该节点本身是否被目录排除名单指名道姓（旧 library.py::
+    is_same_place_blocked，问题47：即时弹窗的触发条件）。只认字符串相等——
+    文件名/格式类规则是"按类匹配"，点具体文件属个别例外，永远不触发。"""
+    s = str(path).replace("\\", "/").strip().strip("/")
+    return bool(s) and s in _norm_ex_dir_entries(exclude_dirs)
+
+
 def decide_included(
     path: str,
     *,
@@ -109,43 +159,32 @@ def decide_included(
     """判定 path 算不算在检索范围内，返回 (included, reason)——语义为旧
     library.py::decide_included + 旧 index.py::collect_md_files 中性分支的
     合并（两处旧代码本就是同一条裁决的两半）。"""
-    action, dm, prefix = _selection_hit(selection_in, selection_out, path)
-    de = _excluded_dir_depth(exclude_dirs, path)
+    verdict, _tie, reason = explicit_verdict(selection_in, selection_out, exclude_dirs, path)
+    if verdict == "in":
+        return True, reason
+    if verdict == "out":
+        return False, reason
 
-    if action is None:
-        # 中性文件：目录排除（子串）→ 文件名名单 → 文件名前缀 → 中性默认
-        if de:
-            return False, "命中排除目录"
-        name = path.rsplit("/", 1)[-1]
-        if name in set(exclude_files or ()):
-            return False, f"命中排除文件名单：{name}"
-        patterns = [str(p) for p in (exclude_patterns or ())]
-        hit_pat = next((p for p in patterns if name.startswith(p)), None)
-        if hit_pat is not None:
-            return False, f"命中文件名前缀排除：{hit_pat}"
-        if new_file_default == "exclude":
-            return False, "中性默认=exclude（中性文件一律排除）"
-        suffix = _rel_suffix(path)
-        if new_file_default == "include":
-            if suffix not in SUPPORTED_EXTS:
-                return False, f"格式 {suffix or '(无后缀)'} 不在受支持格式内（中性默认=include）"
-            return True, "中性默认=include（受支持格式一律纳入）"
-        # follow（旧默认）：按该库格式开关判定
-        exts = {str(e).lower().lstrip(".") for e in (enabled_extensions or ())}
-        if suffix not in exts:
-            return False, f"格式 {suffix or '(无后缀)'} 不在库格式开关内"
-        return True, "中性跟随格式开关"
-
-    if action == "out":
-        return False, f"显式排除规则命中：{prefix}"
-
-    # action == "in"：显式勾选穿透一切（目录继承排除、文件名、格式白名单），
-    # 唯二例外：同位置打架（排除站住）与更深的目录排除。
-    if prefix in _norm_ex_dir_entries(exclude_dirs):
-        return False, f"同位置打架：{prefix} 同时在勾选纳入与目录排除名单，排除站住"
-    if de == 0 or dm > de:
-        return True, f"显式纳入规则命中：{prefix}"
-    return False, f"更深的目录排除压过较浅的纳入（排除深度{de} ≥ 勾选深度{dm}）"
+    # 中性文件（无显式规则、目录排除也没命中）：文件名名单 → 文件名前缀 → 中性默认
+    name = path.rsplit("/", 1)[-1]
+    if name in set(exclude_files or ()):
+        return False, f"命中排除文件名单：{name}"
+    patterns = [str(p) for p in (exclude_patterns or ())]
+    hit_pat = next((p for p in patterns if name.startswith(p)), None)
+    if hit_pat is not None:
+        return False, f"命中文件名前缀排除：{hit_pat}"
+    if new_file_default == "exclude":
+        return False, "中性默认=exclude（中性文件一律排除）"
+    suffix = _rel_suffix(path)
+    if new_file_default == "include":
+        if suffix not in SUPPORTED_EXTS:
+            return False, f"格式 {suffix or '(无后缀)'} 不在受支持格式内（中性默认=include）"
+        return True, "中性默认=include（受支持格式一律纳入）"
+    # follow（旧默认）：按该库格式开关判定
+    exts = {str(e).lower().lstrip(".") for e in (enabled_extensions or ())}
+    if suffix not in exts:
+        return False, f"格式 {suffix or '(无后缀)'} 不在库格式开关内"
+    return True, "中性跟随格式开关"
 
 
 def collect_included_files(
@@ -260,3 +299,86 @@ def apply_selection_changes(
             sout.append(path)
         # action == "neutral"：已经从两份名单里都移除，不需要再做什么
     return sin, sout
+
+
+# ---------------------------------------------------------------------------
+# 格式开关的批量勾选语义（obsidian-rag 问题44 用户拍板③：全局格式开关 =
+# 对该格式文件的批量勾/取消，**无保护概念**——显式勾选的某份也跟着取消）。
+# 纯函数，配置写入的收口在 config.py::set_policy（唯一收口，GUI/CLI/MCP
+# 都只能改那一个公开方法）。
+# ---------------------------------------------------------------------------
+
+
+def _ext_suffixes(exts: Sequence[str] | None) -> tuple[str, ...]:
+    out: list[str] = []
+    for value in exts or ():
+        s = str(value).strip().lower().lstrip(".")
+        if s and f".{s}" not in out:
+            out.append(f".{s}")
+    return tuple(out)
+
+
+def format_selection_bulk(
+    exts: Sequence[str] | None,
+    enabled: bool,
+    selection_in: Sequence[str] | None,
+    selection_out: Sequence[str] | None,
+) -> tuple[list[str], list[str], int]:
+    """格式批量语义，返回 (新 selection_in, 新 selection_out, 受影响条目数)
+    ——对齐 obsidian-rag/library.py:290-323 format_selection_bulk。
+
+    - `enabled=False`（关格式）：selection_in 里扩展名命中 exts 的条目移入
+      selection_out（用户显式勾选的该格式文件跟着取消）；
+    - `enabled=True`（开格式）：selection_out 里扩展名命中 exts 的条目移除
+      （恢复"跟随"=纳入）。
+
+    **文件夹级条目永不被批量触碰**，而"文件级"是按扩展名判定的——不能以
+    "路径里有没有 /"来区分：子目录下的文件同样含斜杠（这条坑旧项目在
+    TASK_LOG.md 问题44 里明确记过"文件级按扩展名判定——子目录文件也有斜杠，
+    不能以'/'有无区分文件/文件夹"，这里照抄不重犯；文件夹条目极少以 .pdf
+    之类结尾，误伤面可忽略，与旧项目一致）。
+
+    与旧项目的一处刻意差异：不排序。旧实现落盘前 sorted()，REDO 的
+    set_selection / apply_selection_changes 一律保持插入顺序；裁决侧本来就是
+    建集合比对，顺序不可观测，统一成"保持原相对顺序"更自洽。
+    """
+    suffixes = _ext_suffixes(exts)
+
+    def _file_fmt(path: str) -> bool:
+        return bool(suffixes) and path.lower().endswith(suffixes)
+
+    sin = [str(p) for p in (selection_in or ())]
+    sout = [str(p) for p in (selection_out or ())]
+    if enabled:
+        kept = [p for p in sout if not _file_fmt(p)]
+        return sin, kept, len(sout) - len(kept)
+    moved = [p for p in sin if _file_fmt(p)]
+    kept_in = [p for p in sin if not _file_fmt(p)]
+    kept_out = list(sout)
+    for path in moved:
+        if path not in kept_out:
+            kept_out.append(path)
+    return kept_in, kept_out, len(moved)
+
+
+def bulk_for_extensions(
+    old_exts: Sequence[str] | None,
+    new_exts: Sequence[str] | None,
+    selection_in: Sequence[str] | None,
+    selection_out: Sequence[str] | None,
+) -> tuple[list[str], list[str], int]:
+    """extensions 变更 → 批量勾选语义的收口（对齐 obsidian-rag/library.py
+    326-339 bulk_for_extensions）。被移除的格式跟着取消勾选，新增的格式把
+    selection_out 里对应的文件条目摘掉。"""
+    old = set(_ext_suffixes(old_exts))
+    new = set(_ext_suffixes(new_exts))
+    sin = [str(p) for p in (selection_in or ())]
+    sout = [str(p) for p in (selection_out or ())]
+    total = 0
+    for ext in sorted(old - new):
+        sin, sout, moved = format_selection_bulk([ext], False, sin, sout)
+        total += moved
+    for ext in sorted(new - old):
+        sin, sout, moved = format_selection_bulk([ext], True, sin, sout)
+        total += moved
+    return sin, sout, total
