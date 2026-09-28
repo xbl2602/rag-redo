@@ -23,9 +23,14 @@ from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Callable, Iterator
 
-from .atomic import atomic_write_text
+from .atomic import atomic_write_text, read_text_retry
 from .runtime import PluginRuntime, PluginState
 from .singleton import FileByteLock, pid_alive
+
+
+#: 索引 worker 的输出日志文件名（`<data_dir>/index_worker.log`）。GUI 的日志面板
+#: 读的就是这份文件，文件名只在这里定义一次，别处引用常量而不是抄字面量。
+INDEX_LOG_NAME = "index_worker.log"
 
 
 def _shutdown_index_worker_manager(manager_ref) -> None:
@@ -99,10 +104,30 @@ def _atomic_write_json(path: Path, data: object) -> bool:
         return False
 
 
-def _read_json(path: Path) -> dict | None:
+class StatusUnreadableError(OSError):
+    """状态文件**存在**，但重试之后仍然读不了（被别的进程占着不放等）。"""
+
+
+def _read_json(path: Path, *, strict: bool = False) -> dict | None:
+    """读状态 JSON。
+
+    - 文件不存在 / 内容损坏 / 顶层不是对象 → `None`（"没有可用状态"）；
+    - 读取撞上瞬时的句柄占用 → 先短退避重试（`core/atomic.py::read_text_retry`，与写侧
+      同口径）。此前这里吞掉**全部** `OSError`，Windows 上与 `os.replace` 撞车的瞬间
+      `PermissionError` 被当成"没有状态"，停止按钮因此间歇性被拒；
+    - 重试后仍读不了：`strict=False` 返回 `None`（查询类接口沿用"无状态"语义），
+      `strict=True` 抛 `StatusUnreadableError`——`stop()` 据此把"读不出来"和"确实没有
+      任务"分开说，绝不把前者说成后者。
+    """
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(read_text_retry(path))
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        return None
+    except OSError as exc:
+        if strict:
+            raise StatusUnreadableError(f"{type(exc).__name__}: {exc}") from exc
         return None
     return data if isinstance(data, dict) else None
 
@@ -587,7 +612,7 @@ class IndexWorkerManager:
                 format_allowlist,
                 os.getpid(),
                 str(ack_path),
-                str(self._data_dir / "index_worker.log"),
+                str(self._data_dir / INDEX_LOG_NAME),
                 self._heartbeat_interval,
                 self._heartbeat_timeout,
                 self._stall_timeout,
@@ -779,7 +804,10 @@ class IndexWorkerManager:
         _atomic_write_json(self._status_path(library_id), data)
 
     def stop(self, library_id: str, run_id: str = "") -> tuple[bool, str]:
-        data = _read_json(self._status_path(library_id))
+        try:
+            data = _read_json(self._status_path(library_id), strict=True)
+        except StatusUnreadableError as exc:
+            return False, f"无法读取索引进度状态（{exc}），请稍后重试"
         if data is None:
             return False, f"库「{library_id}」没有可停止的索引任务"
         if data.get("launcher_pid") != os.getpid():
@@ -808,7 +836,11 @@ class IndexWorkerManager:
             self._forget(target_run_id, process)
             return False, "拒绝停止：工作进程已经退出"
 
-        current = _read_json(self._status_path(library_id))
+        try:
+            current = _read_json(self._status_path(library_id), strict=True)
+        except StatusUnreadableError as exc:
+            # 读不出来 ≠ 状态变了：不下"状态已经变化"的结论，让调用方重试
+            return False, f"无法读取索引进度状态（{exc}），请稍后重试"
         if (
             current is None
             or str(current.get("run_id")) != target_run_id

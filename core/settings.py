@@ -33,6 +33,27 @@ config import CFG` 就能读任意键——这在插件互相隔离、"同一件
 **为什么不路由进 `core/datastore.py::DataStore`**：设置存储是核心服务，
 不是插件私有数据；DataStore 负责插件存储 handle 和跨插件契约权限，设置
 仍由 SettingsStore 直接管理自身文件。规则见 ../AGENTS.md"两个核心组件"节。
+
+**跨进程现读（2026-09-27 补的坑）**：GUI 与 MCP/CLI 是不同进程，GUI 在设置
+面板改一个键（`wemm_backend`、`pdf_scan_backend`…）之后，长驻的 MCP 进程
+此前**永远看不到**——本类只在构造时把 JSON 读进 `_values`，之后所有 `get()`
+都命中内存副本，于是"上一波刚修好的 WEMM 门禁不需重启即生效"只在同进程内
+成立，跨进程不成立。旧项目是靠纪律兜住的：`obsidian-rag/server.py:950-961
+_wemm_cfg()` 在每个工具入口先 `reload_config()` 现读（"长驻 MCP 进程配置一律
+经 config.reload_config() 现读"）。
+
+本类给两种能力，语义都收敛在这一处，调用方不必各自实现：
+
+- `reload()`：无条件重读一次，返回是否真的读了盘。对齐
+  `obsidian-rag/config.py:703-716 reload_config()` 的形状，进程边界
+  （任务入口、GUI 保存之后）显式调它。
+- `auto_reload=True`（默认）：`get()`/`all()` 前按 `(mtime_ns, size)` 戳做
+  **一次 stat**，戳没变直接用内存值——所以既有调用方（`ctx.settings.get(...)`
+  在很多插件里被调用）零改动就拿到跨进程现读，又不会每次 `get()` 都读盘。
+
+长任务（一次索引要跑几分钟，中途被另一个进程改设置带着跑偏 = 一轮索引内
+配置前后不一致）可以 `SettingsStore(path, auto_reload=False)` 退回
+"启动快照 + 显式 reload" 的 LEGACY 形状。
 """
 from __future__ import annotations
 
@@ -43,6 +64,10 @@ from pathlib import Path
 from typing import Any
 
 from .atomic import atomic_write_text
+
+#: 文件戳未知的哨兵：_stamp 为 None 表示"还没读过，或读过之后发生过写入但
+#: 没能重新取到戳"——下一次 get() 必须真读一次盘。
+_UNKNOWN_STAMP = None
 
 
 def _type_compatible(value: Any, default: Any) -> bool:
@@ -63,13 +88,27 @@ def _type_compatible(value: Any, default: Any) -> bool:
 
 class SettingsStore:
     """具名键值对，持久化到 `path` 指向的 JSON 文件。插件/core 通过
-    `ctx.settings`（见 core/context.py）或直接持有这个实例来读写。"""
+    `ctx.settings`（见 core/context.py）或直接持有这个实例来读写。
 
-    def __init__(self, path: Path, *, logger: logging.Logger | None = None) -> None:
+    `auto_reload=True`（默认）时每次读之前按文件戳判断要不要重读，见模块
+    docstring 的"跨进程现读"一节；`auto_reload=False` + 显式 `reload()` 是
+    旧项目 `reload_config()` 的形状。
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        logger: logging.Logger | None = None,
+        auto_reload: bool = True,
+    ) -> None:
         self._path = path
         self._logger = logger if logger is not None else logging.getLogger("rag_redo.core.settings")
         self._lock = threading.Lock()
-        self._values: dict[str, Any] = self._load()
+        self._auto_reload = bool(auto_reload)
+        self._stamp: tuple[int, int] | None = _UNKNOWN_STAMP
+        self._values: dict[str, Any] = {}
+        self.reload(force=True)
 
     def _load(self) -> dict[str, Any]:
         if not self._path.is_file():
@@ -84,11 +123,55 @@ class SettingsStore:
             return {}
         return data
 
+    def _file_stamp(self) -> tuple[int, int] | None:
+        """当前磁盘文件的 `(mtime_ns, size)`；取不到（文件不存在/无权限/
+        目录被替换）返回 None。"""
+        try:
+            stat = self._path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def reload(self, *, force: bool = False) -> bool:
+        """重读设置文件，返回是否真的读了盘。
+
+        `force=False`（默认）时先比文件戳，没变就不读——这是 `get()` 每次都
+        能安全调用的前提。`force=True` 无条件重读（构造时、以及调用方明确
+        要求"现读"时用）。
+
+        **取不到文件就保持内存现状**（返回 False，不动 `_values`）：原子写
+        保证正常路径下文件不会消失，而一次 stat 失败（杀软、只读挂载、网络盘
+        抖动）就把长驻进程的全部设置清空，比"晚一点看到外部改动"坏得多——
+        与 `core/singleton.py` 的 fail-open 是同一条原则。
+        """
+        with self._lock:
+            return self._reload_locked(force=force)
+
+    def _reload_locked(self, *, force: bool) -> bool:
+        """`reload()` 的锁内部分（`_lock` 是普通 Lock，不可重入，所以读路径
+        只能走这个不自己加锁的版本）。"""
+        stamp = self._file_stamp()
+        if stamp is None:
+            return False
+        if not force and stamp == self._stamp:
+            return False
+        self._values = self._load()
+        self._stamp = stamp
+        return True
+
+    def _refresh_if_changed_locked(self) -> None:
+        if not self._auto_reload:
+            return
+        if self._file_stamp() == self._stamp:
+            return
+        self._reload_locked(force=False)
+
     def get(self, key: str, default: Any = None) -> Any:
         """读一个设置项。`key` 不存在、或存的值类型和 `default` 对不上时
         都回退 `default`——调用方永远拿到"类型对的值"，不需要自己再校验
         一遍。"""
         with self._lock:
+            self._refresh_if_changed_locked()
             if key not in self._values:
                 return default
             value = self._values[key]
@@ -119,6 +202,7 @@ class SettingsStore:
         """只读快照——GUI 设置面板列出当前全部已存值时用，返回的是拷贝，
         调用方改了不会污染这个 store 内部状态。"""
         with self._lock:
+            self._refresh_if_changed_locked()
             return dict(self._values)
 
     def _save_locked(self) -> None:
@@ -133,3 +217,9 @@ class SettingsStore:
             )
         except OSError as exc:
             self._logger.warning("设置写盘失败（本次改动只在内存生效，进程重启后会丢失）：%s", exc)
+        # 写完之后把戳标成"未知"而不是就地取新戳：另一个进程完全可能在我们
+        # 写盘和取戳之间改过同一个文件（此时新戳对应的内容里含我们没读过的
+        # 外部改动），标成未知可以保证下一次 get() 一定真读一次盘，把外部
+        # 改动收进来。set() 是低频用户操作，多这一次读盘没有性能代价。
+        self._stamp = _UNKNOWN_STAMP
+

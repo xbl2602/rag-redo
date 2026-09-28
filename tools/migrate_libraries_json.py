@@ -101,7 +101,19 @@ def migrate(store: LibraryConfigStore, old_entries: list[dict], global_selection
         enabled_extensions = [f".{ext.lstrip('.').lower()}" for ext in extensions]
         new_default = global_selection_new_files
 
-        store.add_library(library_id, name, path)
+        # `require_existing_dir=False`：迁移读的是**旧项目注册表**里记下的
+        # 路径，那台机器上它可能已经不在了（库搬过家、外接盘没插、或者像
+        # tools/tests 里的 fixture 那样根本是个占位路径）。迁移的职责是把
+        # 配置搬过来，不是替用户判断路径对不对——直接在这里抛错会让用户既
+        # 迁不动旧配置、也看不出到底是哪一条的路径有问题。所以放行，但把
+        # 不存在的路径明确写进日志行（下面 logs.append 之后会带出来），让
+        # 用户一眼看见哪几条要手工改。对齐 obsidian-rag/library.py:430-451
+        # `_migrate_legacy`：旧项目的自动迁移同样不校验目录存在。
+        resolved = Path(path).expanduser()
+        if not resolved.is_dir():
+            logs.append(f"注意：库「{name}」的路径当前不存在（{resolved}），已照原样迁移，请手工确认")
+        store.add_library(library_id, name, path, require_existing_dir=False)
+
         store.set_policy(
             library_id,
             new_file_default=new_default,

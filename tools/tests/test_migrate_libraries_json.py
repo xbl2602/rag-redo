@@ -56,7 +56,12 @@ class TestMigrateLibrariesJson(unittest.TestCase):
         libs = {c.name: c for c in self.store.list_libraries()}
         self.assertEqual(set(libs), {"工作笔记", "读书笔记"})
         work = libs["工作笔记"]
-        self.assertEqual(work.root_path, "/home/user/vaults/work")
+        # 迁移落盘的 root_path 是**解析后的绝对路径**（add_library 对齐
+        # obsidian-rag/library.py:489 `Path(path).resolve()`）：旧注册表里
+        # 手写的 "/home/user/vaults/work" 在 Windows 上会被解析成当前盘下的
+        # 绝对路径。存解析结果而不是原字符串，是为了让"同一目录不能注册两次"
+        # 的判定有唯一基准（尾斜杠 / 大小写 / `.` / junction 别名都收敛到一处）。
+        self.assertEqual(work.root_path, str(Path("/home/user/vaults/work").resolve()))
         self.assertEqual(work.selection_in, ["projects/rag-redo/notes.md"])
         self.assertEqual(work.selection_out, ["archive", "private/secret.md"])
 

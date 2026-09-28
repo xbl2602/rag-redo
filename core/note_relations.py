@@ -27,6 +27,8 @@ import os
 import re
 from pathlib import Path
 
+from .library_key import library_storage_key
+
 _WIKILINK_RE = re.compile(r"!?\[\[([^\]]*)\]\]")
 
 
@@ -59,7 +61,10 @@ class NoteRelationsStore:
         self._root = root
 
     def _path_for(self, library_id: str, generation: str | None = None) -> Path:
-        safe = re.sub(r"[^\w.-]", "_", library_id)
+        # 目录名走 `library_storage_key`（安全名 + 短哈希，core/library_key.py）：
+        # 裸 `re.sub` 字符替换会把 `"a b"` 与 `"a_b"` 归一成同一个目录，两个库
+        # 的出链图互相覆盖，其中一份还会被全局回收当孤儿删掉。
+        safe = library_storage_key(library_id)
         if generation:
             return self._root / "generations" / safe / f"{generation}.json"
         return self._root / f"{safe}.json"

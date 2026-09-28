@@ -13,7 +13,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from core.index_progress import IndexProgress, IndexWorkerManager
+from unittest.mock import patch
+
+from core import atomic
+from core.index_progress import IndexProgress, IndexWorkerManager, StatusUnreadableError, _read_json
 from core.singleton import pid_alive
 
 
@@ -438,6 +441,90 @@ class TestIndexWorkerManager(unittest.TestCase):
         status_path.parent.mkdir(parents=True, exist_ok=True)
         status_path.write_text("{broken", encoding="utf-8")
         self.assertIsNone(self.manager.status("corrupt"))
+
+    # ---- 读侧瞬时失败（审计 M-1：停止按钮间歇性被拒）------------------------
+    #
+    # 根因：Windows 上读者恰好撞上另一方的 `os.replace`，会得到瞬时的
+    # `PermissionError`；旧 `_read_json` 吞掉全部 OSError，把它当成"没有状态"，
+    # `stop()` 于是回"没有可停止的索引任务"。下面用**注入的**瞬时失败做确定性验证，
+    # 不靠碰运气跑几十遍。
+
+    def _write_running_status(self, library_id: str = "lib1") -> Path:
+        path = self.manager._status_path(library_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        progress = self._manual_progress(heartbeat_at=time.time(), progress_at=time.time())
+        progress.library_id = library_id
+        path.write_text(json.dumps(progress.__dict__), encoding="utf-8")
+        return path
+
+    def test_read_json_retries_transient_permission_errors(self):
+        path = self._write_running_status()
+        real_read_text = Path.read_text
+        attempts = {"n": 0}
+
+        def flaky(self_path, *args, **kwargs):
+            if self_path == path and attempts["n"] < 3:
+                attempts["n"] += 1
+                raise PermissionError(13, "Access is denied")  # 与 os.replace 撞车的瞬间
+            return real_read_text(self_path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", flaky):
+            data = _read_json(path)
+        self.assertIsNotNone(data, "瞬时的 PermissionError 必须被重试掉，而不是当成'没有状态'")
+        self.assertEqual(data["run_id"], "manual-run")
+        self.assertEqual(attempts["n"], 3)
+
+    def test_read_json_missing_file_is_none_immediately_without_retrying(self):
+        path = self.data_dir / "nope" / "missing.json"
+        started = time.monotonic()
+        with patch.object(atomic.time, "sleep") as sleep:
+            self.assertIsNone(_read_json(path))
+            self.assertIsNone(_read_json(path, strict=True))
+        sleep.assert_not_called()
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_read_json_persistent_failure_is_none_when_lenient_and_raises_when_strict(self):
+        path = self._write_running_status()
+
+        def always_denied(self_path, *args, **kwargs):
+            raise PermissionError(13, "Access is denied")
+
+        with patch.object(atomic, "_REPLACE_RETRY_DELAYS_S", (0.0, 0.0)), \
+                patch.object(Path, "read_text", always_denied):
+            self.assertIsNone(_read_json(path))
+            with self.assertRaises(StatusUnreadableError):
+                _read_json(path, strict=True)
+
+    def test_non_busy_os_errors_are_not_retried(self):
+        path = self._write_running_status()
+        calls = {"n": 0}
+
+        def broken_disk(self_path, *args, **kwargs):
+            calls["n"] += 1
+            raise OSError(5, "I/O error")  # 不是句柄占用：重试没有意义
+
+        with patch.object(Path, "read_text", broken_disk):
+            self.assertIsNone(_read_json(path))
+        self.assertEqual(calls["n"], 1)
+
+    def test_stop_does_not_call_an_unreadable_status_no_task_or_changed(self):
+        """读不出来 ≠ 没有任务 ≠ 状态已变化：`stop()` 要把真实情况说出来。"""
+        self._write_running_status("lib1")
+
+        def always_denied(self_path, *args, **kwargs):
+            raise PermissionError(13, "Access is denied")
+
+        with patch.object(atomic, "_REPLACE_RETRY_DELAYS_S", (0.0, 0.0)), \
+                patch.object(Path, "read_text", always_denied):
+            stopped, message = self.manager.stop("lib1", "manual-run")
+        self.assertFalse(stopped)
+        self.assertIn("无法读取索引进度状态", message)
+        self.assertNotIn("没有可停止的索引任务", message)
+        self.assertNotIn("状态已经变化", message)
+        # 真的没有状态文件时，仍然是原来的说法
+        stopped, message = self.manager.stop("never-started", "x")
+        self.assertFalse(stopped)
+        self.assertIn("没有可停止的索引任务", message)
 
 
 if __name__ == "__main__":

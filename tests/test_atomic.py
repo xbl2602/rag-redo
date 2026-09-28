@@ -89,6 +89,74 @@ class TestAtomicWrite(unittest.TestCase):
         atomic_write_bytes(target, b"PK\x03\x04 payload")
         self.assertEqual(target.read_bytes(), b"PK\x03\x04 payload")
 
+    def test_concurrent_writers_survive_a_long_sharing_violation_storm(self):
+        """并发写 + 目标句柄被长时间占用时也必须扛住（2026-09-27 全量回归
+        实测到的偶发 `PermissionError(13, 'Access is denied')` 的护栏）。
+
+        原退避总预算只有 30ms（0/0.01/0.02 三档），机器繁忙时 120 次并发
+        replace 必然有写炸的——一个偶发红会让整道回归门禁不可信。这里让
+        replace 前 6 次都抛"句柄被占"，仍必须最终写成功。
+        """
+        import os as _os
+        import threading
+
+        target = self.tmp / "storm.json"
+        real_replace = _os.replace
+        calls = {"n": 0}
+        lock = threading.Lock()
+
+        def _stormy_replace(src, dst):
+            with lock:
+                calls["n"] += 1
+                attempt = calls["n"]
+            if attempt <= 6:
+                raise PermissionError(13, "Access is denied")
+            return real_replace(src, dst)
+
+        errors: list[Exception] = []
+
+        def _worker() -> None:
+            try:
+                atomic_write_text(target, json.dumps({"written": True}))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        with patch("core.atomic.os.replace", side_effect=_stormy_replace):
+            threads = [threading.Thread(target=_worker) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(errors, [], f"扛不住 6 次连续占用：{errors}")
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"written": True})
+
+    def test_non_sharing_oserror_is_not_retried(self):
+        """非"句柄被占"的 OSError（磁盘满、只读文件系统）必须**立即**抛出，
+        不能被拖成 0.8s 的静默重试——那会把真实故障伪装成"慢"。"""
+        import os as _os
+        import time as _time
+
+        target = self.tmp / "readonly.json"
+        real_replace = _os.replace
+        calls = {"n": 0}
+
+        def _no_space(src, dst):
+            calls["n"] += 1
+            raise OSError(28, "No space left on device")
+
+        started = _time.monotonic()
+        with patch("core.atomic.os.replace", side_effect=_no_space):
+            with self.assertRaises(OSError) as caught:
+                atomic_write_text(target, "content")
+        elapsed = _time.monotonic() - started
+
+        self.assertEqual(calls["n"], 1, "磁盘满重试没有意义，必须一次就抛")
+        self.assertNotIsInstance(caught.exception, PermissionError)
+        self.assertLess(elapsed, 0.2, f"不该退避这么久，实际 {elapsed:.3f}s")
+        self.assertEqual(list(self.tmp.glob("*.tmp")), [])
+        del real_replace
+
 
 if __name__ == "__main__":
     unittest.main()

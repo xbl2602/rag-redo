@@ -19,9 +19,9 @@ index_library()` 跑完后产出的 `IndexReport` 本来就带着这些信息
 from __future__ import annotations
 
 import json
-import re
 
 from .atomic import atomic_write_text
+from .library_key import library_storage_key
 from pathlib import Path
 
 # 终态 reason → 人类可读解释（索引失败溯源用）——逐字对齐旧
@@ -42,7 +42,11 @@ class IndexFailuresStore:
         self._root = root
 
     def _path_for(self, library_id: str, generation: str | None = None) -> Path:
-        safe = re.sub(r"[^\w.-]", "_", library_id)
+        # 目录名走 `library_storage_key`（安全名 + 短哈希，core/library_key.py），
+        # 不用裸 `re.sub` 字符替换——后者不是单射，`"a b"` 与 `"a_b"` 两个不同
+        # 的库会共用同一份诊断数据，其中一份还会被全局回收当孤儿删掉。统一到
+        # 唯一实现也让 `prune_unreferenced_data` 的孤儿判定只需认一种命名。
+        safe = library_storage_key(library_id)
         if generation:
             return self._root / "generations" / safe / f"{generation}.json"
         return self._root / f"{safe}.json"
