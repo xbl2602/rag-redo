@@ -1,5 +1,10 @@
 """official-embedder-bge-m3 插件：生命周期钩子的薄封装，真实逻辑在 embed.py。
 
+**GPU 名额只在"真要装/已装着模型"时占，不是插件启用即占**（见 embed.py 模块
+docstring 的"GPU 租约语义"一节）：`on_enable` 只起空闲卸载守护线程，绝不
+申请 "gpu:0" 名额；名额由 `_ensure_loaded` 在真的要往显存里装模型时申请，
+由卸载/降级/on_disable/on_unload 归还。
+
 **空闲卸载守护线程**：GPU 生命周期管理（见 embed.py 模块 docstring）需要
 一个后台线程周期性检查"模型是否已经空闲太久该卸载了"——不能只在有新
 请求进来时才检查，空闲的定义恰恰是没有请求，只在请求路径里检查会让
@@ -44,6 +49,9 @@ class EmbedderPlugin:
         ctx.logger.info("BGE-M3向量化插件已加载（模型懒加载，首次编码时才真正下载/加载）")
 
     def on_enable(self, ctx):
+        # 刻意不碰 "gpu:0" 名额：名额语义是"模型此刻真的在显存里"（embed.py
+        # 模块 docstring）。插件启用只是"待命"，此刻没有任何模型在显存里，
+        # 在这里占名额会让 WEMM/OCR-local 在显存明明空着时也抢不到。
         self._idle_stop = threading.Event()
 
         def _loop():
@@ -62,15 +70,24 @@ class EmbedderPlugin:
             self._idle_stop.set()
         self._idle_stop = None
         self._idle_thread = None
-        if self.embedder is not None:
-            try:
-                self.embedder.release_gpu_slot()
-            except Exception:  # noqa: BLE001 - 禁用收口失败不拖垮宿主，同守护线程的宽容纪律
-                ctx.logger.warning("BGE-M3插件禁用时归还GPU名额失败（忽略）", exc_info=True)
+        self._release_gpu_slot(ctx)
         ctx.logger.info("BGE-M3向量化插件已禁用")
 
     def on_unload(self, ctx):
+        # on_unload 也要收口：宿主可能不经过 on_disable 直接卸载插件（热重载
+        # 路径）。release_gpu_slot 幂等，重复调用是安全空操作。
+        self._release_gpu_slot(ctx)
         self.embedder = None
+
+    def _release_gpu_slot(self, ctx) -> None:
+        """卸载模型 + 归还 GPU 名额，幂等；失败不拖垮宿主（同守护线程的宽容
+        纪律）。"""
+        if self.embedder is None:
+            return
+        try:
+            self.embedder.release_gpu_slot()
+        except Exception:  # noqa: BLE001 - 禁用收口失败不拖垮宿主
+            ctx.logger.warning("BGE-M3插件收尾时归还GPU名额失败（忽略）", exc_info=True)
 
     def index_signature(self) -> str:
         return MODEL_VERSION

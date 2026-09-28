@@ -97,6 +97,10 @@ class ChromaVectorStorePlugin:
         assert self.store is not None
         return self.store.list_collection_names()
 
+    def ensure_collection_by_name(self, name: str) -> str:
+        assert self.store is not None
+        return self.store.ensure_collection_by_name(name)
+
     def delete_collection_by_name(self, name: str) -> None:
         assert self.store is not None
         self.store.delete_collection_by_name(name)
