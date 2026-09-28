@@ -13,11 +13,41 @@
 5. ~~Phase 3 剩余两项（库 AI 摘要 + Agent 写权限门禁通用化）~~——**已完成（2026-09-23）**，见下方 Phase 3 状态段落。新发现一项未跟踪的功能缺口：调查过程中确认旧项目 `retriever.py::hyde_generate`（查询侧 HyDE 增强，让 LLM 为查询生成一段假设答案文档再去检索）是和库摘要**平行、独立**的功能，用同一协议但不同的配置端点（`hyde_llm_url`/`hyde_llm_model` vs `library_summary_llm_url`/`library_summary_llm_model`）——HyDE 已于 2026-09-24 作为独立 `official-query-enhancer-hyde` 插件完成（`query_enhancer` 多值扩展点）：默认关闭，首轮 top1 低于 `hyde_min_confidence=0.5` 才调用独立 OpenAI 兼容端点生成 60~150 字假设文档，重查后仅在第二轮置信度严格更高时替换，失败静默保留首轮；端点/模型/API Key/超时/token 均保留独立设置与环境变量覆盖。
 6. ~~Phase 4：Windows 分发~~——**已切换为便携 ZIP（2026-09-24）**：`build_windows.py` 不再运行 PyInstaller，也不再依赖 Inno Setup；它生成自带独立 Python、核心代码、插件和启动脚本的 `dist/rag-redo-portable.zip`。仍需在一台没装过任何开发工具的干净 Windows 机器上验证，并继续做体积优化。
 7. ~~多库并查检索选择+folder过滤+置信度真分尺度~~——**已完成（2026-09-23）**：对照 obsidian-rag/retriever.py::hybrid_search 逐项核对 `search_knowledge` 时发现的真实缺口（此前 ROADMAP 从未把这单独列为追踪项，不是遗漏了已知计划，是这轮对照审计才发现），见下方 Phase 1 状态段落。
-8. ~~全面功能审计（2026-09-23）发现的新缺口~~——**核心行为契约已全部完成（2026-09-24）**，见下方独立小节及其后续段落"操作者 `/goal` 锁定"完成所有！"后续完成情况"。仍未完成的是本地 Windows 干净机安装验收、GUI 真实渲染冒烟和打包体积优化，不是行为契约缺口。
+8. ~~全面功能审计（2026-09-23）发现的新缺口~~——**核心行为契约已全部完成（2026-09-24）**，见下方独立小节及其后续段落"操作者 `/goal` 锁定"完成所有！"后续完成情况"。仍未完成的是本地 Windows 干净机安装验收、GUI 的操作者人工验收（2026-09-28 已补自动化的真实进程冒烟与浏览器联调，见下方"2026-09-26～28"一节；BC-15 仍为 `partial`）和打包体积优化，不是行为契约缺口。
 9. ~~完整文件级增量索引~~——**已完成（2026-09-24）**：per-file manifest + 分段 generation + 精确阶段失效 + 原子发布 + 无重算 compaction，文字/BM25/提取缓存/WEMM 页库全部接入；MCP/GUI 同时支持增量和显式完整重建。
 10. **业务 CLI 移植（顺延）**——旧项目有完整业务 CLI（`index.py:2441` 命令行索引、`library.py:700` 库注册管理、`import.py`/`export.py`、`dedup.py`），rag-redo 的 `core/cli.py` 只有插件管理命令（scan/status/load/enable/disable/unload），不是同一业务入口。操作者 2026-09-25 拍板低优先顺延：命令应为 Pipeline 编排层的薄封装（同 MCP/GUI 调同一服务层的纪律），不含新业务逻辑。
 11. **每插件导入隔离（登记）**——`core/runtime.py` 把插件目录加进 sys.path 才能加载入口模块，两个插件若有同名顶层模块会冲突；真实的每插件导入隔离（子进程内加载或独立命名空间）待有真实冲突案例再设计。
 12. **DataStore 深度封装（登记）**——StorageHandle 仍返回裸 Path（in_process 受信任插件定位下够用，见 core/datastore.py docstring 的边界说明）；`DataStore.write/read` 契约值机制已实现但生产数据流暂无调用方（插件通信走 Pipeline 编排）；`gui_main.py` 直传 lib_mgr 插件实例给 GUI Api 属有记录的薄封装层偏离。三者都是架构改进项，不是行为缺口。
+
+## 2026-09-26～28 GUI 启动修复与完整审计闭环
+
+> **起因与纠正**：2026-09-28 的完整审计（对照 `PROBLEMS_2026-09-28.md` 的 A1–A22）发现，此前本文档与行为契约里"GUI 已完成"的表述**不实**——`official-gui-shell` 被运行时判为 `invalid`，GUI 实际起不来；而 60+ 条 GUI 测试全绿，因为它们直接实例化 `Api`、对源码文本做 grep，没有任何一条走过真实的插件加载路径。回归基线也不是文档里记的全绿，而是 **48/51**（`test_api` 22 报错、MCP `find_duplicates` 4 失败、`test_index_progress` 间歇失败）。操作者用 `/goal` 锁定："先把 GUI 搞定（不然没法上手测试），然后其余可以解决的一次性解决"（`GOAL.md` C6–C12）。
+>
+> **结果**：全量回归 **53/53**（`tests/run.py` 退出码 0；日志 0 条 Traceback、0 条 SyntaxWarning；回归结束后无遗留 WEMM/MinerU 服务进程）。约 80 个文件、累积 3 天的未提交改动已按主题拆成多个提交（`git log e141ce4..HEAD`；按文件粒度拆分，单个提交不保证独立全绿），**未 push**。
+
+**GUI（审计 A1 / A3–A8 / A10 / A12 / A16）**
+- **真实启动路径门禁**（`plugins/official-gui-shell/tests/test_boot.py`）：全部 20 个必需插件经真实 `PluginRuntime` 加载并启用后无一 `invalid`/`failed`；用假 `webview` 跑**真实的** `gui_main.main()`（临时数据目录）：窗口规格与冻结夹具逐项一致、`bind_window` 被调用、推送线程真的向前端推了真实快照并在窗口关闭后停止；必需插件起不来时 `main()` 打印真实原因并非零退出（此前静默放过）；`paths.plugins_state_file()` 无参可用，GUI/MCP/CLI 三入口共用 `core/paths.py`（此前 CLI 抄了一份相对工作目录的错版本）。
+- **桥接层重写**（`contract_bridge.py`）：旧 `guiweb/contracts.md` 的 37 个方法逐个真实调用，返回值键集对冻结夹具 `legacy_guiweb_contract.json` 逐个对账（不只比签名）；库"显示名"与 `library_id` 分离（输出显示名，输入按 id、再按唯一显示名解析，重名/未知名明确报错而不是假成功）；进度按 `index_status` 映射成旧形状；提取试验台在子进程里跑、可取消、180 秒硬超时；`index_stats.files` 口径同旧 `meta_stats_for`（含落终态/失败的文件），有测试钉住（1 个 empty + 2 个成功 → `files == 3`，成功数另看 `index_failures()["succeeded"]`）。
+- **设置页**（`settings_schema.py`）：只登记 rag-redo 真的有人读的键（9 个分组，不做假开关），整批保存全有或全无；`test_settings_schema.py` 用 AST 把每个键对账到 core/插件里真实的 `settings.get(...)` 调用点与默认值，漂移即红。
+- **`test_api.py` 迁移**到新 API（原 22 个报错清零），前端资产仍是逐字节复刻并由 sha256 固定。
+- **真实进程冒烟**（本机、临时数据目录）：`gui_main.py` 启动后 6~8 秒内出现标题 **"Obsidian RAG"** 的窗口，标准错误为空；正常关窗后整棵进程树无残留。**注意标题**：`GOAL.md` C6 的冒烟命令按 "RAG REDO" 查找窗口，而窗口规格沿用冻结夹具里旧项目的 "Obsidian RAG"——二者不一致，待操作者决定，`GOAL.md` 未改动。
+- **前端对真实后端的浏览器联调**（harness 只放在临时目录，不入库；真实 `Api` + 真实推送循环，仅嵌入/重排/LLM 为假）：图谱、库、勾选范围（点击关闭 `empty.md` → 保存 → 回读进入排除名单）、检索（含结果建议、双链出入链）、设置（保存后回读）、索引、试验台、诊断（含去重）全部渲染并可操作；0 个 JS 报错、0 个失败请求。**未覆盖**：点击"开始索引"会拉起真实索引 worker 并加载真实 BGE-M3，联调未走这条；图谱在只有 8 个节点的小库上初始取景偏离、节点落在可视区之外（点"适应视图"后正常；`graph()` 载荷的键集与前端自带 `mock.js` 一致，判断是冻结前端自身的初始布局行为，原因未深究，也没有拿旧后端同数据对照）；自动化窗格里 `requestAnimationFrame` 被冻结，联调垫片用定时器模拟。
+- **联调中发现并修复的真实缺陷**：`gui_main.main()` / `mcp_stdio.main()` 退出时不收口运行时，插件拉起的 WEMM 看图服务（及其子进程）在 Windows 上不会跟着父进程走——每开关一次窗口留下一对孤儿进程（真实进程冒烟复现并验证已消除）。修法：两个入口的任何退出路径都 `runtime.close()`；同时让 `PluginRuntime.close()` **不再改写**磁盘上的启用记录（此前每次退出都把 `plugins_state.json` 擦成 `{"enabled": []}`，`scan()` 的自动恢复形同虚设）。A19"全量回归遗留游离 WEMM server"此前没有单独定位泄漏源；入口与 CLI 都收口后，全量回归结束时已无任何遗留服务进程（验证标准：回归前后 `python.exe` 进程数不变、无 `server.py` 服务进程）。
+
+**其余审计项**
+- **A2** `find_duplicates`：单库不再崩溃；多库（含默认 `libraries=""`）按每个库各自的 Agent 授权格式过滤，未授权格式的文件名与重复关系不出现在返回里（BC-02 保持 `pass` 的前提）。
+- **A9** `IndexWorkerManager.stop`：读侧瞬时失败（Windows 句柄被占）不再被误报成"拒绝停止"，读取带同一套退避重试；用注入 `PermissionError` 的确定性用例 + 20 次真实停止循环 0 失败。
+- **A11** CLI 补齐 `official-visual-wemm`：三入口业务插件清单同源（差异只允许各自的门面插件，`test_cli` 钉住），视觉插件只在 `index/export/import` 命令里启用，命令结束收口。
+- **A14** 契约门禁校验 `test_refs` 真实存在（文件、类、方法按 AST 查，不靠子串），并带自测——构造一条失效引用门禁必须转红；顺手修掉 BC-08/BC-09 里指向不存在测试的悬空引用。
+- **A17** 两处 `SyntaxWarning` 清零（全库 `-W error` 编译通过）；**A19** 见上（回归后 0 遗留进程）；**A20** 测试替身补 `release_gpu_slot`/`idle_check`，日志无回溯；**A21** 失效注释/docstring 已更正（12 分组、MRO、`bind_window`、三入口共用）。
+- **A22** `unpack` 体积上限：内存内解包遇到压缩炸弹必须在读取任何条目之前拒绝，按 zip 头声明的总解压体积判断，`MAX_UNPACKED_BYTES = 8 GiB`。**旧项目没有这道闸**（`import.py` 用 `extractall` 落盘），属新增防护，阈值待操作者确认后再登记进行为契约。
+- **升级路径说明（A22 后半）**：库 id → 落盘目录名统一为"安全名 + 短哈希"（`core/library_key.py`）后，此前版本写在**无哈希后缀旧目录名**下的双链关系与失败诊断不会再被读到（`note_relations` 回 `resolved=False`、`index_failures` 报无记录），**没有做自动迁移**；该库下一次索引会按新目录名重新生成，无需手工处理。带空格/中文的库 id 本身不受影响。
+
+**登记待操作者决定的事项**（都没有自行拍板）
+- **A13 两处对旧行为的偏离**（已在代码里，契约里没有条目）：文本提取器剥 UTF-8 BOM + 换行归一为 LF（旧 `index.py:100` 裸 `utf-8` 解码、不归一）——迁移后含 CRLF 的文件首轮会重建；单例守卫不做 PID 预检（旧 `singleton.py:78-84` 两段判定）。草案已备（批准登记 / 改回旧行为 / 再讨论）。
+- **BC-15 仍为 `partial`**：真实窗口内的人工验收只有操作者能做；设置页只列真实读取的键（旧项目 13 组）、切块粒度/collection 不能按库覆盖（rag-redo 无此能力，`UNSUPPORTED_CONFIG_KEYS` 显式拒绝）、进度条 pct 取 0~100（旧桥送 0~1 而旧前端按 0~100 用）——需确认后登记为已批准偏离。
+- **窗口标题**（见上）；**`unpack` 体积上限阈值**（见上）。
+- **`%TEMP%` 里约 2615 个历史测试残留目录**（Chroma 句柄未释放的存量）：是否/何时清理由操作者决定；GUI 测试环境已改成"先关运行时再清理"，不再新增。
 
 ## 2026-09-25 通宵行为对齐审计——报告核实与九项修复
 
