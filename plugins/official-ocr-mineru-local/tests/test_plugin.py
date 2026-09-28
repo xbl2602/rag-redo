@@ -171,6 +171,64 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
         self.assertEqual(self.plugin_module._resolve_mineru_python(), sys.executable)
 
 
+class TestMineruLocalLogLocation(unittest.TestCase):
+    """缺陷 D 的复现组：子进程日志原来写在**插件源码目录**下
+    （`official_ocr_mineru_local/data/mineru_local_server.log`，且 mkdir 没有
+    try 保护——插件装在只读目录时子进程在 import 阶段就死）。这既违反
+    "所有数据落在 data/ 目录"（主程序 DATA_ROOT 锚定在
+    %LOCALAPPDATA%\\RAG-Redo\\data，见 gui_main.py:38-45 / mcp_stdio.py:39-45），
+    又让卸载便携包会连带删掉诊断日志（实测那份日志已累计 4.6MB 并被
+    installer/build_windows.py 打进便携包）。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._env_backup = os.environ.get("RAG_REDO_FAKE_OCR")
+        os.environ["RAG_REDO_FAKE_OCR"] = "1"
+        self.addCleanup(self._restore_env)
+        self.data_dir = self.tmp / "data"
+        self.rt = PluginRuntime(
+            REPO_ROOT / "plugins",
+            state_file=self.tmp / "plugins_state.json",
+            data_dir=self.data_dir,
+        )
+        self.rt.scan()
+        self.rt.settings.set("pdf_scan_backend", "mineru-local")
+        self.rt.load("official-ocr-mineru-local")
+        self.rt.enable("official-ocr-mineru-local")
+        self.instance = self.rt.plugins["official-ocr-mineru-local"].instance
+        self.addCleanup(lambda: self.rt.disable("official-ocr-mineru-local"))
+
+    def _restore_env(self) -> None:
+        if self._env_backup is None:
+            os.environ.pop("RAG_REDO_FAKE_OCR", None)
+        else:
+            os.environ["RAG_REDO_FAKE_OCR"] = self._env_backup
+
+    def test_log_file_lives_under_the_runtime_data_root(self):
+        log_file = self.instance.log_file()
+        self.assertTrue(log_file, "插件必须能报出子进程日志路径（对齐 LEGACY gpu_arbiter.py:273-283）")
+        self.assertTrue(
+            log_file.startswith(str(self.data_dir)),
+            f"日志必须落在 DATA_ROOT 之下，实际落在 {log_file}",
+        )
+
+    def test_subprocess_output_actually_lands_in_that_log_file(self):
+        log_file = Path(self.instance.log_file())
+        self.assertTrue(log_file.is_file(), f"子进程启动后日志文件应已创建：{log_file}")
+        content = log_file.read_text(encoding="utf-8", errors="replace")
+        self.assertIn("mineru-local", content)
+
+    def test_plugin_source_directory_never_gets_a_data_dir(self):
+        """真实跑一轮 extract 之后，插件源码目录底下不能多出 data/——
+        之前子进程一启动就 mkdir 一个，日志还跟着进了便携包。"""
+        (self.tmp / "scan.pdf").write_bytes(b"%PDF-fake-scanned-content")
+        self.instance.extract("lib1", "scan.pdf", self.tmp)
+        self.assertFalse(
+            (REPO_ROOT / "plugins" / "official-ocr-mineru-local" / "official_ocr_mineru_local" / "data").exists()
+        )
+
+
 class TestResolveMineruPythonWithoutFaking(unittest.TestCase):
     """不经过 PluginRuntime，直接测 `_resolve_mineru_python` 在非测试模式下
     的探测/覆盖逻辑——真实按 obsidian-rag/gpu_arbiter.py 同名函数的探测

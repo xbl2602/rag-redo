@@ -1,6 +1,6 @@
 id = "official-extractor-text"
 name = "纯文本/Markdown 提取器"
-version = "0.1.0"
+version = "0.2.0"
 api_version = ">=0.1,<0.2"
 
 [provides]

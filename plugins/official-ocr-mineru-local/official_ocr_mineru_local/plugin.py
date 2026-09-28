@@ -59,6 +59,10 @@ PLUGIN_ID = "official-ocr-mineru-local"
 GPU_RESOURCE_ID = "gpu:0"
 GPU_PRIORITY = 10  # 和 official-visual-wemm 同一层级，互相抢占（preempt_equal）
 _MINERU_INSTALL_HINT = 'uv tool install --python 3.12 -U "mineru[all]"'
+# 子进程日志文件名（对齐 LEGACY obsidian-rag 的 data/mineru_server.log，
+# 见 obsidian-rag/gpu_arbiter.py:294、540-545 用 `Popen(stdout=logf,
+# stderr=logf)` 指向真实文件）
+LOG_FILE_NAME = "mineru_local_server.log"
 
 
 def _content_hash(data: bytes) -> str:
@@ -128,11 +132,27 @@ class MineruLocalOcrPlugin:
         self._settings = None
         self._resource_arbiter = None
         self._plugin_id = ""
+        self._log_path: Path | None = None
 
     def on_load(self, ctx):
         self._logger = ctx.logger
         self._settings = ctx.settings
+        # 子进程输出落本插件在 DATA_ROOT 下的数据目录，不落插件源码目录：
+        # ①架构红线"所有数据落在 data/ 目录"（主程序 DATA_ROOT 锚定在
+        # %LOCALAPPDATA%\\RAG-Redo\\data，见 gui_main.py:38-45）；②插件目录
+        # 在便携包里是随包分发的只读目录、卸载会被连带删除，而"服务为什么
+        # 起不来"的诊断现场恰恰只能留在这儿（LEGACY
+        # obsidian-rag/gpu_arbiter.py:294 把 MinerU 服务日志放在
+        # data/mineru_server.log 同款位置）；③真实后果：修复前这份日志
+        # 累计了 4.6MB 并被 installer/build_windows.py 打进了便携包。
+        self._log_path = ctx.storage.directory("mineru_local", legacy="mineru_local") / LOG_FILE_NAME
         ctx.logger.info("MinerU本机OCR已加载")
+
+    def log_file(self) -> str | None:
+        """子进程日志文件路径（只读诊断用）。写不了时（data 根不可写）由
+        core/subprocess_service.py 降级成"不落盘"，这里仍然报出应有路径，
+        方便用户去查是不是权限问题。"""
+        return str(self._log_path) if self._log_path is not None else None
 
     def on_enable(self, ctx):
         self._resource_arbiter = ctx.resource_arbiter
@@ -187,9 +207,24 @@ class MineruLocalOcrPlugin:
                 "或设置 mineru_python 指向已有安装的 python.exe"
             )
         command = tuple(arg.replace("{python}", python) for arg in self._runtime_command)
-        self._handle = SubprocessServiceHandle(command, health_check=self._runtime_health_check, cwd=self._plugin_dir)
+        self._handle = SubprocessServiceHandle(
+            command,
+            health_check=self._runtime_health_check,
+            cwd=self._plugin_dir,
+            log_path=self._log_path,
+        )
         self._handle.start()
-        self._logger.info("MinerU本机OCR子进程已启动（端口=%d，解释器=%s）", self._handle.port, python)
+        if self._handle.log_file_error:
+            self._logger.warning(
+                "MinerU子进程日志文件打不开，本次输出不会落盘（服务本身不受影响）：%s",
+                self._handle.log_file_error,
+            )
+        self._logger.info(
+            "MinerU本机OCR子进程已启动（端口=%d，解释器=%s，日志=%s）",
+            self._handle.port,
+            python,
+            self.log_file() or "无（不落盘）",
+        )
 
     def _stop_handle(self) -> None:
         if self._handle is not None:

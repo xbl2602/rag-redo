@@ -19,6 +19,7 @@ class MineruCloudOcrPlugin:
             pending_path=ctx.storage.file("mineru_pending.json", legacy="mineru_pending.json"),
             sidecar_dir=ctx.storage.directory("mineru_sidecars", legacy="mineru_sidecars"),
             quota_path=ctx.storage.file("mineru_quota.json", legacy="mineru_quota.json"),
+            logger=ctx.logger,
         )
         ctx.logger.info("MinerU云端OCR已加载")
 
@@ -30,6 +31,17 @@ class MineruCloudOcrPlugin:
 
     def on_unload(self, ctx):
         self._settings = None
+
+    def reset_token_flag(self) -> None:
+        """每轮索引开始的钩子（core/pipeline.py:541-547 对每个
+        extractor:pdf 插件调用一次）。LEGACY 在同一个时点做两件事：
+        obsidian-rag/index.py:1878 复位 Token 失效标志、index.py:2176-2177
+        清理断点簿记孤儿。少任何一件都会留下"标志永不复位"或"簿记只增不减"
+        的慢性病（前者让用户补好 Key 后重跑索引毫无反应）。"""
+        self.extractor.reset_token_flag()
+        if self.is_active():
+            # 本轮不走云端段时别去动云端簿记（清理要逐条读盘算指纹，不值这份开销）
+            self.extractor.prune_pending()
 
     def is_active(self) -> bool:
         selected = self._settings.get("pdf_scan_backend", "none") if self._settings is not None else "none"

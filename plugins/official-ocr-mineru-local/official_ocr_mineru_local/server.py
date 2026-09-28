@@ -25,23 +25,32 @@ official-visual-wemm/server.py 的道理。
 
 **真机调试时抓到的严重坑：内服务（mineru-api）会卡死在"启动中"永远不
 就绪**（2026-09-23，真实用本机 MinerU 环境跑通整条链路时发现，不是猜的）
-——根因见 `_redirect_stdio_to_logfile` 的 docstring：MinerU 官方
-`ReusableLocalAPIServer` 启动内服务子进程时没有显式指定 `stdout`/`stderr`
-（见 mineru/cli/api_client.py），默认继承调用方（也就是这个壳进程）的
-文件描述符；而这个壳进程本身是被
+——根因是 MinerU 官方 `ReusableLocalAPIServer` 启动内服务子进程时没有显式
+指定 `stdout`/`stderr`（见 mineru/cli/api_client.py），默认继承调用方（也就
+是这个壳进程）的文件描述符；而这个壳进程当时是被
 `core/subprocess_service.py::SubprocessServiceHandle` 用
-`stdout=PIPE, stderr=PIPE` 启动的——那两个管道只在崩溃诊断时才读一次，
-平时没人持续排空。内服务（uvicorn+loguru）启动时的日志量一旦把 Windows
-管道的默认缓冲区（64KB）写满，`write()` 系统调用就会阻塞，内服务从此
-卡在"进程活着、端口没监听完、/health 永远连不上"——实测跑满了 300s
-就绪超时，直接构造脚本单独跑（不经过这层被吞的管道）反而几秒钟就绪，
-两相对比才定位到是管道积压不是真的启动慢。修法：这个壳进程一启动就把
-自己的 fd 1/2 换成一个真实日志文件（不是 Python 层面的
-`sys.stdout`/`sys.stderr` 对象重新赋值，那不影响 OS 层面的 fd，内服务
-的 `subprocess.Popen` 继承的是 fd 不是 Python 对象——必须用
-`os.dup2` 才能让继承生效），文件不会像管道那样被写满阻塞，对齐
-obsidian-rag 自己把 `mineru_server.py` 启动时 `stdout=logf, stderr=logf`
-指向真实文件（而不是留给调用方管道）的既有做法。
+`stdout=PIPE, stderr=PIPE` 启动的——那两个管道只在崩溃诊断时才读一次，平时
+没人持续排空。内服务（uvicorn+loguru）启动时的日志量一旦把 Windows 管道的
+默认缓冲区（64KB）写满，`write()` 系统调用就会阻塞，内服务从此卡在"进程
+活着、端口没监听完、/health 永远连不上"——实测跑满了 300s 就绪超时，直接
+构造脚本单独跑（不经过这层被吞的管道）反而几秒钟就绪，两相对比才定位到
+是管道积压不是真的启动慢。
+
+**修法已上移到父进程一侧（2026-09-24）**：现在由
+`core/subprocess_service.py::SubprocessServiceHandle` 在 `Popen` 时就把这个
+壳进程的 fd 1/2 直接指向一个**真实日志文件**（插件在 DATA_ROOT 下的数据
+目录），对齐 LEGACY obsidian-rag 自己做这件事的方式
+（obsidian-rag/gpu_arbiter.py:540-545 的
+`Popen(..., stdout=logf, stderr=logf, ...)`）——文件不会像管道那样被写满
+阻塞，而且内服务子进程继承到的也是这个文件。这样做比"在壳进程内部
+`os.dup2` 换 fd"更靠前一层，好处有三：①父进程一启动就决定了落点，日志
+路径对用户/AI 可查（父进程知道 DATA_ROOT，子进程不知道）；②不必在子进程
+里重复实现一遍 fd 重定向，也就不存在"重定向失败把子进程搞死"这种风险；
+③不再需要在插件源码目录下 mkdir 一个 data/ 目录写日志（那既违反"数据落
+在 data/ 目录"，又会让日志跟着便携包一起分发/删除）。
+
+本文件因此不再自己做 stdio 重定向——`__main__` 只打印一行启动摘要，
+它会和内服务的日志一起落到父进程指定的日志文件里。
 """
 from __future__ import annotations
 
@@ -425,25 +434,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass  # 静默，避免污染核心进程的 stdout/stderr
 
 
-def _redirect_stdio_to_logfile() -> None:
-    """把这个进程自己的 fd 1/2 换成一个真实日志文件——见模块 docstring
-    "真机调试时抓到的严重坑"。必须用 `os.dup2` 操作 OS 层面的文件描述符，
-    不能只重新赋值 `sys.stdout`/`sys.stderr`（那只影响 Python 自己
-    print() 时用哪个对象，不影响子进程 `subprocess.Popen` 默认继承的
-    OS fd——MinerU 内服务子进程继承的正是后者）。日志文件落在这个插件
-    自己的 `data/` 目录下（架构红线7"数据落在插件/项目自己的目录"），
-    用追加模式，方便跨次启动留痕排查。"""
-    log_dir = Path(__file__).parent / "data"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "mineru_local_server.log"
-    log_file = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
-    os.dup2(log_file.fileno(), sys.stdout.fileno())
-    os.dup2(log_file.fileno(), sys.stderr.fileno())
-    sys.stdout = log_file
-    sys.stderr = log_file
-    print(f"\n[mineru-local] ===== 新一轮启动 {time.strftime('%Y-%m-%d %H:%M:%S')} =====", file=sys.stderr)
-
-
 def _int_arg(name: str, default: int) -> int:
     if name in sys.argv:
         return int(sys.argv[sys.argv.index(name) + 1])
@@ -457,7 +447,10 @@ def _float_arg(name: str, default: float) -> float:
 
 
 if __name__ == "__main__":
-    _redirect_stdio_to_logfile()
+    # 注意这里**没有** stdio 重定向：父进程（core/subprocess_service.py::
+    # SubprocessServiceHandle）在 Popen 时已经把本进程的 fd 1/2 指向了
+    # DATA_ROOT 下的真实日志文件，所以下面这行启动摘要和内服务
+    # （mineru-api）的日志都会落到那里。详见模块 docstring。
     MINERU_UNLOAD_AFTER_SECONDS = _int_arg("--unload-after", MINERU_UNLOAD_AFTER_SECONDS)
     MINERU_IDLE_EXIT_SECONDS = _int_arg("--idle-exit", MINERU_IDLE_EXIT_SECONDS)
     MINERU_MIN_VRAM_GB = _float_arg("--min-vram", MINERU_MIN_VRAM_GB)

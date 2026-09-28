@@ -15,6 +15,10 @@ command = ["{python}", "server.py", "--port", "{port}"]
 health_check = "http://127.0.0.1:{port}/health"
 
 [permissions]
-filesystem = ["vault_read"]
+# data_write：子进程日志必须落在 DATA_ROOT 下（本插件的数据目录），不能跟着
+# 插件源码目录走——插件目录在便携包里是只读的、卸载会被一起删掉，而日志是
+# "服务为什么起不来"唯一的诊断现场（LEGACY obsidian-rag/gpu_arbiter.py:32
+# 把它放在 data/wemm_server.log 同款位置）。2026-09-24 补齐。
+filesystem = ["vault_read", "data_write"]
 network = false
 gpu = true
