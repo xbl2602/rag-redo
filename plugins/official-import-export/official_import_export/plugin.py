@@ -38,6 +38,8 @@ class ImportExportPlugin:
         relations: dict | None = None,
         failures: dict | None = None,
         visual: dict | None = None,
+        sources: dict[str, bytes] | None = None,
+        include_source_files: bool = True,
     ) -> bytes:
         return archive.pack(
             manifest,
@@ -48,7 +50,34 @@ class ImportExportPlugin:
             relations=relations,
             failures=failures,
             visual=visual,
+            sources=sources,
+            include_source_files=include_source_files,
         )
 
     def unpack(self, data: bytes) -> dict:
+        """解包 + 全量校验（逐条目 CRC/JSON/sha256 + 结构 + id 互指）。
+        校验在返回之前全部完成，所以调用方拿到 payload 就意味着"这个包
+        已经被验过"——对齐 obsidian-rag/import.py:86-108 的"改动前中止"。"""
         return archive.unpack(data)
+
+    def verify(self, payload: dict) -> None:
+        """写库之前的独立一道闸：给 pipeline 一个可以单独调用的校验入口，
+        正常返回 None，不通过抛 ArchiveFormatError。"""
+        return archive.verify(payload)
+
+    def import_plan(
+        self,
+        payload: dict,
+        target_id: str,
+        *,
+        root_path: str | None = None,
+        upsert_batch: int = 500,
+    ):
+        """纯函数：算出导入要做的全部动作 + 回滚所需信息，不写任何东西。"""
+        return archive.import_plan(
+            payload, target_id, root_path=root_path, upsert_batch=upsert_batch
+        )
+
+    def notices(self, payload: dict) -> tuple[str, ...]:
+        """按读到的清单重算给用户看的提示（"包里没有正文""词法条目被丢弃"…）。"""
+        return archive.notices(payload)
