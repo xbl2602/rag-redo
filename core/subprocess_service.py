@@ -12,6 +12,22 @@ on_disable 都该用这一份来管理自己的子进程，不用每个插件各
 替换成实际分配到的端口。这样两个同时启用的 subprocess_service 插件不会
 抢同一个端口，是真实会发生的场景（比如同时装了 MinerU 本机 OCR 和 WEMM
 两个 subprocess_service 插件），不是假设性的过度设计。
+
+**子进程的 stdout/stderr 去哪（2026-09-24 修复"诊断黑洞 + 永久僵死"）**：
+默认曾用 `stdout=PIPE, stderr=PIPE`，而 `start()` 只在"启动即早夭"那一个
+分支读一次 stderr，之后再无任何读取方。两个真实后果：①诊断黑洞——WEMM
+加载模型失败、端口冲突、`socketserver.handle_error` 的 traceback 全进一个
+没人读的管道，永久丢失，用户和 AI 都没处可查；②永久僵死——Windows 匿名
+管道缓冲约 64KB，写满后子进程任何一次 print/traceback 都阻塞在写 fd 上，
+进程还活着、`is_alive` 仍返回 True，但服务永远起不来（LEGACY
+obsidian-rag 的 MinerU 内服务真机踩过这个坑，本仓
+official-ocr-mineru-local 当时也是在子进程那一侧自己 `os.dup2` 绕开同一个
+根因，见那个插件 server.py 的模块 docstring）。
+现在两条路都堵死了：调用方给了 `log_path` 就把 fd 1/2 重定向到**真实日志
+文件**（对齐 LEGACY obsidian-rag/gpu_arbiter.py:241-252 的
+`Popen(stdout=logf, stderr=logf)`——文件不会像管道那样被写满阻塞，孙进程
+继承到的也是这个文件）；没给就退化成 PIPE，但**必须有持续排空方**（守护
+线程读进有界内存缓冲），绝不再是"只读一次"。早夭诊断改从这两处取尾部。
 """
 from __future__ import annotations
 
@@ -21,10 +37,17 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import IO
+
+# 调用方没指定日志文件时，内存里保留多少子进程输出供崩溃诊断。够看一段
+# traceback 即可，不是日志归档——归档归真实文件。
+_DIAG_TAIL_BYTES = 256 * 1024
+_DIAG_READ_CHUNK = 64 * 1024
 
 
 class EnvBootstrapError(Exception):
@@ -190,7 +213,12 @@ def find_free_port() -> int:
 
 class SubprocessServiceHandle:
     """一个 subprocess_service 插件实例对应一个 handle：插件的 on_enable
-    创建它并 start()，之后用 call() 发请求，on_disable 调 stop()。"""
+    创建它并 start()，之后用 call() 发请求，on_disable 调 stop()。
+
+    `log_path` 给了就把子进程的 stdout/stderr 重定向到这个真实文件（追加
+    模式，跨次启动留痕），并用 `log_file` 属性把路径暴露给调用方做诊断
+    （对齐 LEGACY `wemm_status` 明确把 `data/wemm_server.log` 指给用户/AI
+    的做法）；没给则退回 PIPE + 持续排空线程。"""
 
     def __init__(
         self,
@@ -200,6 +228,7 @@ class SubprocessServiceHandle:
         cwd: Path | None = None,
         startup_timeout: float = 10.0,
         env: dict[str, str] | None = None,
+        log_path: Path | None = None,
     ) -> None:
         self.port = find_free_port()
         self._command = [arg.format(port=self.port) for arg in command]
@@ -207,35 +236,82 @@ class SubprocessServiceHandle:
         self._cwd = cwd
         self._startup_timeout = startup_timeout
         self._env = env
+        self._log_path = Path(log_path) if log_path is not None else None
+        self._log_file: IO[bytes] | None = None
+        self._log_open_error: str | None = None
+        self._drain_lock = threading.Lock()
+        self._drained: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
+        self._drain_threads: list[threading.Thread] = []
         self._process: subprocess.Popen | None = None
 
     @property
     def is_alive(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
+    @property
+    def log_file(self) -> str | None:
+        """子进程输出被重定向到的日志文件路径（没给 `log_path` 时为
+        None）——只读快照，调用方拿它去做"去哪儿看诊断"的提示。"""
+        return str(self._log_path) if self._log_path is not None else None
+
+    @property
+    def log_file_error(self) -> str | None:
+        """日志文件打不开时的原因（`None`=正常或没要求落盘）。
+
+        打不开不是错误——子进程照样能跑（输出只留在内存排空缓冲里），但
+        调用方应该知道"日志这次没落盘"，否则用户按 `log_file` 找过去发现
+        文件不存在会以为诊断信息被吞了。"""
+        return self._log_open_error
+
+    def _log_hint(self) -> str:
+        """失败文案里的"去哪儿看诊断"尾巴。"""
+        if self._log_path is None:
+            return ""
+        if self._log_file is None:
+            return f"（日志文件打不开：{self._log_open_error}，本次子进程输出只留在内存里）"
+        return f"（详见 {self.log_file}）"
+
     def start(self) -> None:
         # POSIX 上起一个独立进程组（start_new_session）——stop() 要对整棵
         # 进程树发信号（见该方法的说明），不新开一个组的话 os.killpg 会把
         # 发信号的核心进程自己也算进去。
         extra_kwargs = {} if sys.platform == "win32" else {"start_new_session": True}
+        self._log_file = self._open_log_file()
+        if self._log_file is not None:
+            # 首选真实文件：文件不会像管道那样被写满后把子进程永久阻塞在
+            # write() 上，而且子进程自己再派生的孙进程（MinerU 内服务那种）
+            # 继承到的也是这个文件而不是调用方的管道。
+            stdout_target: object = self._log_file
+            stderr_target: object = self._log_file
+        else:
+            stdout_target = subprocess.PIPE
+            stderr_target = subprocess.PIPE
         self._process = subprocess.Popen(
             self._command,
             cwd=str(self._cwd) if self._cwd else None,
             env=self._env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=stdout_target,
+            stderr=stderr_target,
             **extra_kwargs,
         )
+        if self._log_file is None:
+            # 没有日志文件可写时 PIPE 仍然保留（它还有"崩溃文本可捞"的价值），
+            # 但必须有持续读取方——见 _start_drain 的说明。
+            self._start_drain("stdout", self._process.stdout)
+            self._start_drain("stderr", self._process.stderr)
         if self._health_check is None:
             return
         deadline = time.time() + self._startup_timeout
         last_error: Exception | None = None
         while time.time() < deadline:
             if self._process.poll() is not None:
-                stderr = self._process.stderr.read().decode("utf-8", errors="replace") if self._process.stderr else ""
                 returncode = self._process.returncode
-                self.stop()  # 进程已经退出，这里只是为了关掉 stdout/stderr 管道，不留文件描述符泄漏
-                raise SubprocessServiceError(f"子进程启动后立刻退出（returncode={returncode}）: {stderr[:2000]}")
+                detail = self._diagnostic_tail()
+                hint = self._log_hint()
+                self.stop()  # 进程已经退出，这里收口管道/日志句柄，不留文件描述符泄漏
+                raise SubprocessServiceError(
+                    f"子进程启动后立刻退出（returncode={returncode}）: {detail[:2000]}{hint}"
+                )
             try:
                 with urllib.request.urlopen(self._health_check, timeout=1.0) as resp:
                     if resp.status == 200:
@@ -245,8 +321,82 @@ class SubprocessServiceHandle:
                 time.sleep(0.1)
         self.stop()
         raise SubprocessServiceError(
-            f"子进程 {self._startup_timeout}s 内没有通过 health_check: {last_error}"
+            f"子进程 {self._startup_timeout}s 内没有通过 health_check: {last_error}{self._log_hint()}"
         )
+
+    def _open_log_file(self) -> IO[bytes] | None:
+        """打开（必要时创建）日志文件。**写不了日志绝不能让子进程起不来**
+        ——插件装在只读目录、data 根不可写、沙箱里跑都可能失败，这里降级成
+        `None`（退回 PIPE + 排空线程），并把原因留在 `_log_open_error` 里
+        供诊断，不向上抛。"""
+        if self._log_path is None:
+            return None
+        try:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            return open(self._log_path, "ab", buffering=0)
+        except OSError as exc:
+            self._log_open_error = f"{type(exc).__name__}: {exc}"
+            return None
+
+    def _start_drain(self, name: str, stream: IO[bytes] | None) -> None:
+        """持续排空子进程的 stdout/stderr（守护线程）。
+
+        这是"没人读的 PIPE"这个 bug 的另一半：管道本身可以留（它让崩溃文本
+        还能捞出来），但**必须有持续读取方**——Windows 管道缓冲约 64KB，
+        写满后子进程的 `write()` 直接阻塞，进程还活着、服务永远起不来。
+        排空线程是 daemon，管道 EOF 后自然退出，stop() 里也会 join。"""
+        if stream is None:
+            return
+
+        def _run() -> None:
+            try:
+                fd = stream.fileno()
+            except (OSError, ValueError):
+                return
+            while True:
+                try:
+                    chunk = os.read(fd, _DIAG_READ_CHUNK)
+                except (OSError, ValueError):
+                    return
+                if not chunk:
+                    return
+                with self._drain_lock:
+                    buffer = self._drained[name]
+                    buffer.extend(chunk)
+                    if len(buffer) > _DIAG_TAIL_BYTES:
+                        del buffer[: len(buffer) - _DIAG_TAIL_BYTES]
+
+        thread = threading.Thread(target=_run, daemon=True, name=f"subprocess-stdio-{name}")
+        self._drain_threads.append(thread)
+        thread.start()
+
+    def _diagnostic_tail(self, limit: int = 4000) -> str:
+        """子进程最近输出的尾部（stderr 优先，没有再退 stdout）——启动即
+        早夭时的诊断文案来源。有日志文件读文件（崩溃现场永久可查），没有
+        就读排空线程攒下来的内存缓冲。"""
+        if self._log_path is not None and self._log_path.is_file():
+            try:
+                with self._log_path.open("rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    handle.seek(max(0, handle.tell() - limit * 4))
+                    return handle.read().decode("utf-8", errors="replace")[-limit:]
+            except OSError:
+                return ""
+        return self._drained_tail(limit)
+
+    def _drained_tail(self, limit: int = 4000, wait_s: float = 2.0) -> str:
+        """读排空缓冲。子进程刚退出时排空线程可能还没被调度到，最多等一小段
+        时间再放弃——早夭诊断恰恰是这个场景，不能因为"线程慢了几毫秒"就把
+        崩溃原因读丢了。"""
+        deadline = time.monotonic() + max(0.0, wait_s)
+        while True:
+            with self._drain_lock:
+                stderr = bytes(self._drained["stderr"])
+                stdout = bytes(self._drained["stdout"])
+            data = stderr if stderr else stdout
+            if data or time.monotonic() >= deadline:
+                return data.decode("utf-8", errors="replace")[-limit:]
+            time.sleep(0.02)
 
     def call(self, method: str, payload: dict, *, timeout: float = 30.0) -> dict:
         if not self.is_alive:
@@ -264,18 +414,41 @@ class SubprocessServiceHandle:
         """不留游离进程（架构红线6）：先礼后兵——给子进程机会自己清理，
         grace_period 内没退出再强杀，最后 wait() 确认真的没了，不是发了
         信号就假装完事。真实踩过的坑：只 wait() 进程退出不够，
-        Popen(stdout=PIPE, stderr=PIPE) 打开的管道文件描述符不会因为子
-        进程退出就自动关闭，得手动 close()，不然每 start/stop 一轮就泄漏
-        两个文件描述符（测试里用 ResourceWarning 抓到的）。"""
+        Popen 打开的管道文件描述符不会因为子进程退出就自动关闭，得手动
+        close()，不然每 start/stop 一轮就泄漏两个文件描述符（测试里用
+        ResourceWarning 抓到的）。日志文件句柄同样必须在这里关掉——
+        Windows 上还开着的文件删不掉、临时目录也清不掉（架构红线 §7
+        "任何文件锁和句柄都必须有停止、等待和异常收口路径"）。
+
+        收口顺序有讲究：先杀进程树 → 再 join 排空线程（子进程一死，管道写
+        端全部关闭，os.read 立刻拿到 EOF 返回，线程自然退出）→ 最后才
+        close 管道/日志句柄。反过来做就是在另一个线程阻塞读的时候抽掉它的
+        句柄。"""
         if self._process is None:
+            self._close_log_file()
             return
         if self._process.poll() is None:
             self._kill_process_tree(grace_period)
-        if self._process.stdout is not None:
-            self._process.stdout.close()
-        if self._process.stderr is not None:
-            self._process.stderr.close()
+        for thread in self._drain_threads:
+            thread.join(timeout=1.0)
+        self._drain_threads.clear()
+        for stream in (self._process.stdout, self._process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
         self._process = None
+        self._close_log_file()
+
+    def _close_log_file(self) -> None:
+        if self._log_file is None:
+            return
+        try:
+            self._log_file.close()
+        except OSError:
+            pass
+        self._log_file = None
 
     def _kill_process_tree(self, grace_period: float) -> None:
         """只杀 Popen 直接跟踪的那一个 pid 不够——真实在 Windows 上踩到的坑：

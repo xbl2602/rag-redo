@@ -52,6 +52,42 @@ srv.serve_forever()
 
 _EXITS_IMMEDIATELY = "import sys; sys.stderr.write('boom\\n'); sys.exit(1)"
 
+# 往 stdout 狂写 300KB 的假子进程：Windows 匿名管道缓冲约 64KB（旧项目
+# gpu_arbiter.py:241-252 与 rag-redo 重构前 subprocess_service.py:221-228 都
+# 踩过"没人排空的 PIPE 写满后子进程永久阻塞在 write 上"这个坑），用来证明
+# 重定向到真实日志文件之后子进程不会被写死、内容也会完整落盘。
+_FLOODS_STDOUT = '''
+import sys
+chunk = "x" * 4096 + "\\n"
+for _ in range(80):  # 80 * ~4KB = 320KB，远超任何管道的默认缓冲
+    sys.stdout.write(chunk)
+    sys.stdout.flush()
+sys.stdout.write("FLOOD_DONE\\n")
+sys.stdout.flush()
+import http.server, json, time
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'{"ok": true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        body = json.dumps({"echo": payload}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+port = int(sys.argv[sys.argv.index("--port") + 1])
+http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+'''
+
 
 def _process_is_gone(pid: int) -> bool:
     """跨平台的"这个 pid 是不是真的没了"检查，理由同 test_runtime.py 里
@@ -161,6 +197,135 @@ class TestSubprocessServiceHandle(unittest.TestCase):
         self._handles.append(handle)
         handle.start()
         self.assertTrue(handle.is_alive)
+
+
+class TestSubprocessStdioRedirection(unittest.TestCase):
+    """缺陷 A 的复现组：子进程 stdout/stderr 原来用 `subprocess.PIPE` 交给
+    核心进程，而核心只在"启动即早夭"那一个分支读一次 stderr，之后再无任何
+    读取方。两个真实后果（对齐 LEGACY obsidian-rag/gpu_arbiter.py:241-252
+    把子进程 stdout/stderr 直接指向 `data/wemm_server.log` 真实文件的既有
+    做法、以及同仓 official-ocr-mineru-local 在真机调试时抓到的内服务 64KB
+    管道写满死锁）：
+
+    ① 诊断黑洞：WEMM 加载模型失败、端口冲突、`socketserver.handle_error`
+       的 traceback 全进一个没人读的管道，永久丢失；
+    ② 永久僵死：管道缓冲写满后子进程任何一次 print/traceback 都阻塞在写
+       fd 上，进程还活着、is_alive 仍为 True，但服务永远起不来。
+
+    修法是重定向到真实日志文件（LEGACY 的做法），并且在没有指定日志文件
+    时也必须有持续排空方，绝不能"只读一次"。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.server_script = self.tmp / "echo_server.py"
+        self.server_script.write_text(_ECHO_SERVER, encoding="utf-8")
+        self.flood_script = self.tmp / "flood.py"
+        self.flood_script.write_text(_FLOODS_STDOUT, encoding="utf-8")
+        self.log_path = self.tmp / "logs" / "service.log"
+        self._handles: list[SubprocessServiceHandle] = []
+        self.addCleanup(self._stop_all)
+
+    def _stop_all(self) -> None:
+        for handle in self._handles:
+            handle.stop()
+
+    def _echo_handle(self, **kwargs) -> SubprocessServiceHandle:
+        handle = SubprocessServiceHandle(
+            (sys.executable, str(self.server_script), "--port", "{port}"),
+            health_check="http://127.0.0.1:{port}/health",
+            **kwargs,
+        )
+        self._handles.append(handle)
+        return handle
+
+    def _flood_handle(self, **kwargs) -> SubprocessServiceHandle:
+        handle = SubprocessServiceHandle(
+            (sys.executable, str(self.flood_script), "--port", "{port}"),
+            health_check="http://127.0.0.1:{port}/health",
+            startup_timeout=20.0,
+            **kwargs,
+        )
+        self._handles.append(handle)
+        return handle
+
+    def test_flooding_child_does_not_deadlock_and_output_lands_in_logfile(self):
+        handle = self._flood_handle(log_path=self.log_path)
+        handle.start()
+        # 子进程在起 HTTP 服务之前先往 stdout 写满 320KB：如果这条 fd 还是
+        # 那个"没人排空、缓冲约 64KB"的管道，它会永久阻塞在 write 上，
+        # /health 永远不响，start() 这里就会抛"没有通过 health_check"。
+        self.assertTrue(handle.is_alive)
+        content = self.log_path.read_text(encoding="utf-8", errors="replace")
+        self.assertIn("FLOOD_DONE", content)
+        self.assertGreater(len(content), 300 * 1024)
+
+    def test_flooding_child_does_not_deadlock_even_when_no_logfile_is_given(self):
+        """没给 log_path 的调用方也必须有持续排空方——PIPE 本身可以留（有人
+        读就不存在写满死锁），但不能"只在早夭时读一次"。"""
+        handle = self._flood_handle()
+        handle.start()
+        self.assertTrue(handle.is_alive)
+        self.assertEqual(handle.call("echo", {"who": "flood"})["echo"], {"who": "flood"})
+
+    def test_early_exit_reason_comes_from_the_logfile_not_only_memory(self):
+        broken = self.tmp / "broken.py"
+        broken.write_text(_EXITS_IMMEDIATELY, encoding="utf-8")
+        handle = SubprocessServiceHandle(
+            (sys.executable, str(broken)),
+            health_check="http://127.0.0.1:{port}/health",
+            startup_timeout=5.0,
+            log_path=self.log_path,
+        )
+        self._handles.append(handle)
+        with self.assertRaises(SubprocessServiceError) as ctx:
+            handle.start()
+        self.assertIn("boom", str(ctx.exception))
+        # 关键：崩溃原因落进了可被用户/AI 事后翻查的日志文件，而不是只留在
+        # 一个已经随异常丢掉的内核对象里。
+        self.assertIn("boom", self.log_path.read_text(encoding="utf-8", errors="replace"))
+        self.assertFalse(handle.is_alive)
+
+    def test_early_exit_reason_is_captured_even_without_logfile(self):
+        broken = self.tmp / "broken_nolog.py"
+        broken.write_text(_EXITS_IMMEDIATELY, encoding="utf-8")
+        handle = SubprocessServiceHandle(
+            (sys.executable, str(broken)),
+            health_check="http://127.0.0.1:{port}/health",
+            startup_timeout=5.0,
+        )
+        self._handles.append(handle)
+        with self.assertRaises(SubprocessServiceError) as ctx:
+            handle.start()
+        self.assertIn("boom", str(ctx.exception))
+
+    def test_unwritable_log_path_degrades_instead_of_preventing_startup(self):
+        """写不了日志绝不能让子进程起不来（插件装在只读目录、或 data 根不可
+        写都会触发）——降级成"不落文件"继续跑。"""
+        blocker = self.tmp / "blocker"
+        blocker.write_text("这是一个文件，不是目录", encoding="utf-8")
+        handle = self._echo_handle(log_path=blocker / "logs" / "service.log")
+        handle.start()
+        self.assertTrue(handle.is_alive)
+        self.assertEqual(handle.call("echo", {"ok": 1})["echo"], {"ok": 1})
+
+    def test_stop_closes_the_log_file_handle(self):
+        """架构红线 §7"任何子进程/文件句柄都必须有停止、等待和异常收口路径"：
+        stop() 之后日志文件必须可以被删掉——Windows 上仍被打开的文件删不掉，
+        这条断言在 Windows 上才是真断言。"""
+        handle = self._echo_handle(log_path=self.log_path)
+        handle.start()
+        self.assertTrue(self.log_path.is_file())
+        handle.stop()
+        self.log_path.unlink()
+        self.assertFalse(self.log_path.exists())
+
+    def test_log_file_property_exposes_the_path_for_diagnostics(self):
+        """日志路径要能被查询到（对齐 LEGACY obsidian-rag/server.py:965 的
+        `wemm_status` 明确把 `data/wemm_server.log` 指给用户/AI）。"""
+        handle = self._echo_handle(log_path=self.log_path)
+        self.assertEqual(handle.log_file, str(self.log_path))
+        self.assertIsNone(SubprocessServiceHandle((sys.executable, "-c", "pass")).log_file)
 
 
 class TestFindFreePort(unittest.TestCase):

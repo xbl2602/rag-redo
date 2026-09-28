@@ -52,6 +52,13 @@ GPU_LOCK_ACQUIRE_TIMEOUT_S = 15.0
 
 _cache: tuple[float | None, float] = (None, 0.0)
 
+# 显存门槛，逐字取自旧项目 obsidian-rag/gpu_arbiter.py:34-35 的同名常量。
+# 旧项目用它们在 index.py::_vram_maybe_evict_wemm（704-745）里判断"空闲显存够
+# 不够让另一个模型进来"；rag-redo 的名额仲裁（resource_arbiter）只管"轮到谁"，
+# 管不了"装不装得下"，所以这两个数字必须在这里，由插件的设备选择路径真的用上。
+WEMM_MIN_VRAM_GB = 5.5  # WeMM-2B bf16 + 激活余量；低于此 WEMM 不进显存
+BGE_MIN_VRAM_GB = 3.5   # bge-m3 fp16 + CUDA context + 批次激活余量
+
 
 def vram_free_gb(max_age: float = 5.0) -> float | None:
     """当前空闲显存（GB）。探测失败返回 None（fail-open）。
@@ -214,3 +221,55 @@ class CudaCooldownGate:
             atomic_write_text(self._state_file, json.dumps(state, ensure_ascii=False))
         except OSError:
             pass  # 诊断写盘失败不影响任何主流程（对齐旧项目"写入失败忽略"）
+
+
+#: 整卡只读探测的缓存（与 vram_free_gb 同一个 5s 窗口口径）。
+_card_cache: tuple[dict, float] = ({}, 0.0)
+
+
+def probe_card(max_age: float = 5.0) -> dict:
+    """整卡只读探测（nvidia-smi，5 秒缓存），供 GUI 全局快照显示显存/利用率/
+    功耗。返回 `{ok, mem_used_mb, mem_total_mb, util_pct, power_w}`。
+
+    **fail-open**：没有 N 卡、nvidia-smi 不存在、命令失败/超时，一律返回
+    `ok=False` 且各字段 None——调用方（GUI）显示"—"，绝不让"探测失败"被
+    渲染成"显存 0"或"GPU 空闲"。
+
+    这与 `core/resource_arbiter.py` 的所有权语义是两件事、也不能互相替代：
+    这里是"我读到了整卡数字吗"，那里是"这块卡此刻归谁"。WDDM 下 nvidia-smi
+    拆不到进程归属，所以本函数的 ok=True 也不代表任何进程级归属结论。
+    """
+    global _card_cache
+    now = time.time()
+    if _card_cache[1] and now - _card_cache[1] < max_age:
+        return dict(_card_cache[0])
+    result = {
+        "ok": False,
+        "mem_used_mb": None,
+        "mem_total_mb": None,
+        "util_pct": None,
+        "power_w": None,
+    }
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu,power.draw",
+             "--format=csv,noheader,nounits"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        first = out.stdout.decode("utf-8", "replace").strip().splitlines()
+        if first:
+            parts = [p.strip() for p in first[0].split(",")]
+            if len(parts) >= 4:
+                result.update(
+                    ok=True,
+                    mem_used_mb=float(parts[0]),
+                    mem_total_mb=float(parts[1]),
+                    util_pct=float(parts[2]),
+                    power_w=float(parts[3]),
+                )
+    except Exception:  # noqa: BLE001 - 探测失败 = ok:False，绝不抛
+        pass
+    _card_cache = (dict(result), now)
+    return result

@@ -83,14 +83,28 @@ class PluginRuntime:
         self.plugins: dict[str, Plugin] = {}
         self._logger = logging.getLogger("rag_redo.core.runtime")
         self._enabled_ids: set[str] = self._load_state()
+        self._persist_suspended = False
 
     def close(self) -> None:
-        for plugin_id in reversed(list(self.plugins)):
-            plugin = self.plugins[plugin_id]
-            if plugin.state.value == "enabled":
-                self.disable(plugin_id)
-            if plugin.state.value == "disabled":
-                self.unload(plugin_id)
+        """进程退出时收口：逆序跑每个插件的 `on_disable`/`on_unload`（插件在里面终止自己拉起的
+        子进程、归还 GPU 租约），单个插件的钩子抛异常不影响其余插件（`disable`/`unload` 各自兜底）。
+
+        **不改写**磁盘上的启用记录：这是"关机"，不是用户手动停用。`disable()` 平时会把插件从
+        启用集合里删掉并落盘（用户手动停用要记住），如果收口也照做，每次 GUI/CLI/MCP 退出就把
+        `plugins_state.json` 擦成 `{"enabled": []}`，`scan()` 里"核心重启后插件自己恢复到之前
+        的状态"就落空。所以收口期间暂停落盘，结束后把内存里的启用集合也还原。"""
+        remembered = set(self._enabled_ids)
+        self._persist_suspended = True
+        try:
+            for plugin_id in reversed(list(self.plugins)):
+                plugin = self.plugins[plugin_id]
+                if plugin.state.value == "enabled":
+                    self.disable(plugin_id)
+                if plugin.state.value == "disabled":
+                    self.unload(plugin_id)
+        finally:
+            self._persist_suspended = False
+            self._enabled_ids = remembered
 
     def set_active_choice(self, point: str, plugin_id: str) -> None:
         if not self.registry.is_singleton(point):
@@ -324,7 +338,7 @@ class PluginRuntime:
             return set()
 
     def _save_state(self) -> None:
-        if self.state_file is None:
+        if self.state_file is None or self._persist_suspended:
             return
         # 原子写：plugins_state.json 半截会让重启后插件启用状态错乱
         atomic_write_text(

@@ -327,6 +327,55 @@ class TestPluginRuntimeLifecycle(unittest.TestCase):
         rt = PluginRuntime(self.plugins_dir, state_file=None)
         rt.scan()  # 不传 state_file 时纯内存运行，不该报错
 
+    def test_close_runs_shutdown_hooks_but_keeps_the_persisted_enable_record(self):
+        """进程退出收口（`close()`）不等于用户手动停用：钩子照跑（插件在 `on_disable` 里回收
+        子进程、归还 GPU 租约），但磁盘上"上次启用了哪些插件"的记录原样保留——否则每次
+        GUI/CLI/MCP 一退出就把记录擦成 `{"enabled": []}`，`scan()` 里"核心重启后插件自己
+        恢复到之前的状态"这条就形同虚设。"""
+        hooks = "hooks.txt"
+        body = (
+            "class Hooked:\n"
+            "    def on_load(self, ctx): pass\n"
+            "    def on_enable(self, ctx): pass\n"
+            f"    def on_disable(self, ctx): open({str(self.tmp / hooks)!r}, 'a').write('disable;')\n"
+            f"    def on_unload(self, ctx): open({str(self.tmp / hooks)!r}, 'a').write('unload;')\n"
+        )
+        _make_plugin(self.plugins_dir, "t-hooked", "t_hooked_mod", "Hooked", body)
+        rt1 = self._runtime()
+        rt1.scan()
+        rt1.load("t-hooked")
+        rt1.enable("t-hooked")
+        rt1.close()
+
+        self.assertEqual((self.tmp / hooks).read_text(encoding="utf-8"), "disable;unload;")
+        self.assertEqual(json.loads(self.state_file.read_text(encoding="utf-8"))["enabled"], ["t-hooked"])
+        rt2 = self._runtime()
+        rt2.scan()
+        self.assertEqual(rt2.plugins["t-hooked"].state, PluginState.ENABLED)
+
+    def test_close_is_idempotent_and_a_failing_hook_does_not_block_the_others(self):
+        body = (
+            "class Hostile:\n"
+            "    def on_load(self, ctx): pass\n"
+            "    def on_enable(self, ctx): pass\n"
+            "    def on_disable(self, ctx): raise RuntimeError('boom')\n"
+            "    def on_unload(self, ctx): raise RuntimeError('boom')\n"
+        )
+        _make_plugin(self.plugins_dir, "t-hostile", "t_hostile_mod", "Hostile", body)
+        _make_plugin(self.plugins_dir, "t-fine", "t_fine_mod", "Fine", _LIFECYCLE_BODY.format(cls="Fine"))
+        rt = self._runtime()
+        rt.scan()
+        for plugin_id in ("t-hostile", "t-fine"):
+            rt.load(plugin_id)
+            rt.enable(plugin_id)
+        rt.close()
+        rt.close()
+        self.assertEqual(rt.plugins["t-hostile"].state, PluginState.DISCOVERED)
+        self.assertEqual(rt.plugins["t-fine"].state, PluginState.DISCOVERED)
+        self.assertEqual(
+            sorted(json.loads(self.state_file.read_text(encoding="utf-8"))["enabled"]), ["t-fine", "t-hostile"]
+        )
+
 
 def _process_is_gone(pid: int) -> bool:
     """跨平台的"这个 pid 是不是真的没了"检查。POSIX 上 os.kill(pid, 0)

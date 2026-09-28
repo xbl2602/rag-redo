@@ -16,6 +16,13 @@
 PID 写进文件、持锁到进程退出；后来者抢不到锁立即知道"已有实例在跑"，
 应该主动退出，不是报错崩溃。
 
+**fail-open 是设计原则，不是遗漏**（2026-09-27 修正）：守卫把两种失败严格
+分开——"抢不到锁"说明确实有健康实例在跑，返回 False 让调用方谦让退出；
+"守卫自己坏了"（锁文件打不开/权限不足/路径异常/磁盘满）只打一行告警然后
+放行，对齐 `obsidian-rag/singleton.py:96-98` 与 `obsidian-rag/guiweb/app.py:62-66`。
+此前把后者也当成"已有实例"返回 False，等于让只读数据目录、杀软锁文件这类
+纯环境问题把 MCP 进程变成静默 `sys.exit(0)`。
+
 **与 obsidian-rag 的一处刻意差异**：这里包成 `ProcessSingletonGuard`
 类而不是模块级全局变量（`singleton.py` 用的是模块全局 `_singleton_f`）
 ——纯粹是为了这份模块自己好测试：每个测试新建一个独立的 guard 实例，
@@ -26,6 +33,7 @@ from __future__ import annotations
 
 import errno
 import os
+import sys
 from pathlib import Path
 
 _IS_WINDOWS = os.name == "nt"
@@ -164,11 +172,30 @@ class ProcessSingletonGuard:
         self._lock = FileByteLock(pid_file)
 
     def acquire(self) -> bool:
-        """尝试成为唯一实例。文件锁是唯一权威，PID 内容只用于诊断。"""
+        """尝试成为唯一实例。文件锁是唯一权威，PID 内容只用于诊断。
+
+        返回 False **只**表示"确实有另一个实例持锁在跑"，调用方据此谦让
+        退出。守卫自身故障（锁文件打不开、权限不足、路径异常、磁盘满——
+        全是 OSError）必须 fail-open：打一行告警后照常启动，逐字对齐
+        `obsidian-rag/singleton.py:96-98` 的"单例守卫失败（继续启动）"
+        和 `obsidian-rag/guiweb/app.py:62-66` 的"锁文件打开失败（忽略，
+        可能重复实例）"——单例机制本身不该成为故障点。fail-closed 的代价是
+        数据目录只读 / 杀软锁文件这类纯环境问题会让 MCP 进程
+        `sys.exit(0)` 静默消失，调用方只看到"服务没了"。
+        """
         try:
             acquired = self._lock.acquire()
-        except OSError:
-            return False
+        except OSError as exc:
+            # 只捕获 OSError：FileNotFoundError/PermissionError/IsADirectoryError
+            # 都是它的子类，而裸 `except Exception` 会把真实编程错误一起吞掉。
+            # 告警只带锁文件路径和异常类型/摘要——路径是 data/ 下的固定文件名，
+            # 不含任何配置值或密钥。
+            print(
+                f"单例守卫失败（继续启动）：锁文件 {self._pid_file}"
+                f"（{type(exc).__name__}: {exc}）",
+                file=sys.stderr,
+            )
+            return True
         if not acquired:
             return False
 

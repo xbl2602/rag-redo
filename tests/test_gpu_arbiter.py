@@ -44,6 +44,19 @@ class TestVramFreeGb(unittest.TestCase):
         self.assertEqual(first, second)  # 第二次探测被缓存挡住，没有真的重新跑
 
 
+class TestVramThresholds(unittest.TestCase):
+    """显存门槛常量必须与旧项目逐字一致（obsidian-rag/gpu_arbiter.py:34-35）。
+
+    这两个数字是"物理显存判据"的唯一事实来源：official-embedder-bge-m3 与
+    official-reranker 的设备选择都拿 `BGE_MIN_VRAM_GB` 和真实空闲显存比对
+    （见各自 `_select_device`）。门槛漂了就是静默改变"什么时候让路、什么时候
+    降级 CPU"的用户可观察行为，所以在这里钉死旧项目的值。"""
+
+    def test_thresholds_match_legacy_values(self):
+        self.assertEqual(ga.WEMM_MIN_VRAM_GB, 5.5)
+        self.assertEqual(ga.BGE_MIN_VRAM_GB, 3.5)
+
+
 class TestWaitForVram(unittest.TestCase):
     def test_sufficient_vram_returns_immediately(self):
         with patch.object(ga, "vram_free_gb", return_value=7.9):

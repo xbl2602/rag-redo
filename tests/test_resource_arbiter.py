@@ -5,6 +5,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -271,6 +273,153 @@ class TestCrossProcessResourceArbiter(unittest.TestCase):
             runtime.resource_arbiter.lock_dir,
             self.tmp / "data" / "resource_locks",
         )
+
+
+class TestArbiterLockOrdering(unittest.TestCase):
+    """锁序回归（缺陷 A：on_preempt 回调在持有 `_guard` 时执行 → 与插件侧
+    `self._lock → GPU_LOCK → _guard` 的正常编码路径构成 ABBA 死锁）。
+
+    两条腿都钉住：
+    1. 结构性断言——回调被调用时 `_guard` 不在**当前线程**手里
+       （进程内抢占路径 + 后台监控处理跨进程请求路径各一条）；
+    2. 真实多线程复现——一条线程持"插件锁"卡在 acquire()，另一条线程走
+       on_preempt 回调去抢同一把"插件锁"，两边都必须在超时内推进完。
+
+    为什么同时要结构断言：死锁一旦发生就是两条线程永久互等，测试只能靠
+    join 超时判定"卡住了"，说不清是哪条锁序写反了；结构断言直接把
+    "回调执行时持有哪些仲裁器锁"钉死，回归时定位快得多。多线程那条负责
+    保证"结构对了之后真的不死锁"。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.lock_dir = self.tmp / "resource_locks"
+
+    @staticmethod
+    def _guard_owned_by_current_thread(arb: ResourceArbiter) -> bool:
+        """当前线程是否持有 arb._guard。RLock 没有公开的"是否被持有"，但
+        CPython 的 _thread.RLock 一直有 `_is_owned()`；这里做能力探测，探测
+        不可用时由测试显式失败，不允许"静默当成没持有"让断言空过。"""
+        probe = getattr(arb._guard, "_is_owned", None)
+        if not callable(probe):
+            self_fail("当前解释器的 RLock 没有 _is_owned()，无法追踪 _guard 持有者")
+            return True
+        return bool(probe())
+
+    def test_guard_ownership_probe_itself_works(self):
+        """守住上面那个能力探测：探针在真持有 `_guard` 时必须报 True，否则
+        下面两条"回调时未持锁"的断言会永远空过。"""
+        arb = ResourceArbiter()
+        self.assertFalse(self._guard_owned_by_current_thread(arb))
+        with arb._guard:
+            self.assertTrue(self._guard_owned_by_current_thread(arb))
+        self.assertFalse(self._guard_owned_by_current_thread(arb))
+
+    def test_in_process_preempt_callback_runs_without_guard(self):
+        arb = ResourceArbiter()
+        seen: list[bool] = []
+        arb.acquire(
+            "gpu:0", "official-visual-wemm", priority=10,
+            on_preempt=lambda: seen.append(self._guard_owned_by_current_thread(arb)),
+        )
+        self.assertTrue(arb.acquire("gpu:0", "official-text-retrieval-gpu", priority=100))
+        self.assertEqual(seen, [False], "on_preempt 回调绝不能在持有 _guard 时执行")
+        self.assertEqual(arb.holder_of("gpu:0"), "official-text-retrieval-gpu")
+
+    def test_monitor_preempt_callback_runs_without_guard(self):
+        """跨进程抢占请求走后台监控线程（_process_preempt_requests）——这条
+        路径此前同样在 `_guard` 内调用回调，是真实双进程场景（GUI 与 MCP 都
+        跑检索侧、同一个 holder_id）下的死锁入口。"""
+        arb = ResourceArbiter(lock_dir=self.lock_dir, poll_interval_s=0.01)
+        seen: list[bool] = []
+        called = threading.Event()
+
+        def _on_preempt() -> None:
+            seen.append(self._guard_owned_by_current_thread(arb))
+            called.set()
+
+        self.assertTrue(
+            arb.acquire("gpu:0", "official-text-retrieval-gpu", priority=100, on_preempt=_on_preempt)
+        )
+        # 模拟"另一个进程写进来的抢占请求"（用仲裁器自己的写入路径，保证
+        # 字段名/存活判定/优先级规则与生产一致）
+        arb._write_preempt_request(
+            "gpu:0", "official-text-retrieval-gpu", "another-process", 200, False, "token-1"
+        )
+        self.addCleanup(self._cleanup_request, arb, "token-1")
+        self.assertTrue(called.wait(timeout=10), "后台监控线程没有执行 on_preempt 回调")
+        self.assertEqual(seen, [False], "on_preempt 回调绝不能在持有 _guard 时执行")
+        self.assertIsNone(arb.holder_of("gpu:0"), "让路后原持有者应已交出名额")
+
+    def _cleanup_request(self, arb: ResourceArbiter, token: str) -> None:
+        try:
+            arb._request_path("gpu:0", os.getpid(), token).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def test_preempt_against_plugin_lock_does_not_deadlock(self):
+        """真实多线程复现：模拟 embed.py 的锁序（self._lock → GPU_LOCK →
+        acquire()）撞上 on_preempt → _unload（self._lock → GPU_LOCK）。
+
+        - 线程 A 持"插件锁"再去 acquire()：它必须先拿 `_guard`；
+        - 监控线程执行 on_preempt，回调里抢同一把"插件锁"。
+
+        修复前：监控线程持 `_guard` 跑回调、回调等 A 的插件锁；A 等 `_guard`
+        → 双方永久互等（都是裸锁、无超时），encode() 永不返回。
+        修复后：回调在锁外执行，A 先推进完释放插件锁，回调随后完成。
+        """
+        arb = ResourceArbiter(lock_dir=self.lock_dir, poll_interval_s=0.01)
+        plugin_lock = threading.Lock()  # 模拟插件实例锁 self._lock
+        callback_entered = threading.Event()
+        callback_done = threading.Event()
+
+        def _on_preempt() -> None:
+            callback_entered.set()
+            plugin_lock.acquire()  # 模拟 _unload 拿 self._lock
+            try:
+                time.sleep(0.05)
+            finally:
+                plugin_lock.release()
+            callback_done.set()
+
+        self.assertTrue(
+            arb.acquire("gpu:0", "official-text-retrieval-gpu", priority=100, on_preempt=_on_preempt)
+        )
+        arb._write_preempt_request(
+            "gpu:0", "official-text-retrieval-gpu", "another-process", 200, False, "token-2"
+        )
+        self.addCleanup(self._cleanup_request, arb, "token-2")
+
+        encoder_finished = threading.Event()
+
+        def _encoder_thread() -> None:
+            plugin_lock.acquire()
+            try:
+                # 等监控线程进回调（此时它若持着 _guard 就是死锁的前置条件），
+                # 再去 acquire()——这一步制造 ABBA 的另一端。
+                callback_entered.wait(timeout=10)
+                arb.acquire("gpu:0", "official-text-retrieval-gpu", priority=100)
+            finally:
+                plugin_lock.release()
+            encoder_finished.set()
+
+        thread = threading.Thread(target=_encoder_thread, daemon=True, name="test-encoder")
+        thread.start()
+        self.addCleanup(thread.join, 0.1)
+        self.assertTrue(
+            encoder_finished.wait(timeout=15),
+            "检测到锁序反转（ABBA 死锁）：acquire() 持插件锁等 _guard、"
+            "on_preempt 回调持 _guard 等插件锁，两条线程都推不动",
+        )
+        self.assertTrue(
+            callback_done.wait(timeout=15),
+            "on_preempt 回调没有完成（同样说明锁序反转导致互相等待）",
+        )
+
+
+def self_fail(message: str) -> None:
+    raise AssertionError(message)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,14 @@
 """core/singleton.py 的单元测试：真实文件锁、真实跨进程存活探测。"""
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -69,7 +71,7 @@ class TestFileByteLock(unittest.TestCase):
                 "print('ACQUIRED' if lock.acquire() else 'REJECTED')"
             ) % (str(REPO_ROOT), str(self.lock_file))
             result = subprocess.run(
-                [sys.executable, "-c", script], capture_output=True, text=True, timeout=15
+                [sys.executable, "-c", script], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15
             )
             self.assertIn("REJECTED", result.stdout, result.stderr)
         finally:
@@ -125,10 +127,67 @@ class TestProcessSingletonGuard(unittest.TestCase):
         guard.release()
         self.assertTrue(self.pid_file.exists())
 
-    def test_lock_unavailable_fails_closed(self):
+    # 2026-09-27 修正：原用例 test_lock_unavailable_fails_closed 把错误行为
+    # 固化成了预期（守卫自身抛 OSError 时返回 False），与 LEGACY 相反——
+    # obsidian-rag/singleton.py:96-98 明确"守卫失败（继续启动）"返回 True，
+    # guiweb/app.py:62-66 同样是"锁文件打开失败（忽略，可能重复实例）"。
+    # fail-closed 会让只读数据目录、杀软锁文件、磁盘满这类环境问题把 MCP
+    # 进程变成 sys.exit(0) 静默消失，调用方只看到"服务没了"。故改写为断言
+    # fail-open + 告警，而不是删掉。
+    def test_guard_self_failure_fails_open_with_warning(self):
         guard = ProcessSingletonGuard(self.pid_file)
+        buf = io.StringIO()
         with patch.object(guard._lock, "acquire", side_effect=OSError("lock failed")):
-            self.assertFalse(guard.acquire())
+            with redirect_stderr(buf):
+                self.assertTrue(guard.acquire())
+        err = buf.getvalue()
+        self.assertIn("单例守卫失败（继续启动）", err)
+        self.assertIn(str(self.pid_file), err)
+        self.assertIn("OSError", err)
+        # 放行 ≠ 拿到锁：不得留下"我以为自己是唯一实例"的假象
+        # （AGENTS.md §7"所有权未知不能宣称资源空闲"）。
+        self.assertIsNone(guard._lock._f)
+
+    def test_unusable_pid_file_parent_path_fails_open(self):
+        """真实 OSError 而非 mock：父路径是个已存在的文件，mkdir 必然抛
+        NotADirectoryError（OSError 子类）。数据目录被换成文件、挂载点掉了
+        这类真实环境问题都必须放行，不能让服务静默退出。"""
+        blocked = self.tmp / "not_a_dir"
+        blocked.write_text("x", encoding="utf-8")
+        pid_file = blocked / "server.pid"
+        guard = ProcessSingletonGuard(pid_file)
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            self.assertTrue(guard.acquire())
+        err = buf.getvalue()
+        self.assertIn("单例守卫失败（继续启动）", err)
+        self.assertIn(str(pid_file), err)
+
+    def test_pid_file_path_pointing_at_directory_fails_open(self):
+        """锁文件路径本身是个目录：os.open 打不开（Windows PermissionError /
+        POSIX IsADirectoryError），同样是守卫故障而不是"已有实例在跑"。"""
+        guard = ProcessSingletonGuard(self.tmp)
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            self.assertTrue(guard.acquire())
+        err = buf.getvalue()
+        self.assertIn("单例守卫失败（继续启动）", err)
+        self.assertIn(str(self.tmp), err)
+
+    def test_contention_is_not_reported_as_guard_failure(self):
+        """回归保护：抢不到锁仍然 fail-closed（另一个实例真的在跑），而且
+        守卫自己必须保持安静——"已有实例退出"由调用方打印，stderr 里不该同时
+        出现"守卫失败"这种自相矛盾的两套结论。"""
+        first = ProcessSingletonGuard(self.pid_file)
+        self.assertTrue(first.acquire())
+        try:
+            second = ProcessSingletonGuard(self.pid_file)
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                self.assertFalse(second.acquire())
+            self.assertEqual("", buf.getvalue())
+        finally:
+            first.release()
 
     def test_live_pid_record_does_not_replace_file_lock_authority(self):
         self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
@@ -158,7 +217,7 @@ class TestProcessSingletonGuard(unittest.TestCase):
                 "print('ACQUIRED' if g.acquire() else 'REJECTED')"
             ) % (str(REPO_ROOT), str(self.pid_file))
             result = subprocess.run(
-                [sys.executable, "-c", script], capture_output=True, text=True, timeout=15
+                [sys.executable, "-c", script], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15
             )
             self.assertIn("REJECTED", result.stdout, result.stderr)
         finally:
@@ -197,7 +256,7 @@ class TestGuiMainSingletonWiring(unittest.TestCase):
         try:
             result = subprocess.run(
                 [sys.executable, "-c", self._child_script(self.marker)],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
             )
             self.assertFalse(self.marker.exists(), "守卫被占时不得执行 build_runtime")
             self.assertIn("单例守卫", result.stderr)
@@ -210,7 +269,7 @@ class TestGuiMainSingletonWiring(unittest.TestCase):
         # 就证明守卫没有拦截无冲突的首次启动。
         result = subprocess.run(
             [sys.executable, "-c", self._child_script(self.marker)],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
         )
         self.assertTrue(self.marker.exists(), "无既有实例时守卫应当放行，build_runtime 应被执行")
 
