@@ -203,7 +203,7 @@
       "test_refs": [
         "rag-redo/plugins/official-result-advisor/tests/test_advice.py::TestResultAdvisorPlugin",
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_search_advice_uses_separate_response_channel",
-        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpToolsAsyncBase.test_search_knowledge_returns_separate_advice_channel"
+        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_knowledge_returns_separate_advice_channel"
       ],
       "acceptance": "建议必须纯规则、零 I/O、同一输入同一输出、最多限定数量，并与结果本体使用不同通道。【经操作者确认的偏离（2026-09-25）】\"单文件集中\"场景的建议文案改为指向 read_document 精读入口——旧项目 advice.py:148-150 建议 `exclude=\"<文件路径>\"`，但两边检索入口的 exclude 实际语义都是库 ID，照做整次检索报错（继承的既有 bug）；除此之外全部规则文案与旧项目逐字对齐。",
       "blocker": ""
@@ -221,15 +221,16 @@
         "rag-redo/core/graph.py::build_graph",
         "rag-redo/core/pipeline.py::Pipeline.graph",
         "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py::VisualWemmPlugin.export_state",
-        "rag-redo/plugins/official-gui-shell/official_gui_shell/api.py::Api.graph",
-        "rag-redo/plugins/official-gui-shell/official_gui_shell/api.py::Api.open_source"
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/contract_bridge.py::_LegacyContractMixin.graph",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/contract_bridge.py::_LegacyContractMixin.open_source"
       ],
       "test_refs": [
         "rag-redo/tests/test_graph.py::TestGraphReadModel",
         "rag-redo/tests/test_graph.py::TestSemanticEdgeSelection",
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_graph_reads_active_manifest_and_relations_without_loading_embedder",
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_graph_semantic_edges_are_separate_and_use_existing_embedder",
-        "rag-redo/plugins/official-gui-shell/tests/test_assets.py::TestGraphAssets",
+        "rag-redo/plugins/official-gui-shell/tests/test_api.py::TestApi.test_graph_serializes_read_model_and_uses_all_for_empty_scope",
+        "rag-redo/plugins/official-gui-shell/tests/test_api.py::TestApi.test_graph_nodes_carry_the_display_name_not_the_library_id",
         "rag-redo/plugins/official-gui-shell/tests/test_api.py::TestApi.test_open_source_resolves_only_inside_library",
         "rag-redo/tests/test_pipeline_e2e.py::TestExportImportLibrary.test_import_preserves_terminal_failure_diagnostics"
       ],
@@ -339,6 +340,48 @@
       ],
       "acceptance": "HyDE 默认关闭；首轮 top1 置信度低于阈值时生成假设文档并重查；仅第二轮置信度严格更高时替换；LLM 失败或空响应时保留首轮。",
       "blocker": ""
+    },
+    {
+      "id": "BC-15",
+      "title": "GUI 操作方式复刻 obsidian-rag guiweb",
+      "status": "partial",
+      "legacy_refs": [
+        "obsidian-rag/guiweb/contracts.md:1-251",
+        "obsidian-rag/guiweb/bridge.py:1-1200",
+        "obsidian-rag/guiweb/app.py:99-144",
+        "obsidian-rag/guiweb/ui/index.html:1-1200",
+        "obsidian-rag/guiweb/ui/app.js:1-3026",
+        "obsidian-rag/guiweb/ui/app.css:1-2400",
+        "obsidian-rag/guiweb/ui/mock.js:1-820"
+      ],
+      "redo_refs": [
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/assets/index.html",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/assets/app.js",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/assets/app.css",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/assets/mock.js",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/api.py",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/contract_bridge.py",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/push.py",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/settings_schema.py",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/preview_job.py",
+        "rag-redo/gui_main.py:1-160"
+      ],
+      "test_refs": [
+        "rag-redo/plugins/official-gui-shell/tests/test_assets.py::TestLegacyAssetParity",
+        "rag-redo/plugins/official-gui-shell/tests/test_assets.py::TestNoBusinessLogicInFrontend",
+        "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestContractMethodCoverage",
+        "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestContractReturnShapes.test_every_contract_method_returns_its_frozen_key_set",
+        "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestDisplayNameVersusLibraryId",
+        "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestSelectionTreeMatchesLegacySemantics",
+        "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestSettingsPage",
+        "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestProgressSnapshot",
+        "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestPreviewLifecycle",
+        "rag-redo/plugins/official-gui-shell/tests/test_boot.py::TestRuntimeBoot",
+        "rag-redo/plugins/official-gui-shell/tests/test_boot.py::TestMainEntry",
+        "rag-redo/plugins/official-gui-shell/tests/test_boot.py::TestPushLoop"
+      ],
+      "acceptance": "GUI 是操作方式而非独立产品，必须与 MCP/CLI 共用同一业务核心，自身零业务判断。量化门槛：(1) 资产一致性——assets/{index.html,app.css,app.js,mock.js} 与 obsidian-rag/guiweb/ui/ 逐字节相同，sha256 冻结为 fixture 且测试断言 4/4；(2) 契约覆盖——contracts.md 定义的 37 个方法，新桥接层 37/37 同名存在且返回 JSON 键集合与契约一致，缺口必须为 0；(3) 推送通道——snapshot/log/alert/notice/preview 五类推送与 bind_window 必须存在，snapshot 周期 1 秒，连续失败 5 次才退出；(4) 视图覆盖——contracts.md 视图映射表 7 个视图（检索/库/索引/诊断/设置/图谱/全局）逐项可达；(5) 零业务逻辑——前端与桥接层不得出现 RRF/BM25/cosine/rerank 计算，排序过滤置信度一律来自 core，入口不得各自实现。",
+      "blocker": "阶段A（资产原样搬运）已完成并通过 4/4 sha256 校验；阶段B/C（37 个契约方法桥接、勾选树/进度/推送/试验台/设置等 16 项 core 侧能力）已实现，并由 test_contracts_parity.py 对夹具 37/37 逐个真实调用断言返回键集合，test_boot.py 走真实运行时与真实 gui_main.main() 断言启动路径。**仍待**：①真实 pywebview 窗口内的人工验证（7 个视图逐项可达、推送通道在真实窗口里生效）与操作者确认（2026-09-28 已有的自动化证据，不代替这一步：真实进程冒烟——`gui_main.py` 在临时数据目录下 6~8 秒内出现标题「Obsidian RAG」的窗口，标准错误输出为空，正常关窗后整棵进程树（含 WEMM 看图服务）无残留；前端对真实 Api 与真实推送循环的浏览器联调——图谱/库/勾选范围写入回读/检索含建议与双链/设置保存回读/索引/试验台/诊断含去重均渲染并可操作，无 JS 报错、无失败请求；联调用的是假嵌入，未覆盖「点击开始索引」拉起真实 BGE-M3 worker 的路径）；②与旧项目的有意差异——设置页只列 rag-redo 真实读取的键（不是旧项目的 13 组）、切块粒度/collection 不能按库覆盖（rag-redo 没有该能力）、进度条 pct 取 0~100（旧桥送 0~1 而旧前端按 0~100 用）——需操作者确认后再登记为已批准偏离。原 official-gui-shell/tests/test_assets.py 的 7 条断言针对被取代的自制界面设计，已由本契约的资产一致性与零业务逻辑断言取代。"
     }
   ]
 }
