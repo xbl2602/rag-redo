@@ -62,6 +62,9 @@ class TestResultAdvisorPlugin(unittest.TestCase):
         mode: str = "body",
         top_k: int = 5,
         default_libraries=(),
+        capped: bool = False,
+        folded: int = 0,
+        empty_reason: str | None = None,
     ):
         request = SearchAdviceInput(
             results=tuple(results),
@@ -71,11 +74,73 @@ class TestResultAdvisorPlugin(unittest.TestCase):
             default_libraries=tuple(default_libraries),
             warn_threshold=0.30,
             strong_threshold=0.75,
+            capped=capped,
+            folded=folded,
+            empty_reason=empty_reason,
         )
         return self.instance.advise(request)
 
-    def test_empty_results_return_no_advice(self):
-        self.assertEqual(self._advise([]), ())
+    def test_empty_results_explain_why(self):
+        """空结果必须说话——对齐 obsidian-rag/retriever.py:479-483 的两分支。
+
+        之前这里断言"空结果不给任何建议"，那正是缺陷本体：把
+        confidence_drop_threshold 调高后全部命中被过滤，调用方拿到的响应与
+        "库里压根没有相关内容"完全一样，零信息。
+        """
+        no_score = self._advise([], empty_reason="no-score")
+        self.assertEqual(len(no_score), 1)
+        self.assertIn("未找到相关内容", no_score[0])
+
+        filtered = self._advise([], empty_reason="all-below-drop-threshold")
+        self.assertEqual(len(filtered), 1)
+        self.assertIn("低于置信度下限", filtered[0])
+        # 两套文案必须真的不同，否则分叉没有意义
+        self.assertNotEqual(no_score, filtered)
+
+    def test_duplicate_stem_is_reported_even_when_sections_differ(self):
+        """同名不同目录的判据是**文件名 stem**，不是小节标题面包屑。
+
+        对齐旧 advice.py:113-117（`title` 实际几乎总为空，那条规则的语义就是
+        stem）。用小节标题当判据会同时漏报（两篇同名笔记命中不同小节——正是
+        这条规则要解决的场景）和误报（两篇不同名笔记都命中「## 结论」，可
+        文案却打印文件名「A」/「A.md」「B.md」）。
+        """
+        advice = self._advise(
+            [
+                _result("c1", "a/主题.md", 0.8, heading="安装"),
+                _result("c2", "b/主题.md", 0.7, heading="配置"),
+            ]
+        )
+        self.assertTrue(any("同名不同目录" in line for line in advice), advice)
+
+        # 反向：不同名笔记命中同一个小节，不该报"同名"
+        unrelated = self._advise(
+            [
+                _result("c1", "a/甲.md", 0.8, heading="结论"),
+                _result("c2", "b/乙.md", 0.7, heading="结论"),
+            ]
+        )
+        self.assertFalse(any("同名不同目录" in line for line in unrelated), unrelated)
+
+    def test_capped_and_folded_signals_reach_the_rules(self):
+        """`capped`/`folded` 两个信号以前在 `_search_once` 里算出来却无处可去，
+        建议层和渲染层整体看不到它们（缺陷：封顶/折叠对用户不可见）。"""
+        capped = self._advise(
+            [_result("c1", "a.md", 0.9, library="notes")],
+            capped=True,
+        )
+        self.assertTrue(any("最多展示" in line for line in capped), capped)
+
+        folded = self._advise(
+            [_result("c1", "a.md", 0.9, library="notes")],
+            folded=2,
+        )
+        self.assertTrue(any("按小节回填" in line for line in folded), folded)
+
+    def test_advice_max_lines_zero_still_silences_empty_advice(self):
+        """关掉建议输出时，空结果也不该硬塞一行出来。"""
+        self.runtime.settings.set("advice_max_lines", 0)
+        self.assertEqual(self._advise([], empty_reason="no-score"), ())
 
     def test_low_confidence_and_keyword_rules(self):
         advice = self._advise(
@@ -86,14 +151,19 @@ class TestResultAdvisorPlugin(unittest.TestCase):
         self.assertIn("相关度都偏低", advice[0])
         self.assertIn("关键词式查询", advice[1])
 
-    def test_duplicate_heading_uses_complete_paths(self):
+    def test_duplicate_name_advice_uses_complete_paths(self):
+        """提示里必须给**完整路径**而不是只给文件名——只给文件名的话，调用方
+        拿到这句提示仍然分不清该打开哪一个，这正是这条规则要解决的问题。"""
         advice = self._advise(
             [
                 _result("c1", "a/主题.md", 0.8, heading="Fluent 配置"),
                 _result("c2", "b/主题.md", 0.7, heading="fluent配置"),
             ]
         )
-        self.assertTrue(any("同名不同目录" in line for line in advice))
+        line = next(line for line in advice if "同名不同目录" in line)
+        self.assertIn("a/主题.md", line)
+        self.assertIn("b/主题.md", line)
+
 
     def test_non_default_config_library_is_called_out(self):
         advice = self._advise(

@@ -47,11 +47,13 @@ class ResultAdvisorPlugin:
         self._settings = None
 
     def advise(self, request: SearchAdviceInput) -> tuple[str, ...]:
-        if self._settings is None or not request.results:
+        if self._settings is None:
             return ()
         max_lines = max(0, int(self._settings.get("advice_max_lines", MAX_LINES)))
         if max_lines == 0:
             return ()
+        if not request.results:
+            return self._advise_empty(request)
         hits: tuple[SearchResult, ...] = request.results
         scores = [result.confidence for result in hits]
         top = max(scores) if scores else None
@@ -78,8 +80,18 @@ class ResultAdvisorPlugin:
         if len(output) < max_lines:
             by_title: dict[str, set[tuple[str, str]]] = {}
             for result in hits:
-                title = result.heading_breadcrumb
-                key = _norm_title(title if title and title != "(无标题)" else _stem(result.path))
+                # 判据是**文件名 stem**，不是小节标题面包屑——对齐
+                # obsidian-rag/advice.py:113-117 的 `_norm_title(h["title"]) or
+                # _norm_title(_stem(h["rel"]))`：`title` 来自 frontmatter，实际
+                # 几乎总为空，所以那条规则的**实际**语义就是"文件名 stem"。
+                # 这条规则要解决的是"两篇同名不同目录的笔记在列表里长得一样、
+                # 容易看错"（旧项目 advice.py:5-7 记的实测案）。改用
+                # heading_breadcrumb 会同时坏两头：
+                #   漏报——两篇同名笔记命中**不同小节**时不再提示，而那正是这条
+                #          规则存在的理由；
+                #   误报——两篇**不同名**笔记都命中「## 结论」时触发，可文案打印
+                #          的却是文件名「A」/「A.md」「B.md」，语义自相矛盾。
+                key = _stem(result.path)
                 by_title.setdefault(key, set()).add((result.library_id, result.path))
             duplicate = next((paths for paths in by_title.values() if len(paths) > 1), None)
             if duplicate:
@@ -134,10 +146,22 @@ class ResultAdvisorPlugin:
                 "命中含 PDF/Word：read_document 可拿已提取的 Markdown 全文，图表或扫描页内容用 navigate_knowledge 看页。"
             )
 
-        if len(output) < max_lines and any(result.backfilled for result in hits):
+        if len(output) < max_lines and (
+            request.folded > 0 or any(result.backfilled for result in hits)
+        ):
+            # `folded > 0` 是对齐旧 advice.py:158 的 `folded > 0 or any(backfilled)`：
+            # 同一个小节被折叠掉重复块时也要说，否则调用方会以为"库里就这一段"。
             output.append(
                 "命中正文已按小节回填、且同一小节只交付一次：要看原文全文用 read_document，"
                 "要看它连到哪些笔记用 note_relations。"
+            )
+
+        if len(output) < max_lines and request.capped:
+            # 对齐旧 retriever.py:494-497 的尾注。少了它，调用方看到同一篇笔记
+            # 占满 N 条会以为库里没有更多相关内容，而实际上后面还有被封顶掉的块。
+            output.append(
+                "同一文件最多展示若干块（本批有命中触发了这个上限），"
+                "同一篇笔记的后续内容请用 read_document 读全文，或把 top_k 调大。"
             )
 
         if len(output) < max_lines and request.mode == "list":
@@ -152,3 +176,21 @@ class ResultAdvisorPlugin:
             output.append("关键词式查询命中精确但覆盖窄：若想问\"怎么做/为什么\"这类，换成完整问句（一句自然语言的问题）结果会更全。")
 
         return tuple(output[:max_lines])
+
+    def _advise_empty(self, request: SearchAdviceInput) -> tuple[str, ...]:
+        """空结果也要说话——对齐 obsidian-rag/retriever.py:479-483。
+
+        之前这里对空结果直接返回 `()`，于是"把 confidence_drop_threshold 调高
+        导致全部命中被过滤"和"库里压根没有相关内容"给调用方**完全一样**的
+        零信息响应，只能自己去猜。两种原因给的下一步动作完全不同：前者是
+        "阈值滤掉了已有的东西，换个说法或把阈值调回去"，后者是"换个词/扩库
+        范围/确认索引过"。所以按 `empty_reason` 分两套文案。
+        """
+        if request.empty_reason == "all-below-drop-threshold":
+            return (
+                "未找到相关内容（检索到的命中均低于置信度下限，已过滤；"
+                "可尝试换关键词、扩库范围或检查是否索引了相关内容）。",
+            )
+        return (
+            "未找到相关内容。可换关键词、放宽库范围，或确认目标笔记已建好索引。",
+        )
