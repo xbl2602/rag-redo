@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import atexit
 import multiprocessing
-import os
 import sys
 from pathlib import Path
 
@@ -28,21 +27,18 @@ from pathlib import Path
 #: 同 gui_main.py 里的同名判断：plugins/ 必须是发行目录里一个真实、用户
 #: 能自己增删的文件夹，不能被打包进冻结产物内部。
 if getattr(sys, "frozen", False):
-    REPO_ROOT = Path(sys.executable).parent
+    _BOOTSTRAP_ROOT = Path(sys.executable).parent
 else:
-    REPO_ROOT = Path(__file__).parent
-sys.path.insert(0, str(REPO_ROOT))
+    _BOOTSTRAP_ROOT = Path(__file__).parent
+sys.path.insert(0, str(_BOOTSTRAP_ROOT))
 
-#: 数据目录：理由和 GUI/MCP 共享同一份数据的说明，见 gui_main.py 里同名
-#: 常量的注释——这里不重复展开，两个入口必须保持完全一致的解析逻辑
-#: （同一份数据只能有一处权威路径判定，DATA_FLOW.md 规则4的体现）。
-configured_data_root = os.environ.get("RAG_REDO_DATA_ROOT")
-if configured_data_root:
-    DATA_ROOT = Path(configured_data_root)
-elif getattr(sys, "frozen", False):
-    DATA_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "RAG-Redo" / "data"
-else:
-    DATA_ROOT = REPO_ROOT / "data"
+from core import paths  # noqa: E402
+
+REPO_ROOT = paths.repo_root()
+#: 数据目录：理由和 GUI/MCP 共享同一份数据的说明，见 gui_main.py 里同名常量的注释。
+#: 三个入口（GUI/MCP/CLI）的路径规则统一在 `core/paths.py`，同一份数据只能有一处权威
+#: 路径判定（DATA_FLOW.md 规则4的体现）。
+DATA_ROOT = paths.data_root()
 for _plugin_dir in (REPO_ROOT / "plugins").glob("*"):
     if _plugin_dir.is_dir():
         sys.path.insert(0, str(_plugin_dir))
@@ -53,9 +49,10 @@ from core.pipeline import Pipeline  # noqa: E402
 from core.runtime import PluginRuntime  # noqa: E402
 from core.singleton import ProcessSingletonGuard  # noqa: E402
 
-#: MCP 工具实际需要的官方插件集——不含 GUI（gui-shell 目前还不存在，
-#: 就算存在，MCP 服务这条路径也用不上它，证明插件之间真的没有硬编码
-#: 依赖，见 docs/ROADMAP.md Phase 1 验收标准）。
+#: MCP 工具实际需要的官方插件集——不含 GUI 壳（official-gui-shell）：MCP 服务这条
+#: 路径用不上它，证明插件之间真的没有硬编码依赖（docs/ROADMAP.md Phase 1 验收标准）。
+#: 与 gui_main.py / core/cli.py 启用的业务插件是同一份（差异只有各自的门面插件），
+#: `tests/test_cli.py` 钉住这条一致性。
 REQUIRED_PLUGINS = [
     "official-extractor-text",
     "official-extractor-pdf-text",
@@ -112,6 +109,15 @@ def main() -> None:
     atexit.register(guard.release)
 
     runtime = build_runtime()
+    try:
+        _serve(runtime)
+    finally:
+        # 客户端断开（stdin EOF）或必需插件起不来而退出时收口整个运行时：插件拉起的子进程
+        # （页级视觉的看图服务等）不会跟着父进程一起走，理由同 gui_main.py 的同名收口。
+        runtime.close()
+
+
+def _serve(runtime: PluginRuntime) -> None:
     pipeline = Pipeline(runtime)
     lib_mgr_plugin = runtime.plugins.get("official-library-manager")
     mcp_plugin = runtime.plugins.get("official-mcp-server")

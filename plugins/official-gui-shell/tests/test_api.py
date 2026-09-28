@@ -1,138 +1,100 @@
 """Api 类是纯 Python，不需要真的渲染一个窗口就能测——这里覆盖的是
 "GUI后端调用Pipeline/library-manager对不对、失败会不会被折叠成
-{"ok": False, ...}而不是让调用方（js_api桥）异常"，渲染层的验证见
-scripts/smoke_gui.py（手动冒烟，不进自动化回归，风格同旧项目
-tests/smoke_gui.py）。
+{"ok": False, ...}而不是让调用方（js_api桥）异常"。渲染层与启动路径的验证见
+test_boot.py（真实运行时加载 + 真实 gui_main.main()）与 test_contracts_parity.py
+（37 个契约方法逐个真实调用）。
+
+**两套入口各自的覆盖**（2026-09-28 审计 M-7：BC-15 阶段B 把精确 API 改名后这里没有迁移，
+33 条里 22 条报错）：
+
+- 本文件测**精确 API**（库 id 在前，供 MCP/CLI/脚本用）：`register_library` /
+  `search_scoped` / `stop_index_run` / `get_settings_values` / `dedup_run_library` /
+  `document_text` …；
+- 同一批行为经**契约 API**（前端真正调用的名字与参数顺序）的对应用例也在这里：
+  `add_library(path, name)` / `search(query, top_k, libraries, include_body)` /
+  `stop_index()` / `get_settings()` / `dedup_run(threshold)` / `read_document(lib, rel)` …
 """
 from __future__ import annotations
 
-import shutil
 import sys
-import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-_PLUGIN_DIR = Path(__file__).parent.parent
-_REPO_ROOT = _PLUGIN_DIR.parent.parent
-for p in (_REPO_ROOT, _PLUGIN_DIR):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
-for other_plugin_dir in (_REPO_ROOT / "plugins").glob("*"):
-    if other_plugin_dir.is_dir() and str(other_plugin_dir) not in sys.path:
-        sys.path.insert(0, str(other_plugin_dir))
+_TESTS_DIR = Path(__file__).parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
 
-from official_gui_shell.api import Api  # noqa: E402
-
-from core.pipeline import Pipeline  # noqa: E402
-from core.runtime import PluginRuntime  # noqa: E402
-
-REQUIRED_PLUGINS = [
-    "official-extractor-text",
-    "official-chunker",
-    "official-library-manager",
-    "official-lexical-bm25",
-    "official-embedder-bge-m3",
-    "official-vector-store-chroma",
-    "official-fusion-rrf",
-    "official-reranker",
-    "official-import-export",
-    "official-library-summary",
-    "official-llm-openai-compatible",
-    "official-result-advisor",
-]
-
-
-class _FakeEncoder:
-    KEYWORDS = ["插件", "架构"]
-
-    def encode(self, texts):
-        return [[float(t.count(k)) for k in self.KEYWORDS] for t in texts]
-
-
-class _FakeReranker:
-    def score(self, query, texts):
-        # query.split()，不是逐字符遍历——见 tests/test_demo_vault.py 的
-        # 同类注释，逐字符统计在更长的真实文本上容易被噪声干扰。
-        terms = query.split()
-        return [sum(text.count(term) for term in terms) for text in texts]
-
-
-class _FakeLlmClient:
-    def __init__(self, response: str = "这是一个关于插件架构的知识库。") -> None:
-        self.response = response
-        self.calls: list[dict] = []
-
-    def complete(self, system, user, **kwargs):
-        self.calls.append({"system": system, "user": user})
-        return self.response
+from gui_test_env import GuiTestEnv  # noqa: E402
 
 
 class TestApi(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.env = GuiTestEnv()
+        self.addCleanup(self.env.close)
+        self.tmp = self.env.tmp
+        self.vault = self.env.vault
+        self.fake_llm = self.env.fake_llm
+        self.runtime = self.env.runtime
+        self.pipeline = self.env.pipeline
+        self.api = self.env.api
 
-        self.vault = self.tmp / "vault"
-        self.vault.mkdir()
-        (self.vault / "notes.md").write_text("# 插件架构\n\n插件系统笔记。", encoding="utf-8")
-
-        self.runtime = PluginRuntime(
-            _REPO_ROOT / "plugins",
-            state_file=self.tmp / "plugins_state.json",
-            data_dir=self.tmp / "data",
-        )
-        self.runtime.scan()
-        for plugin_id in REQUIRED_PLUGINS:
-            self.runtime.load(plugin_id)
-            self.runtime.enable(plugin_id)
-
-        from official_embedder_bge_m3.embed import BGEM3Embedder
-
-        self.runtime.plugins["official-embedder-bge-m3"].instance.embedder = BGEM3Embedder(
-            encoder=_FakeEncoder()
-        )
-        from official_reranker.rerank import RerankerEngine
-
-        self.runtime.plugins["official-reranker"].instance.engine = RerankerEngine(reranker=_FakeReranker())
-
-        from official_llm_openai_compatible.llm import OpenAiCompatibleClient
-
-        self.fake_llm = _FakeLlmClient()
-        self.runtime.plugins["official-llm-openai-compatible"].instance._client = OpenAiCompatibleClient(  # noqa: SLF001
-            http_client=self.fake_llm
-        )
-
-        lib_mgr = self.runtime.plugins["official-library-manager"].instance
-        self.pipeline = Pipeline(self.runtime)
-        self.api = Api(self.pipeline, lib_mgr)
+    # ---- 库 -------------------------------------------------------------
 
     def test_list_libraries_empty_initially(self):
         self.assertEqual(self.api.list_libraries(), [])
 
-    def test_add_library_then_list(self):
-        result = self.api.add_library("lib1", "测试库", str(self.vault))
+    def test_register_library_then_list(self):
+        result = self.api.register_library("lib1", "测试库", str(self.vault))
         self.assertTrue(result["ok"])
         libs = self.api.list_libraries()
         self.assertEqual(len(libs), 1)
-        self.assertEqual(libs[0]["library_id"], "lib1")
+        self.assertEqual(libs[0]["collection"], "lib1")  # 库 id
+        self.assertEqual(libs[0]["name"], "测试库")  # 前端看到的是显示名
+
+    def test_contract_add_library_uses_the_name_as_identity(self):
+        """契约 `add_library(path, name)`：旧项目里名字就是库身份，库 id 取名字本身。"""
+        result = self.api.add_library(str(self.vault), "测试库")
+        self.assertEqual(result, {"ok": True, "library_id": "测试库"})
+        self.assertEqual(self.api.list_libraries()[0]["collection"], "测试库")
 
     def test_add_duplicate_library_returns_error_not_exception(self):
-        self.api.add_library("lib1", "测试库", str(self.vault))
-        result = self.api.add_library("lib1", "重复", str(self.vault))
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        result = self.api.register_library("lib1", "重复", str(self.vault))
         self.assertFalse(result["ok"])
         self.assertIn("error", result)
+        duplicate = self.api.add_library(str(self.vault), "另一个名字")
+        self.assertFalse(duplicate["ok"], "同一目录不能注册两次")
+
+    # ---- 索引 -----------------------------------------------------------
 
     def test_index_and_search_round_trip(self):
-        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.register_library("lib1", "测试库", str(self.vault))
         report = self.pipeline.index_library("lib1")
         self.assertEqual(report.succeeded, 1)
 
-        search_result = self.api.search("lib1", "插件 架构")
+        search_result = self.api.search_scoped("lib1", "插件 架构")
         self.assertTrue(search_result["ok"])
         self.assertGreater(len(search_result["results"]), 0)
         self.assertEqual(search_result["results"][0]["path"], "notes.md")
         self.assertIn("confidence_tier", search_result["results"][0])
+
+    def test_contract_search_has_the_legacy_shape_and_argument_order(self):
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        self.pipeline.index_library("lib1")
+        result = self.api.search("插件 架构", 5, "lib1", True)
+        self.assertIsNone(result["error"])
+        hits = [r for r in result["results"] if not r.get("notice")]
+        self.assertGreater(len(hits), 0)
+        first = hits[0]
+        self.assertEqual((first["lib"], first["rel"]), ("测试库", "notes.md"))
+        self.assertTrue(first["body"])
+        self.assertIn("<", first["rendered_html"])
+        self.assertIn("confidence", first)
+        # 块序号来自 core，不再是写死的"块 1/1"
+        self.assertEqual(first["chunk_total"], self.pipeline.search("lib1", "插件 架构")[0].total_chunks)
+        self.assertEqual(self.api.search("   ", 5, "lib1", True), {"results": [], "error": "请输入问题"})
 
     def test_reindex_library_starts_background_index_from_gui(self):
         start_result = Mock(
@@ -175,7 +137,7 @@ class TestApi(unittest.TestCase):
         self.assertEqual(index_status.call_count, 2)
         index_status.assert_called_with("lib1")
 
-    def test_stop_index_returns_pipeline_result(self):
+    def test_stop_index_run_returns_pipeline_result(self):
         for stopped, message in (
             (True, "索引任务已取消"),
             (False, "拒绝停止：索引任务 run_id 不匹配"),
@@ -184,7 +146,7 @@ class TestApi(unittest.TestCase):
                 with patch.object(
                     self.pipeline, "stop_index_library", return_value=(stopped, message)
                 ) as stop_index:
-                    result = self.api.stop_index("lib1", "run-1")
+                    result = self.api.stop_index_run("lib1", "run-1")
                 self.assertEqual(
                     result,
                     {"ok": True, "stopped": stopped, "message": message},
@@ -197,7 +159,7 @@ class TestApi(unittest.TestCase):
         calls = (
             ("start_index_library", lambda: self.api.reindex_library("no-such-lib")),
             ("index_status", lambda: self.api.index_status("no-such-lib")),
-            ("stop_index_library", lambda: self.api.stop_index("no-such-lib", "run-1")),
+            ("stop_index_library", lambda: self.api.stop_index_run("no-such-lib", "run-1")),
         )
         for method_name, call in calls:
             with self.subTest(method_name=method_name):
@@ -205,32 +167,39 @@ class TestApi(unittest.TestCase):
                     result = call()
                 self.assertEqual(result, {"ok": False, "error": expected_error})
 
+    # ---- 检索 -----------------------------------------------------------
+
     def test_search_unknown_library_returns_error_not_exception(self):
         """GUI 是零侵入观察者：Pipeline 抛出的任何异常（比如查询一个不存在
         的库）都必须在 Api 这一层被折叠成 {"ok": False}，绝不能让异常
         原样冒泡到 js_api 桥、把整个窗口炸掉（AGENTS.md 架构红线4的GUI
         层体现）。"""
-        result = self.api.search("no-such-lib", "随便查点什么")
+        result = self.api.search_scoped("no-such-lib", "随便查点什么")
         self.assertFalse(result["ok"])
         self.assertIn("error", result)
+        contract = self.api.search("随便查点什么", 5, "no-such-lib", True)
+        self.assertEqual(contract["results"], [])
+        self.assertTrue(contract["error"])
 
     def test_search_empty_query_returns_empty_results_not_error(self):
-        self.api.add_library("lib1", "测试库", str(self.vault))
-        result = self.api.search("lib1", "   ")
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        result = self.api.search_scoped("lib1", "   ")
         self.assertTrue(result["ok"])
         self.assertEqual(result["results"], [])
 
     def test_search_marks_small_to_big_parent_backfill(self):
         parent = "\n\n".join(f"细节第{i}段。" + "工程内容" * 60 for i in range(8))
         (self.vault / "long.md").write_text(f"# 长父节\n\n{parent}", encoding="utf-8")
-        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.register_library("lib1", "测试库", str(self.vault))
         self.pipeline.index_library("lib1")
-        result = self.api.search("lib1", "细节", top_k=3)
+        result = self.api.search_scoped("lib1", "细节", top_k=3)
         self.assertTrue(result["ok"])
         self.assertIn("advice", result)
         self.assertTrue(result["results"])
         self.assertTrue(result["results"][0]["backfilled"])
         self.assertGreater(len(result["results"][0]["text"]), 300)
+
+    # ---- 图谱 -----------------------------------------------------------
 
     def test_graph_serializes_read_model_and_uses_all_for_empty_scope(self):
         node = Mock(
@@ -259,9 +228,19 @@ class TestApi(unittest.TestCase):
             result = self.api.graph("")
         graph.assert_called_once_with("all")
         self.assertEqual(result["nodes"][0]["id"], "lib1|a.md")
+        self.assertEqual(result["nodes"][0]["lib"], "lib1")  # 库未注册时退回 id
         self.assertEqual(result["nodes"][0]["pipeline"], {"mineru": "done", "wemm": "none"})
         self.assertEqual(result["edges"], [{"a": "lib1|a.md", "b": "lib1|b.md", "kind": "link"}])
         self.assertEqual(result["stats"], {"nodes": 2, "edges": 1})
+        self.assertEqual(result["libs"], ["lib1"])
+
+    def test_graph_nodes_carry_the_display_name_not_the_library_id(self):
+        self.api.register_library("lib1", "显示名", str(self.vault))
+        self.pipeline.index_library("lib1")
+        result = self.api.graph("")
+        self.assertTrue(result["nodes"])
+        self.assertEqual({n["lib"] for n in result["nodes"]}, {"显示名"})
+        self.assertEqual(result["libs"], ["显示名"])
 
     def test_graph_semantic_edges_exposes_error_without_raising(self):
         with patch.object(
@@ -274,21 +253,41 @@ class TestApi(unittest.TestCase):
         self.assertEqual(result, {"ok": True, "edges": [], "error": "模型不可用"})
 
     def test_graph_api_folds_pipeline_errors(self):
+        self.api.register_library("lib1", "测试库", str(self.vault))
         with patch.object(self.pipeline, "graph", side_effect=ValueError("bad graph")):
-            self.assertEqual(self.api.graph("bad"), {"ok": False, "error": "bad graph"})
+            result = self.api.graph("lib1")
+        self.assertEqual(result["error"], "bad graph")
+        self.assertEqual((result["nodes"], result["edges"]), ([], []))
+        unknown = self.api.graph("bad")
+        self.assertIn("库不存在", unknown["error"])
+
+    # ---- 打开 / 正文 / 关系 ------------------------------------------------
 
     def test_open_source_resolves_only_inside_library(self):
-        self.api.add_library("lib1", "测试库", str(self.vault))
-        with patch("os.startfile") as startfile:
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        with patch("os.startfile", create=True) as startfile:
             result = self.api.open_source("lib1", "notes.md")
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["opened"])
-        startfile.assert_called_once_with(str(self.vault / "notes.md"))
+        startfile.assert_called_once_with(str((self.vault / "notes.md").resolve()))
         outside = self.api.open_source("lib1", "../outside.txt")
         self.assertFalse(outside["ok"])
         self.assertIn("越出", outside["error"])
 
+    def test_open_source_uses_the_obsidian_uri_for_a_vault(self):
+        """含 `.obsidian` 的目录是 Obsidian vault，走 obsidian:// URI（旧 open_source）。"""
+        (self.vault / ".obsidian").mkdir()
+        (self.vault / "中文 笔记.md").write_text("# 甲\n\n乙", encoding="utf-8")
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        with patch("os.startfile", create=True) as startfile:
+            result = self.api.open_source("lib1", "中文 笔记.md")
+        self.assertTrue(result["ok"], result)
+        url = startfile.call_args[0][0]
+        self.assertTrue(url.startswith("obsidian://open?vault="), url)
+        self.assertIn("file=%E4%B8%AD%E6%96%87%20%E7%AC%94%E8%AE%B0.md", url)
+
     def test_index_failures_read_document_and_relations_delegate(self):
+        self.api.register_library("lib1", "测试库", str(self.vault))
         failures = {"succeeded": 1, "failures": [{"path": "bad.md", "reason": "提取失败"}]}
         document = Mock(path="notes.md", text="正文", source="源文件直读")
         relations = {"resolved": True, "file": "notes.md", "outlinks": ["a.md"], "inlinks": []}
@@ -300,15 +299,40 @@ class TestApi(unittest.TestCase):
             index_failures.assert_called_once_with("lib1")
         with patch.object(self.pipeline, "read_document", return_value=document):
             self.assertEqual(
-                self.api.read_document("lib1", "notes.md"),
+                self.api.document_text("lib1", "notes.md"),
                 {"ok": True, "path": "notes.md", "text": "正文", "source": "源文件直读"},
             )
+            contract = self.api.read_document("lib1", "notes.md")
+            self.assertEqual(
+                (contract["ok"], contract["markdown"], contract["chars"], contract["route"], contract["error"]),
+                (True, "正文", 2, "源文件", None),
+            )
+            self.assertFalse(contract["truncated"])
         with patch.object(self.pipeline, "note_relations", return_value=relations):
-            self.assertEqual(self.api.note_relations("lib1", "notes.md"), {"ok": True, **relations})
+            self.assertEqual(self.api.note_relations("lib1", "notes.md"), relations)
 
-        self.api.add_library("lib1", "测试库", str(self.vault))
+    def test_read_document_truncates_very_long_text_and_explains_unindexed_files(self):
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        long_text = "字" * 250_000
+        (self.vault / "long.md").write_text(long_text, encoding="utf-8")
+        result = self.api.read_document("lib1", "long.md")
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["chars"], 200_000)
+        # pdf/docx 没索引过：零触发只读，不后台提取，给出可执行的提示
+        (self.vault / "x.docx").write_bytes(b"not a real docx")
         self.pipeline.index_library("lib1")
-        before = self.api.search("lib1", "插件 架构")
+        with patch.object(self.pipeline, "read_document",
+                          side_effect=ValueError("「x.docx」还没有被成功索引过，先调用 index_library 建好索引再重试")):
+            missing = self.api.read_document("lib1", "x.docx")
+        self.assertFalse(missing["ok"])
+        self.assertEqual(missing["error"], "该文件尚未被索引/提取，请先增量重建后再查看")
+
+    # ---- 导出 / 导入 ------------------------------------------------------
+
+    def test_export_then_import_round_trip_preserves_search_results(self):
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        self.pipeline.index_library("lib1")
+        before = self.api.search_scoped("lib1", "插件 架构")
 
         dest = str(self.tmp / "lib1.ragexport.zip")
         export_result = self.api.export_library("lib1", dest)
@@ -319,7 +343,7 @@ class TestApi(unittest.TestCase):
         self.assertTrue(import_result["ok"], import_result)
         self.assertEqual(import_result["library_id"], "lib1-restored")
 
-        after = self.api.search("lib1-restored", "插件 架构")
+        after = self.api.search_scoped("lib1-restored", "插件 架构")
         self.assertEqual(
             [r["path"] for r in before["results"]],
             [r["path"] for r in after["results"]],
@@ -335,8 +359,16 @@ class TestApi(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("error", result)
 
+    def test_import_run_requires_the_exact_confirmation_text(self):
+        self.assertEqual(
+            self.api.import_run("确认"),
+            {"ok": False, "error": "确认文本不匹配，未执行导入"},
+        )
+
+    # ---- 库简介 -----------------------------------------------------------
+
     def test_get_library_summary_blank_by_default(self):
-        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.register_library("lib1", "测试库", str(self.vault))
         result = self.api.get_library_summary("lib1")
         self.assertTrue(result["ok"])
         self.assertEqual(result["text"], "")
@@ -346,16 +378,19 @@ class TestApi(unittest.TestCase):
         """用户在 GUI 手写简介：无条件生效，不需要写权限门禁确认——
         即使覆盖的是用户自己之前写的内容也一样（用户改自己的东西不需要
         向自己确认）。"""
-        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.register_library("lib1", "测试库", str(self.vault))
         self.api.set_library_summary("lib1", "第一版手写简介")
         result = self.api.set_library_summary("lib1", "第二版手写简介")
         self.assertTrue(result["ok"])
         summary = self.api.get_library_summary("lib1")
         self.assertEqual(summary["text"], "第二版手写简介")
         self.assertEqual(summary["source"], "user")
+        # 库列表里的来源标注如实反映（此前只要有文字就写死成 "ai"）
+        row = self.api.list_libraries()[0]
+        self.assertEqual((row["summary"]["text"], row["summary"]["source"]), ("第二版手写简介", "user"))
 
     def test_refresh_library_summary_calls_llm_and_writes_directly(self):
-        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.register_library("lib1", "测试库", str(self.vault))
         self.pipeline.index_library("lib1")
         result = self.api.refresh_library_summary("lib1")
         self.assertTrue(result["ok"], result)
@@ -365,7 +400,7 @@ class TestApi(unittest.TestCase):
         self.assertEqual(summary["source"], "ai")
 
     def test_refresh_library_summary_needs_confirm_when_user_authored_and_not_forced(self):
-        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.register_library("lib1", "测试库", str(self.vault))
         self.pipeline.index_library("lib1")
         self.api.set_library_summary("lib1", "用户手写的简介")
         result = self.api.refresh_library_summary("lib1")
@@ -375,7 +410,7 @@ class TestApi(unittest.TestCase):
         self.assertEqual(self.api.get_library_summary("lib1")["text"], "用户手写的简介")
 
     def test_refresh_library_summary_force_overwrites_user_authored(self):
-        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.register_library("lib1", "测试库", str(self.vault))
         self.pipeline.index_library("lib1")
         self.api.set_library_summary("lib1", "用户手写的简介")
         result = self.api.refresh_library_summary("lib1", force=True)
@@ -383,19 +418,56 @@ class TestApi(unittest.TestCase):
         self.assertEqual(self.api.get_library_summary("lib1")["text"], self.fake_llm.response)
 
     def test_refresh_library_summary_on_unindexed_library_returns_error(self):
-        self.api.add_library("lib1", "测试库", str(self.vault))
+        self.api.register_library("lib1", "测试库", str(self.vault))
         result = self.api.refresh_library_summary("lib1")
         self.assertFalse(result["ok"])
 
-    def test_get_settings_starts_empty(self):
-        result = self.api.get_settings()
+    def test_batch_summary_refresh_background_and_poll(self):
+        """对齐旧 guiweb/bridge.py::refresh_library_summaries_batch+poll：后台线程逐库生成，
+        轮询读进度与结果，手写库不传 force 时标 needs_confirm 而不阻塞批次；结果按**显示名**
+        归位（前端按名字找库卡片）。"""
+        # lib2 必须用自己的目录：库注册表按 resolve 后的根路径拒绝重复注册
+        # （对齐 obsidian-rag/library.py:497-498，同一目录只能注册成一个库）。
+        vault2 = self.env.make_vault("vault2", {"notes2.md": "# 厨房笔记\n\n食谱记录。"})
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        self.api.register_library("lib2", "第二库", str(vault2))
+        self.pipeline.index_library("lib2")
+        self.pipeline.set_library_summary_direct("lib1", "手写简介", source="user")
+        started = self.api.refresh_library_summaries_batch(["lib1", "第二库"])
+        self.assertEqual(started, {"ok": True, "total": 2})
+        self.assertFalse(self.api.refresh_library_summaries_batch(["lib2"])["ok"], "已有任务在跑时应拒绝")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            poll = self.api.refresh_library_summaries_poll()
+            if not poll["running"]:
+                break
+            time.sleep(0.05)
+        self.assertFalse(poll["running"])
+        self.assertEqual(poll["done"], poll["total"])
+        self.assertIsNone(poll["current"])
+        self.assertEqual(poll["results"]["测试库"], {"ok": False, "needs_confirm": True})
+        # lib2 生成失败的详细原因（假 LLM 环境下的可诊断性）
+        self.assertTrue(
+            poll["results"]["第二库"]["ok"],
+            poll["results"].get("第二库", {}).get("error", "no error field"),
+        )
+
+    def test_batch_summary_refresh_with_no_matching_library_is_an_error(self):
+        result = self.api.refresh_library_summaries_batch(["不存在"])
+        self.assertFalse(result["ok"])
+        self.assertIn("没有可刷新的库", result["error"])
+
+    # ---- 设置 -------------------------------------------------------------
+
+    def test_get_settings_values_starts_empty(self):
+        result = self.api.get_settings_values()
         self.assertEqual(result["values"], {})
         self.assertIn("fusion_dense_weight", result["meta"])
 
-    def test_set_setting_then_get_settings_round_trips(self):
+    def test_set_setting_then_get_settings_values_round_trips(self):
         result = self.api.set_setting("fusion_dense_weight", 2.0)
         self.assertTrue(result["ok"])
-        self.assertEqual(self.api.get_settings()["values"], {"fusion_dense_weight": 2.0})
+        self.assertEqual(self.api.get_settings_values()["values"], {"fusion_dense_weight": 2.0})
 
     def test_set_setting_takes_effect_immediately_without_restart(self):
         """对齐架构红线8"切换实现是配置层面操作，不需要重启"——写了设置
@@ -407,62 +479,12 @@ class TestApi(unittest.TestCase):
         self.api.set_setting("k", "v")
         result = self.api.unset_setting("k")
         self.assertTrue(result["ok"])
-        self.assertEqual(self.api.get_settings()["values"], {})
+        self.assertEqual(self.api.get_settings_values()["values"], {})
         self.assertEqual(self.api._pipeline.runtime.settings.get("k", "default"), "default")
 
     def test_unset_setting_missing_key_is_ok_not_error(self):
         result = self.api.unset_setting("never-set")
         self.assertTrue(result["ok"])
-
-    def test_library_management_methods(self):
-        """G1 后端补齐（对齐旧 bridge.py 的库管理方法）：remove_library 注销、
-        get/set_library_config、dedup_run、wemm_status、open_path。"""
-        self.api.add_library("lib1", "测试库", str(self.vault))
-        cfg = self.api.get_library_config("lib1")
-        self.assertTrue(cfg["ok"])
-        self.assertEqual(cfg["config"]["library_id"], "lib1")
-        result = self.api.set_library_config("lib1", {"exclude_dirs": [".trash"], "bad_key": 1})
-        self.assertFalse(result["ok"], "非法键必须报错")
-        result = self.api.set_library_config("lib1", {"exclude_dirs": [".trash"]})
-        self.assertTrue(result["ok"])
-        self.assertEqual(self.api._lib_mgr.store.get("lib1").exclude_dirs, [".trash"])
-        self.api._pipeline.index_library("lib1")
-        dedup = self.api.dedup_run("lib1")
-        self.assertTrue(dedup["ok"])
-        wemm = self.api.wemm_status()
-        self.assertTrue(wemm["ok"])
-        opened = self.api.open_path(str(self.vault))
-        self.assertTrue(opened["ok"])
-        missing = self.api.open_path(str(self.tmp / "no-such-dir"))
-        self.assertFalse(missing["ok"])
-        removed = self.api.remove_library("lib1")
-        self.assertTrue(removed["ok"])
-        self.assertIsNone(self.api._lib_mgr.store.get("lib1"))
-
-    def test_batch_summary_refresh_background_and_poll(self):
-        """对齐旧 guiweb/bridge.py::refresh_library_summaries_batch+poll：
-        后台线程逐库生成，轮询读进度与结果，手写库跳过不阻塞批次。"""
-        self.api.add_library("lib1", "测试库", str(self.vault))
-        self.api.add_library("lib2", "第二库", str(self.vault))
-        self.api._pipeline.index_library("lib2")
-        self.api._pipeline.set_library_summary_direct("lib1", "手写简介", source="user")
-        result = self.api.refresh_library_summaries_batch(["lib1", "lib2"])
-        self.assertTrue(result["ok"])
-        deadline = __import__("time").monotonic() + 30
-        while __import__("time").monotonic() < deadline:
-            poll = self.api.refresh_library_summaries_poll()
-            if not poll["running"]:
-                break
-            __import__("time").sleep(0.05)
-        self.assertFalse(poll["running"])
-        self.assertEqual(poll["done"], poll["total"])
-        self.assertIn("lib1", poll["skipped"], "手写简介在 force=False 时跳过")
-        self.assertIn("lib2", poll["results"])
-        # lib2 生成失败的详细原因（假 LLM 环境下的可诊断性）
-        self.assertTrue(
-            poll["results"]["lib2"]["ok"],
-            poll["results"].get("lib2", {}).get("error", "no error field"),
-        )
 
     def test_settings_meta_marks_api_keys_secret(self):
         """对齐 obsidian-rag/gui/config_editor.py:168/278（secret 标志）与
@@ -471,12 +493,81 @@ class TestApi(unittest.TestCase):
         self.api.set_setting("hyde_llm_api_key", "sk-something")
         self.api.set_setting("custom_provider_token", "tok-something")
         self.api.set_setting("fusion_dense_weight", 1.5)
-        meta = self.api.get_settings()["meta"]
+        meta = self.api.get_settings_values()["meta"]
         self.assertTrue(meta["hyde_llm_api_key"]["secret"])
         self.assertTrue(meta["custom_provider_token"]["secret"], "未登记的 *_token 键按规则兜底")
         self.assertFalse(meta["fusion_dense_weight"]["secret"])
         self.assertTrue(meta["hyde_llm_api_key"]["label"])
         self.assertTrue(meta["fusion_dense_weight"]["hint"], "已知键必须带中文说明")
+
+    # ---- 库管理 -----------------------------------------------------------
+
+    def test_library_management_methods(self):
+        """库管理契约方法：get/set_library_config、dedup、wemm_status、open_path、remove_library。"""
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        cfg = self.api.get_library_config("lib1")
+        self.assertEqual(sorted(cfg), ["all_keys", "effective", "overrides"])
+        self.assertEqual(cfg["effective"]["extensions"], ["md", "pdf", "docx"])
+        self.assertEqual(cfg["overrides"], {}, "全默认的库没有任何覆盖项")
+        # 逐键校验：非法键报错，合法键照常生效（旧 guiweb 桥逐键各自写）
+        result = self.api.set_library_config("lib1", {"exclude_dirs": ".trash", "bad_key": 1})
+        self.assertFalse(result["ok"], "非法键必须报错")
+        self.assertIn("bad_key", result["errors"])
+        self.assertEqual(self.api._lib_mgr.store.get("lib1").exclude_dirs, [".trash"])
+        self.assertEqual(self.api.get_library_config("lib1")["overrides"], {"exclude_dirs": [".trash"]})
+        # 空字符串 = 恢复默认
+        self.assertEqual(self.api.set_library_config("lib1", {"exclude_dirs": ""}), {"ok": True, "errors": {}})
+        self.assertEqual(self.api.get_library_config("lib1")["overrides"], {})
+        self.api._pipeline.index_library("lib1")
+        dedup = self.api.dedup_run_library("lib1")
+        self.assertTrue(dedup["ok"])
+        contract_dedup = self.api.dedup_run(0.8)
+        self.assertEqual(sorted(contract_dedup["stats"]), ["clusters", "files", "seconds"])
+        wemm = self.api.wemm_status("lib1")
+        self.assertEqual((wemm["exists"], wemm["total_pages"], wemm["rows"]), (False, 0, []))
+        with patch("os.startfile", create=True) as startfile:
+            opened = self.api.open_path(str(self.vault))
+        self.assertTrue(opened["ok"])
+        startfile.assert_called_once_with(str(self.vault))
+        missing = self.api.open_path(str(self.tmp / "no-such-dir"))
+        self.assertFalse(missing["ok"])
+        removed = self.api.remove_library("lib1")
+        self.assertTrue(removed["ok"])
+        self.assertIsNone(self.api._lib_mgr.store.get("lib1"))
+
+    def test_library_config_agent_formats_and_extensions_follow_the_legacy_rules(self):
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        # 关掉 pdf 后再授权 pdf → 旧规则："以下格式未在该库 extensions 中启用，无法授权"
+        self.assertEqual(self.api.set_library_config("lib1", {"extensions": "md,docx"}), {"ok": True, "errors": {}})
+        denied = self.api.set_library_config("lib1", {"agent_formats": "pdf"})
+        self.assertFalse(denied["ok"])
+        self.assertIn("agent_formats", denied["errors"])
+        self.assertEqual(self.api.set_library_config("lib1", {"agent_formats": "docx"}), {"ok": True, "errors": {}})
+        cfg = self.api.get_library_config("lib1")
+        self.assertEqual(cfg["effective"]["agent_formats"], ["docx"])
+        self.assertEqual(cfg["overrides"]["extensions"], ["md", "docx"])
+        # 不支持的扩展名 / 空扩展名
+        self.assertIn("extensions", self.api.set_library_config("lib1", {"extensions": "md,exe"})["errors"])
+        # 前端保存时会把切块粒度/collection 也带回；rag-redo 没有按库覆盖，空值无害、非空值明确报错
+        harmless = self.api.set_library_config("lib1", {"chunk_char_limit": "", "collection": ""})
+        self.assertEqual(harmless, {"ok": True, "errors": {}})
+        refused = self.api.set_library_config("lib1", {"chunk_char_limit": "800"})
+        self.assertIn("chunk_char_limit", refused["errors"])
+        self.assertIn("暂不支持", refused["errors"]["chunk_char_limit"])
+        # 撤销授权 = 清空；unset 把整项恢复默认
+        self.assertEqual(self.api.set_library_config("lib1", {"agent_formats": ""}), {"ok": True, "errors": {}})
+        self.assertEqual(self.api.unset_library_config("lib1", ["extensions"]), {"ok": True})
+        self.assertEqual(self.api.get_library_config("lib1")["overrides"], {})
+
+    def test_remove_library_with_drop_clears_index_data(self):
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        self.pipeline.index_library("lib1")
+        self.assertTrue(self.pipeline.has_index("lib1"))
+        result = self.api.remove_library("lib1", True)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("索引数据已清理", result["note"])
+        self.assertIsNone(self.api._lib_mgr.store.get("lib1"))
+        self.assertTrue((self.vault / "notes.md").exists(), "笔记文件永远保留")
 
 
 if __name__ == "__main__":
