@@ -26,9 +26,28 @@ def _runtime_ignore(directory: str, names: list[str]) -> set[str]:
     return ignored
 
 
+def _site_packages_ignore(directory: str, names: list[str]) -> set[str]:
+    """site-packages 专用的忽略规则。
+
+    这里**不能**排除名为 "data" 的目录——不少包把资源/权重/模板放在
+    `pkg/data/` 下（连 torch 生态都有），砍掉会得到一个能启动但一 import
+    就炸的包。运行期产物（__pycache__/*.pyc/.venv）可以安全排除。
+    """
+    ignored = {name for name in names if name in {"__pycache__", ".pytest_cache", ".mypy_cache"}}
+    ignored.update(name for name in names if name.endswith(".pyc"))
+    return ignored
+
+
 def _app_ignore(directory: str, names: list[str]) -> set[str]:
     ignored = {name for name in names if name in {".venv", "__pycache__", ".pytest_cache", ".mypy_cache", "tests"}}
     ignored.update(name for name in names if name.endswith(".pyc"))
+    # 运行期产物一律不进包："data" 目录（插件自己的落盘目录曾误建在这里，
+    # 见 plugins/official-ocr-mineru-local/official_ocr_mineru_local/data/）
+    # 和 "*.log" 都是构建机上的残留，正式数据由启动器设的
+    # RAG_REDO_DATA_ROOT=%LOCALAPPDATA%\RAG-Redo\data 承载，不该跟着包走。
+    # 只用于 app 树（core/ 与 plugins/），site-packages 走上面那条规则。
+    ignored.update(name for name in names if name == "data")
+    ignored.update(name for name in names if name.endswith(".log"))
     return ignored
 
 
@@ -44,7 +63,7 @@ def _copy_runtime(target: Path) -> None:
             _copy_tree(source_dir, target / directory, ignore=_runtime_ignore)
     if not (target / "python.exe").is_file():
         raise RuntimeError(f"便携 Python 缺少解释器: {target / 'python.exe'}")
-    _copy_tree(SOURCE_SITE_PACKAGES, target / "Lib" / "site-packages", ignore=_app_ignore)
+    _copy_tree(SOURCE_SITE_PACKAGES, target / "Lib" / "site-packages", ignore=_site_packages_ignore)
 
 
 def _copy_app(target: Path) -> None:
