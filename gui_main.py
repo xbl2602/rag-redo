@@ -13,6 +13,7 @@ import multiprocessing
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 #: 打包后（PyInstaller）跑的是冻结的 exe，__file__ 指向的是打包器内部临时/内嵌路径，
@@ -40,6 +41,7 @@ for _plugin_dir in (REPO_ROOT / "plugins").glob("*"):
 
 import webview  # noqa: E402
 
+from core.index_progress import INDEX_LOG_NAME  # noqa: E402
 from core.pipeline import Pipeline  # noqa: E402
 from core.runtime import PluginRuntime  # noqa: E402
 from core.singleton import ProcessSingletonGuard  # noqa: E402
@@ -172,6 +174,68 @@ def build_runtime() -> PluginRuntime:
     return runtime
 
 
+#: 关窗收口的摘要素材：`_close_runtime_reported` 记下收口前的子进程与用时，
+#: `_report_shutdown` 在退出钩子里（索引 worker 也已回收之后）补上“还剩几个”一起写日志。
+_CLOSE_REPORT: dict = {"before": None, "elapsed": None}
+
+
+def _child_processes() -> "list[tuple[int, str]] | None":
+    """本进程的全部后代进程 `[(pid, 进程名)]`；没装 psutil / 读不到返回 None（fail-open，
+    与桥接层读 CPU 占用同一口径）。"""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return [(child.pid, child.name()) for child in psutil.Process().children(recursive=True)]
+    except Exception:  # noqa: BLE001 - 进程刚好退出等竞态：不影响关窗
+        return None
+
+
+def _append_gui_log(text: str, *, is_error: bool = False) -> None:
+    """往 GUI 日志面板读的同一份日志追加一行（格式同桥接层 `Api._log`）。尽力而为：
+    退出阶段写不进去不能拖住进程退出，也不在数据目录已被删掉时把它重新建出来。"""
+    line = "%s [GUI]%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), " ERROR" if is_error else "", text)
+    try:
+        with open(DATA_ROOT / INDEX_LOG_NAME, "ab") as handle:
+            handle.write(line.encode("utf-8"))
+    except OSError:
+        pass
+
+
+def _close_runtime_reported(runtime: PluginRuntime) -> None:
+    """收口运行时，并记下收口前有多少子进程、用了多久（供 `_report_shutdown` 写日志）。"""
+    _CLOSE_REPORT["before"] = _child_processes()
+    started = time.monotonic()
+    try:
+        runtime.close()
+    finally:
+        _CLOSE_REPORT["elapsed"] = time.monotonic() - started
+
+
+def _report_shutdown() -> None:
+    """退出钩子：把“关窗回收了几个子进程、用时多久、退出时还剩几个”写进 GUI 日志。
+
+    2026-09-29 操作者反馈“关掉 GUI 之后显存没有及时释放、进程没有关闭”，但真实进程冒烟
+    （正常关窗、索引 worker 被强杀）都收得干净，现场无从复现。这行日志就是下一次遇到时
+    的证据：能直接看到是哪几个进程、回收用了多久、退出时谁还活着。本钩子在 `main()` 开头
+    注册——atexit 后注册先执行，所以它排在索引 worker 管理器的退出回收**之后**，报的
+    是“真正退出时”还剩的子进程。"""
+    before = _CLOSE_REPORT.get("before")
+    elapsed = _CLOSE_REPORT.get("elapsed")
+    after = _child_processes()
+    took = "" if elapsed is None else "，运行时收口用时 %.1f 秒" % elapsed
+    if before is None or after is None:
+        _append_gui_log("窗口已关闭%s（未安装 psutil，无法统计子进程）" % took)
+        return
+    after_pids = {pid for pid, _name in after}
+    reclaimed = [item for item in before if item[0] not in after_pids]
+    _append_gui_log("窗口已关闭：回收了 %d 个子进程%s" % (len(reclaimed), took))
+    if after:
+        names = "、".join("%s(pid %d)" % (name, pid) for pid, name in after)
+        _append_gui_log("退出时仍有 %d 个子进程未回收：%s" % (len(after), names), is_error=True)
+
+
 def main() -> None:
     # 进程单例守卫（对齐 obsidian-rag gui/app.py:46-69 与 guiweb/app.py:46-87 的
     # _acquire_singleton：两个 GUI 入口都有非阻塞文件锁，锁文件名区分实例；MCP 侧同款
@@ -182,6 +246,7 @@ def main() -> None:
         print("检测到已有 GUI 实例运行，本实例退出（单例守卫）。", file=sys.stderr)
         sys.exit(0)
     atexit.register(guard.release)
+    atexit.register(_report_shutdown)  # 后注册先执行：排在索引 worker 回收之后，见 _report_shutdown
 
     runtime = build_runtime()
     try:
@@ -191,7 +256,7 @@ def main() -> None:
         # 服务等）不会跟着父进程一起走——Windows 上父进程退出不会带走子进程——不在这里回收，
         # 就是每开关一次窗口留下一对孤儿进程（2026-09-28 真实进程冒烟复现）。CLAUDE.md §4.3：
         # 子进程必须能被停止、等待、回收，不能留下进程树残留。
-        runtime.close()
+        _close_runtime_reported(runtime)
 
 
 def _serve(runtime: PluginRuntime) -> None:

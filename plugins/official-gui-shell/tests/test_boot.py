@@ -339,6 +339,54 @@ class TestMainEntry(_TempDataRoot):
         state = json.loads(paths.plugins_state_file(self.tmp / "data").read_text(encoding="utf-8"))
         self.assertIn("official-gui-shell", state["enabled"])
 
+    def test_closing_the_window_leaves_a_reclaim_summary_in_the_gui_log(self) -> None:
+        """2026-09-29 操作者反馈“关掉 GUI 之后显存没有及时释放、进程没有关闭”，现场无法复现：
+        关窗后必须在 GUI 日志里留下“回收了几个子进程、用时多久”，下次遇到有据可查。"""
+        from core.index_progress import INDEX_LOG_NAME
+
+        window = _FakeWindow()
+        webview_module = _fake_webview(window)
+        gm = _load_gui_main(self.tmp / "data", webview_module)
+        with _webview_installed(webview_module), contextlib.redirect_stderr(io.StringIO()):
+            gm.main()
+        gm._report_shutdown()  # 真实进程里由退出钩子调用；测试进程不退出，直接调
+        log_text = (self.tmp / "data" / INDEX_LOG_NAME).read_text(encoding="utf-8")
+        self.assertRegex(log_text, r"\[GUI\] 窗口已关闭")
+        self.assertIn("用时", log_text)
+
+    def test_reclaim_summary_names_the_children_that_are_still_alive_at_exit(self) -> None:
+        from core.index_progress import INDEX_LOG_NAME
+
+        gm = _load_gui_main(self.tmp / "data", _fake_webview(_FakeWindow()))
+        (self.tmp / "data").mkdir(parents=True, exist_ok=True)
+        gm._CLOSE_REPORT.update(before=[(101, "server.py"), (202, "python.exe")], elapsed=0.4)
+        with patch.object(gm, "_child_processes", return_value=[(202, "python.exe")]):
+            gm._report_shutdown()
+        lines = (self.tmp / "data" / INDEX_LOG_NAME).read_text(encoding="utf-8").splitlines()
+        self.assertTrue(any("回收了 1 个子进程" in line and "用时 0.4 秒" in line for line in lines), lines)
+        leftover = [line for line in lines if "仍有 1 个子进程未回收" in line]
+        self.assertEqual(len(leftover), 1, lines)
+        self.assertIn("[GUI] ERROR", leftover[0])
+        self.assertIn("python.exe(pid 202)", leftover[0])
+
+    def test_reclaim_summary_without_psutil_still_reports_the_close(self) -> None:
+        from core.index_progress import INDEX_LOG_NAME
+
+        gm = _load_gui_main(self.tmp / "data", _fake_webview(_FakeWindow()))
+        (self.tmp / "data").mkdir(parents=True, exist_ok=True)
+        gm._CLOSE_REPORT.update(before=None, elapsed=1.2)
+        with patch.object(gm, "_child_processes", return_value=None):
+            gm._report_shutdown()
+        text = (self.tmp / "data" / INDEX_LOG_NAME).read_text(encoding="utf-8")
+        self.assertIn("窗口已关闭", text)
+        self.assertIn("用时 1.2 秒", text)
+
+    def test_summary_never_recreates_a_deleted_data_dir(self) -> None:
+        gm = _load_gui_main(self.tmp / "gone", _fake_webview(_FakeWindow()))
+        with patch.object(gm, "_child_processes", return_value=None):
+            gm._report_shutdown()  # 数据目录不存在：静默放弃，不抛、不创建
+        self.assertFalse((self.tmp / "gone").exists())
+
     def test_deferred_plugin_enable_is_joined_before_runtime_close(self) -> None:
         """`_serve()` 必须在 `runtime.close()` 之前等后台 enable 线程
         （`_enable_deferred_plugins`）真正跑完——`PluginRuntime.close()` 只收口
