@@ -1593,6 +1593,38 @@ class TestOcrChainTryFallback(unittest.TestCase):
         self.assertEqual(report.failed, 1)
         self.assertEqual(report.files[0].extract_failure, "scanned")
 
+    def _write_watermarked_scan(self, name: str = "stamped-scan.pdf") -> None:
+        """每页只有同一个水印（扫描 App 盖的 "CamScanner"，恰好 10 个字符）的 3 页扫描件。"""
+        import pymupdf
+
+        doc = pymupdf.open()
+        for _ in range(3):
+            doc.new_page().insert_text((72, 72), "CamScanner")
+        doc.save(str(self.vault / name))
+        doc.close()
+
+    def test_watermark_only_scan_is_routed_to_ocr_not_recorded_as_empty(self):
+        """2026-09-29 真机：Y2S1 库里 7 个 CamScanner 扫描件被水印骗成"有文字层"，转出
+        只有水印，切块后为空，记成终态 empty，OCR 从未被调用（BC-01，操作者确认的新规则）。"""
+        self._write_watermarked_scan()
+        self.runtime.settings.set("pdf_scan_backend", "mineru-local")
+        report = self.pipeline.index_library("scan-lib")
+        stamped = next(f for f in report.files if f.path == "stamped-scan.pdf")
+        self.assertIsNone(stamped.extract_failure)
+        self.assertGreater(stamped.chunk_count, 0)
+        manifest = self.pipeline._manifests.read("scan-lib", self.pipeline._generations.active("scan-lib"))
+        record = manifest["files"]["stamped-scan.pdf"]
+        self.assertEqual(record["status"], "indexed")
+        self.assertEqual(record["extractor_id"], "official-ocr-mineru-local")
+
+    def test_watermark_only_scan_without_ocr_is_scanned_terminal_not_empty(self):
+        self._write_watermarked_scan()
+        self.runtime.settings.set("pdf_scan_backend", "none")
+        report = self.pipeline.index_library("scan-lib")
+        stamped = next(f for f in report.files if f.path == "stamped-scan.pdf")
+        self.assertEqual(stamped.extract_failure, "scanned")
+        self.assertEqual(stamped.failure_state, "scanned")
+
     def test_stable_scanned_terminal_does_not_repeat_provider_work(self):
         self.runtime.settings.set("pdf_scan_backend", "none")
         first = self.pipeline.index_library("scan-lib")

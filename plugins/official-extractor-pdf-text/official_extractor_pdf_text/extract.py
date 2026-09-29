@@ -21,8 +21,11 @@ import pymupdf4llm
 
 from core.contracts import ExtractedDocument
 
-EXTRACTOR_VERSION = "0.2.0"
+EXTRACTOR_VERSION = "0.3.0"
 _TEXT_PAGE_MIN_CHARS = 10
+#: 每一页文字都完全相同、且不超过这么多字符，就是水印/印章（如扫描 App 盖在每页的
+#: "CamScanner"），不是正文。见 `_is_repeated_watermark`。
+_WATERMARK_MAX_CHARS = 40
 PLUGIN_ID = "official-extractor-pdf-text"
 
 
@@ -30,15 +33,32 @@ def _content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _is_repeated_watermark(page_texts: list[str]) -> bool:
+    """每一页的文字（折叠空白后）都是同一句短话 -> 水印，不是正文。
+
+    2026-09-29 操作者真机反馈 + 确认的新规则（BC-01，**旧项目没有**）：扫描 App
+    （如 CamScanner）会在每页盖一个文字水印，恰好达到"每页 >= 10 字符"的文字页门槛
+    （"CamScanner" 正好 10 个字符），整份扫描件被当成"文字层 PDF"，转出来只有水印，
+    切块清洗后为空，记成终态 empty，OCR 从未被调用。
+
+    只在至少两页、且全部页面折叠空白后完全相同、长度不超过 `_WATERMARK_MAX_CHARS` 时
+    才判水印：只有一页时没有"每一页都一样"的证据；页面文字里除水印外还有各不相同的正文，
+    或者重复的是一整段长文，都仍按文字层处理。"""
+    if len(page_texts) < 2:
+        return False
+    distinct = {" ".join(text.split()) for text in page_texts}
+    return len(distinct) == 1 and len(next(iter(distinct))) <= _WATERMARK_MAX_CHARS
+
+
 def _has_text_layer(path: Path) -> bool:
     doc = pymupdf.open(path)
     try:
-        return all(
-            len(page.get_text("text").strip()) >= _TEXT_PAGE_MIN_CHARS
-            for page in doc
-        )
+        page_texts = [page.get_text("text").strip() for page in doc]
     finally:
         doc.close()
+    if not all(len(text) >= _TEXT_PAGE_MIN_CHARS for text in page_texts):
+        return False
+    return not _is_repeated_watermark(page_texts)
 
 
 def _fail(library_id: str, path: str, reason: str, content_hash: str = "") -> ExtractedDocument:
