@@ -49,6 +49,16 @@
 - **窗口标题**（见上）；**`unpack` 体积上限阈值**（见上）。
 - **`%TEMP%` 里约 2615 个历史测试残留目录**（Chroma 句柄未释放的存量）：是否/何时清理由操作者决定；GUI 测试环境已改成"先关运行时再清理"，不再新增。
 
+## 2026-09-29 桌面真机使用反馈：黑屏闪窗、启动顺序
+
+> 操作者把新做的桌面快捷方式指到 `data-real`（真实 4 个库）后真机反馈三个问题：①双击后先出一个黑色弹窗、等好几秒才出界面；②出界面后每隔几秒还会再弹出关闭一次、界面跟着刷新，一直重复；③担心多次点击会开出多个 GUI。逐项根因追查+修复：
+
+- **反复弹窗（根因，已修）**：`core/gpu_arbiter.py::probe_card()` 是 GUI 全局快照每秒调用一次（内部 5s 缓存）的整卡探测，和 `vram_free_gb()` 的 nvidia-smi 兜底一样，`subprocess.run(["nvidia-smi", ...])` 没带 Windows 专属的 `creationflags=CREATE_NO_WINDOW`——宿主是 `pythonw.exe`，没有控制台，Windows 会给子进程现开一个、用完即关，这就是"每隔几秒黑屏一闪"。`core/subprocess_service.py`（WEMM/MinerU-local 子进程的 `Popen`、`taskkill`、`env_bootstrap` 的 `pip install`）和两个插件各自子进程里的同款 nvidia-smi 调用同理修复，共 7 处调用点补齐（`core/index_progress.py` 里已有的一处一直是对的，这次统一按它的写法补）。新增 `tests/test_gpu_arbiter.py::TestProbeCard`（此前完全没有测试覆盖）和 `tests/test_subprocess_service.py::TestNoConsoleWindowOnWindows` 钉住不回归。
+- **启动慢+首次黑屏（根因，已修两层）**：①桌面快捷方式原本走 `cmd.exe /c set ... && start ...` 来设置 `RAG_REDO_DATA_ROOT`，cmd.exe 本身就是那个"先出的黑色弹窗"——改成 `wscript.exe` 跑一个纯本机的 `.vbs`（`WshShell.Environment` 设环境变量、`WshShell.Run` 隐藏方式拉起 `pythonw.exe`），不进版本库，是操作者桌面上的个人文件。②`gui_main.py::build_runtime()` 此前按声明顺序同步 `load()`+`enable()` 全部 20 个插件，其中 `official-visual-wemm`（默认开）和 `official-ocr-mineru-local`（`data-real` 配了 `mineru-local`）是 `subprocess_service` 插件，`on_enable` 会真的 `Popen` 子进程并阻塞轮询 `health_check`（最多 10s/个）——窗口在 `_serve()` 建出来之前必须先扛完这最多约 20s。旧项目 `guiweb/app.py::main` 本来就是"窗口先建、`Bridge()` 不碰任何子进程"，这次把 rag-redo 对齐回这个已验证过的旧行为：新增 `DEFERRED_PLUGIN_IDS`，这两个插件只在 `build_runtime()` 里 `load()`、真正 `enable()` 挪到窗口打开、推送线程起来之后的一个后台线程（`_enable_deferred_plugins`），并且 `_serve()` 的 `finally` 里必须先 `join()` 这个线程才能让 `main()` 去调 `runtime.close()`——不然 `close()` 会跳过还没到 enabled/disabled 状态的插件，子进程就成了没人收的游离进程。`plugins/official-gui-shell/tests/test_boot.py` 新增两条测试钉住"窗口不被这两个插件的 enable 阻塞"和"close() 一定等后台线程跑完"。**真机效果**：走真实桌面 shortcut 对 `data-real` 实测，双击到出窗口约 6 秒、单例守卫挡住了几乎同时的第二次启动、关闭后 0 进程残留；这台机器上 WEMM/MinerU-local 的 health_check 本来就不慢（读独立 venv 已建好），所以这次没有测出总时长的大幅下降，改动的价值是消除了"健康检查一旦变慢（最坏 ~20s）就会连累窗口打不开"这条尾部风险，并让 rag-redo 的启动顺序重新对齐旧项目。
+- **多次点击开多个 GUI（确认无需修——已有防护）**：`core/singleton.py::ProcessSingletonGuard` 已经是文件字节锁、在 `main()` 最开头获取，与 `build_runtime()` 的速度无关；真机测试里故意用两次几乎同时的双击验证过，第二次会在 `build_runtime()` 之前就被拒绝退出，全程只出现一个窗口（`tests/test_singleton.py` 的 `test_real_second_process_cannot_acquire_while_first_holds` 等用例早已覆盖这条）。
+
+以上三处均为修复代码缺陷/对齐旧项目已验证过的启动顺序，不是新的产品行为设计，未新增行为契约条目。
+
 ## 2026-09-25 通宵行为对齐审计——报告核实与九项修复
 
 > 操作者提供了一份过时的调研报告并要求先核实时效性，再"继续未完成工作 + 检查已实现代码是否有简化"。方法：六个只读调研 agent 把报告的每条声明对照当前代码与旧项目生产代码逐条验证，然后按 AGENTS.md §8（先复现测试后实现、逐项全量回归、分项提交）执行。全程 45/45 套测试全绿（新增约 30 条用例）。工作区在报告写作后已被推送（报告里"79 个文件未提交/领先 24 提交"已过时），14 条 BC 契约当时已全部标 pass——但核实证明其中三条是虚标（见下）。
