@@ -121,6 +121,7 @@ def _run_env_bootstrap(plugin_dir: Path, env_bootstrap: str, *, timeout: float, 
             capture_output=True,
             timeout=timeout,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except subprocess.TimeoutExpired as exc:
         raise EnvBootstrapError(f"env_bootstrap 超时（>{timeout:.0f}s）: {exc}") from exc
@@ -292,6 +293,11 @@ class SubprocessServiceHandle:
             env=self._env,
             stdout=stdout_target,
             stderr=stderr_target,
+            # Windows 上宿主（pythonw.exe/冻结 GUI exe）本身没有控制台；不带这个
+            # flag 时 CreateProcess 会给子进程新分配并短暂显示一个控制台窗口
+            # （2026-09-29 用户真实反馈：桌面双击后先黑屏几秒才出界面）。POSIX 上
+            # `CREATE_NO_WINDOW` 属性不存在，`getattr` 退化成 0，行为不变。
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             **extra_kwargs,
         )
         if self._log_file is None:
@@ -483,6 +489,7 @@ class SubprocessServiceHandle:
                 ["taskkill", "/F", "/T", "/PID", str(self._process.pid)],
                 capture_output=True,
                 check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             try:
                 self._process.wait(timeout=grace_period)

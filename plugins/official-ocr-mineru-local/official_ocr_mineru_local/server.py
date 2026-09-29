@@ -102,6 +102,10 @@ def _vram_free_gb(max_age: float = 5.0):
                 capture_output=True,
                 timeout=5,
                 check=False,
+                # 这个子进程本身也是被 core/subprocess_service.py 用
+                # CREATE_NO_WINDOW 拉起的、没有控制台的进程——这里不加同一个
+                # flag，Windows 还是会给 nvidia-smi 单独弹一个控制台窗口。
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             nums = [float(x) for x in out.stdout.decode("utf-8", "replace").split()]
             if nums:

@@ -58,6 +58,7 @@ def main() -> int:
     result = subprocess.run(
         [str(venv_python), "-m", "pip", "install", "--disable-pip-version-check", "-r", str(REQUIREMENTS)],
         cwd=str(PLUGIN_DIR),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if result.returncode != 0:
         print(f"[env_bootstrap] pip install 失败，退出码 {result.returncode}", file=sys.stderr)

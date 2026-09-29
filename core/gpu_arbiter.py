@@ -86,6 +86,10 @@ def vram_free_gb(max_age: float = 5.0) -> float | None:
                 capture_output=True,
                 timeout=5,
                 check=False,
+                # Windows 上宿主没有控制台（pythonw.exe/冻结 GUI exe）时不带这个
+                # flag 会短暂弹出一个控制台窗口——这个探测每 5 秒可能被复用一次
+                # （GUI 推送线程），不加这行就是"每隔几秒黑屏一闪"的真实来源之一。
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             nums = [float(x) for x in out.stdout.decode("utf-8", "replace").split()]
             if nums:
@@ -257,6 +261,10 @@ def probe_card(max_age: float = 5.0) -> dict:
             capture_output=True,
             timeout=5,
             check=False,
+            # 同 vram_free_gb：这是 GUI 全局快照每秒调用一次（内部 5s 缓存）的
+            # 探测，宿主是 pythonw.exe 时不加这行就会每隔几秒弹出又关闭一个黑色
+            # 控制台窗口——2026-09-29 用户真实反馈的"反复弹窗+界面刷新"根因。
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         first = out.stdout.decode("utf-8", "replace").strip().splitlines()
         if first:

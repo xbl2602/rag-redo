@@ -496,5 +496,65 @@ class TestResolvePluginPythonEnvBootstrap(unittest.TestCase):
         self.assertTrue(any("冻结" in msg for msg in logger.warnings))
 
 
+class TestNoConsoleWindowOnWindows(unittest.TestCase):
+    """2026-09-29 真实反馈：桌面双击 GUI 后先黑屏几秒才出界面，之后每隔几秒
+    还会再闪一下——根因是本模块三处 `subprocess.Popen`/`subprocess.run` 调用
+    都没带 `creationflags=CREATE_NO_WINDOW`：宿主是 pythonw.exe/冻结 GUI exe
+    时没有控制台，Windows 会给子进程现开一个、用完即关，看起来就是"黑色
+    弹窗一闪"。
+
+    这里特意对 `subprocess` 打 mock（本文件其余测试刻意不这么做，见模块
+    docstring）——"Windows 有没有弹出一个控制台窗口"这件事本身没有可移植、
+    可在无头测试环境里断言的观测点，唯一能钉住的是"调用点确实传了这个
+    flag"，所以只对这一条窗口相关的编排逻辑做例外。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_start_passes_creationflags_to_popen(self):
+        import core.subprocess_service as svc
+
+        with patch.object(svc, "subprocess") as fake_sp:
+            fake_sp.PIPE = "PIPE"
+            fake_sp.Popen.return_value.stdout = None  # 让 _start_drain 干净地 no-op
+            fake_sp.Popen.return_value.stderr = None
+            handle = SubprocessServiceHandle((sys.executable, "-c", "pass"), cwd=self.tmp)
+            handle.start()
+        self.assertIs(
+            fake_sp.Popen.call_args.kwargs["creationflags"],
+            fake_sp.CREATE_NO_WINDOW,
+        )
+
+    def test_kill_process_tree_taskkill_passes_creationflags(self):
+        import core.subprocess_service as svc
+
+        handle = SubprocessServiceHandle((sys.executable, "-c", "pass"), cwd=self.tmp)
+        handle.start()
+        self.addCleanup(handle.stop)
+        with patch.object(svc, "subprocess") as fake_sp, patch.object(sys, "platform", "win32"):
+            fake_sp.run.return_value = None
+            fake_sp.TimeoutExpired = Exception
+            handle._kill_process_tree(grace_period=1.0)
+        self.assertIs(
+            fake_sp.run.call_args.kwargs["creationflags"],
+            fake_sp.CREATE_NO_WINDOW,
+        )
+
+    def test_env_bootstrap_run_passes_creationflags(self):
+        import core.subprocess_service as svc
+
+        script = self.tmp / "env_bootstrap.py"
+        script.write_text("pass\n", encoding="utf-8")
+        with patch.object(svc, "subprocess") as fake_sp:
+            fake_sp.run.return_value.returncode = 0
+            svc._run_env_bootstrap(self.tmp, "env_bootstrap.py", timeout=30.0, logger=_FakeLogger())
+        self.assertIs(
+            fake_sp.run.call_args.kwargs["creationflags"],
+            fake_sp.CREATE_NO_WINDOW,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

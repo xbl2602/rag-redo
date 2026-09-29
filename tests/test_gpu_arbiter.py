@@ -43,6 +43,65 @@ class TestVramFreeGb(unittest.TestCase):
             second = ga.vram_free_gb(max_age=60.0)
         self.assertEqual(first, second)  # 第二次探测被缓存挡住，没有真的重新跑
 
+    def test_nvidia_smi_fallback_suppresses_console_window(self):
+        """2026-09-29 真实反馈：GUI 用 pythonw.exe（无控制台）跑起来后，每隔
+        几秒会闪一下黑色控制台窗口——根因是这条 nvidia-smi 兜底调用没有带
+        `creationflags=CREATE_NO_WINDOW`，Windows 会给它现开一个控制台。这里
+        钉住"调用时一定带上这个 flag"，不回归。"""
+        with patch.object(ga, "subprocess") as fake_sp, patch.dict("sys.modules", {"torch": None}):
+            fake_sp.run.return_value.stdout = b"1024\n"
+            ga.vram_free_gb(max_age=0.0)
+            self.assertIs(
+                fake_sp.run.call_args.kwargs["creationflags"],
+                fake_sp.CREATE_NO_WINDOW,
+            )
+
+
+class TestProbeCard(unittest.TestCase):
+    """`probe_card` 是 GUI 全局快照每秒调用一次（内部 5s 缓存）的整卡探测，
+    此前没有任何测试覆盖——补上基本的 ok/fail-open 覆盖，以及 2026-09-29
+    那次"每隔几秒黑屏一闪"的根因回归（nvidia-smi 调用漏了
+    `creationflags=CREATE_NO_WINDOW`）。"""
+
+    def setUp(self):
+        ga._card_cache = ({}, 0.0)
+
+    def test_ok_response_parses_all_fields(self):
+        with patch.object(ga, "subprocess") as fake_sp:
+            fake_sp.run.return_value.stdout = b"1024, 8192, 37, 55.5\n"
+            result = ga.probe_card(max_age=0.0)
+        self.assertEqual(
+            result,
+            {"ok": True, "mem_used_mb": 1024.0, "mem_total_mb": 8192.0, "util_pct": 37.0, "power_w": 55.5},
+        )
+
+    def test_fail_open_when_nvidia_smi_missing(self):
+        with patch.object(ga, "subprocess") as fake_sp:
+            fake_sp.run.side_effect = OSError("no nvidia-smi")
+            result = ga.probe_card(max_age=0.0)
+        self.assertEqual(result["ok"], False)
+        self.assertIsNone(result["mem_used_mb"])
+
+    def test_result_cached_within_max_age(self):
+        with patch.object(ga, "subprocess") as fake_sp:
+            fake_sp.run.return_value.stdout = b"1024, 8192, 37, 55.5\n"
+            first = ga.probe_card(max_age=60.0)
+            fake_sp.run.return_value.stdout = b"2048, 8192, 90, 100.0\n"
+            second = ga.probe_card(max_age=60.0)
+        self.assertEqual(first, second)  # 第二次探测被缓存挡住，没有真的重新跑
+
+    def test_nvidia_smi_call_suppresses_console_window(self):
+        """2026-09-29 真实反馈：GUI 打开后每隔几秒黑屏一闪——根因就是这条
+        每秒被推送线程间接调用（5s 缓存）的 nvidia-smi 调用没有带
+        `creationflags=CREATE_NO_WINDOW`。钉住不回归。"""
+        with patch.object(ga, "subprocess") as fake_sp:
+            fake_sp.run.return_value.stdout = b"1024, 8192, 37, 55.5\n"
+            ga.probe_card(max_age=0.0)
+            self.assertIs(
+                fake_sp.run.call_args.kwargs["creationflags"],
+                fake_sp.CREATE_NO_WINDOW,
+            )
+
 
 class TestVramThresholds(unittest.TestCase):
     """显存门槛常量必须与旧项目逐字一致（obsidian-rag/gpu_arbiter.py:34-35）。
