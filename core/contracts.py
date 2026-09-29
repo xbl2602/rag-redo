@@ -253,6 +253,11 @@ class SemanticGraphResponse:
 
 
 # ---- 页级视觉导航（visual_index 扩展点，比如 official-visual-wemm）--------
+#
+# `index_library(library_id, root, pdf_paths, *, generation, changed_paths,
+# previous_generation, before_serve=None)`：`before_serve` 是核心传入的"让路"回调——
+# 插件在**真要占显卡渲染页面之前**调用一次（无页可渲染时不调用），核心借它把文字向量/
+# 重排模型从显卡卸下来（旧项目 index.py:1784-1806 的 `_release_for_wemm`）。回调不抛异常。
 
 
 @dataclass(frozen=True)

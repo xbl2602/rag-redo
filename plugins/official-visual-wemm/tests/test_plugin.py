@@ -275,6 +275,70 @@ class TestVisualWemmPlugin(unittest.TestCase):
         self.assertEqual({hit.path for hit in hits}, {"doc.pdf"})
         self.assertEqual(len(hits), 2)
 
+    # ---- 2026-09-29 真机：WEMM 整轮没被调用（BC-11/BC-15）-----------------------
+    # 4 个库的日志全是"WEMM子进程未运行，页级索引本轮跳过"：文字向量模型做完后还占着
+    # 显卡名额，WEMM 抢不到；70 个 PDF 的页库因此全被记成失败，而失败记录只要 PDF 没变
+    # 就永远不会重试——图谱里就永远没有 WEMM 页节点。旧项目 wemm_indexer.py 的做法：
+    # ①真要拉看图服务（要占显存）前才调 before_serve 让 bge/reranker 让路，无活可干时
+    # 零拉起零开销（:260-278）；②失败终态绝不走快速路径，每轮都重试（:311-312）。
+
+    def test_before_serve_runs_before_the_service_is_needed_and_only_when_there_is_work(self):
+        order: list[str] = []
+        real_ensure = self.instance._ensure_alive  # noqa: SLF001
+
+        def _recording_ensure():
+            order.append("ensure")
+            return real_ensure()
+
+        with patch.object(self.instance, "_ensure_alive", side_effect=_recording_ensure):
+            self.instance.index_library(
+                "lib1", self.vault, ["doc.pdf"], generation="g1",
+                before_serve=lambda: order.append("release"),
+            )
+        self.assertEqual(order, ["release", "ensure"])
+        self.assertTrue(self.instance._generations.commit("lib1", "g1"))  # noqa: SLF001
+
+        order.clear()
+        with patch.object(self.instance, "_ensure_alive", side_effect=_recording_ensure):
+            self.instance.index_library(
+                "lib1", self.vault, ["doc.pdf"], generation="g2", changed_paths=[],
+                previous_generation="g1", before_serve=lambda: order.append("release"),
+            )
+        self.assertEqual(order, [], "没有页要渲染时，既不该让文字模型让路，也不该去抢显卡/拉起看图服务")
+
+    def test_a_failing_before_serve_never_breaks_page_indexing(self):
+        def _boom():
+            raise RuntimeError("release failed")
+
+        self.instance.index_library("lib1", self.vault, ["doc.pdf"], before_serve=_boom)
+        self.assertEqual(self.instance._collection("lib1").count(), 2)  # noqa: SLF001
+
+    def test_a_failed_page_index_is_retried_next_round_even_when_the_pdf_is_unchanged(self):
+        with patch.object(self.instance, "_ensure_alive", return_value=False):
+            self.instance.index_library("lib1", self.vault, ["doc.pdf"], generation="g1")
+        self.assertTrue(self.instance._generations.commit("lib1", "g1"))  # noqa: SLF001
+        first = self.instance._read_state("lib1", "g1")["files"]["doc.pdf"]  # noqa: SLF001
+        self.assertEqual(first["status"], "failed")
+
+        self.instance.index_library(
+            "lib1", self.vault, ["doc.pdf"], generation="g2", changed_paths=[], previous_generation="g1",
+        )
+        self.assertTrue(self.instance._generations.commit("lib1", "g2"))  # noqa: SLF001
+        second = self.instance._read_state("lib1", "g2")["files"]["doc.pdf"]  # noqa: SLF001
+        self.assertEqual(second["status"], "indexed")
+        self.assertEqual(len(second["page_ids"]), 2)
+        self.assertEqual(len(self.instance.navigate("lib1", "query", top_k=5)), 2)
+
+    def test_a_successfully_indexed_pdf_is_still_never_reencoded(self):
+        """重试只针对失败/部分成功的记录；已成功且没变的 PDF 仍然零渲染零编码。"""
+        self.instance.index_library("lib1", self.vault, ["doc.pdf"], generation="g1")
+        self.assertTrue(self.instance._generations.commit("lib1", "g1"))  # noqa: SLF001
+        with patch.object(self.instance._handle, "call", wraps=self.instance._handle.call) as call_mock:  # noqa: SLF001
+            self.instance.index_library(
+                "lib1", self.vault, ["doc.pdf"], generation="g2", changed_paths=[], previous_generation="g1",
+            )
+        self.assertEqual(call_mock.call_count, 0)
+
     def test_disable_releases_gpu_lease_and_kills_subprocess(self):
         pid = self.instance._handle._process.pid  # noqa: SLF001 - 直接问操作系统这个pid还在不在
         self.rt.disable("official-visual-wemm")

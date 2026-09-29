@@ -1494,6 +1494,7 @@ class Pipeline:
                 generation=generation,
                 changed_paths=changed_pdf_paths,
                 previous_generation=previous,
+                before_serve=self._release_text_models_for_visual,
             )
 
         links_by_path = {
@@ -2708,6 +2709,29 @@ class Pipeline:
         "official-visual-wemm",
         "official-ocr-mineru-local",
     )
+
+    def _release_text_models_for_visual(self) -> None:
+        """页级视觉索引真要占显卡之前的"让路"：把文字向量模型与重排模型从显卡上卸下来。
+
+        对齐 obsidian-rag/index.py:1784-1806 `_release_for_wemm`（经 wemm_indexer.py 的
+        `before_serve` 回调）。2026-09-29 真机：文字嵌入做完后 bge-m3 还带着 GPU 名额，
+        名额优先级比 WEMM 高，WEMM 抢不到 → 4 个库的页级索引整轮被跳过、页库全记失败。
+        只在视觉插件"确有页要渲染"时才被调用（无页可渲染的纯 md 增量不会白白卸模型，
+        下次搜索也不必重新装）。每个插件独立隔离：一个卸不掉不能连累另一个，也绝不
+        抛出来拖垮页级索引；模型下次真正用到时会懒加载回来。"""
+        for plugin_id in ("official-embedder-bge-m3", "official-reranker"):
+            plugin = self.runtime.plugins.get(plugin_id)
+            if plugin is None or plugin.instance is None or plugin.state.value != "enabled":
+                continue
+            release = getattr(plugin.instance, "release_gpu", None)
+            if release is None:
+                continue
+            try:
+                release()
+            except Exception as exc:  # noqa: BLE001 - 让路失败不能连累其它插件/页级索引
+                logging.getLogger("rag_redo.core.pipeline").warning(
+                    "页级视觉索引前释放 %s 的显存失败（忽略）：%s: %s", plugin_id, type(exc).__name__, exc
+                )
 
     def release_gpu_memory(self) -> dict:
         """手动立即释放显存（2026-09-29 操作者需求；旧项目 guiweb 没有对应

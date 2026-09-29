@@ -397,7 +397,13 @@ class VisualWemmPlugin:
         generation: str | None = None,
         changed_paths: list[str] | None = None,
         previous_generation: str | None = None,
+        before_serve=None,
     ) -> None:
+        """`before_serve`：真要占显卡渲染页面之前调用一次的"让路"回调（对齐旧项目
+        obsidian-rag/index.py:1784-1806 `_release_for_wemm` 经 wemm_indexer.py:266-272
+        传入的 `before_serve`）——调用方借它把文字向量/重排模型从显卡上卸下来。
+        没有页需要渲染时不会调用（零拉起零开销，wemm_indexer.py:253-254）；回调抛异常
+        也绝不影响页级索引。"""
         if not self.is_active():
             # LEGACY obsidian-rag/index.py:1842 与
             # docs/legacy/TASK_LOG.md:1818 的原话："wemm_backend off →
@@ -427,8 +433,27 @@ class VisualWemmPlugin:
             requested.update(pdf_paths)
         current_paths = set(pdf_paths)
         files = {path: record for path, record in files.items() if path in current_paths}
+        # 失败/部分成功的记录**每轮都重试**：旧项目 wemm_indexer.py:311-312 "终态条目绝不走
+        # 快速路径——失败文件（看图服务中途挂掉等）每轮都给重试机会，让「记入终态待重试」
+        # 是真承诺而非死寂"。此前这里只要 PDF 没变就永远跳过失败记录：真机 70 个 PDF 因
+        # "WEMM子进程未运行"被记失败后再也没有页库。没有记录、或记录的签名不是当前签名的
+        # PDF 同样必须处理，否则下面的快速路径会拿它们去用一个没起的服务。
+        requested.update(
+            path for path in pdf_paths
+            if files.get(path, {}).get("status") != "indexed"
+            or files.get(path, {}).get("signature") != signature
+        )
         indexed_pages = 0
-        alive = self._ensure_alive()
+        if requested:
+            # 真要渲染页面了：先让文字向量/重排模型让出显卡，再去抢名额拉服务
+            if before_serve is not None:
+                try:
+                    before_serve()
+                except Exception as exc:  # noqa: BLE001 - 让路失败绝不能拖垮页级索引
+                    self._logger.warning("WEMM让路回调失败（忽略）：%s: %s", type(exc).__name__, exc)
+            alive = self._ensure_alive()
+        else:
+            alive = True  # 没有页要渲染：不占显卡、不拉服务，只按旧记录计页
         collection = None
         if alive and requested:
             try:
@@ -456,7 +481,11 @@ class VisualWemmPlugin:
                         "segment": generation_key,
                     }
                     continue
-                if old.get("signature") == signature and old.get("content_hash") == content_hash:
+                if (
+                    old.get("status") == "indexed"
+                    and old.get("signature") == signature
+                    and old.get("content_hash") == content_hash
+                ):
                     files[path] = old
                     indexed_pages += len(old.get("page_ids", []))
                     continue

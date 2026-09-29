@@ -378,7 +378,7 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
 
         class _RecordingVisual:
             def index_library(self, library_id, root, pdf_paths, *, generation,
-                              changed_paths, previous_generation):
+                              changed_paths, previous_generation, before_serve=None):
                 visual_calls.append((list(pdf_paths), list(changed_paths)))
 
         for allowlist in ((".md", ".txt", ".pdf"), (".md", ".txt")):
@@ -404,6 +404,69 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
                 self.pipeline.index_library("test-lib", format_allowlist=allowlist)
         self.assertEqual(visual_calls[0], (["visual.pdf"], ["visual.pdf"]))
         self.assertEqual(visual_calls[1], (["visual.pdf"], []))
+
+    def _run_with_fake_visual(self, fake_visual) -> None:
+        """把 visual_index 扩展点换成 `fake_visual` 后跑一轮 test-lib 索引。"""
+        real_plugin = self.pipeline._plugin
+        real_providers_of = self.runtime.registry.providers_of
+
+        def _fake_providers(point, _real=real_providers_of):
+            if point == "visual_index":
+                return ["fake-visual"]
+            return _real(point)
+
+        def _fake_plugin(plugin_id, _real=real_plugin):
+            return fake_visual if plugin_id == "fake-visual" else _real(plugin_id)
+
+        with (
+            patch.object(self.runtime.registry, "providers_of", side_effect=_fake_providers),
+            patch.object(self.pipeline, "_plugin", side_effect=_fake_plugin),
+        ):
+            self.pipeline.index_library("test-lib")
+
+    def test_visual_phase_gets_a_hook_that_makes_the_text_models_give_up_the_gpu(self):
+        """2026-09-29 真机：文字向量模型做完后还占着显卡名额，WEMM 抢不到，4 个库的页级
+        索引整轮被跳过。对齐旧项目 index.py:1784-1806 `_release_for_wemm`：轮到 WEMM 真要
+        占显卡时，先让 bge 与 reranker 下车。hook 由视觉插件在“真有页要渲染”时才调用。"""
+        hooks: list = []
+
+        class _V:
+            def index_library(self, library_id, root, pdf_paths, *, generation,
+                              changed_paths, previous_generation, before_serve=None):
+                hooks.append(before_serve)
+
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        reranker = self.runtime.plugins["official-reranker"].instance
+        with (
+            patch.object(embedder, "release_gpu") as embedder_release,
+            patch.object(reranker, "release_gpu") as reranker_release,
+        ):
+            self._run_with_fake_visual(_V())
+            self.assertEqual(len(hooks), 1)
+            self.assertTrue(callable(hooks[0]))
+            embedder_release.assert_not_called()  # 由视觉插件决定何时真的需要让路
+            reranker_release.assert_not_called()
+            hooks[0]()
+            embedder_release.assert_called_once_with()
+            reranker_release.assert_called_once_with()
+
+    def test_one_text_model_failing_to_release_does_not_stop_the_other_or_raise(self):
+        hooks: list = []
+
+        class _V:
+            def index_library(self, library_id, root, pdf_paths, *, generation,
+                              changed_paths, previous_generation, before_serve=None):
+                hooks.append(before_serve)
+
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        reranker = self.runtime.plugins["official-reranker"].instance
+        self._run_with_fake_visual(_V())
+        with (
+            patch.object(embedder, "release_gpu", side_effect=RuntimeError("boom")),
+            patch.object(reranker, "release_gpu") as reranker_release,
+        ):
+            hooks[0]()
+        reranker_release.assert_called_once_with()
 
     def test_index_then_search_finds_relevant_doc(self):
         report = self.pipeline.index_library("test-lib")
