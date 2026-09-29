@@ -356,6 +356,31 @@ class TestIndexWorkerManager(unittest.TestCase):
         self.assertEqual(after["health"], "healthy")
         self._wait_stage("lib1", "done")
 
+    def test_embedding_phase_percent_counts_chunks_and_gives_no_file_based_eta(self):
+        """索引先全部转换切块、再连续向量化：向量化阶段文件数已走满，percent 只能按块数算
+        （旧 gui/store.py::progress_ratio），按文件外推的 eta 没有意义。"""
+        now = time.time()
+        progress = self._manual_progress(heartbeat_at=now, progress_at=now)
+        progress.phase = "embedding"
+        progress.files_done = 12
+        progress.files_total = 12
+        progress.chunks_done = 30
+        progress.chunks_total = 120
+        self.assertTrue(self.manager._write(progress))
+        status = self.manager.status("manual")
+        self.assertAlmostEqual(status["percent"], 25.0)
+        self.assertIsNone(status["eta_s"])
+
+        progress.phase = "extracting"
+        progress.files_done = 3
+        progress.files_total = 12
+        progress.chunks_done = 0
+        progress.chunks_total = None
+        self.assertTrue(self.manager._write(progress))
+        status = self.manager.status("manual")
+        self.assertAlmostEqual(status["percent"], 25.0)
+        self.assertIsNotNone(status["eta_s"])
+
     def test_manual_progress_without_grace_is_stalled(self):
         now = time.time()
         self.assertTrue(self.manager._write(self._manual_progress(heartbeat_at=now, progress_at=now - 5)))

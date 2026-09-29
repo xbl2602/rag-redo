@@ -48,6 +48,12 @@ OFFICIAL_PHASE1_PLUGINS = [
 ]
 
 
+def _embedded_chunk_count(embed_mock) -> int:
+    """被送去向量化的块总数。向量化现在是跨文件的连续调用（旧项目顺序：先全部转换切块、
+    再统一嵌入），所以不能再用“嵌入器被调用几次 == 文件数”来数——数块。"""
+    return sum(len(call.args[0]) for call in embed_mock.call_args_list)
+
+
 class _DeterministicFakeEncoder:
     """给 embedder 用的假编码器：把关键词出现次数映射进固定维度，保证
     "包含相同关键词的文本"在向量空间里更接近——端到端测试才能验证"真的
@@ -424,6 +430,83 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         ):
             self.pipeline.index_library("test-lib")
 
+    # ---- 2026-09-29 真机：显卡忽高忽低、转一个索引一个（BC-04/BC-05/BC-15）---------
+    # 旧项目 index.py:2056-2300：先逐个文件转换+切块并把新块攒起来，全部转完后一次性、
+    # 连续地做向量（分批只为进度心跳），最后拿一次写锁统一写库。rag-redo 曾经是
+    # “一个文件：提取→切块→向量→写库”再下一个，显卡每做完一个小文件就闲下来等 CPU，
+    # 且 MinerU/WEMM 与向量模型在每个文件之间来回抢显存。
+
+    def _index_with_recording(self, names: list[str] | None = None):
+        """跑一轮索引，返回按发生顺序记录的事件：("extract", 路径) 与 ("embed", 文本数)。"""
+        for name in names or []:
+            (self.vault / name).write_text(f"# {name}\n\n插件 架构 {name} 的内容。", encoding="utf-8")
+        log: list[tuple] = []
+
+        class _RecordingEncoder(_DeterministicFakeEncoder):
+            def encode(self, texts):
+                log.append(("embed", len(texts)))
+                return super().encode(texts)
+
+        from official_embedder_bge_m3.embed import BGEM3Embedder
+
+        self.runtime.plugins["official-embedder-bge-m3"].instance.embedder = BGEM3Embedder(
+            encoder=_RecordingEncoder()
+        )
+        real_extract = self.pipeline._extract
+
+        def _recording_extract(library_id, path, root):
+            log.append(("extract", path))
+            return real_extract(library_id, path, root)
+
+        events: list = []
+        with patch.object(self.pipeline, "_extract", side_effect=_recording_extract):
+            report = self.pipeline.index_library("test-lib", progress_callback=events.append)
+        return report, log, events
+
+    def test_all_files_are_extracted_before_the_first_embedding_call(self):
+        report, log, _events = self._index_with_recording(["a.md", "b.md", "c.md"])
+        extracts = [i for i, e in enumerate(log) if e[0] == "extract"]
+        embeds = [i for i, e in enumerate(log) if e[0] == "embed"]
+        self.assertEqual(len(extracts), 5)  # setUp 的 2 篇 + 3 篇新增
+        self.assertTrue(embeds)
+        self.assertLess(max(extracts), min(embeds), f"向量化夹在提取中间了：{log}")
+        self.assertEqual(report.succeeded, 5)
+
+    def test_embedding_is_one_continuous_stream_across_files_not_one_call_per_file(self):
+        _report, log, _events = self._index_with_recording(["a.md", "b.md", "c.md"])
+        embed_calls = [e for e in log if e[0] == "embed"]
+        # 5 个文件、每个文件至少 1 块：跨文件攒成一次连续调用，而不是每个文件调一次
+        self.assertEqual(len(embed_calls), 1, embed_calls)
+        self.assertGreaterEqual(embed_calls[0][1], 5)
+
+    def test_embedding_progress_counts_chunks_and_never_precedes_extraction_progress(self):
+        _report, _log, events = self._index_with_recording(["a.md", "b.md"])
+        phases = [e.phase for e in events]
+        first_embedding = phases.index("embedding")
+        self.assertNotIn("extracting", phases[first_embedding:])
+        embedding = [e for e in events if e.phase == "embedding"]
+        self.assertTrue(all(e.chunks_total and e.chunks_total > 0 for e in embedding))
+        self.assertEqual(embedding[-1].chunks_done, embedding[-1].chunks_total)
+        # 收尾事件里的 chunks_done 仍是“本库全部块数”，与改动前的口径一致
+        finalizing = [e for e in events if e.phase == "finalizing"][-1]
+        self.assertGreaterEqual(finalizing.chunks_total, embedding[-1].chunks_total)
+
+    def test_failure_while_embedding_publishes_nothing_and_keeps_the_old_index(self):
+        self.pipeline.index_library("test-lib")
+        active_before = self.pipeline._generations.active("test-lib")
+        (self.vault / "plugin-notes.md").write_text("# 插件架构笔记\n\n改过之后的内容 插件 插件。", encoding="utf-8")
+
+        class _BoomEncoder(_DeterministicFakeEncoder):
+            def encode(self, texts):
+                raise RuntimeError("embedding blew up")
+
+        from official_embedder_bge_m3.embed import BGEM3Embedder
+
+        self.runtime.plugins["official-embedder-bge-m3"].instance.embedder = BGEM3Embedder(encoder=_BoomEncoder())
+        with self.assertRaises(RuntimeError):
+            self.pipeline.index_library("test-lib")
+        self.assertEqual(self.pipeline._generations.active("test-lib"), active_before)
+
     def test_visual_phase_gets_a_hook_that_makes_the_text_models_give_up_the_gpu(self):
         """2026-09-29 真机：文字向量模型做完后还占着显卡名额，WEMM 抢不到，4 个库的页级
         索引整轮被跳过。对齐旧项目 index.py:1784-1806 `_release_for_wemm`：轮到 WEMM 真要
@@ -622,25 +705,39 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         for event in events:
             if event.phase not in phases:
                 phases.append(event.phase)
+        # 2026-09-29：旧项目顺序——先逐个文件转换切块（extracting/file_complete），全部转完
+        # 再连续向量化（embedding），最后统一写入（writing）
         self.assertEqual(
             phases,
-            ["scanning", "extracting", "embedding", "writing", "file_complete", "visual", "finalizing"],
+            ["scanning", "extracting", "file_complete", "embedding", "writing", "visual", "finalizing"],
         )
 
         extracting = [event for event in events if event.phase == "extracting"]
         self.assertEqual([event.files_done for event in extracting], [0, 1])
         self.assertTrue(all(event.stall_grace_s == 300.0 for event in extracting))
-        self.assertTrue(all(event.chunks_total is None for event in events if event.phase != "visual" and event.phase != "finalizing"))
+        total_chunks = sum(f.chunk_count for f in report.files)
+        # 只有向量化阶段（按块计进度）与收尾阶段带 chunks_total
+        self.assertTrue(
+            all(
+                event.chunks_total is None
+                for event in events
+                if event.phase not in ("embedding", "visual", "finalizing")
+            )
+        )
 
         completed = [event for event in events if event.phase == "file_complete"]
         self.assertEqual([event.files_done for event in completed], [1, 2])
-        expected_chunks = [report.files[0].chunk_count, sum(f.chunk_count for f in report.files)]
-        self.assertEqual([event.chunks_done for event in completed], expected_chunks)
+        # 文件级“完成”发生在转换切块阶段，向量化还没开始：此时没有已嵌块
+        self.assertEqual([event.chunks_done for event in completed], [0, 0])
 
         embedding = [event for event in events if event.phase == "embedding"]
         writing = [event for event in events if event.phase == "writing"]
         self.assertTrue(all(event.stall_grace_s == 300.0 for event in embedding))
+        self.assertTrue(all(event.chunks_total == total_chunks for event in embedding))
+        self.assertEqual(embedding[0].chunks_done, 0)
+        self.assertEqual(embedding[-1].chunks_done, total_chunks)
         self.assertTrue(all(event.stall_grace_s == 180.0 for event in writing))
+        self.assertTrue(all(event.chunks_done == total_chunks for event in writing))
 
         visual = next(event for event in events if event.phase == "visual")
         self.assertEqual(visual.chunks_total, visual.chunks_done)
@@ -862,7 +959,7 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
             with patch.object(embedder, "embed_chunks", wraps=embedder.embed_chunks) as embed_mock:
                 report = self.pipeline.index_library("test-lib", generation_id="second")
         self.assertEqual(extract_mock.call_count, 0)
-        self.assertEqual(embed_mock.call_count, 2)
+        self.assertEqual(_embedded_chunk_count(embed_mock), 2)
         self.assertEqual(report.changed, 2)
         updated_manifest = self.pipeline._manifest("test-lib", "second")
         self.assertIsNotNone(updated_manifest)
@@ -874,7 +971,7 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
         with patch.object(embedder, "embed_chunks", wraps=embedder.embed_chunks) as embed_mock:
             report = self.pipeline.index_library("test-lib", generation_id="second", full=True)
-        self.assertEqual(embed_mock.call_count, 2)
+        self.assertEqual(_embedded_chunk_count(embed_mock), 2)
         self.assertEqual(report.unchanged, 0)
         self.assertEqual(report.changed, 2)
 

@@ -603,6 +603,21 @@ class TestProgressSnapshot(unittest.TestCase):
         self.assertLess(low["pct"], high["pct"])
         self.assertEqual((low["phase"], high["phase"]), ("embedding", "writing"))
 
+    def test_embedding_phase_progress_counts_chunks_like_the_legacy_bar(self) -> None:
+        """旧 gui/store.py::progress_ratio：向量化阶段按块数，其余阶段按文件数。索引先全部转换
+        切块、再连续向量化之后，向量化阶段文件数已经 12/12，进度条不能停在 100%。"""
+        embedding = self._snapshot_with(self._status(
+            phase="embedding", files_done=12, files_total=12, chunks_done=30, chunks_total=120,
+        ))["progress"]
+        self.assertAlmostEqual(embedding["pct"], 25.0)
+        self.assertEqual((embedding["chunks_done"], embedding["chunks_total"]), (30, 120))
+        writing = self._snapshot_with(self._status(
+            phase="writing", files_done=12, files_total=12, chunks_done=120, chunks_total=120,
+        ))["progress"]
+        self.assertAlmostEqual(writing["pct"], 100.0)
+        converting = self._snapshot_with(self._status(phase="extracting", files_done=3, files_total=12))["progress"]
+        self.assertAlmostEqual(converting["pct"], 25.0)
+
     def test_foreign_process_is_reported_as_foreign(self) -> None:
         progress = self._snapshot_with(self._status(owner="foreign", can_stop=False))["progress"]
         self.assertEqual(progress["task"], "foreign")

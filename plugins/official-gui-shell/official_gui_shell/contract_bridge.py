@@ -464,14 +464,21 @@ class _LegacyContractMixin:
         files_done = sum(int(s.get("files_done") or 0) for _c, s in active)
         files_total = sum(int(s.get("files_total") or 0) for _c, s in active)
         phases = [str(s.get("phase") or "") for _c, s in active]
-        if files_total > 0:
-            pct = min(100.0, files_done / files_total * 100.0)
-        else:
-            pct = 0.0
         # 合并后的阶段：多个库取最靠前的阶段（还有库在扫描/提取，就不算进入写入）
         mapped = [_PHASE_MAP.get(phase, "scanning") for phase in phases]
         order = ["scanning", "converting", "embedding", "writing", "wemm"]
         phase = min(mapped, key=lambda item: order.index(item) if item in order else 0)
+        chunks_done_sum = sum(int(s.get("chunks_done") or 0) for _c, s in active)
+        chunks_total_sum = sum(int(s.get("chunks_total") or 0) for _c, s in active)
+        # 进度条比例对齐旧项目 gui/store.py::progress_ratio：**向量化阶段按块数，其余阶段按
+        # 文件数**。索引改回“先全部转换切块、再连续向量化”之后，向量化阶段所有文件都已
+        # “转换完”，若仍按文件数计，进度条会在最耗时的向量化阶段一直停在 100%。
+        if phase == "embedding" and chunks_total_sum > 0:
+            pct = min(100.0, chunks_done_sum / chunks_total_sum * 100.0)
+        elif files_total > 0:
+            pct = min(100.0, files_done / files_total * 100.0)
+        else:
+            pct = 0.0
         health = {str(s.get("health") or "healthy") for _c, s in active}
         if health & {"orphaned", "stalled_no_heartbeat"}:
             heartbeat = "dead"
@@ -486,8 +493,8 @@ class _LegacyContractMixin:
             "phase": phase,
             "files_done": files_done,
             "files_total": files_total,
-            "chunks_done": sum(int(s.get("chunks_done") or 0) for _c, s in active),
-            "chunks_total": sum(int(s.get("chunks_total") or 0) for _c, s in active),
+            "chunks_done": chunks_done_sum,
+            "chunks_total": chunks_total_sum,
             "pct": pct,
             "elapsed": max(float(s.get("elapsed_s") or 0.0) for _c, s in active),
             "library": "、".join(c.name for c, _s in active),

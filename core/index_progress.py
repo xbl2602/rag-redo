@@ -990,6 +990,14 @@ class IndexWorkerManager:
             percent = 100.0
         elif data["stage"] in {"starting", "running"} and data["phase"] in {"visual", "finalizing"}:
             percent = None
+        elif (
+            data["stage"] in {"starting", "running"}
+            and data["phase"] == "embedding"
+            and (data.get("chunks_total") or 0) > 0
+        ):
+            # 索引先全部转换切块、再连续向量化：向量化阶段文件数已经走满，进度只能按块数算
+            # （对齐旧 gui/store.py::progress_ratio：嵌入阶段按块数，其他阶段按文件数）
+            percent = max(0.0, min(100.0, int(data.get("chunks_done") or 0) / int(data["chunks_total"]) * 100.0))
         elif files_total > 0:
             percent = max(0.0, min(100.0, files_done / files_total * 100.0))
         else:
@@ -997,6 +1005,9 @@ class IndexWorkerManager:
         if data["stage"] == "done":
             eta_s = 0.0
         elif data["stage"] in {"failed", "cancelled"}:
+            eta_s = None
+        elif data["phase"] in {"embedding", "writing"}:
+            # 按文件数外推的剩余时间在这两个阶段没有意义（文件已全部转换完），宁可不给
             eta_s = None
         elif percent is not None and files_total > 0 and files_done > 0:
             eta_s = max(0.0, elapsed_s * (files_total - files_done) / files_done)

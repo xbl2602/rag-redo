@@ -49,6 +49,12 @@ def _collection_name(library_id: str, segment: str) -> str:
     return "libg_" + hashlib.sha256(f"{library_id}\0{segment}".encode("utf-8")).hexdigest()[:40]
 
 
+def _embedded_chunk_count(embed_mock) -> int:
+    """被送去向量化的块总数。向量化现在是跨文件的连续调用（旧项目顺序：先全部转换切块、
+    再统一嵌入），所以不能再用“嵌入器被调用几次 == 文件数”来数——数块。"""
+    return sum(len(call.args[0]) for call in embed_mock.call_args_list)
+
+
 class _DataSafetyBase(unittest.TestCase):
     """借用 e2e 的 setUp（一个已注册、含两个 md 的库 + 完整插件运行时）。"""
 
@@ -180,7 +186,7 @@ class TestConsistencySelfHealing(_DataSafetyBase):
         with patch.object(self._embedder(), "embed_chunks", wraps=self._embedder().embed_chunks) as embed_mock:
             report = self.pipeline.index_library("test-lib", generation_id="second")
         # 增量修不了缺失的块（指纹全命中 → 没有新块可写），必须整库重建
-        self.assertEqual(embed_mock.call_count, 2, "缺块后必须整库重建而不是当无事发生")
+        self.assertEqual(_embedded_chunk_count(embed_mock), 2, "缺块后必须整库重建而不是当无事发生")
         self.assertEqual(report.changed, 2, report.files)
         self.assertEqual(self.pipeline._generations.active("test-lib"), "second")
         self.assertTrue(self.pipeline.search("test-lib", "插件 架构", top_k=5))
@@ -280,7 +286,7 @@ class TestFullReusesExtractCache(_DataSafetyBase):
             with patch.object(embedder, "embed_chunks", wraps=embedder.embed_chunks) as embed_mock:
                 report = self.pipeline.index_library("test-lib", generation_id="second", full=True)
         self.assertEqual(extract_mock.call_count, 0, "full 不该重新解析正文（否则改切块粒度要重烧 MinerU 配额）")
-        self.assertEqual(embed_mock.call_count, 2, "full 必须重切块 + 重嵌")
+        self.assertEqual(_embedded_chunk_count(embed_mock), 2, "full 必须重切块 + 重嵌")
         self.assertEqual(report.changed, 2, report.files)
         self.assertEqual(report.unchanged, 0)
         self.assertEqual(self.pipeline._generations.active("test-lib"), "second")
@@ -658,7 +664,7 @@ class TestFreshnessSignatureCheck(_DataSafetyBase):
             self.assertEqual(report.changed, 2, report.files)
             self.assertEqual(self.pipeline._generations.active("test-lib"), "second")
             self.assertFalse(self.pipeline.library_freshness("test-lib")["test-lib"].stale)
-        self.assertEqual(embed_mock.call_count, 2, "签名升级后必须整库重切块重嵌")
+        self.assertEqual(_embedded_chunk_count(embed_mock), 2, "签名升级后必须整库重切块重嵌")
         # 签名回退（换回旧切块器）同样是能力变化 → 又一次 stale（LEGACY
         # index.py:1518-1519 `version_upgrade` 对"任一签名变了"的判定是
         # 无方向的）：这条钉住漂移判定的两个方向，防止实现偷偷写成单边比较。

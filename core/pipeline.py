@@ -62,6 +62,29 @@ TERMINAL_FAILURE_STATES = frozenset({"unreadable", "empty", "tbd", "scanned", "e
 #: 稳定 token，调用方按它分支，不要写自由文本。
 SKIP_MISSING_ROOT = "library-root-missing"
 
+#: 向量化的分片大小（块数）。只用来给进度心跳/停滞看门狗喘气：分片之间没有别的活，
+#: 显卡连续工作；嵌入器内部仍按旧项目的批大小（8，按显存自动收紧）逐批编码。
+_EMBED_SLICE = 64
+#: 向量库写入的缓冲上限（块数）：攒够一批再 upsert，与压缩段用的 1000 一致。
+_WRITE_FLUSH_CHUNKS = 1000
+
+
+@dataclass
+class _PendingFile:
+    """“已转换切块、等着统一向量化与写入”的一个文件（见 `Pipeline.index_library`）。"""
+
+    plan: dict
+    file_report: "IndexFileReport"
+    chunks: list
+    ctx_by_id: dict
+    section_counts: dict
+    section_headings: dict
+    section_texts: dict
+    raw_links: list
+    extracted_by: str
+    extractor_version: str
+    content_hash: str
+
 #: 提取试验台（`Pipeline.preview_extract`）的后端覆盖名 → provider 插件 id。
 #: 键名沿用旧项目 guiweb/bridge.py::preview_start 的 `backend` 取值
 #: （None/"local"/"mineru-cloud"/"mineru-local"），值是本项目对应的插件 id——
@@ -859,6 +882,7 @@ class Pipeline:
             *,
             current_path: str = "",
             chunks_total: int | None = None,
+            chunks_done_value: int | None = None,
             stall_grace_s: float = 0.0,
             message: str = "",
         ) -> None:
@@ -869,7 +893,7 @@ class Pipeline:
                         files_done=files_done,
                         files_total=files_total,
                         current_path=current_path,
-                        chunks_done=chunks_done,
+                        chunks_done=chunks_done if chunks_done_value is None else chunks_done_value,
                         chunks_total=chunks_total,
                         message=message,
                         stall_grace_s=stall_grace_s,
@@ -1043,6 +1067,7 @@ class Pipeline:
                 for chunk_id in plan["old"].get("chunk_ids", []):
                     lexical.remove_chunk(library_id, chunk_id, generation=generation)
 
+        pending: list[_PendingFile] = []
         for plan in plans:
             path = str(plan["path"])
             file_report = IndexFileReport(
@@ -1291,66 +1316,149 @@ class Pipeline:
                 files_done += 1
                 _emit("file_complete", current_path=path, message=f"索引失败：{reason}")
                 continue
-            _emit("embedding", current_path=path, stall_grace_s=300.0, message=f"正在嵌入：{path}")
-            vectors = embedder.embed_chunks(chunks)
-            vector_by_id = {vector.chunk_id: list(vector.vector) for vector in vectors}
-            chunk_ids = [chunk.chunk_id for chunk in chunks]
-            embed_vectors = [vector_by_id[chunk_id] for chunk_id in chunk_ids]
-            _emit("writing", current_path=path, stall_grace_s=180.0, message=f"正在写入：{path}")
-            _drop_old_lexical_chunks(plan)
-            vector_store.upsert(
-                library_id,
-                chunk_ids,
-                embed_vectors,
-                documents=[chunk.text for chunk in chunks],
-                metadatas=[
+            # 不在这里向量化/写库：先把这个文件的块攒起来，等全部文件都转换切块完，再统一
+            # 连续向量化、统一写入——对齐旧项目 obsidian-rag/index.py:2056-2300 的顺序
+            # （“先转换、后嵌入、一次写锁”）。此前是“一个文件：提取→切块→向量→写库”再下
+            # 一个，显卡每做完一个小文件就闲下来等 CPU，MinerU/WEMM 与向量模型还在每个
+            # 文件之间来回抢显存（2026-09-29 真机：GPU 功耗在 0 和高值之间来回跳、显存反复
+            # 冒尖又回落）。见本函数循环之后的第二段（向量化）与第三段（写入）。
+            pending.append(
+                _PendingFile(
+                    plan=plan,
+                    file_report=file_report,
+                    chunks=chunks,
+                    ctx_by_id=ctx_by_id,
+                    section_counts=section_counts,
+                    section_headings=section_headings,
+                    section_texts=section_texts,
+                    raw_links=raw_links,
+                    extracted_by=doc.extracted_by,
+                    extractor_version=doc.extractor_version,
+                    content_hash=doc.content_hash or plan["content_hash"],
+                )
+            )
+            files_done += 1
+            _emit("file_complete", current_path=path, message=f"已转换切块：{path}")
+
+        # ---- 第二段：全部待嵌块连续向量化（对齐旧 index.py:2238-2255）--------------------
+        # 分片只为给进度心跳/停滞看门狗喘气，不是“一个文件一次”：跨文件攒成连续的调用，
+        # 显卡不会在两个文件之间闲下来等 CPU。片内按文本长度从长到短排好，每个小批里的
+        # 块长度相近、填充浪费最少（最长的排最前，显存/OOM 类问题也尽早暴露）；结果按
+        # chunk_id 取回，与顺序无关。
+        vectors_by_id: dict[str, object] = {}
+        pending_chunks = [chunk for item in pending for chunk in item.chunks]
+        embedded_total = len(pending_chunks)
+        if pending_chunks:
+            _emit(
+                "embedding",
+                chunks_total=embedded_total,
+                chunks_done_value=0,
+                stall_grace_s=300.0,
+                message=f"正在向量化 0/{embedded_total} 块",
+            )
+            ordered_chunks = sorted(pending_chunks, key=lambda chunk: len(chunk.text), reverse=True)
+            embedded = 0
+            for start in range(0, embedded_total, _EMBED_SLICE):
+                piece = ordered_chunks[start : start + _EMBED_SLICE]
+                for vector in embedder.embed_chunks(piece):
+                    vectors_by_id[vector.chunk_id] = vector
+                embedded += len(piece)
+                _emit(
+                    "embedding",
+                    chunks_total=embedded_total,
+                    chunks_done_value=embedded,
+                    stall_grace_s=300.0,
+                    message=f"正在向量化 {embedded}/{embedded_total} 块",
+                )
+
+        # 口径与改动前一致：向量化完成后，chunks_done 是“本库全部块数”（未变文件 + 本轮新嵌的块）
+        chunks_done += embedded_total
+
+        # ---- 第三段：统一写入向量库/词法库，生成每个文件的清单记录 -----------------------
+        # 仍写进本轮独立 generation，最后才原子发布——任何一步异常整轮不发布，旧索引不动。
+        if pending:
+            _emit(
+                "writing",
+                stall_grace_s=180.0,
+                message=f"正在写入 {len(pending)} 个文件的索引",
+            )
+            buffer_ids: list[str] = []
+            buffer_vectors: list[list[float]] = []
+            buffer_documents: list[str] = []
+            buffer_metadatas: list[dict] = []
+
+            def _flush_vector_buffer() -> None:
+                if not buffer_ids:
+                    return
+                vector_store.upsert(
+                    library_id,
+                    list(buffer_ids),
+                    list(buffer_vectors),
+                    documents=list(buffer_documents),
+                    metadatas=list(buffer_metadatas),
+                    generation=generation,
+                )
+                buffer_ids.clear()
+                buffer_vectors.clear()
+                buffer_documents.clear()
+                buffer_metadatas.clear()
+
+            for item in pending:
+                plan = item.plan
+                chunks = item.chunks
+                chunk_ids = [chunk.chunk_id for chunk in chunks]
+                file_vectors = [vectors_by_id[chunk_id] for chunk_id in chunk_ids]
+                _drop_old_lexical_chunks(plan)
+                buffer_ids.extend(chunk_ids)
+                buffer_vectors.extend(list(vector.vector) for vector in file_vectors)
+                buffer_documents.extend(chunk.text for chunk in chunks)
+                buffer_metadatas.extend(
                     {
                         "path": chunk.path,
                         "heading_breadcrumb": chunk.heading_breadcrumb,
                         "chunk_index": chunk.chunk_index,
                         "section_id": chunk.section_id,
-                        "ctx": ctx_by_id.get(chunk.chunk_id, ""),
+                        "ctx": item.ctx_by_id.get(chunk.chunk_id, ""),
                     }
                     for chunk in chunks
-                ],
-                generation=generation,
-            )
-            if lexical_current:
-                for chunk in chunks:
-                    lexical.index_chunk(chunk, generation=generation)
-            record = {
-                "size": plan["size"],
-                "mtime_ns": plan["mtime_ns"],
-                "content_hash": doc.content_hash or plan["content_hash"],
-                "status": "indexed",
-                "failure_state": None,
-                "failure_reason": None,
-                "failure_detail": None,
-                "capability_signature": plan["capability_signature"],
-                "extractor_id": doc.extracted_by,
-                "extractor_version": doc.extractor_version,
-                "chunker_id": chunks[0].chunked_by,
-                "chunker_version": chunks[0].chunker_version,
-                "embedder_id": vectors[0].model_id,
-                "embedder_version": vectors[0].model_version,
-                "dim": vectors[0].dim,
-                "chunk_ids": chunk_ids,
-                "sections": {
-                    section_id: {
-                        "heading": section_headings[section_id],
-                        "text": section_texts[section_id],
-                        "chunk_count": section_counts[section_id],
-                    }
-                    for section_id in section_counts
-                },
-                "links": raw_links,
-            }
-            plan["record"] = record
-            file_report.extracted = True
-            file_report.chunk_count = len(chunks)
-            files_done += 1
-            chunks_done += len(chunks)
-            _emit("file_complete", current_path=path, message=f"已完成：{path}")
+                )
+                if len(buffer_ids) >= _WRITE_FLUSH_CHUNKS:
+                    _flush_vector_buffer()
+                    _emit("writing", stall_grace_s=180.0, message="正在写入向量库")
+                if lexical_current:
+                    for chunk in chunks:
+                        lexical.index_chunk(chunk, generation=generation)
+                first_vector = file_vectors[0]
+                plan["record"] = {
+                    "size": plan["size"],
+                    "mtime_ns": plan["mtime_ns"],
+                    "content_hash": item.content_hash,
+                    "status": "indexed",
+                    "failure_state": None,
+                    "failure_reason": None,
+                    "failure_detail": None,
+                    "capability_signature": plan["capability_signature"],
+                    "extractor_id": item.extracted_by,
+                    "extractor_version": item.extractor_version,
+                    "chunker_id": chunks[0].chunked_by,
+                    "chunker_version": chunks[0].chunker_version,
+                    "embedder_id": first_vector.model_id,
+                    "embedder_version": first_vector.model_version,
+                    "dim": first_vector.dim,
+                    "chunk_ids": chunk_ids,
+                    "sections": {
+                        section_id: {
+                            "heading": item.section_headings[section_id],
+                            "text": item.section_texts[section_id],
+                            "chunk_count": item.section_counts[section_id],
+                        }
+                        for section_id in item.section_counts
+                    },
+                    "links": item.raw_links,
+                }
+                item.file_report.extracted = True
+                item.file_report.chunk_count = len(chunks)
+            _flush_vector_buffer()
 
         if lexical_current:
             if force_lexical:

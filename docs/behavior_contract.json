@@ -106,7 +106,9 @@
         "obsidian-rag/index.py:114-159",
         "obsidian-rag/index.py:2142-2148",
         "obsidian-rag/index.py:2204-2206",
-        "obsidian-rag/index.py:97-101"
+        "obsidian-rag/index.py:97-101",
+        "obsidian-rag/index.py:2056-2300",
+        "obsidian-rag/gui/store.py:317-326"
       ],
       "redo_refs": [
         "rag-redo/plugins/official-extractor-text/official_extractor_text/extract.py::extract",
@@ -114,7 +116,9 @@
         "rag-redo/core/pipeline.py::Pipeline._failure_record",
         "rag-redo/core/pipeline.py::Pipeline.failure_will_retry",
         "rag-redo/core/pipeline.py::Pipeline.index_library deferred 分支",
-        "rag-redo/core/index_progress.py::IndexProgress"
+        "rag-redo/core/index_progress.py::IndexProgress",
+        "rag-redo/core/pipeline.py:_PendingFile",
+        "rag-redo/core/index_progress.py:IndexWorkerManager.status"
       ],
       "test_refs": [
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_empty_and_tbd_terminal_states_are_stable_until_content_changes",
@@ -123,9 +127,15 @@
         "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_deferred_is_not_a_terminal_failure_and_remains_stale",
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_deferred_keeps_previous_record_and_old_chunks_searchable",
         "rag-redo/plugins/official-extractor-text/tests/test_extract.py::TestExtract.test_utf8_bom_is_handled",
-        "rag-redo/plugins/official-extractor-text/tests/test_extract.py::TestExtract.test_crlf_and_lf_produce_identical_markdown"
+        "rag-redo/plugins/official-extractor-text/tests/test_extract.py::TestExtract.test_crlf_and_lf_produce_identical_markdown",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_all_files_are_extracted_before_the_first_embedding_call",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_embedding_is_one_continuous_stream_across_files_not_one_call_per_file",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_embedding_progress_counts_chunks_and_never_precedes_extraction_progress",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_failure_while_embedding_publishes_nothing_and_keeps_the_old_index",
+        "rag-redo/tests/test_index_progress.py::TestIndexWorkerManager.test_embedding_phase_percent_counts_chunks_and_gives_no_file_based_eta",
+        "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestProgressSnapshot.test_embedding_phase_progress_counts_chunks_like_the_legacy_bar"
       ],
-      "acceptance": "unreadable、empty、tbd、scanned、extract-failed 等终态可区分；稳定失败不重复消耗资源；能力签名变化和内容变化可重试；deferred 不得伪装成终态且不落 manifest 记录——保留旧条目与旧块继续服务（检索不受影响），文件与旧记录的差异驱动下一轮自动重试，恢复后重试成功。【经操作者确认的偏离（2026-09-29）】文本提取器读文件时先剥掉开头的 UTF-8 BOM、再把 \\r\\n 与 \\r 统一成 \\n；旧项目 index.py:100 是裸 utf-8 解码、不做这两步（BOM 会以看不见的字符混进正文，Windows 换行会把 \\r 带进块文本，同一篇笔记在 Windows/Linux 间还会被当成内容变了）。用户可见的后果：含 CRLF 或 BOM 的旧笔记，块文本会变，迁移后首轮索引会重建一次，之后与旧项目一样稳定。除这两步外，解码降级（非 UTF-8 用替换字符入库、不落失败终态）、空文件落 empty 终态与旧项目逐条一致。",
+      "acceptance": "unreadable、empty、tbd、scanned、extract-failed 等终态可区分；稳定失败不重复消耗资源；能力签名变化和内容变化可重试；deferred 不得伪装成终态且不落 manifest 记录——保留旧条目与旧块继续服务（检索不受影响），文件与旧记录的差异驱动下一轮自动重试，恢复后重试成功。【经操作者确认的偏离（2026-09-29）】文本提取器读文件时先剥掉开头的 UTF-8 BOM、再把 \\r\\n 与 \\r 统一成 \\n；旧项目 index.py:100 是裸 utf-8 解码、不做这两步（BOM 会以看不见的字符混进正文，Windows 换行会把 \\r 带进块文本，同一篇笔记在 Windows/Linux 间还会被当成内容变了）。用户可见的后果：含 CRLF 或 BOM 的旧笔记，块文本会变，迁移后首轮索引会重建一次，之后与旧项目一样稳定。除这两步外，解码降级（非 UTF-8 用替换字符入库、不落失败终态）、空文件落 empty 终态与旧项目逐条一致。【缺陷修复，恢复旧行为（2026-09-29）】索引轮次的顺序必须是旧项目 index.py:2056-2300 的三段：①逐个文件提取→清洗→切块，并把待嵌的块攒起来（提取失败/deferred/空文件/tbd 等终态在这一段就地落定）；②全部转换完后对所有待嵌块连续做向量（分片只为进度心跳，片内按文本长度排序减少填充，嵌入器内部批大小与显存自动收紧不变）；③统一写入向量库/词法库并生成清单记录，最后才原子发布 generation。此前是“一个文件：提取→切块→向量→写库”再下一个，真机上显卡每做完一个小文件就闲下来等 CPU（GPU 功耗在 0 和高值间来回跳），MinerU/WEMM 与向量模型在每个文件之间来回抢显存。进度口径随之对齐旧 gui/store.py::progress_ratio：向量化阶段进度条与 percent 按块数、其余阶段按文件数，按文件外推的剩余时间在向量化/写入阶段不给。任何一段异常整轮不发布，旧索引不动（有测试）。",
       "blocker": ""
     },
     {
