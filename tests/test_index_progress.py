@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -26,6 +27,7 @@ PLUGIN_SOURCE = textwrap.dedent(
 
     import json
     import os
+    import sys
     import time
     from pathlib import Path
     from types import SimpleNamespace
@@ -40,6 +42,7 @@ PLUGIN_SOURCE = textwrap.dedent(
             roots = json.loads((self._data_dir / "worker_roots.json").read_text(encoding="utf-8"))
             self.roots = roots
             self.mode = (self._data_dir / "worker_mode.txt").read_text(encoding="utf-8").strip()
+            (self._data_dir / "worker_utf8.txt").write_text(str(sys.flags.utf8_mode), encoding="utf-8")
             if self.mode == "early_crash":
                 os._exit(24)
             if self.mode == "foreign":
@@ -108,6 +111,10 @@ PLUGIN_SOURCE = textwrap.dedent(
                 os._exit(23)
             if self.mode == "fail":
                 raise RuntimeError("worker exploded")
+            if self.mode == "fail_lib1" and chunks and chunks[0].library_id == "lib1":
+                raise RuntimeError("lib1 exploded")
+            if self.mode == "long_lib1" and chunks and chunks[0].library_id == "lib1":
+                time.sleep(2.0)
             return [
                 EmbeddingVector(
                     chunk_id=chunk.chunk_id,
@@ -317,6 +324,8 @@ class TestIndexWorkerManager(unittest.TestCase):
         self._wait_stage("lib1", "done")
 
     def test_different_libraries_run_in_parallel(self):
+        # 只说 `start()` 本身：各自独立的单库调用（如 MCP 的 reindex_knowledge）互不排队。
+        # "一次点击重建多个库"走 `start_batch`，那条是串行的（见下面的批次测试）。
         self._set_mode("long")
         first = self.manager.start("lib1")
         second = self.manager.start("lib2")
@@ -442,6 +451,144 @@ class TestIndexWorkerManager(unittest.TestCase):
         status_path.write_text("{broken", encoding="utf-8")
         self.assertIsNone(self.manager.status("corrupt"))
 
+    # ---- 一次重建多个库：依次串行（旧项目 index.py `__main__` 的逐库循环）--------
+    #
+    # 此前 GUI 对每个库各起一个 worker，4 个库 = 4 份模型同时占显卡/CPU（2026-09-29
+    # 真机复现）。`start_batch`：第一个立刻起，其余排队，前一个退出才起下一个。
+
+    def _batch_idle(self, timeout_s: float = 8.0) -> bool:
+        return _wait_until(lambda: not self.manager._batches, timeout_s)
+
+    def test_batch_runs_libraries_one_after_another_never_together(self):
+        self._set_mode("long_lib1")
+        result = self.manager.start_batch(["lib1", "lib2"], source="test")
+        self.assertTrue(result.started, result.message)
+        self.assertTrue(result.run_id)
+        # lib1 在跑（要 2 秒），lib2 还在排队：没有 worker、没有进度文件，读模型合成"排队中"
+        self.assertTrue(
+            _wait_until(lambda: (self.manager.status("lib1") or {}).get("stage") == "running", 5.0)
+        )
+        queued = self.manager.status("lib2") or {}
+        self.assertEqual((queued.get("stage"), queued.get("phase")), ("starting", "queued"))
+        self.assertTrue(queued["active"])
+        self.assertTrue(queued["can_stop"])
+        self.assertEqual(queued["owner"], "self")
+        self.assertEqual(queued["run_id"], "")
+        self.assertIn("排队", queued["message"])
+        self.assertIsNone(_read_json(self.manager._status_path("lib2")), "排队的库不该已经有 worker 的进度文件")
+        first = self._wait_stage("lib1", "done")
+        second = self._wait_stage("lib2", "done")
+        self.assertGreaterEqual(
+            second["started_at"], first["finished_at"], "lib2 必须在 lib1 结束之后才开始，不能同时跑"
+        )
+        self.assertNotEqual(first["worker_pid"], second["worker_pid"])
+        self.assertTrue(self._batch_idle(), "整批结束后批次线程应退出、队列清空")
+
+    def test_batch_continues_with_the_next_library_after_one_fails(self):
+        self._set_mode("fail_lib1")
+        result = self.manager.start_batch(["lib1", "lib2"], source="test")
+        self.assertTrue(result.started, result.message)
+        failed = self._wait_stage("lib1", "failed")
+        self.assertIn("lib1 exploded", failed["error"])
+        done = self._wait_stage("lib2", "done")  # 旧项目：索引失败（继续下一库）
+        self.assertEqual(done["succeeded"], 1)
+
+    def test_stopping_the_running_library_cancels_the_rest_of_the_batch(self):
+        self._set_mode("long_lib1")
+        result = self.manager.start_batch(["lib1", "lib2"], source="test")
+        self.assertTrue(result.started, result.message)
+        self.assertTrue(
+            _wait_until(lambda: (self.manager.status("lib1") or {}).get("stage") == "running", 5.0)
+        )
+        stopped, message = self.manager.stop("lib1", result.run_id)
+        self.assertTrue(stopped, message)
+        self._wait_stage("lib1", "cancelled")
+        self.assertTrue(self._batch_idle())
+        time.sleep(1.0)  # 给"错误地把下一个库起起来"留出足够时间
+        self.assertIsNone(self.manager.status("lib2"), "停止 = 整批取消，lib2 不许被起起来")
+        self.assertFalse(self.manager._status_path("lib2").exists())
+
+    def test_stopping_a_queued_library_only_removes_it_from_the_queue(self):
+        self._set_mode("long_lib1")
+        result = self.manager.start_batch(["lib1", "lib2"], source="test")
+        self.assertTrue(result.started, result.message)
+        stopped, message = self.manager.stop("lib2")
+        self.assertTrue(stopped, message)
+        self.assertIn("队列", message)
+        self.assertIsNone(self.manager.status("lib2"))
+        self._wait_stage("lib1", "done")  # 在跑的那个不受影响
+        self.assertTrue(self._batch_idle())
+        time.sleep(0.5)
+        self.assertFalse(self.manager._status_path("lib2").exists(), "被取消的库不许再被起起来")
+
+    def test_a_queued_library_cannot_be_started_or_queued_again(self):
+        self._set_mode("long_lib1")
+        result = self.manager.start_batch(["lib1", "lib2"], source="test")
+        self.assertTrue(result.started, result.message)
+        again = self.manager.start("lib2")
+        self.assertFalse(again.started)
+        self.assertIn("排队", again.message)
+        batch_again = self.manager.start_batch(["lib2"], source="test")
+        self.assertFalse(batch_again.started)
+        self.assertIn("排队", batch_again.message)
+        self._wait_stage("lib2", "done")
+
+    def test_batch_whose_first_library_cannot_start_does_not_begin(self):
+        self._set_mode("long")
+        first = self.manager.start("lib1")
+        self.assertTrue(first.started, first.message)
+        refused = self.manager.start_batch(["lib1", "lib2"], source="test")
+        self.assertFalse(refused.started)
+        self.assertIn("已经有一个索引任务在跑", refused.message)
+        self.assertFalse(self.manager._batches, "起不来的批次不能留下幽灵队列")
+        self.assertIsNone(self.manager.status("lib2"))
+        self._wait_stage("lib1", "done")
+
+    def test_single_library_batch_is_just_start(self):
+        result = self.manager.start_batch(["lib1"], source="test")
+        self.assertTrue(result.started, result.message)
+        self.assertFalse(self.manager._batches)
+        self._wait_stage("lib1", "done")
+
+    def test_shutdown_drops_the_queue(self):
+        self._set_mode("long_lib1")
+        result = self.manager.start_batch(["lib1", "lib2"], source="test")
+        self.assertTrue(result.started, result.message)
+        self.manager.shutdown()
+        self.assertIsNone(self.manager.status("lib2"))
+        self.assertTrue(self._batch_idle())
+        time.sleep(0.5)
+        self.assertFalse(self.manager._status_path("lib2").exists())
+
+    # ---- worker 输出与崩溃留痕 ------------------------------------------------
+
+    def test_worker_starts_in_utf8_mode_and_the_launcher_environment_is_left_alone(self):
+        """worker 以 UTF-8 模式启动（默认编码也是 UTF-8，不只是标准流）；起完进程后发起方环境还原。"""
+        before = os.environ.get("PYTHONUTF8")
+        result = self.manager.start("lib1", source="test")
+        self.assertTrue(result.started, result.message)
+        self._wait_stage("lib1", "done")
+        marker = (self.data_dir / "worker_utf8.txt").read_text(encoding="utf-8")
+        self.assertEqual(marker, "1", "worker 进程应在 UTF-8 模式下启动")
+        self.assertEqual(os.environ.get("PYTHONUTF8"), before, "起进程只是临时设置，不能污染发起进程的环境")
+
+    def _read_log(self) -> str:
+        path = self.data_dir / "index_worker.log"
+        return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+    def test_worker_failure_leaves_a_library_line_and_the_traceback_in_the_log(self):
+        """崩了不能只剩进度文件里的一句摘要：日志里要有"哪个库、什么错"和完整堆栈。"""
+        self._set_mode("fail")
+        result = self.manager.start("lib1")
+        self.assertTrue(result.started, result.message)
+        self._wait_stage("lib1", "failed")
+        self.assertTrue(
+            _wait_until(lambda: "Traceback" in self._read_log(), 5.0), self._read_log()
+        )
+        log = self._read_log()
+        self.assertIn("[lib1] 索引失败：RuntimeError: worker exploded", log)
+        self.assertIn('raise RuntimeError("worker exploded")', log)
+
     # ---- 读侧瞬时失败（审计 M-1：停止按钮间歇性被拒）------------------------
     #
     # 根因：Windows 上读者恰好撞上另一方的 `os.replace`，会得到瞬时的
@@ -525,6 +672,53 @@ class TestIndexWorkerManager(unittest.TestCase):
         stopped, message = self.manager.stop("never-started", "x")
         self.assertFalse(stopped)
         self.assertIn("没有可停止的索引任务", message)
+
+
+class TestWorkerOutputEncoding(unittest.TestCase):
+    """worker 输出必须是 UTF-8：中文写不进系统编码（Windows cp1252）时不许把整轮索引带崩。
+
+    2026-09-29 真机：4 个库的后台索引全都在中途崩于
+    `UnicodeEncodeError: 'charmap' codec can't encode characters`，用户看到"没转成向量，
+    也没报错"。子进程里 stdout 按系统区域编码严格编码，中文一写就抛。
+    """
+
+    def _run(self, code: str, *args: str) -> "subprocess.CompletedProcess[bytes]":
+        env = {k: v for k, v in os.environ.items() if k not in {"PYTHONUTF8", "PYTHONIOENCODING"}}
+        env["PYTHONIOENCODING"] = "cp1252"  # 复现系统区域编码（Windows 中文版之外的默认）
+        return subprocess.run(
+            [sys.executable, "-c", code, *args],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            timeout=60,
+        )
+
+    def test_control_plain_print_of_chinese_crashes_under_cp1252(self):
+        """对照：不做处理时，同样的环境里 print 中文确实会崩——证明下面的测试有意义。"""
+        proc = self._run("print('中文输出')")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(b"UnicodeEncodeError", proc.stderr)
+
+    def test_redirect_output_makes_chinese_print_and_stderr_safe_and_utf8_on_disk(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        log = tmp / "worker.log"
+        code = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+            "from pathlib import Path\n"
+            "from core.index_progress import _redirect_output\n"
+            "_redirect_output(Path(sys.argv[1]))\n"
+            "print('中文输出：模型已加载')\n"
+            "print('emoji 😀 也不许崩')\n"
+            "sys.stderr.write('错误：堆栈\\n')\n"
+        )
+        proc = self._run(code, str(log))
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", errors="replace"))
+        text = log.read_text(encoding="utf-8")
+        self.assertIn("中文输出：模型已加载", text)
+        self.assertIn("错误：堆栈", text)
+        self.assertIn("emoji", text)
 
 
 if __name__ == "__main__":

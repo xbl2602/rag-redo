@@ -137,7 +137,7 @@ class TestContractReturnShapes(unittest.TestCase):
 
         def start_index():
             fake = Mock(started=True, message="ok", run_id="r1", worker_pid=1)
-            with patch.object(env.pipeline, "start_index_library", return_value=fake):
+            with patch.object(env.pipeline, "start_index_libraries", return_value=fake):
                 return api.start_index(False, "测试库")
 
         def open_source():
@@ -638,11 +638,98 @@ class TestProgressSnapshot(unittest.TestCase):
         self.assertEqual((busy["ok"], busy.get("already_running")), (False, True))
         fail = Mock(started=False, message="启动失败：无法获取库锁", run_id="", worker_pid=None)
         with patch.object(self.env.pipeline, "index_status", return_value=None), \
-                patch.object(self.env.pipeline, "start_index_library", return_value=fail):
+                patch.object(self.env.pipeline, "start_index_libraries", return_value=fail):
             failed = self.api.start_index(True, "")
         self.assertFalse(failed["ok"])
         self.assertNotIn("already_running", failed, "启动失败不是'已在运行'，此前一律误标成 already_running")
         self.assertIn("无法获取库锁", failed["error"])
+
+
+
+class TestStartIndexBatch(unittest.TestCase):
+    """一次重建多个库：整批交给 core 依次排队（旧项目一次点击只起一个索引进程，逐库循环）。
+
+    此前入口层对每个库各调一次 `start_index_library`，4 个库 = 4 个 worker 同时开跑，
+    同时加载模型压满显卡和 CPU（2026-09-29 真机复现）。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.env = GuiTestEnv(plugins=["official-library-manager"])
+        cls.api = cls.env.api
+        for name in ("库甲", "库乙", "库丙"):
+            vault = cls.env.make_vault(f"v_{name}", {"a.md": "# a\n\nx"})
+            assert cls.api.add_library(str(vault), name)["ok"]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.env.close()
+
+    def test_start_index_hands_the_whole_batch_to_core_in_one_call(self) -> None:
+        ok = Mock(started=True, message="ok", run_id="r1", worker_pid=1)
+        with patch.object(self.env.pipeline, "index_status", return_value=None), \
+                patch.object(self.env.pipeline, "start_index_libraries", return_value=ok) as batch, \
+                patch.object(self.env.pipeline, "start_index_library") as single:
+            result = self.api.start_index(False, "")
+        self.assertTrue(result["ok"], result)
+        batch.assert_called_once()
+        ids = list(batch.call_args.args[0])
+        self.assertEqual(len(ids), 3)
+        self.assertEqual(result["started"], ids)
+        self.assertEqual(batch.call_args.kwargs, {"source": "gui", "full": False})
+        single.assert_not_called()
+
+    def test_progress_shows_the_running_library_not_every_queued_name(self) -> None:
+        """排队中的库（phase=queued）不并进进度条的库名/阶段，只有排队的空档才显示队首。"""
+        now = time.time()
+
+        def status(library_id: str) -> dict:
+            queued = library_id != "库甲"
+            return {
+                "library_id": library_id, "run_id": "" if queued else "r1", "stage": "starting" if queued else "running",
+                "phase": "queued" if queued else "embedding",
+                "files_done": 0 if queued else 5, "files_total": 0 if queued else 10,
+                "chunks_done": 0, "chunks_total": None,
+                "started_at": now - 30 + (1 if library_id == "库丙" else 0), "heartbeat_at": now, "progress_at": now,
+                "stall_grace_until": None, "finished_at": None, "elapsed_s": 30.0, "eta_s": None,
+                "percent": 0.0, "owner": "self", "active": True, "can_stop": True, "health": "healthy",
+                "message": "", "error": None,
+            }
+
+        with patch.object(self.env.pipeline, "index_status", side_effect=status):
+            progress = self.api.get_snapshot()["progress"]
+        self.assertTrue(progress["running"])
+        self.assertEqual(progress["library"], "库甲")
+        self.assertEqual(progress["phase"], "embedding")
+        self.assertEqual((progress["files_done"], progress["files_total"]), (5, 10))
+
+    def test_gap_between_two_libraries_still_reads_as_running(self) -> None:
+        """上一个库刚结束、下一个还没起来的交接空档：只剩排队中的库，界面不能闪成"完成/空闲"。"""
+        now = time.time()
+
+        def status(library_id: str) -> dict | None:
+            if library_id == "库甲":  # 刚跑完
+                return {
+                    "library_id": library_id, "run_id": "r1", "stage": "done", "phase": "finalizing",
+                    "files_done": 10, "files_total": 10, "chunks_done": 3, "chunks_total": 3,
+                    "started_at": now - 60, "heartbeat_at": now, "progress_at": now,
+                    "stall_grace_until": None, "finished_at": now - 1, "elapsed_s": 59.0, "eta_s": 0.0,
+                    "percent": 100.0, "owner": "self", "active": False, "can_stop": False, "health": "healthy",
+                    "message": "", "error": None,
+                }
+            return {
+                "library_id": library_id, "run_id": "", "stage": "starting", "phase": "queued",
+                "files_done": 0, "files_total": 0, "chunks_done": 0, "chunks_total": None,
+                "started_at": now - 60 + (1 if library_id == "库丙" else 0), "heartbeat_at": now, "progress_at": now,
+                "stall_grace_until": None, "finished_at": None, "elapsed_s": 60.0, "eta_s": None,
+                "percent": 0.0, "owner": "self", "active": True, "can_stop": True, "health": "healthy",
+                "message": "", "error": None,
+            }
+
+        with patch.object(self.env.pipeline, "index_status", side_effect=status):
+            progress = self.api.get_snapshot()["progress"]
+        self.assertTrue(progress["running"], "交接空档不能被显示成已完成")
+        self.assertEqual(progress["library"], "库乙", "只显示队首，不把所有排队的库名连起来")
 
 
 class TestPreviewLifecycle(unittest.TestCase):

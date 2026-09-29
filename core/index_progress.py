@@ -1,12 +1,21 @@
 """core/index_progress.py — 索引进度报告 + 独立工作进程（核心服务，不是插件）。
 
 GUI 和 MCP 可以是两个独立进程，所以最近一次进度、worker 状态和停止操作都
-通过磁盘状态与每库文件锁协调。同一个库只允许一个 worker 持锁运行，不同库
-可以并行；worker 持锁到退出，操作系统会在进程崩溃后自动释放锁。
+通过磁盘状态与每库文件锁协调。同一个库只允许一个 worker 持锁运行；worker
+持锁到退出，操作系统会在进程崩溃后自动释放锁。
+
+**一次"重建多个库"是串行的**（`IndexWorkerManager.start_batch`，2026-09-29
+按旧项目 `obsidian-rag/index.py` 的 `__main__` 校正）：旧项目一次点击只起一个
+索引进程、按库 `for` 循环一个接一个跑，某个库失败记一行日志继续下一库；此前这里
+对每个库同时各起一个 worker，4 个库就是 4 份模型同时占显卡/CPU。现在第一个库立刻
+起 worker，其余的排在管理器的内存队列里，前一个 worker 退出后才起下一个；停止
+（停在跑的那个）= 整批取消，和旧项目 taskkill 掉那一个进程等价。不同批次/不同
+入口（MCP 单库调用、CLI）互不排队，仍靠每库文件锁保证同库互斥。
 """
 from __future__ import annotations
 
 import atexit
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -15,8 +24,10 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
+import traceback
 import uuid
 import weakref
 from multiprocessing.process import BaseProcess
@@ -140,6 +151,54 @@ def _redirect_output(log_path: Path) -> None:
         os.dup2(fd, 2)
     finally:
         os.close(fd)
+    _use_utf8_output()
+
+
+#: 起 worker 期间改环境变量要互斥：`os.environ` 是进程级的，多线程同时改会互相踩。
+_SPAWN_ENV_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _utf8_child_environment() -> Iterator[None]:
+    """让 spawn 出来的 worker 以 UTF-8 模式启动（等价 `python -X utf8`），只在起进程的这一瞬间生效。
+
+    只换 `sys.stdout/stderr`（见 `_use_utf8_output`）挡不住第三方库直接 `open(path, "w")` 用
+    系统默认编码（Windows 上是 cp1252）写中文——那同样抛 `UnicodeEncodeError: 'charmap'`。
+    UTF-8 模式把**默认编码**也一并改成 UTF-8，是这一类问题的根治办法。`multiprocessing`
+    的 spawn 没有传解释器参数的口子，只能借环境变量：起进程时临时设上、起完立刻还原，
+    不污染发起进程自己和它之后启动的其他子进程。
+    """
+    with _SPAWN_ENV_LOCK:
+        previous = os.environ.get("PYTHONUTF8")
+        os.environ["PYTHONUTF8"] = "1"
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop("PYTHONUTF8", None)
+            else:
+                os.environ["PYTHONUTF8"] = previous
+
+
+def _use_utf8_output() -> None:
+    """把 worker 的 `sys.stdout`/`sys.stderr` 换成 UTF-8 文本流，写不进的字符替换而不抛错。
+
+    **为什么**（2026-09-29 真机现象）：4 个库的后台索引全都死于 `UnicodeEncodeError:
+    'charmap' codec can't encode characters`，用户看到的是"没变成向量，也没报错"。
+    worker 是 spawn 出来的子进程，Windows 上标准流继承系统区域编码（这台机器是 cp1252），
+    fd 重定向只换了底层文件、没换 Python 层的编码；`print` 往 stdout 写中文就会抛（stdout
+    是严格编码，已用对照测试确认）。具体是哪一行触发的没有定位到，所以这里不猜，直接把
+    两个标准流统一成 UTF-8：日志文件本来就按 UTF-8 读（GUI 日志面板），`errors="replace"`
+    保证再怪的字符也只是变成 `?`，不会让索引因为日志而死。标准流本身为 `None`（无控制台
+    启动）时同样适用——这里是新建的流，不依赖原来的。默认编码层面的兜底见
+    `_utf8_child_environment`。
+    """
+    for fd, name in ((1, "stdout"), (2, "stderr")):
+        try:
+            stream = open(fd, "w", encoding="utf-8", errors="replace", buffering=1, closefd=False)
+        except OSError:
+            continue
+        setattr(sys, name, stream)
 
 
 def _terminate_worker(process: BaseProcess) -> bool:
@@ -454,6 +513,14 @@ def _index_worker(
             }
         except Exception as exc:
             terminal_error = f"{type(exc).__name__}: {exc}"
+            # 进度文件只留这一行摘要；完整堆栈和一行"哪个库失败了"写进 worker 日志
+            # （GUI 日志面板读它；旧项目同款：`[库名] 索引失败：原因`）。此前只留摘要，
+            # 崩在哪一行事后完全查不出来。日志写不进也不许盖掉真正的失败状态。
+            try:
+                print(f"[{library_id}] 索引失败：{terminal_error}")
+                traceback.print_exc()
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             if runtime is not None:
                 for plugin_id in reversed(activated):
@@ -496,6 +563,24 @@ def _status_key(library_id: str) -> str:
     return f"{safe}-{hashlib.sha256(library_id.encode('utf-8')).hexdigest()[:16]}"
 
 
+@dataclasses.dataclass
+class _Batch:
+    """一次"依次索引多个库"的排队状态（只存在于发起它的管理器内存里）。
+
+    `queue` 是还没轮到的库（按顺序）；正在跑的那个库不在里面，它的 run_id 记在
+    `current_run_id`，停止时据此认出"这是哪一批的"。`cancelled` 被置位后，批次线程
+    不再起新的 worker。
+    """
+
+    source: str
+    full: bool
+    format_allowlist: tuple[str, ...] | None
+    queue: list[str]
+    created_at: float
+    cancelled: threading.Event = dataclasses.field(default_factory=threading.Event)
+    current_run_id: str = ""
+
+
 class IndexWorkerManager:
     HEARTBEAT_TIMEOUT_S = 15.0
     STALL_TIMEOUT_S = 25.0  # 对齐旧项目 config.py::stall_timeout（进度停滞判定，5×心跳间隔）
@@ -525,6 +610,7 @@ class IndexWorkerManager:
         self._lock = threading.Lock()
         self._workers: dict[str, BaseProcess] = {}
         self._worker_libraries: dict[str, str] = {}
+        self._batches: list[_Batch] = []
         self._cleanup_callback: Callable[[str, str], None] | None = None
         atexit.register(_shutdown_index_worker_manager, weakref.ref(self))
 
@@ -589,8 +675,11 @@ class IndexWorkerManager:
         full: bool = False,
         *,
         format_allowlist: tuple[str, ...] | None = None,
+        _from_batch: bool = False,
     ) -> IndexStartResult:
         self._reap_finished()
+        if not _from_batch and self._is_queued(library_id):
+            return IndexStartResult(False, f"库「{library_id}」已经在索引队列里排队")
         run_id = uuid.uuid4().hex
         try:
             self._data_dir.mkdir(parents=True, exist_ok=True)
@@ -620,7 +709,8 @@ class IndexWorkerManager:
             daemon=False,
         )
         try:
-            process.start()
+            with _utf8_child_environment():
+                process.start()
         except Exception as exc:
             return IndexStartResult(False, f"启动失败：无法创建索引工作进程：{type(exc).__name__}: {exc}")
         with self._lock:
@@ -674,8 +764,175 @@ class IndexWorkerManager:
                 return IndexStartResult(False, message)
             time.sleep(0.02)
 
+    # ------------------------------------------------------------------
+    # 依次索引多个库（串行批次）
+    # ------------------------------------------------------------------
+
+    def _is_queued(self, library_id: str) -> bool:
+        with self._lock:
+            return any(library_id in batch.queue for batch in self._batches)
+
+    def _append_log(self, line: str) -> None:
+        """往 worker 日志（GUI 日志面板读的那份）追加一行。写不进就算了。"""
+        try:
+            path = self._data_dir / INDEX_LOG_NAME
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("ab") as handle:
+                handle.write((line + "\n").encode("utf-8", errors="replace"))
+        except OSError:
+            pass
+
+    def start_batch(
+        self,
+        library_ids: list[str] | tuple[str, ...],
+        source: str = "api",
+        full: bool = False,
+        *,
+        format_allowlist: tuple[str, ...] | None = None,
+    ) -> IndexStartResult:
+        """一次点击索引多个库：**依次**一个一个跑（对齐旧项目 `index.py` 的逐库循环）。
+
+        第一个库立刻起 worker，返回它的启动结果（起不来就整批不开始，原样返回失败原因）；
+        其余库进内存队列，由批次线程在前一个 worker 退出后再起下一个。某个库失败或起不来
+        不影响后面的库（旧项目：`索引失败（继续下一库）`）。只有一个库时等价于 `start()`。
+        """
+        ids = list(dict.fromkeys(library_ids))
+        if not ids:
+            return IndexStartResult(False, "没有可索引的库")
+        for library_id in ids:
+            if self._is_queued(library_id):
+                return IndexStartResult(False, f"库「{library_id}」已经在索引队列里排队")
+        if len(ids) == 1:
+            return self.start(ids[0], source, full, format_allowlist=format_allowlist)
+        batch = _Batch(
+            source=source,
+            full=full,
+            format_allowlist=format_allowlist,
+            queue=ids[1:],
+            created_at=time.time(),
+        )
+        # 先登记队列再起第一个：起的过程中后面的库就已经显示"排队中"，
+        # 不会出现别的调用在这个空档里把它抢先单独开一份。
+        with self._lock:
+            self._batches.append(batch)
+        first = self.start(ids[0], source, full, format_allowlist=format_allowlist, _from_batch=True)
+        if not first.started:
+            with self._lock:
+                if batch in self._batches:
+                    self._batches.remove(batch)
+            return first
+        batch.current_run_id = first.run_id
+        threading.Thread(
+            target=self._run_batch,
+            args=(batch,),
+            daemon=True,
+            name="index-batch",
+        ).start()
+        return IndexStartResult(
+            True,
+            f"已开始后台重建索引（共 {len(ids)} 个库，依次进行）",
+            first.run_id,
+            first.worker_pid,
+        )
+
+    def _wait_run_end(self, batch: _Batch, run_id: str) -> None:
+        """等这个 run 的 worker 进程退出（或整批被取消）。"""
+        with self._lock:
+            process = self._workers.get(run_id)
+        while process is not None and process.is_alive():
+            if batch.cancelled.wait(0.2):
+                return
+        if process is not None:
+            process.join(timeout=1)
+        # worker 异常退出没来得及写终态时，在这里补成 failed，别让下一个库起来时上一个还挂着"运行中"
+        self._reap_finished()
+
+    def _run_batch(self, batch: _Batch) -> None:
+        try:
+            while True:
+                self._wait_run_end(batch, batch.current_run_id)
+                if batch.cancelled.is_set():
+                    return
+                with self._lock:
+                    if not batch.queue:
+                        return
+                    library_id = batch.queue[0]
+                result = self.start(
+                    library_id,
+                    batch.source,
+                    batch.full,
+                    format_allowlist=batch.format_allowlist,
+                    _from_batch=True,
+                )
+                with self._lock:
+                    # 取消（停止/关闭）可能在 start() 期间发生：队列已被清空就不再动它
+                    if batch.queue and batch.queue[0] == library_id:
+                        batch.queue.pop(0)
+                if batch.cancelled.is_set():
+                    return
+                if result.started:
+                    batch.current_run_id = result.run_id
+                else:
+                    # 起不来（如同库已被别的进程在跑）：留一行日志，继续下一个库
+                    self._append_log(f"[{library_id}] 索引未能启动（继续下一库）：{result.message}")
+                    batch.current_run_id = ""
+        finally:
+            with self._lock:
+                if batch in self._batches:
+                    self._batches.remove(batch)
+
+    def _cancel_batches_of_run(self, run_id: str) -> None:
+        """停止了某个在跑的 worker：它所在批次里还没轮到的库一并取消（整批停）。"""
+        with self._lock:
+            for batch in self._batches:
+                if batch.current_run_id == run_id:
+                    batch.cancelled.set()
+                    batch.queue.clear()
+
+    def _queued_status(self, library_id: str) -> dict | None:
+        """排队中的库没有 worker、没有进度文件，读模型在这里合成一份"排队中"的进度。
+
+        形状与 `status()` 的正常返回一致：阶段是 `starting`、`phase="queued"`、`active`
+        为真（这样界面不会在两个库交接的空档里误显示"已完成/空闲"，也不会允许再点一次
+        重建），`can_stop` 为真（停止 = 把它从队列里拿掉）。只在发起批次的这个进程里可见。
+        """
+        now = time.time()
+        with self._lock:
+            for batch in self._batches:
+                if library_id not in batch.queue:
+                    continue
+                ahead = batch.queue.index(library_id) + 1  # 正在跑的那个 + 队列里更靠前的
+                progress = IndexProgress(
+                    library_id=library_id,
+                    run_id="",
+                    source=batch.source,
+                    full=batch.full,
+                    launcher_pid=os.getpid(),
+                    worker_pid=os.getpid(),
+                    stage="starting",
+                    phase="queued",
+                    message=f"排队等待（前面还有 {ahead} 个库）",
+                    # 按队列位置错开一点点，界面按 started_at 排序时保持队列顺序
+                    started_at=batch.created_at + ahead * 1e-3,
+                    heartbeat_at=now,
+                    progress_at=now,
+                )
+                result = dataclasses.asdict(progress)
+                result["elapsed_s"] = max(0.0, now - batch.created_at)
+                result["eta_s"] = None
+                result["percent"] = 0.0
+                result["owner"] = "self"
+                result["active"] = True
+                result["can_stop"] = True
+                result["health"] = "healthy"
+                return result
+        return None
+
     def status(self, library_id: str) -> dict | None:
         self._reap_finished()
+        queued = self._queued_status(library_id)
+        if queued is not None:
+            return queued
         data = _read_json(self._status_path(library_id))
         if data is None:
             return None
@@ -804,6 +1061,12 @@ class IndexWorkerManager:
         _atomic_write_json(self._status_path(library_id), data)
 
     def stop(self, library_id: str, run_id: str = "") -> tuple[bool, str]:
+        # 还在排队、没轮到的库：停止 = 把它从队列里拿掉（没有 worker 可杀）。
+        with self._lock:
+            for batch in self._batches:
+                if library_id in batch.queue:
+                    batch.queue.remove(library_id)
+                    return True, "已从索引队列取消"
         try:
             data = _read_json(self._status_path(library_id), strict=True)
         except StatusUnreadableError as exc:
@@ -849,6 +1112,9 @@ class IndexWorkerManager:
         ):
             return False, "拒绝停止：索引进度状态已经变化"
 
+        # 先把这一批后面排队的库取消，再杀 worker：否则 worker 一死，批次线程会抢在
+        # 我们前面把下一个库起起来（旧项目 taskkill 掉那一个进程 = 整轮都没了）。
+        self._cancel_batches_of_run(target_run_id)
         if not _terminate_worker(process):
             return False, "停止失败：索引工作进程或其进程树仍在运行"
         self._mark_terminal(library_id, target_run_id, "cancelled", "索引任务已取消")
@@ -858,6 +1124,9 @@ class IndexWorkerManager:
 
     def shutdown(self) -> None:
         with self._lock:
+            for batch in self._batches:
+                batch.cancelled.set()
+                batch.queue.clear()
             workers = list(self._workers.items())
         for run_id, process in workers:
             library_id = self._worker_libraries.get(run_id, "")

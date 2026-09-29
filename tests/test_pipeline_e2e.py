@@ -602,6 +602,18 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         start_mock.assert_called_once_with("test-lib", "e2e")
         stop_mock.assert_called_once_with("test-lib", result.run_id)
 
+    def test_start_index_libraries_hands_one_batch_to_the_manager_and_rejects_unknown_ids(self):
+        """多库重建整批交给管理器依次排队（旧项目一次点击只起一个进程）；未知库整批拒绝。"""
+        result = IndexStartResult(True, "started", "run-1", 123)
+        with patch.object(self.pipeline._index_progress, "start_batch", return_value=result) as batch:
+            outcome = self.pipeline.start_index_libraries(["test-lib", "test-lib"], source="e2e", full=True)
+        self.assertTrue(outcome.started)
+        batch.assert_called_once_with(["test-lib"], "e2e", True)
+        with patch.object(self.pipeline._index_progress, "start_batch") as never:
+            with self.assertRaises(KeyError):
+                self.pipeline.start_index_libraries(["test-lib", "no-such-lib"])
+        never.assert_not_called()
+
     def test_search_advice_uses_separate_response_channel(self):
         result = SearchResult("c1", "test-lib", "low.md", "低", "正文", 0.1)
         with patch.object(self.pipeline, "_search_once", return_value=SearchDelivery(tuple([result]))):

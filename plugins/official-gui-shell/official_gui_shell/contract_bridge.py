@@ -451,6 +451,14 @@ class _LegacyContractMixin:
             })
             return base
 
+        # 排队中的库（core 合成的 phase=queued）不参与合并：旧前端一根进度条展示的是"当前
+        # 正在跑的那个库"，不是所有排队的库名；只有排队的（两个库交接的空档）就展示队首那个，
+        # 这样界面不会在交接瞬间闪成"完成/空闲"。
+        working = [(c, s) for c, s in active if s.get("phase") != "queued"]
+        if working:
+            active = working
+        else:
+            active = sorted(active, key=lambda item: float(item[1].get("started_at") or 0.0))[:1]
         active.sort(key=lambda item: float(item[1].get("started_at") or 0.0))
         first_status = active[0][1]
         files_done = sum(int(s.get("files_done") or 0) for _c, s in active)
@@ -863,8 +871,9 @@ class _LegacyContractMixin:
     # ==================================================================
 
     def start_index(self, full: bool = False, libraries: str = "") -> dict[str, Any]:
-        """启动索引。`libraries` 逗号分隔的库名，空 = 全部已注册库。逐库调 core 的
-        `start_index_library`，本方法不重试、不排队、不判断该不该重跑。"""
+        """启动索引。`libraries` 逗号分隔的库名，空 = 全部已注册库。整批交给 core 的
+        `start_index_libraries`：库**依次**一个一个跑（旧项目同款，见该方法说明），排队和
+        顺序由 core 负责；本方法不重试、不排队、不判断该不该重跑。"""
         try:
             scope = self._resolve_scope(libraries)
             if scope in ("", "all"):
@@ -877,17 +886,15 @@ class _LegacyContractMixin:
             return {"ok": False, "error": "没有可索引的库"}
         if self._any_index_active_in(targets):
             return {"ok": False, "already_running": True, "error": "已有索引任务在运行"}
-        started: list[str] = []
-        for library_id in targets:
-            try:
-                result = self._pipeline.start_index_library(  # type: ignore[attr-defined]
-                    library_id, source="gui", full=bool(full)
-                )
-            except Exception as exc:  # noqa: BLE001 - 单库失败不拖垮批次
-                return {"ok": False, "started": started, "error": _exc_text(exc)}
-            if not result.started:
-                return {"ok": False, "started": started, "error": result.message}
-            started.append(library_id)
+        try:
+            result = self._pipeline.start_index_libraries(  # type: ignore[attr-defined]
+                targets, source="gui", full=bool(full)
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "started": [], "error": _exc_text(exc)}
+        if not result.started:
+            return {"ok": False, "started": [], "error": result.message}
+        started = list(targets)  # 第一个已开跑，其余在 core 的队列里依次跟上
         self._invalidate_cache()
         names = "、".join(self._name_of(t) for t in started)
         self._log("触发%s重建（库=%s）" % ("全量" if full else "增量", names))

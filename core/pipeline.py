@@ -2012,6 +2012,31 @@ class Pipeline:
             format_allowlist=format_allowlist,
         )
 
+    def start_index_libraries(
+        self,
+        library_ids: list[str] | tuple[str, ...],
+        source: str = "api",
+        full: bool = False,
+    ) -> IndexStartResult:
+        """一次重建**多个库**——依次一个一个跑，不是同时开跑。
+
+        对齐 obsidian-rag `index.py` 的 `__main__`：一次调用只起一个索引进程、按库逐个
+        `for` 循环，某个库失败记日志后继续下一个（旧项目日志 `索引失败（继续下一库）`）。
+        此前 GUI 对每个库各调一次 `start_index_library`，4 个库就是 4 个 worker 同时加载
+        模型、同时压满显卡和 CPU。排队与"前一个结束再起下一个"由
+        `IndexWorkerManager.start_batch` 负责；入口层（GUI）不许自己拼这个顺序。
+
+        任一库不存在就整批拒绝（抛 `KeyError`，和单库入口同口径）；第一个库起不来则整批
+        不开始，返回失败原因。
+        """
+        lib_mgr = self._singleton("library_manager")
+        ids = list(dict.fromkeys(library_ids))
+        for library_id in ids:
+            if lib_mgr.store.get(library_id) is None:
+                raise KeyError(f"未知库: {library_id}")
+        self._index_progress.set_active_choices(self.runtime.registry.active_choices())
+        return self._index_progress.start_batch(ids, source, full)
+
     def stop_index_library(self, library_id: str, run_id: str = "") -> tuple[bool, str]:
         lib_mgr = self._singleton("library_manager")
         if lib_mgr.store.get(library_id) is None:
