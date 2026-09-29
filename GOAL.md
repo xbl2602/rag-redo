@@ -137,10 +137,10 @@
 - [x] C10 其余审计项（A9/A11/A14/A17/A19/A20/A21/A22）——契约门禁 11 项全绿（含"失效引用必须转红"自测）；`-W error` 编译全库 176 个 `.py` 0 失败；`stop` 注入 `PermissionError` 用例通过；A22 `unpack` 体积上限已加（阈值 8 GiB，待操作者确认后登记契约）；A13 不在本项范围，草案待操作者决定
 - [x] C11 全量回归 + 按主题提交（A15）——`tests/run.py` 53/53、退出码 0；累积改动已按主题拆成多个提交（`git log e141ce4..HEAD`），敏感文件模式与凭据扫描无命中，`test_agents_contract` 通过（含 AGENTS.md/CLAUDE.md 同步），未 push
 - [ ] C12 文档闭环（人工确认，我不代勾）
-- [ ] C13 A 索引顺序改回“先全部转换切块→连续做向量→一次写入”
-- [ ] C14 B WEMM 交接前让文字模型让出显卡
-- [ ] C15 C 本机 MinerU 服务并发应答 + /health 秒回
-- [ ] C16 D 设置页补 MinerU API Key 等真实在用的键，云端读设置
-- [ ] C17 E 水印页不再冒充文字层（BC-01 登记）
-- [ ] C18 关窗回收日志 + MinerU 单文件实测（数字待本机实跑）
-- [ ] C19 全量回归 + 契约门禁 + 分次提交（不 push）
+- [x] C13 A 索引顺序改回“先全部转换切块→连续做向量→一次写入”——`test_pipeline_e2e.py` 243 条 + `test_pipeline_data_safety.py` 94 条全绿；新增 4 条（全部提取完才有第一次向量化 / 跨文件连续调用 / 进度按块计 / 向量化中途失败不发布），改回旧实现时前三条转红；旧的“嵌入器调用 N 次”断言改为数被向量化的总块数（调用粒度是被有意改掉的结构）；GUI 进度条与 core percent 同步按阶段计（提交 b854016）
+- [x] C14 B WEMM 交接前让文字模型让出显卡——`visual_index.index_library` 新增可选 `before_serve`，视觉插件仅在有页要渲染时调用；同时补上“页级索引失败记录每轮重试”（旧项目行为）；插件 4 条 + 主管道 2 条测试（提交 6abfce8）
+- [x] C15 C 本机 MinerU 服务并发应答 + /health 秒回——进程内起服务端验证：解析卡住时 /health 1 秒内 200、探测不在请求线程、服务是 ThreadingHTTPServer；改回旧实现三条转红（提交 6475ea9）
+- [x] C16 D 设置页补 MinerU API Key 等真实在用的键，云端读设置——新增 `official-ocr-mineru-cloud/tests/test_plugin.py`（14 条）+ 设置页往返/保密/枚举 + 主管道能力签名；验证命令里 C16 写的 test 文件路径 `test_plugin.py` 即该新建文件（提交 08d70de）
+- [x] C17 E 水印页不再冒充文字层（BC-01 登记）——提取器 6 条 + 主管道 2 条；真实的 7 个 `empty` 文件复核全部转为 `scanned`；已知局限：单页水印扫描件无法识别（提交 d1cc38f）
+- [ ] C18 关窗回收日志 + MinerU 单文件实测——关窗回收日志已做并有 4 条测试（提交 a101bfa）；MinerU 单文件实测已在本机跑出并写入 ROADMAP（5 页扫描件：冷态 57.9 秒、热态 3.3 秒，热态 MinerU 进程树平均约 6.3 个 CPU 核、显卡利用率均值 14%/峰值 48%）。**追加（第 7 条）**：追查中抓到真实机制——宿主异常没了时 WEMM/MinerU 服务孤儿会一直活着占显存（实测一个活了 29 分钟以上）；已加“宿主没了就自退出”兜底（BC-11，`RAG_REDO_PARENT_PID` + 每 2 秒检查；有 4 条测试，关掉监视后端到端用例转红；真实 MinerU 模型已装进显存时宿主被硬杀，进程树 12.4 秒内全部消失、显存回基线）。**未勾的原因**：数字只是这台机器一个样本，真伪由操作者复核，我不代勾；操作者当时那一次“关 GUI 后残留”的具体原因仍未复现
+- [x] C19 全量回归 + 契约门禁 + 分次提交（不 push）——第一次全量 `tests/run.py` **55/55 套通过、退出码 0**（0 条 Traceback、0 条 SyntaxWarning）；加入“宿主没了子进程自退出”兜底后再跑一次 54/55：唯一红的是已知的间歇用例 `tests/test_subprocess_service.py::test_stop_actually_terminates_the_process_not_just_marks_it_gone`（杀掉子进程后立刻用 OpenProcess 查它是否消失，Windows 上进程已终止但只要还有句柄就仍能被打开；那次机器明显更慢，耗时约为第一次的两倍），单独重跑该用例 5/5 通过、整套重跑 3/3 通过，未改动它；契约门禁 11/11；分次提交见 `git log`；未 push；未提交 `data-real/`。工作区里另有 `README.md` 改动、`LICENSE`、`docs/DIAGRAMS.md`、`docs/media/` 未跟踪——都不是我改的/建的，未动未提交
