@@ -353,6 +353,70 @@ class TestVisualWemmPlugin(unittest.TestCase):
         self.instance.release_gpu()  # 不抛异常即通过
         self.assertIsNone(self.instance._handle)  # noqa: SLF001
 
+    def test_subprocess_is_pointed_at_the_default_project_models_folder(self):
+        """BC-17：没配 models_dir 时，看图服务去项目内的 models/ 找/下模型。"""
+        from core.paths import models_dir
+
+        env = self.instance._handle._env  # noqa: SLF001
+        self.assertEqual(env["HF_HUB_CACHE"], str(models_dir("")))
+        self.assertEqual(Path(env["HF_HUB_CACHE"]).name, "models")
+        self.assertIn("PATH", env, "子进程必须继承当前环境，丢 PATH 会直接起不来")
+
+    def test_subprocess_uses_the_configured_models_dir_after_restart(self):
+        """用户在设置页改了模型路径：看图服务下次（重新）启动时用新路径。"""
+        target = self.tmp / "my-models"
+        self.rt.settings.set("models_dir", str(target))
+        self.instance._stop_handle()  # noqa: SLF001
+        self.instance._start_handle()  # noqa: SLF001
+        self.assertEqual(self.instance._handle._env["HF_HUB_CACHE"], str(target))  # noqa: SLF001
+        self.assertTrue(self.instance._handle.is_alive)  # noqa: SLF001
+
+
+class TestVisualWemmServerModelLookup(unittest.TestCase):
+    """BC-17：看图服务（与核心完全隔离的子进程脚本）只认核心传进来的 `HF_HUB_CACHE`。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib.util
+
+        path = REPO_ROOT / "plugins" / "official-visual-wemm" / "official_visual_wemm" / "server.py"
+        spec = importlib.util.spec_from_file_location("wemm_server_under_test", path)
+        cls.server = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.server)
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _env(self, **values: str):
+        cleaned = {k: v for k, v in os.environ.items() if k not in ("HF_HUB_CACHE", "HF_HOME")}
+        cleaned.update(values)
+        return patch.dict(os.environ, cleaned, clear=True)
+
+    def test_hf_hub_cache_variable_wins(self):
+        with self._env(HF_HUB_CACHE=str(self.tmp / "a"), HF_HOME=str(self.tmp / "b")):
+            self.assertEqual(self.server._hf_hub_dir(), self.tmp / "a")
+
+    def test_hf_home_is_used_when_no_explicit_cache_variable(self):
+        with self._env(HF_HOME=str(self.tmp / "b")):
+            self.assertEqual(self.server._hf_hub_dir(), self.tmp / "b" / "hub")
+
+    def test_falls_back_to_the_huggingface_default_location(self):
+        with self._env():
+            self.assertEqual(self.server._hf_hub_dir(), Path.home() / ".cache" / "huggingface" / "hub")
+
+    def test_a_downloaded_snapshot_in_the_configured_folder_is_reused_not_redownloaded(self):
+        snapshot = self.tmp / "models--tencent--WeMM-Embedding-2B" / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+        with self._env(HF_HUB_CACHE=str(self.tmp)):
+            self.assertEqual(self.server._resolve_model_path("tencent/WeMM-Embedding-2B"), str(snapshot))
+
+    def test_missing_model_falls_through_to_the_model_id_for_on_demand_download(self):
+        with self._env(HF_HUB_CACHE=str(self.tmp)):
+            self.assertEqual(
+                self.server._resolve_model_path("tencent/WeMM-Embedding-2B"), "tencent/WeMM-Embedding-2B"
+            )
+
 
 class TestVisualWemmBackendGate(unittest.TestCase):
     """缺陷 B 的复现组：`on_enable` 曾经在**没有任何开关判断**的情况下直接

@@ -173,6 +173,24 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
         self.instance.release_gpu()  # 不抛异常即通过
         self.assertIsNone(self.instance._handle)  # noqa: SLF001
 
+    def test_subprocess_is_pointed_at_the_default_project_models_folder(self):
+        """BC-17：没配 models_dir 时，本机OCR服务去项目内的 models/ 找/下模型。"""
+        from core.paths import models_dir
+
+        env = self.instance._handle._env  # noqa: SLF001
+        self.assertEqual(env["HF_HUB_CACHE"], str(models_dir("")))
+        self.assertEqual(Path(env["HF_HUB_CACHE"]).name, "models")
+        self.assertIn("PATH", env, "子进程必须继承当前环境，丢 PATH 会直接起不来")
+
+    def test_subprocess_uses_the_configured_models_dir_after_restart(self):
+        """用户在设置页改了模型路径：本机OCR服务下次（重新）启动时用新路径。"""
+        target = self.tmp / "my-models"
+        self.rt.settings.set("models_dir", str(target))
+        self.instance._stop_handle()  # noqa: SLF001
+        self.instance._start_handle()  # noqa: SLF001
+        self.assertEqual(self.instance._handle._env["HF_HUB_CACHE"], str(target))  # noqa: SLF001
+        self.assertTrue(self.instance._handle.is_alive)  # noqa: SLF001
+
     def test_extract_after_disable_folds_to_failure_not_crash(self):
         self.rt.disable("official-ocr-mineru-local")
         doc = self.instance.extract("lib1", "whatever.pdf", self.tmp)

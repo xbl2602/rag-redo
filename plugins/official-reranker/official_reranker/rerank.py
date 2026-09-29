@@ -90,9 +90,12 @@ class RerankUnavailable(RuntimeError):
 
 
 class _RealReranker:
-    def __init__(self, model_name: str = MODEL_VERSION, *, resource_arbiter=None, cooldown_gate: CudaCooldownGate | None = None, logger=None) -> None:
+    def __init__(self, model_name: str = MODEL_VERSION, *, resource_arbiter=None, cooldown_gate: CudaCooldownGate | None = None, logger=None, models_dir=None) -> None:
         self._model_name = model_name
         self._model = None
+        # 模型存放目录的读取函数（BC-17），语义同 embed.py::_RealEncoder：每次加载现读；
+        # None = 走 HuggingFace 默认缓存（测试与旧调用方式不变）。
+        self._models_dir = models_dir
         self._resource_arbiter = resource_arbiter
         self._cooldown_gate = cooldown_gate if cooldown_gate is not None else CudaCooldownGate()
         self._logger = logger
@@ -192,7 +195,17 @@ class _RealReranker:
             factory, self._model_name, log=self._log,
             device=device, max_length=512,
             model_kwargs={"torch_dtype": "float16"},
+            **self._cache_kwargs(),
         )
+
+    def _cache_kwargs(self) -> dict:
+        """用户指定的模型目录 → sentence-transformers 的 `cache_folder`；没配读取
+        函数就返回空（沿用 HuggingFace 默认缓存）。日志只写路径。"""
+        if self._models_dir is None:
+            return {}
+        folder = str(self._models_dir())
+        self._log(f"重排器模型目录：{folder}")
+        return {"cache_folder": folder}
 
     def _select_device(self) -> str:
         """同 embed.py::_select_device 的对齐口径：冷却期状态机取代裸
@@ -422,11 +435,15 @@ class RerankerEngine:
         resource_arbiter=None,
         cooldown_gate: CudaCooldownGate | None = None,
         logger=None,
+        models_dir=None,
     ) -> None:
         self._reranker = (
             reranker
             if reranker is not None
-            else _RealReranker(resource_arbiter=resource_arbiter, cooldown_gate=cooldown_gate, logger=logger)
+            else _RealReranker(
+                resource_arbiter=resource_arbiter, cooldown_gate=cooldown_gate, logger=logger,
+                models_dir=models_dir,
+            )
         )
 
     def rerank(

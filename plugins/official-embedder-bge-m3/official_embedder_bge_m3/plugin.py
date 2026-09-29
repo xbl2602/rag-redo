@@ -18,6 +18,7 @@ import threading
 
 from core.contracts import Chunk, EmbeddingVector
 from core.gpu_arbiter import CudaCooldownGate
+from core.paths import models_dir
 
 from .embed import IDLE_UNLOAD_SECONDS, MODEL_VERSION, BGEM3Embedder, Encoder
 
@@ -45,6 +46,8 @@ class EmbedderPlugin:
             resource_arbiter=ctx.resource_arbiter,
             cooldown_gate=gate,
             logger=ctx.logger,
+            # 每次加载模型时现读设置项 models_dir（BC-17）；默认项目内 models/
+            models_dir=lambda: models_dir(ctx.settings.get("models_dir", "")),
         )
         ctx.logger.info("BGE-M3向量化插件已加载（模型懒加载，首次编码时才真正下载/加载）")
 

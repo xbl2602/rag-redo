@@ -156,12 +156,17 @@ class _RealEncoder:
         resource_arbiter=None,
         cooldown_gate: CudaCooldownGate | None = None,
         logger=None,
+        models_dir=None,
     ) -> None:
         self._model_name = model_name
         self._model = None
         self._resource_arbiter = resource_arbiter
         self._cooldown_gate = cooldown_gate if cooldown_gate is not None else CudaCooldownGate()
         self._logger = logger
+        # 模型存放目录的**读取函数**（BC-17）：每次加载模型时现读，用户在设置页改了
+        # 路径后，下一次（空闲卸载/手动释放之后的）重新加载就用新路径，不用重启。
+        # None = 不指定，走 HuggingFace 自己的默认缓存（测试与旧调用方式不变）。
+        self._models_dir = models_dir
         self._last_use = time.time()
         self._slow_batch_count = 0
         self._last_batch_cap: int | None = None  # 上次自动批次收紧值（仅变化时打日志，避免刷屏）
@@ -240,10 +245,11 @@ class _RealEncoder:
         WDDM 溢出，实测单批编码掉进分钟级），失败或参数 dtype 混搭回退
         fp32。加载本身走 core.model_loading.load_pretrained 的离线优先
         （问题56），不再触发 hub 联网核对。"""
+        cache = self._cache_kwargs()
         try:
             model = load_pretrained(
                 factory, self._model_name, log=self._log,
-                device=device, model_kwargs={"torch_dtype": "float16"},
+                device=device, model_kwargs={"torch_dtype": "float16"}, **cache,
             )
             if param_dtype_mixed(model):
                 self._log(f"{device} fp16 加载后参数 dtype 混搭（Half/Float 并存），回退 fp32")
@@ -251,7 +257,16 @@ class _RealEncoder:
             return model
         except Exception as exc:
             self._log(f"{device} fp16 加载失败，回退 fp32：{exc}")
-            return load_pretrained(factory, self._model_name, log=self._log, device=device)
+            return load_pretrained(factory, self._model_name, log=self._log, device=device, **cache)
+
+    def _cache_kwargs(self) -> dict:
+        """用户指定的模型目录 → sentence-transformers 的 `cache_folder`。没配
+        读取函数就返回空（沿用 HuggingFace 默认缓存）。日志只写路径。"""
+        if self._models_dir is None:
+            return {}
+        folder = str(self._models_dir())
+        self._log(f"BGE-M3 模型目录：{folder}")
+        return {"cache_folder": folder}
 
     def _select_device(self) -> str:
         """有 CUDA 就优先用（大幅提速），但**先用物理显存判据筛一遍**，再向
@@ -583,12 +598,16 @@ class BGEM3Embedder:
         resource_arbiter=None,
         cooldown_gate: CudaCooldownGate | None = None,
         logger=None,
+        models_dir=None,
     ) -> None:
         # encoder=None 时用真实的（懒加载）；测试/CI 注入假 encoder。
         self._encoder = (
             encoder
             if encoder is not None
-            else _RealEncoder(resource_arbiter=resource_arbiter, cooldown_gate=cooldown_gate, logger=logger)
+            else _RealEncoder(
+                resource_arbiter=resource_arbiter, cooldown_gate=cooldown_gate, logger=logger,
+                models_dir=models_dir,
+            )
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:

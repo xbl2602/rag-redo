@@ -787,6 +787,70 @@ class TestGpuLeaseNotLeakedOnDegradePaths(_LeaseTestBase):
         self.assertIsNone(self.arb.holder_of(GPU_RESOURCE_ID))
 
 
+class TestEmbedderModelsDir(_LeaseTestBase):
+    """BC-17：模型存放目录可配置（默认项目内 models/），每次加载模型时现读设置。"""
+
+    def _load_recording_cache_folders(self, enc_or_plugin_call, folders: list) -> None:
+        def _factory(model_id, **kwargs):
+            folders.append(kwargs.get("cache_folder"))
+            return _FakeSentenceTransformerModel(kwargs.get("device", "cpu"))
+
+        with patch.dict(sys.modules, {"sentence_transformers": _fake_sentence_transformers(_factory)}), patch(
+            _VRAM, return_value=8.0
+        ):
+            enc_or_plugin_call()
+
+    def test_configured_models_dir_is_passed_to_the_factory_as_cache_folder(self):
+        import tempfile
+        from pathlib import Path
+
+        target = Path(tempfile.gettempdir()) / "rag_redo_models_a"
+        enc = self._encoder(models_dir=lambda: target)
+        folders: list = []
+        self._load_recording_cache_folders(lambda: enc.encode(["a"]), folders)
+        self.assertEqual(folders, [str(target)], "模型必须从用户配置的目录加载")
+
+    def test_without_a_models_dir_reader_nothing_extra_is_passed(self):
+        """旧调用方式（不传读取函数）行为不变：不带 cache_folder，走 HuggingFace 默认缓存。"""
+        enc = self._encoder()
+        folders: list = []
+        self._load_recording_cache_folders(lambda: enc.encode(["a"]), folders)
+        self.assertEqual(folders, [None])
+
+    def test_plugin_reads_the_setting_afresh_on_every_model_load(self):
+        """用户在设置页改了路径，下一次重新加载模型就用新路径，不用重启。"""
+        import tempfile
+        from pathlib import Path
+
+        first = Path(tempfile.gettempdir()) / "rag_redo_models_first"
+        second = Path(tempfile.gettempdir()) / "rag_redo_models_second"
+        plugin = EmbedderPlugin()
+        ctx = _Ctx(self.logger, self.counting)
+        ctx.settings["models_dir"] = str(first)
+        plugin.on_load(ctx)
+        plugin.on_enable(ctx)
+        self.addCleanup(plugin.on_disable, ctx)
+        folders: list = []
+        self._load_recording_cache_folders(lambda: plugin.embed_texts(["a"]), folders)
+        plugin.release_gpu()
+        ctx.settings["models_dir"] = str(second)
+        self._load_recording_cache_folders(lambda: plugin.embed_texts(["b"]), folders)
+        self.assertEqual(folders, [str(first), str(second)])
+
+    def test_plugin_defaults_to_the_project_models_folder(self):
+        from core.paths import models_dir as default_models_dir
+
+        plugin = EmbedderPlugin()
+        ctx = _Ctx(self.logger, self.counting)  # settings 为空 = 没配置
+        plugin.on_load(ctx)
+        plugin.on_enable(ctx)
+        self.addCleanup(plugin.on_disable, ctx)
+        folders: list = []
+        self._load_recording_cache_folders(lambda: plugin.embed_texts(["a"]), folders)
+        self.assertEqual(folders, [str(default_models_dir(""))])
+        self.assertEqual(default_models_dir("").name, "models", "默认必须是项目内的 models 文件夹")
+
+
 class TestEmbedderPluginLeaseLifecycle(_LeaseTestBase):
     """插件生命周期钩子：启用不占名额，停用/卸载必须收口且幂等。"""
 

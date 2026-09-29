@@ -53,6 +53,7 @@ CORE_SUITES = [
     "test_note_relations",
     "test_graph",
     "test_singleton",
+    "test_paths",
     "test_runtime",
     "test_subprocess_service",
     "test_pipeline_e2e",

@@ -99,9 +99,11 @@
       "legacy_refs": [
         "obsidian-rag/index.py:114-159",
         "obsidian-rag/index.py:2142-2148",
-        "obsidian-rag/index.py:2204-2206"
+        "obsidian-rag/index.py:2204-2206",
+        "obsidian-rag/index.py:97-101"
       ],
       "redo_refs": [
+        "rag-redo/plugins/official-extractor-text/official_extractor_text/extract.py::extract",
         "rag-redo/core/pipeline.py::normalize_failure_state",
         "rag-redo/core/pipeline.py::Pipeline._failure_record",
         "rag-redo/core/pipeline.py::Pipeline.failure_will_retry",
@@ -113,9 +115,11 @@
         "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_stable_scanned_terminal_does_not_repeat_provider_work",
         "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_capability_change_retries_stable_scanned_terminal",
         "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_deferred_is_not_a_terminal_failure_and_remains_stale",
-        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_deferred_keeps_previous_record_and_old_chunks_searchable"
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_deferred_keeps_previous_record_and_old_chunks_searchable",
+        "rag-redo/plugins/official-extractor-text/tests/test_extract.py::TestExtract.test_utf8_bom_is_handled",
+        "rag-redo/plugins/official-extractor-text/tests/test_extract.py::TestExtract.test_crlf_and_lf_produce_identical_markdown"
       ],
-      "acceptance": "unreadable、empty、tbd、scanned、extract-failed 等终态可区分；稳定失败不重复消耗资源；能力签名变化和内容变化可重试；deferred 不得伪装成终态且不落 manifest 记录——保留旧条目与旧块继续服务（检索不受影响），文件与旧记录的差异驱动下一轮自动重试，恢复后重试成功。",
+      "acceptance": "unreadable、empty、tbd、scanned、extract-failed 等终态可区分；稳定失败不重复消耗资源；能力签名变化和内容变化可重试；deferred 不得伪装成终态且不落 manifest 记录——保留旧条目与旧块继续服务（检索不受影响），文件与旧记录的差异驱动下一轮自动重试，恢复后重试成功。【经操作者确认的偏离（2026-09-29）】文本提取器读文件时先剥掉开头的 UTF-8 BOM、再把 \\r\\n 与 \\r 统一成 \\n；旧项目 index.py:100 是裸 utf-8 解码、不做这两步（BOM 会以看不见的字符混进正文，Windows 换行会把 \\r 带进块文本，同一篇笔记在 Windows/Linux 间还会被当成内容变了）。用户可见的后果：含 CRLF 或 BOM 的旧笔记，块文本会变，迁移后首轮索引会重建一次，之后与旧项目一样稳定。除这两步外，解码降级（非 UTF-8 用替换字符入库、不落失败终态）、空文件落 empty 终态与旧项目逐条一致。",
       "blocker": ""
     },
     {
@@ -159,9 +163,10 @@
       "test_refs": [
         "rag-redo/tests/test_runtime.py::TestPluginRuntimeLifecycle.test_cross_plugin_import_is_rejected_before_load",
         "rag-redo/tests/test_datastore.py::TestDataStore.test_storage_handle_denies_plugin_without_data_write_permission",
-        "rag-redo/tests/test_subprocess_service.py::TestSubprocessServiceHandle.test_start_then_call_gets_real_response_from_subprocess"
+        "rag-redo/tests/test_subprocess_service.py::TestSubprocessServiceHandle.test_start_then_call_gets_real_response_from_subprocess",
+        "rag-redo/tests/test_singleton.py::TestProcessSingletonGuard.test_live_pid_record_does_not_replace_file_lock_authority"
       ],
-      "acceptance": "in_process 插件不得 import 另一个插件；subprocess_service 必须有独立进程/环境；manifest 权限必须在运行前校验并在运行时限制能力。",
+      "acceptance": "in_process 插件不得 import 另一个插件；subprocess_service 必须有独立进程/环境；manifest 权限必须在运行前校验并在运行时限制能力。【经操作者确认的偏离（2026-09-29）】单例守卫（GUI/MCP 防同时开两个实例）只靠文件字节锁判定，不做 PID 预检；旧项目 singleton.py:78-84 是两段判定（先读 PID 文件、发现记录的 PID 还活着就直接退出，再抢锁）。用户可见的后果：日常“重复双击不会开出两个窗口”的效果与旧项目一致；只在一种边角情况下不同——上一个实例已经死掉、锁已自动释放，但 PID 文件里记的号码恰好被别的程序占用，旧项目会误以为还有实例而拒绝启动，新版会正常启动。",
       "blocker": ""
     },
     {
@@ -250,15 +255,17 @@
         "rag-redo/core/pipeline.py::Pipeline.import_library",
         "rag-redo/core/extract_cache.py::ExtractCache.export_state",
         "rag-redo/core/note_relations.py::NoteRelationsStore.read_library",
-        "rag-redo/plugins/official-import-export/official_import_export/archive.py::pack"
+        "rag-redo/plugins/official-import-export/official_import_export/archive.py::pack",
+        "rag-redo/plugins/official-import-export/official_import_export/archive.py::unpack"
       ],
       "test_refs": [
         "rag-redo/tests/test_pipeline_e2e.py::TestExportImportLibrary.test_import_creates_library_with_same_search_results",
         "rag-redo/tests/test_pipeline_e2e.py::TestExportImportLibrary.test_import_preserves_terminal_failure_diagnostics",
         "rag-redo/tests/test_pipeline_e2e.py::TestExportImportLibrary.test_import_survives_process_restart",
-        "rag-redo/plugins/official-import-export/tests/test_archive.py::TestPackUnpackRoundTrip.test_round_trip_preserves_all_three_sections"
+        "rag-redo/plugins/official-import-export/tests/test_archive.py::TestPackUnpackRoundTrip.test_round_trip_preserves_all_three_sections",
+        "rag-redo/plugins/official-import-export/tests/test_archive.py::TestUnpackedSizeCap"
       ],
-      "acceptance": "导入后必须恢复搜索、正文、关系、失败状态、版本和校验能力；归档不得静默丢失旧系统状态。",
+      "acceptance": "导入后必须恢复搜索、正文、关系、失败状态、版本和校验能力；归档不得静默丢失旧系统状态。【经操作者确认的新增防护（2026-09-29，旧项目没有对应）】导入包解压前按压缩包头声明的解压后总体积判断，超过 8 GiB（MAX_UNPACKED_BYTES）直接拒绝、不读取任何条目——防压缩炸弹撑爆磁盘；旧项目 import.py 是直接 extractall 落盘、没有这道闸。8 GiB 由操作者确认，是防护栏不是业务限制。",
       "blocker": ""
     },
     {
@@ -380,8 +387,8 @@
         "rag-redo/plugins/official-gui-shell/tests/test_boot.py::TestMainEntry",
         "rag-redo/plugins/official-gui-shell/tests/test_boot.py::TestPushLoop"
       ],
-      "acceptance": "GUI 是操作方式而非独立产品，必须与 MCP/CLI 共用同一业务核心，自身零业务判断。量化门槛：(1) 资产一致性——assets/{index.html,app.css,app.js,mock.js} 与 obsidian-rag/guiweb/ui/ 逐字节相同，sha256 冻结为 fixture 且测试断言 4/4；(2) 契约覆盖——contracts.md 定义的 37 个方法，新桥接层 37/37 同名存在且返回 JSON 键集合与契约一致，缺口必须为 0；(3) 推送通道——snapshot/log/alert/notice/preview 五类推送与 bind_window 必须存在，snapshot 周期 1 秒，连续失败 5 次才退出；(4) 视图覆盖——contracts.md 视图映射表 7 个视图（检索/库/索引/诊断/设置/图谱/全局）逐项可达；(5) 零业务逻辑——前端与桥接层不得出现 RRF/BM25/cosine/rerank 计算，排序过滤置信度一律来自 core，入口不得各自实现。",
-      "blocker": "阶段A（资产原样搬运）已完成并通过 4/4 sha256 校验；阶段B/C（37 个契约方法桥接、勾选树/进度/推送/试验台/设置等 16 项 core 侧能力）已实现，并由 test_contracts_parity.py 对夹具 37/37 逐个真实调用断言返回键集合，test_boot.py 走真实运行时与真实 gui_main.main() 断言启动路径。**仍待**：①真实 pywebview 窗口内的人工验证（7 个视图逐项可达、推送通道在真实窗口里生效）与操作者确认（2026-09-28 已有的自动化证据，不代替这一步：真实进程冒烟——`gui_main.py` 在临时数据目录下 6~8 秒内出现标题「Obsidian RAG」的窗口，标准错误输出为空，正常关窗后整棵进程树（含 WEMM 看图服务）无残留；前端对真实 Api 与真实推送循环的浏览器联调——图谱/库/勾选范围写入回读/检索含建议与双链/设置保存回读/索引/试验台/诊断含去重均渲染并可操作，无 JS 报错、无失败请求；联调用的是假嵌入，未覆盖「点击开始索引」拉起真实 BGE-M3 worker 的路径）；②与旧项目的有意差异——设置页只列 rag-redo 真实读取的键（不是旧项目的 13 组）、切块粒度/collection 不能按库覆盖（rag-redo 没有该能力）、进度条 pct 取 0~100（旧桥送 0~1 而旧前端按 0~100 用）——需操作者确认后再登记为已批准偏离。原 official-gui-shell/tests/test_assets.py 的 7 条断言针对被取代的自制界面设计，已由本契约的资产一致性与零业务逻辑断言取代。**2026-09-29 追记**：新增 BC-16（手动释放 GPU 显存按钮）后，index.html/app.js/mock.js 的 bytes/sha256 已按操作者确认的新增内容更新（`legacy_guiweb_contract.json` 的 `_comment_bc16` 有完整记录），是本契约验收标准 (1) 资产一致性条款唯一一处已登记的例外，不是未声明的漂移；app.css 未改动。"
+      "acceptance": "GUI 是操作方式而非独立产品，必须与 MCP/CLI 共用同一业务核心，自身零业务判断。量化门槛：(1) 资产一致性——assets/{index.html,app.css,app.js,mock.js} 与 obsidian-rag/guiweb/ui/ 逐字节相同，sha256 冻结为 fixture 且测试断言 4/4；(2) 契约覆盖——contracts.md 定义的 37 个方法，新桥接层 37/37 同名存在且返回 JSON 键集合与契约一致，缺口必须为 0；(3) 推送通道——snapshot/log/alert/notice/preview 五类推送与 bind_window 必须存在，snapshot 周期 1 秒，连续失败 5 次才退出；(4) 视图覆盖——contracts.md 视图映射表 7 个视图（检索/库/索引/诊断/设置/图谱/全局）逐项可达；(5) 零业务逻辑——前端与桥接层不得出现 RRF/BM25/cosine/rerank 计算，排序过滤置信度一律来自 core，入口不得各自实现。【经操作者确认的偏离（2026-09-29）】共 4 处，用户可见的差别如下：①窗口标题叫 \"Obsidian RAG 2.0\"（旧项目叫 \"Obsidian RAG\"；夹具 `title` 保留旧值、`redo_title` 记新值，测试按新值断言）；②设置页只列 rag-redo 真实读取的键（当前 9 组，旧项目 13 组）——少掉的组对应的功能新版本来就没有，画出来只会是改了没用的假开关；③切块粒度（chunk_char_limit/short_doc_char_limit）与 collection 不能按库单独覆盖，只有全局统一值（旧项目可以按库覆盖；rag-redo 目前没有该能力，`UNSUPPORTED_CONFIG_KEYS` 显式拒绝，这是已知的能力缺口而非行为对齐；排除规则 exclude_dirs/files/patterns 仍可按库覆盖）；④索引进度条的 pct 取 0~100（旧桥送的是 0~1 小数，旧前端却按 0~100 使用，导致旧进度条几乎不动——这是旧项目自身的 bug，新版按前端实际读法送 0~100，进度条正常走）。",
+      "blocker": "阶段A（资产原样搬运）已完成并通过 4/4 sha256 校验；阶段B/C（37 个契约方法桥接、勾选树/进度/推送/试验台/设置等 16 项 core 侧能力）已实现，并由 test_contracts_parity.py 对夹具 37/37 逐个真实调用断言返回键集合，test_boot.py 走真实运行时与真实 gui_main.main() 断言启动路径。**仍待**：①真实 pywebview 窗口内的人工验证（7 个视图逐项可达、推送通道在真实窗口里生效）与操作者确认（2026-09-28 已有的自动化证据，不代替这一步：真实进程冒烟——`gui_main.py` 在临时数据目录下 6~8 秒内出现标题「Obsidian RAG」的窗口，标准错误输出为空，正常关窗后整棵进程树（含 WEMM 看图服务）无残留；前端对真实 Api 与真实推送循环的浏览器联调——图谱/库/勾选范围写入回读/检索含建议与双链/设置保存回读/索引/试验台/诊断含去重均渲染并可操作，无 JS 报错、无失败请求；联调用的是假嵌入，未覆盖「点击开始索引」拉起真实 BGE-M3 worker 的路径）；②与旧项目的有意差异（窗口标题、设置页只列真实读取的键、切块粒度/collection 不能按库覆盖、进度条 pct 取 0~100）已于 2026-09-29 经操作者确认，登记在 acceptance 的【经操作者确认的偏离】里，不再是待办。原 official-gui-shell/tests/test_assets.py 的 7 条断言针对被取代的自制界面设计，已由本契约的资产一致性与零业务逻辑断言取代。**2026-09-29 追记**：新增 BC-16（手动释放 GPU 显存按钮）后，index.html/app.js/mock.js 的 bytes/sha256 已按操作者确认的新增内容更新（`legacy_guiweb_contract.json` 的 `_comment_bc16` 有完整记录），是本契约验收标准 (1) 资产一致性条款唯一一处已登记的例外，不是未声明的漂移；app.css 未改动。"
     },
     {
       "id": "BC-16",
@@ -418,6 +425,41 @@
       ],
       "acceptance": "点击 GUI 索引页的『释放显存』按钮后：official-embedder-bge-m3/official-reranker（检索侧，共用一个 GPU 名额）立即卸载显存中的模型并归还名额，但插件保持 enabled，下一次真正检索/索引时透明重新加载模型，用户无需手动重新启用；official-visual-wemm/official-ocr-mineru-local 的子进程收到软驱逐请求卸载模型但继续存活监听（同资源仲裁器抢占时走的同一条路径），下一次真正查询/提取时子进程自己按需重新加载模型。不碰任何插件的启用状态、`wemm_backend`/`pdf_scan_backend` 等持久化配置——这是操作者明确要求的边界：GUI 目前没有运行中重新启用一个已禁用插件的入口，真把插件 disable 掉会让相关功能卡死到重启整个 GUI 才能恢复。四个消费者互相独立：某个插件未启用/不支持这个操作就跳过（不算错误），某一个插件释放失败不影响其它插件已经释放成功的部分。",
       "blocker": "legacy_refs 四个文件均已核实确认**没有**对应能力：guiweb/contracts.md 的 GPU 段落（第35-52行附近）只声明只读字段 `gpu`/`wemm_live`；guiweb/bridge.py 通读一遍没有任何 release/evict/unload 相关方法；gpu_arbiter.py 的 `request_evict` 只在插件互相抢占时内部调用，没有暴露成用户可触发的入口；guiweb/ui/mock.js 的 GPU 卡片只做展示，没有配套按钮。2026-09-29 由操作者在对话中提出并逐步确认语义（先问是否连子进程一起停掉，操作者澄清『最重要的是释放模型显存，不是关闭进程』后改为只软驱逐/卸载模型，子进程与配置都不动）——是纯新设计，不是行为兼容缺口。仍待操作者在真实窗口里实际点一次这个按钮、观察显存数字变化做最终人工确认（同 BC-15 GUI 视觉验收的一贯要求，自动化测试不代替这一步）。"
+    },
+    {
+      "id": "BC-17",
+      "title": "模型存放路径可配置（新能力，无旧项目对应）",
+      "status": "partial",
+      "legacy_refs": [
+        "obsidian-rag/index.py:610-632",
+        "obsidian-rag/wemm_server.py:95-115",
+        "obsidian-rag/gpu_arbiter.py:341-354",
+        "obsidian-rag/mineru_server.py:502-511"
+      ],
+      "redo_refs": [
+        "rag-redo/core/paths.py::models_dir",
+        "rag-redo/core/paths.py::models_env",
+        "rag-redo/plugins/official-embedder-bge-m3/official_embedder_bge_m3/embed.py::_RealEncoder._cache_kwargs",
+        "rag-redo/plugins/official-reranker/official_reranker/rerank.py::_RealReranker._cache_kwargs",
+        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py::Plugin._start_handle",
+        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/server.py::_hf_hub_dir",
+        "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/plugin.py::MineruLocalOcrPlugin._start_handle",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/settings_schema.py::GROUPS"
+      ],
+      "test_refs": [
+        "rag-redo/tests/test_paths.py::TestModelsDir",
+        "rag-redo/tests/test_paths.py::TestModelsEnv",
+        "rag-redo/plugins/official-embedder-bge-m3/tests/test_embed.py::TestEmbedderModelsDir",
+        "rag-redo/plugins/official-reranker/tests/test_rerank.py::TestRerankerModelsDir",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_subprocess_is_pointed_at_the_default_project_models_folder",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_subprocess_uses_the_configured_models_dir_after_restart",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmServerModelLookup",
+        "rag-redo/plugins/official-ocr-mineru-local/tests/test_plugin.py::TestMineruLocalOcrPlugin.test_subprocess_is_pointed_at_the_default_project_models_folder",
+        "rag-redo/plugins/official-ocr-mineru-local/tests/test_plugin.py::TestMineruLocalOcrPlugin.test_subprocess_uses_the_configured_models_dir_after_restart",
+        "rag-redo/plugins/official-gui-shell/tests/test_settings_schema.py::TestSchemaMatchesTheRealConsumers"
+      ],
+      "acceptance": "所有模型（嵌入 bge-m3、重排 bge-reranker、看图 WEMM、本机 OCR MinerU）统一从一个『模型目录』找/下载：设置项 models_dir 留空 = 项目内（发行目录下）的 models/ 文件夹（默认，已加入 .gitignore，不入库）；用户可在设置页『模型』组的『模型存放路径』改成任意文件夹（支持 ~ 与环境变量；相对路径按发行目录解析而不是当前工作目录；指到 HF_HOME 这种『模型其实在 hub 子文件夹里』的路径会自动落到 hub），从而复用电脑上已有的模型、不必重新下载。生效时机：嵌入/重排模型每次加载时现读设置（改路径后下一次重新加载就用新路径，不用重启）；看图/本机 OCR 是子进程，启动时定死，改路径后要等它们下次（重新）启动才生效。文件夹不存在不是错误（首次下载时 HuggingFace 自己建）。这是纯路径能力：不改模型版本、不改索引数据，因此不会让已有索引失效。",
+      "blocker": "legacy_refs 均已核实旧项目**没有**这个能力：index.py 只按模型名交给 HuggingFace 默认缓存加载（离线优先）；wemm_server.py 把 ~/.cache/huggingface/hub 写死为查找位置；仅 MinerU 子进程由 gpu_arbiter.py 设置 HF_HOME（旧项目默认指向 E:\\models\\hf），主模型与 WEMM 都没有可配置路径。2026-09-29 由操作者提出需求（『默认放项目内文件夹，用户可自定义模型路径』），并指示把本机现有模型位置（C:\\Users\\xbl26\\.cache\\huggingface\\hub）作为其自定义路径配置——是纯新设计，不是行为兼容缺口。已知局限：①MinerU 本机 OCR 只做了『环境变量 HF_HUB_CACHE 传到子进程』的自动化测试，没有用真实 MinerU 模型验证它确实遵循该变量；②仍待操作者在真实使用中确认各模型都从配置的路径加载（同 BC-15/BC-16 的一贯要求，自动化测试不代替这一步）。"
     }
   ]
 }

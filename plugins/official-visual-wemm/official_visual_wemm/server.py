@@ -121,6 +121,20 @@ def _wait_for_vram(min_free_gb: float, timeout_s: float = WEMM_VRAM_WAIT_SECONDS
         time.sleep(poll_s)
 
 
+def _hf_hub_dir() -> Path:
+    """模型缓存目录：核心启动本服务时通过 `HF_HUB_CACHE` 传入用户配置的模型目录
+    （core/paths.py::models_env，BC-17）；没传（单独手动跑本脚本）才退回
+    HuggingFace 的默认位置。本文件与核心完全隔离、import 不到 core.*，所以这里
+    只认环境变量，不重新实现路径规则。"""
+    configured = os.environ.get("HF_HUB_CACHE")
+    if configured:
+        return Path(configured)
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        return Path(hf_home) / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
 def _resolve_model_path(model_id: str) -> str:
     """优先用本机 HuggingFace 缓存里已经下好的快照（不重新下载）——真实
     用户机器上如果已经用别的工具下过这个模型（比如旧项目本身），这里应该
@@ -130,7 +144,7 @@ def _resolve_model_path(model_id: str) -> str:
         return model_id
     if Path(model_id).is_dir():
         return model_id
-    hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+    hf_cache = _hf_hub_dir()
     safe = model_id.replace("/", "--").replace(":", "--")
     snapshots = hf_cache / f"models--{safe}" / "snapshots"
     if snapshots.is_dir():

@@ -497,6 +497,72 @@ class TestRerankerPluginReleaseGpu(unittest.TestCase):
         self.assertIsNotNone(real._model, "释放显存之后插件必须还能正常工作，不需要重新启用")
 
 
+class TestRerankerModelsDir(unittest.TestCase):
+    """BC-17：模型存放目录可配置（默认项目内 models/），每次加载模型时现读设置。
+    同 official-embedder-bge-m3/tests/test_embed.py::TestEmbedderModelsDir。"""
+
+    def setUp(self) -> None:
+        self.logger = logging.getLogger("rag_redo.test.rerank.models_dir")
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.propagate = False
+        self.logger.addHandler(logging.NullHandler())
+
+    def _score_recording_cache_folders(self, call, folders: list) -> None:
+        def _factory(*args, **kwargs):
+            folders.append(kwargs.get("cache_folder"))
+            return _FakeCrossEncoderModel()
+
+        with patch("official_reranker.rerank.gpu_arbiter.vram_free_gb", return_value=8.0), \
+                patch.dict(sys.modules, {"sentence_transformers": _fake_sentence_transformers(_factory)}):
+            call()
+
+    def test_configured_models_dir_is_passed_to_the_factory_as_cache_folder(self):
+        import tempfile
+        from pathlib import Path
+
+        target = Path(tempfile.gettempdir()) / "rag_redo_rerank_models"
+        reranker = _RealReranker(
+            resource_arbiter=ResourceArbiter(), cooldown_gate=_stub_gate_ready(), models_dir=lambda: target
+        )
+        folders: list = []
+        self._score_recording_cache_folders(lambda: reranker.score("q", ["a"]), folders)
+        self.assertEqual(folders, [str(target)], "重排模型必须从用户配置的目录加载")
+
+    def test_without_a_models_dir_reader_nothing_extra_is_passed(self):
+        reranker = _RealReranker(resource_arbiter=ResourceArbiter(), cooldown_gate=_stub_gate_ready())
+        folders: list = []
+        self._score_recording_cache_folders(lambda: reranker.score("q", ["a"]), folders)
+        self.assertEqual(folders, [None])
+
+    def test_plugin_reads_the_setting_afresh_on_every_model_load(self):
+        import tempfile
+        from pathlib import Path
+
+        first = Path(tempfile.gettempdir()) / "rag_redo_rerank_first"
+        second = Path(tempfile.gettempdir()) / "rag_redo_rerank_second"
+        plugin = RerankerPlugin()
+        ctx = _Ctx(self.logger)
+        ctx.settings["models_dir"] = str(first)
+        plugin.on_load(ctx)
+        folders: list = []
+        self._score_recording_cache_folders(lambda: plugin.engine.rerank("q", [("c1", "t")]), folders)
+        plugin.release_gpu()
+        ctx.settings["models_dir"] = str(second)
+        self._score_recording_cache_folders(lambda: plugin.engine.rerank("q", [("c1", "t2")]), folders)
+        self.assertEqual(folders, [str(first), str(second)])
+
+    def test_plugin_defaults_to_the_project_models_folder(self):
+        from core.paths import models_dir as default_models_dir
+
+        plugin = RerankerPlugin()
+        ctx = _Ctx(self.logger)  # settings 为空 = 没配置
+        plugin.on_load(ctx)
+        folders: list = []
+        self._score_recording_cache_folders(lambda: plugin.engine.rerank("q", [("c1", "t")]), folders)
+        self.assertEqual(folders, [str(default_models_dir(""))])
+        self.assertEqual(default_models_dir("").name, "models", "默认必须是项目内的 models 文件夹")
+
+
 class TestRerankerDegradeKeepsModelLoaded(unittest.TestCase):
     """降级到 CPU 之后模型必须留在内存里接着用，且名额当场归还。
 

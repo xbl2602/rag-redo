@@ -17,6 +17,8 @@
   "push_types": ["snapshot", "log", "alert", "notice", "preview"],
   "window": {
     "title": "Obsidian RAG",
+    "redo_title": "Obsidian RAG 2.0",
+    "_comment_redo_title": "title 是旧项目 guiweb/app.py 的原值（冻结事实，不改）；redo_title 是 2026-09-29 操作者确认的新版窗口标题，见 BC-15。",
     "width": 1440,
     "height": 900,
     "min_width": 1080,

@@ -18,4 +18,6 @@ Thumbs.db
 
 tmp_search_*.json
 data-real/
+# 模型文件夹（默认存放位置，BC-17）：几个 GB 的权重，绝不入库
+/models/
 tmp_matrix_*.json

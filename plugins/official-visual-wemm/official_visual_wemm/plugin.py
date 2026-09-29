@@ -74,6 +74,7 @@ import chromadb
 from core.atomic import atomic_write_text
 from core.contracts import PageHit, VisualPageState
 from core.index_generation import IndexGenerationStore
+from core.paths import models_env
 from core.subprocess_service import SubprocessServiceError, SubprocessServiceHandle, resolve_plugin_python
 
 PLUGIN_ID = "official-visual-wemm"
@@ -239,6 +240,9 @@ class VisualWemmPlugin:
             health_check=self._runtime_health_check,
             cwd=self._plugin_dir,
             log_path=self._log_path,
+            # 让看图服务去用户配置的模型目录找/下模型（BC-17）。子进程启动时定死：
+            # 之后在设置页改路径，要等这个服务下次（重新）启动才生效。
+            env=models_env(self._settings.get("models_dir", "") if self._settings is not None else ""),
         )
         self._handle.start()
         if self._handle.log_file_error:

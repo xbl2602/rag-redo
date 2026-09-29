@@ -36,6 +36,12 @@ APP_DIR_NAME = "RAG-Redo"
 DATA_DIR_NAME = "data"
 PLUGINS_DIR_NAME = "plugins"
 PLUGINS_STATE_FILE = "plugins_state.json"
+#: 模型默认存放在发行目录下的这个文件夹（项目内），用户可用设置项改到别处（BC-17）
+MODELS_DIR_NAME = "models"
+#: 设置项名：用户自定义的模型存放路径，留空 = 默认的项目内 `models/`
+MODELS_DIR_SETTING = "models_dir"
+#: HuggingFace 的"模型缓存目录"环境变量——子进程（看图/本机 OCR）靠它找模型
+HF_CACHE_ENV = "HF_HUB_CACHE"
 
 
 def repo_root() -> Path:
@@ -67,6 +73,48 @@ def data_root() -> Path:
 
 def plugins_dir() -> Path:
     return repo_root() / PLUGINS_DIR_NAME
+
+
+def models_dir(configured: object = "") -> Path:
+    """模型存放目录（里面放 HuggingFace 缓存布局的 `models--<组织>--<名字>` 文件夹）。
+
+    **规则（BC-17，旧项目没有这个能力，2026-09-29 操作者提出并确认）**：
+    1. `configured`（设置项 `models_dir`）非空 → 用它。支持 `~` 与 `%VAR%`；
+       相对路径按**发行目录**解析，不按当前工作目录（与 `data_root()` 同一条
+       "CWD 无关"纪律，否则在别处跑一次 CLI 就会指到另一个空文件夹）。
+    2. 留空 → `<发行目录>/models`（项目内，默认值）。
+    3. 宽容一步：用户把路径指到 HuggingFace 的 `HF_HOME`（模型其实在它的
+       `hub` 子文件夹里）时，自动落到 `hub`——只在"这一层没有任何
+       `models--*`、而 `hub` 里有"时才这么做，不会误伤正常目录。
+
+    只算路径，不创建目录、不检查里面有没有模型：文件夹不存在不是错误
+    （首次下载时由 HuggingFace 自己建）。
+    """
+    text = str(configured or "").strip()
+    if text:
+        path = Path(os.path.expandvars(text)).expanduser()
+        if not path.is_absolute():
+            path = repo_root() / path
+    else:
+        path = repo_root() / MODELS_DIR_NAME
+    hub = path / "hub"
+    try:
+        if hub.is_dir() and not any(child.name.startswith("models--") for child in path.iterdir()):
+            return hub
+    except OSError:
+        pass
+    return path
+
+
+def models_env(configured: object = "", base: dict[str, str] | None = None) -> dict[str, str]:
+    """给子进程（看图 WEMM / 本机 OCR MinerU）用的环境变量：继承当前环境（丢
+    PATH 子进程必死，同旧项目 `gpu_arbiter._mineru_env` 的 E1 教训），只增量
+    覆盖 `HF_HUB_CACHE` 让它们去同一个模型目录找/下模型。旧项目对 MinerU 子进程
+    就是这么设 `HF_HOME` 的（`gpu_arbiter.py:341-354`），这里推广到所有模型
+    子进程，并统一到用户可配的 `models_dir`。"""
+    env = dict(os.environ if base is None else base)
+    env[HF_CACHE_ENV] = str(models_dir(configured))
+    return env
 
 
 def plugins_state_file(root: Path | None = None) -> Path:

@@ -237,7 +237,7 @@ class TestMainEntry(_TempDataRoot):
         self.assertEqual(len(webview_module.created), 1)
         args, kwargs = webview_module.created[0]
         spec = FIXTURE["window"]
-        self.assertEqual(args[0], spec["title"])
+        self.assertEqual(args[0], spec["redo_title"])  # 标题是唯一经操作者批准的偏离（BC-15）
         self.assertEqual(kwargs["width"], spec["width"])
         self.assertEqual(kwargs["height"], spec["height"])
         self.assertEqual(kwargs["min_size"], (spec["min_width"], spec["min_height"]))
@@ -398,7 +398,8 @@ class TestWindowSpecAndPaths(unittest.TestCase):
     def test_window_spec_constants_match_the_frozen_fixture(self) -> None:
         gm = _load_gui_main(Path(tempfile.gettempdir()) / "gui_boot_spec", _fake_webview(_FakeWindow()))
         spec = FIXTURE["window"]
-        self.assertEqual(gm.WINDOW_SPEC["title"], spec["title"])
+        self.assertEqual(gm.WINDOW_SPEC["title"], spec["redo_title"])  # 标题是唯一经操作者批准的偏离（BC-15）
+        self.assertNotEqual(spec["redo_title"], spec["title"], "redo_title 应是与旧标题不同的新名字")
         self.assertEqual(gm.WINDOW_SPEC["width"], spec["width"])
         self.assertEqual(gm.WINDOW_SPEC["height"], spec["height"])
         self.assertEqual(gm.WINDOW_SPEC["min_size"], (spec["min_width"], spec["min_height"]))

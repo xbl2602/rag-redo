@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).parent.parent
 CONTRACT_PATH = REPO_ROOT / "docs" / "behavior_contract.json"
 AGENTS_PATH = REPO_ROOT / "AGENTS.md"
 CLAUDE_PATH = REPO_ROOT / "CLAUDE.md"
-EXPECTED_IDS = [f"BC-{index:02d}" for index in range(1, 17)]
+EXPECTED_IDS = [f"BC-{index:02d}" for index in range(1, 18)]
 ALLOWED_STATUSES = {"blocked", "partial", "pass"}
 _DEFS = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import threading
 
 from core.gpu_arbiter import CudaCooldownGate
+from core.paths import models_dir
 from .rerank import IDLE_UNLOAD_SECONDS, MODEL_VERSION, Reranker, RerankerEngine
 
 _IDLE_CHECK_INTERVAL_S = min(30, max(1, IDLE_UNLOAD_SECONDS)) if IDLE_UNLOAD_SECONDS > 0 else 30
@@ -36,6 +37,8 @@ class RerankerPlugin:
             resource_arbiter=ctx.resource_arbiter,
             cooldown_gate=gate,
             logger=ctx.logger,
+            # 每次加载模型时现读设置项 models_dir（BC-17）；默认项目内 models/
+            models_dir=lambda: models_dir(ctx.settings.get("models_dir", "")),
         )
         ctx.logger.info("重排器已加载（模型懒加载，型号 %s）", MODEL_VERSION)
 

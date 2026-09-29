@@ -68,13 +68,20 @@ class SettingGroup:
 GROUPS: tuple[SettingGroup, ...] = (
     SettingGroup(
         "模型", "basic",
-        "两阶段检索的重排开关。嵌入与重排用哪个模型由插件决定，不在设置里选。",
+        "两阶段检索的重排开关，以及模型文件存放在哪。嵌入与重排用哪个模型由插件决定，不在设置里选。",
         (
             SettingField(
                 "rerank_enabled", "bool", "两阶段重排开关",
                 "检索两步走：向量+关键词融合先粗筛候选，重排模型再对「查询-块」逐对精排取 top_k；"
                 "关闭 = 只用粗筛排序",
                 True,
+            ),
+            SettingField(
+                "models_dir", "str", "模型存放路径",
+                "嵌入/重排/看图/本机OCR 的模型文件夹（里面是 models--BAAI--bge-m3 这类子文件夹）；"
+                "留空 = 项目内的 models 文件夹（没有就首次使用时自动下载到那里）；"
+                "改后检索模型下次加载时生效，看图/本机OCR 服务下次重新启动时生效",
+                "",
             ),
         ),
     ),

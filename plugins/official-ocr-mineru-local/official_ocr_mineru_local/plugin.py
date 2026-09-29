@@ -52,6 +52,7 @@ import sys
 from pathlib import Path
 
 from core.contracts import ExtractedDocument
+from core.paths import models_env
 from core.subprocess_service import SubprocessServiceError, SubprocessServiceHandle
 
 EXTRACTOR_VERSION = "0.2.0"
@@ -212,6 +213,10 @@ class MineruLocalOcrPlugin:
             health_check=self._runtime_health_check,
             cwd=self._plugin_dir,
             log_path=self._log_path,
+            # 让 MinerU 去用户配置的模型目录找/下模型（BC-17；旧项目对 MinerU 子进程
+            # 也是设 HF_HOME，见 obsidian-rag/gpu_arbiter.py::_mineru_env）。子进程启动时
+            # 定死：之后在设置页改路径，要等这个服务下次（重新）启动才生效。
+            env=models_env(self._settings.get("models_dir", "") if self._settings is not None else ""),
         )
         self._handle.start()
         if self._handle.log_file_error:

@@ -74,7 +74,7 @@ def extract(library_id: str, path: str, root: Path) -> ExtractedDocument:
     # 留下的老编码、Shift-JIS 笔记）会被逐个坏字节换成 U+FFFD 后照常产出内容
     # ——"可搜、不会消失"，与 LEGACY 逐条一致。
     #
-    # 两个有意偏离 LEGACY 的改进（都不是缺陷，需登记进行为契约）：
+    # 两个有意偏离 LEGACY 的改进（都不是缺陷，已登记进行为契约 BC-04）：
     #   1. `utf-8-sig`：有 BOM 就剥掉。LEGACY 用裸 "utf-8"，BOM 会以 U+FEFF
     #      留在结果串开头一路带进索引污染检索；而 bytes.decode("utf-8") 对带
     #      BOM 的内容**不会**抛 UnicodeDecodeError，所以"失败才回退"的写法在
@@ -83,7 +83,7 @@ def extract(library_id: str, path: str, root: Path) -> ExtractedDocument:
     #      写出的 .md 每行都带一个看不见的 \r，会被切块按行切分时带进块文本；
     #      且同一篇笔记在 Windows/Linux 之间换行符不同会被误判成"内容变了"。
     #      这是用户可见的行为差异（块文本哈希不同 → 迁移后首轮全量重建），
-    #      保留改进，但必须显式登记。
+    #      保留改进。（两条均已于 2026-09-29 经操作者确认，登记在 BC-04。）
     text = data.decode("utf-8-sig", errors="replace")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 

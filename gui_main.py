@@ -69,9 +69,11 @@ REQUIRED_PLUGINS = [
 
 #: 窗口规格：与旧项目 `guiweb/app.py::main` 的 `create_window` 一致，冻结在
 #: `plugins/official-gui-shell/tests/fixtures/legacy_guiweb_contract.json` 的 `window`
-#: 段里（`test_boot.py` 逐项对账）。
+#: 段里（`test_boot.py` 逐项对账）。**唯一的例外是标题**：旧项目叫 "Obsidian RAG"，
+#: 2026-09-29 操作者确认新版窗口叫 "Obsidian RAG 2.0"（夹具里保留旧值
+#: `title`，新值记在 `redo_title`，见 BC-15）。
 WINDOW_SPEC = {
-    "title": "Obsidian RAG",
+    "title": "Obsidian RAG 2.0",
     "width": 1440,
     "height": 900,
     "min_size": (1080, 700),
