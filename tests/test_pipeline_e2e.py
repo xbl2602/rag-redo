@@ -1647,6 +1647,16 @@ class TestOcrChainTryFallback(unittest.TestCase):
         self.assertEqual(record["failure_state"], "scanned")
         self.assertFalse(self.pipeline.failure_will_retry({"path": "scanned-contract.pdf", **record}))
 
+    def test_filling_in_the_mineru_key_in_settings_changes_the_capability_signature(self):
+        """设置页填的 Key 与环境变量等价：补 Key 必须改变能力签名，存量 scanned 终态才会重试。"""
+        self.runtime.settings.set("pdf_scan_backend", "mineru-cloud")
+        before = self.pipeline._extraction_capability_signature("a.pdf")
+        self.runtime.settings.set("mineru_api_key", "sk-anything")
+        after = self.pipeline._extraction_capability_signature("a.pdf")
+        self.assertNotEqual(before, after)
+        self.runtime.settings.set("mineru_api_key", "")
+        self.assertEqual(self.pipeline._extraction_capability_signature("a.pdf"), before)
+
     def test_capability_change_retries_stable_scanned_terminal(self):
         self.runtime.settings.set("pdf_scan_backend", "none")
         self.pipeline.index_library("scan-lib")

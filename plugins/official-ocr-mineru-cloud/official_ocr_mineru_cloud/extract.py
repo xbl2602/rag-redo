@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import threading
 import time
 from pathlib import Path
@@ -59,8 +58,9 @@ class MineruCloudExtractor:
         sidecar_dir: Path | None = None,
         quota_path: Path | None = None,
         logger: logging.Logger | None = None,
+        settings=None,
     ) -> None:
-        self._client = http_client if http_client is not None else _RealHttpClient()
+        self._client = http_client if http_client is not None else _RealHttpClient(settings=settings)
         self._pending_path = pending_path
         self._sidecar_dir = sidecar_dir
         self._quota_path = quota_path
@@ -294,7 +294,7 @@ class MineruCloudExtractor:
         except OSError as exc:
             return _fail(library_id, path, f"读取失败: {type(exc).__name__}: {exc}", state="unreadable")
         content_hash = _content_hash(data)
-        if isinstance(self._client, _RealHttpClient) and not os.environ.get("MINERU_API_KEY"):
+        if isinstance(self._client, _RealHttpClient) and not self._client.has_key():
             return _fail(library_id, path, "scanned", content_hash, state="scanned")
 
         try:

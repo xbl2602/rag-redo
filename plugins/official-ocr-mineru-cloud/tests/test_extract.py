@@ -629,12 +629,18 @@ class TestApiKeyNeverLeaks(unittest.TestCase):
 
         self.assertNotIn(FAKE_KEY_SENTINEL, str(ctx.exception))
 
-    def test_submit_without_key_reports_env_var_name_only(self):
+    def test_submit_without_key_reports_where_to_configure_only(self):
+        # 2026-09-29：Key 现在也可以在设置页填，提示语随之说明两处；性质不变——只说
+        # 去哪里配（设置页/环境变量名），绝不带出任何 Key 的值。
         client = _RealHttpClient(rate_per_minute=0)
         os.environ.pop("MINERU_API_KEY", None)
         with self.assertRaises(MineruCloudError) as ctx:
             client.submit(b"data", "a.pdf", is_ocr=True)
-        self.assertEqual(str(ctx.exception), "缺少 MINERU_API_KEY 环境变量")
+        self.assertEqual(
+            str(ctx.exception),
+            "缺少 MinerU API Key（请在设置页填写，或设置 MINERU_API_KEY 环境变量）",
+        )
+        self.assertNotIn(FAKE_KEY_SENTINEL, str(ctx.exception))
 
 
 if __name__ == "__main__":

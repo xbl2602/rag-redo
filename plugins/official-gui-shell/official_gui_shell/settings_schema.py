@@ -101,6 +101,22 @@ GROUPS: tuple[SettingGroup, ...] = (
                 ),
             ),
             SettingField(
+                "mineru_api_key", "str", "MinerU API Key",
+                "云端 OCR 用：mineru.net → 个人中心 → API Token；也可用环境变量 MINERU_API_KEY，"
+                "这里填了以这里为准。敏感信息，不进任何日志；补上 Key 后下轮索引自动重试此前因没 Key 跳过的扫描件",
+                "",
+                secret=True,
+            ),
+            SettingField(
+                "mineru_model_version", "str", "MinerU 云端模型版本",
+                "仅影响送 MinerU 云端时用哪个模型解析；本地直提与本机解析不受影响",
+                "vlm",
+                choices=(
+                    ("vlm", "视觉语言模型（默认，官方推荐，精度更高）"),
+                    ("pipeline", "传统流水线（更快更省配额，精度稍低）"),
+                ),
+            ),
+            SettingField(
                 "mineru_python", "str", "MinerU 环境 Python",
                 "uv tool 装好的 py3.12 全路径；空=自动探测。别填 .venv/全局3.14",
                 "",

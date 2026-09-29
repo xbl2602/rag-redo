@@ -2,10 +2,10 @@
 extract.py/ocr.py。"""
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from .extract import MineruCloudExtractor
+from .ocr import resolve_api_key
 
 
 class MineruCloudOcrPlugin:
@@ -20,6 +20,7 @@ class MineruCloudOcrPlugin:
             sidecar_dir=ctx.storage.directory("mineru_sidecars", legacy="mineru_sidecars"),
             quota_path=ctx.storage.file("mineru_quota.json", legacy="mineru_quota.json"),
             logger=ctx.logger,
+            settings=ctx.settings,
         )
         ctx.logger.info("MinerU云端OCR已加载")
 
@@ -49,7 +50,7 @@ class MineruCloudOcrPlugin:
 
     def index_signature(self) -> str:
         selected = self._settings.get("pdf_scan_backend", "none") if self._settings is not None else "none"
-        key_state = "key" if os.environ.get("MINERU_API_KEY") else "nokey"
+        key_state = "key" if resolve_api_key(self._settings) else "nokey"
         return f"selected:{selected}:{key_state}"
 
     def extract(self, library_id: str, path: str, root: Path):

@@ -457,6 +457,22 @@ class TestSettingsPage(unittest.TestCase):
         self.assertTrue(fields["pdf_scan_backend"]["choices"])
         self.assertEqual(fields["default_libraries"]["kind"], "list")
 
+    def test_mineru_key_and_model_version_are_on_the_page_and_the_key_is_secret(self) -> None:
+        """2026-09-29 操作者反馈“设置里 MinerU API 完全不见了”：旧项目设置页有这两项，云端识别读它们。"""
+        page = self.api.get_settings()
+        group = next(g for g in page["groups"] if g["title"] == "PDF 与云端 OCR")
+        fields = {f["key"]: f for f in group["fields"]}
+        self.assertTrue(fields["mineru_api_key"]["secret"])
+        self.assertEqual(fields["mineru_api_key"]["value"], "")
+        self.assertEqual([c[0] for c in fields["mineru_model_version"]["choices"]], ["vlm", "pipeline"])
+        self.assertEqual(fields["mineru_model_version"]["value"], "vlm")
+        self.assertEqual(self.api.save_settings({"mineru_api_key": "0123456789", "mineru_model_version": "pipeline"}), {"errors": {}})
+        self.assertEqual(self.settings.get("mineru_api_key", ""), "0123456789")  # 全数字也不被转成整数
+        self.assertEqual(self.settings.get("mineru_model_version", "vlm"), "pipeline")
+        again = {f["key"]: f for g in self.api.get_settings()["groups"] for f in g["fields"]}
+        self.assertEqual(again["mineru_api_key"]["value"], "0123456789")
+        self.assertEqual(self.api.save_settings({"mineru_model_version": "nonsense"})["errors"].keys(), {"mineru_model_version"})
+
     def test_saving_the_untouched_page_pins_nothing(self) -> None:
         """前端保存时把每个字段都发回：值等于默认值就清除该键，不把默认值钉死。"""
         page = self.api.get_settings()

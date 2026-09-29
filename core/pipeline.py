@@ -543,7 +543,13 @@ class Pipeline:
         material: tuple[object, ...] = (extension, providers)
         if extension == "pdf":
             backend = str(self.runtime.settings.get("pdf_scan_backend", "none") or "none")
-            credential = bool(str(os.environ.get("MINERU_API_KEY", "") or "").strip())
+            # 设置页填的 mineru_api_key 与环境变量 MINERU_API_KEY 等价（云端插件
+            # 同样是设置优先、环境变量兜底）：补上 Key 必须改变能力签名，存量
+            # scanned 终态才会在下一轮自动重试。
+            credential = bool(
+                str(self.runtime.settings.get("mineru_api_key", "") or "").strip()
+                or str(os.environ.get("MINERU_API_KEY", "") or "").strip()
+            )
             material += (backend, credential)
         return hashlib.sha256(repr(material).encode("utf-8")).hexdigest()
 

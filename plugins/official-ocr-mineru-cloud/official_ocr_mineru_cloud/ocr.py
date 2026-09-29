@@ -34,6 +34,33 @@ def _classify_mineru_code(code: object) -> str:
     return "transient"
 
 
+_NO_KEY_MESSAGE = "缺少 MinerU API Key（请在设置页填写，或设置 MINERU_API_KEY 环境变量）"
+
+
+def resolve_api_key(settings=None) -> str:
+    """MinerU 云端 API Key：**设置页的 `mineru_api_key` 优先，环境变量 `MINERU_API_KEY` 兜底**。
+
+    旧项目 obsidian-rag 的 Key 存在配置里、设置页可填（gui/config_editor.py 的保密字段；
+    extractors.py:1239 读它）；rag-redo 此前只认环境变量，只用界面的人没有地方填。现在
+    两处都认，此前靠环境变量配置的用法不受影响。每次调用现读，不缓存：设置页改了立刻生效。
+    返回去掉首尾空白后的值，都没配返回空串。本函数的返回值绝不写进日志/异常。"""
+    value = ""
+    if settings is not None:
+        value = str(settings.get("mineru_api_key", "") or "").strip()
+    return value or str(os.environ.get("MINERU_API_KEY", "") or "").strip()
+
+
+def resolve_model_version(settings=None) -> str:
+    """云端解析模型版本（vlm | pipeline）：设置页 `mineru_model_version` 优先，环境变量
+    `MINERU_MODEL_VERSION` 兜底，默认 vlm（旧项目 config.py 的默认值）。"""
+    value = ""
+    if settings is not None:
+        value = str(settings.get("mineru_model_version", "vlm") or "").strip()
+    if value and value != "vlm":
+        return value
+    return str(os.environ.get("MINERU_MODEL_VERSION", "") or "").strip() or value or "vlm"
+
+
 class MineruCloudError(Exception):
     def __init__(
         self,
@@ -64,7 +91,9 @@ class _RealHttpClient:
         endpoint: str = "https://mineru.net/api/v4",
         *,
         rate_per_minute: int = 45,
+        settings=None,
     ) -> None:
+        self._settings = settings
         self.endpoint = endpoint.rstrip("/")
         self._rate_per_minute = max(0, int(rate_per_minute))
         self._submit_times: deque[float] = deque()
@@ -73,6 +102,13 @@ class _RealHttpClient:
         # 请求大概率全部失败，置位后提交快速失败。每轮索引云端段开始时
         # 由调用方 reset_token_flag() 归零（长驻进程跨轮次复用）。
         self._token_invalid = threading.Event()
+
+    def _api_key(self) -> str:
+        return resolve_api_key(self._settings)
+
+    def has_key(self) -> bool:
+        """是否配了 Key（设置页或环境变量）；每次现读。"""
+        return bool(self._api_key())
 
     def token_invalid(self) -> bool:
         return self._token_invalid.is_set()
@@ -118,9 +154,9 @@ class _RealHttpClient:
         return payload
 
     def submit(self, file_bytes: bytes, filename: str, *, is_ocr: bool) -> dict:
-        api_key = os.environ.get("MINERU_API_KEY")
+        api_key = self._api_key()
         if not api_key:
-            raise MineruCloudError("缺少 MINERU_API_KEY 环境变量")
+            raise MineruCloudError(_NO_KEY_MESSAGE)
         if self._token_invalid.is_set():
             # 同批已有任务发现 Token 失效：本文件不发请求直接失败（问题35
             # ——重试只会烧频控配额；调度方/后续任务据此快速失败）
@@ -129,7 +165,7 @@ class _RealHttpClient:
             {
                 "enable_formula": True,
                 "enable_table": True,
-                "config": {"mineru_model_version": os.environ.get("MINERU_MODEL_VERSION", "vlm")},
+                "config": {"mineru_model_version": resolve_model_version(self._settings)},
                 "files": [{"name": filename, "is_ocr": bool(is_ocr), "data_id": "doc"}],
             }
         ).encode("utf-8")
@@ -186,9 +222,9 @@ class _RealHttpClient:
             raise MineruCloudError(f"上传网络错误: {type(exc).__name__}", retryable=True) from exc
 
     def poll(self, batch_id: str, *, timeout: float = 600.0) -> tuple[str | None, str, bytes | None]:
-        api_key = os.environ.get("MINERU_API_KEY")
+        api_key = self._api_key()
         if not api_key:
-            raise MineruCloudError("缺少 MINERU_API_KEY 环境变量")
+            raise MineruCloudError(_NO_KEY_MESSAGE)
         deadline = time.monotonic() + max(30.0, timeout)
         while time.monotonic() < deadline:
             request = urllib.request.Request(
