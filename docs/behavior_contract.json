@@ -381,7 +381,43 @@
         "rag-redo/plugins/official-gui-shell/tests/test_boot.py::TestPushLoop"
       ],
       "acceptance": "GUI 是操作方式而非独立产品，必须与 MCP/CLI 共用同一业务核心，自身零业务判断。量化门槛：(1) 资产一致性——assets/{index.html,app.css,app.js,mock.js} 与 obsidian-rag/guiweb/ui/ 逐字节相同，sha256 冻结为 fixture 且测试断言 4/4；(2) 契约覆盖——contracts.md 定义的 37 个方法，新桥接层 37/37 同名存在且返回 JSON 键集合与契约一致，缺口必须为 0；(3) 推送通道——snapshot/log/alert/notice/preview 五类推送与 bind_window 必须存在，snapshot 周期 1 秒，连续失败 5 次才退出；(4) 视图覆盖——contracts.md 视图映射表 7 个视图（检索/库/索引/诊断/设置/图谱/全局）逐项可达；(5) 零业务逻辑——前端与桥接层不得出现 RRF/BM25/cosine/rerank 计算，排序过滤置信度一律来自 core，入口不得各自实现。",
-      "blocker": "阶段A（资产原样搬运）已完成并通过 4/4 sha256 校验；阶段B/C（37 个契约方法桥接、勾选树/进度/推送/试验台/设置等 16 项 core 侧能力）已实现，并由 test_contracts_parity.py 对夹具 37/37 逐个真实调用断言返回键集合，test_boot.py 走真实运行时与真实 gui_main.main() 断言启动路径。**仍待**：①真实 pywebview 窗口内的人工验证（7 个视图逐项可达、推送通道在真实窗口里生效）与操作者确认（2026-09-28 已有的自动化证据，不代替这一步：真实进程冒烟——`gui_main.py` 在临时数据目录下 6~8 秒内出现标题「Obsidian RAG」的窗口，标准错误输出为空，正常关窗后整棵进程树（含 WEMM 看图服务）无残留；前端对真实 Api 与真实推送循环的浏览器联调——图谱/库/勾选范围写入回读/检索含建议与双链/设置保存回读/索引/试验台/诊断含去重均渲染并可操作，无 JS 报错、无失败请求；联调用的是假嵌入，未覆盖「点击开始索引」拉起真实 BGE-M3 worker 的路径）；②与旧项目的有意差异——设置页只列 rag-redo 真实读取的键（不是旧项目的 13 组）、切块粒度/collection 不能按库覆盖（rag-redo 没有该能力）、进度条 pct 取 0~100（旧桥送 0~1 而旧前端按 0~100 用）——需操作者确认后再登记为已批准偏离。原 official-gui-shell/tests/test_assets.py 的 7 条断言针对被取代的自制界面设计，已由本契约的资产一致性与零业务逻辑断言取代。"
+      "blocker": "阶段A（资产原样搬运）已完成并通过 4/4 sha256 校验；阶段B/C（37 个契约方法桥接、勾选树/进度/推送/试验台/设置等 16 项 core 侧能力）已实现，并由 test_contracts_parity.py 对夹具 37/37 逐个真实调用断言返回键集合，test_boot.py 走真实运行时与真实 gui_main.main() 断言启动路径。**仍待**：①真实 pywebview 窗口内的人工验证（7 个视图逐项可达、推送通道在真实窗口里生效）与操作者确认（2026-09-28 已有的自动化证据，不代替这一步：真实进程冒烟——`gui_main.py` 在临时数据目录下 6~8 秒内出现标题「Obsidian RAG」的窗口，标准错误输出为空，正常关窗后整棵进程树（含 WEMM 看图服务）无残留；前端对真实 Api 与真实推送循环的浏览器联调——图谱/库/勾选范围写入回读/检索含建议与双链/设置保存回读/索引/试验台/诊断含去重均渲染并可操作，无 JS 报错、无失败请求；联调用的是假嵌入，未覆盖「点击开始索引」拉起真实 BGE-M3 worker 的路径）；②与旧项目的有意差异——设置页只列 rag-redo 真实读取的键（不是旧项目的 13 组）、切块粒度/collection 不能按库覆盖（rag-redo 没有该能力）、进度条 pct 取 0~100（旧桥送 0~1 而旧前端按 0~100 用）——需操作者确认后再登记为已批准偏离。原 official-gui-shell/tests/test_assets.py 的 7 条断言针对被取代的自制界面设计，已由本契约的资产一致性与零业务逻辑断言取代。**2026-09-29 追记**：新增 BC-16（手动释放 GPU 显存按钮）后，index.html/app.js/mock.js 的 bytes/sha256 已按操作者确认的新增内容更新（`legacy_guiweb_contract.json` 的 `_comment_bc16` 有完整记录），是本契约验收标准 (1) 资产一致性条款唯一一处已登记的例外，不是未声明的漂移；app.css 未改动。"
+    },
+    {
+      "id": "BC-16",
+      "title": "手动释放 GPU 显存（新能力，无旧项目对应）",
+      "status": "partial",
+      "legacy_refs": [
+        "obsidian-rag/guiweb/contracts.md:1-251",
+        "obsidian-rag/guiweb/bridge.py:1-1200",
+        "obsidian-rag/gpu_arbiter.py:131,441",
+        "obsidian-rag/guiweb/ui/mock.js:1-820"
+      ],
+      "redo_refs": [
+        "rag-redo/core/pipeline.py::Pipeline.release_gpu_memory",
+        "rag-redo/plugins/official-embedder-bge-m3/official_embedder_bge_m3/plugin.py::EmbedderPlugin.release_gpu",
+        "rag-redo/plugins/official-reranker/official_reranker/plugin.py::RerankerPlugin.release_gpu",
+        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py::Plugin.release_gpu",
+        "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/plugin.py::Plugin.release_gpu",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/api.py::Api.release_gpu_memory",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/assets/index.html（#btnReleaseGpu）",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/assets/app.js",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/assets/mock.js"
+      ],
+      "test_refs": [
+        "rag-redo/plugins/official-embedder-bge-m3/tests/test_embed.py::TestEmbedderPluginLeaseLifecycle.test_release_gpu_unloads_model_but_keeps_plugin_usable",
+        "rag-redo/plugins/official-reranker/tests/test_rerank.py::TestRerankerPluginReleaseGpu",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_release_gpu_soft_evicts_without_killing_subprocess",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_release_gpu_is_a_noop_when_subprocess_never_started",
+        "rag-redo/plugins/official-ocr-mineru-local/tests/test_plugin.py::TestMineruLocalOcrPlugin.test_release_gpu_soft_evicts_without_killing_subprocess",
+        "rag-redo/plugins/official-ocr-mineru-local/tests/test_plugin.py::TestMineruLocalOcrPlugin.test_release_gpu_is_a_noop_when_subprocess_never_started",
+        "rag-redo/tests/test_pipeline_e2e.py::TestReleaseGpuMemory",
+        "rag-redo/plugins/official-gui-shell/tests/test_api.py::TestApi.test_release_gpu_memory_delegates_to_pipeline",
+        "rag-redo/plugins/official-gui-shell/tests/test_api.py::TestApi.test_release_gpu_memory_folds_pipeline_exception_instead_of_crashing",
+        "rag-redo/plugins/official-gui-shell/tests/test_assets.py::TestReleaseGpuButton"
+      ],
+      "acceptance": "点击 GUI 索引页的『释放显存』按钮后：official-embedder-bge-m3/official-reranker（检索侧，共用一个 GPU 名额）立即卸载显存中的模型并归还名额，但插件保持 enabled，下一次真正检索/索引时透明重新加载模型，用户无需手动重新启用；official-visual-wemm/official-ocr-mineru-local 的子进程收到软驱逐请求卸载模型但继续存活监听（同资源仲裁器抢占时走的同一条路径），下一次真正查询/提取时子进程自己按需重新加载模型。不碰任何插件的启用状态、`wemm_backend`/`pdf_scan_backend` 等持久化配置——这是操作者明确要求的边界：GUI 目前没有运行中重新启用一个已禁用插件的入口，真把插件 disable 掉会让相关功能卡死到重启整个 GUI 才能恢复。四个消费者互相独立：某个插件未启用/不支持这个操作就跳过（不算错误），某一个插件释放失败不影响其它插件已经释放成功的部分。",
+      "blocker": "legacy_refs 四个文件均已核实确认**没有**对应能力：guiweb/contracts.md 的 GPU 段落（第35-52行附近）只声明只读字段 `gpu`/`wemm_live`；guiweb/bridge.py 通读一遍没有任何 release/evict/unload 相关方法；gpu_arbiter.py 的 `request_evict` 只在插件互相抢占时内部调用，没有暴露成用户可触发的入口；guiweb/ui/mock.js 的 GPU 卡片只做展示，没有配套按钮。2026-09-29 由操作者在对话中提出并逐步确认语义（先问是否连子进程一起停掉，操作者澄清『最重要的是释放模型显存，不是关闭进程』后改为只软驱逐/卸载模型，子进程与配置都不动）——是纯新设计，不是行为兼容缺口。仍待操作者在真实窗口里实际点一次这个按钮、观察显存数字变化做最终人工确认（同 BC-15 GUI 视觉验收的一贯要求，自动化测试不代替这一步）。"
     }
   ]
 }
