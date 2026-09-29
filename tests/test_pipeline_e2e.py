@@ -1243,6 +1243,53 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         self.assertTrue(any(r.path == "占位报告.docx" for r in results))
 
 
+class TestReleaseGpuMemory(TestEndToEndSearchPipeline):
+    """手动"释放显存"按钮的编排层测试（core/pipeline.py::release_gpu_memory，
+    2026-09-29 新能力，BC-16；旧项目 guiweb 没有对应能力）。复用
+    TestEndToEndSearchPipeline 的 setUp（embedder/reranker 已真实 enabled，
+    注入假 encoder/reranker）——这里只测编排逻辑本身（该调的调、该跳的
+    跳、一个插件失败不连累其它插件），"模型是不是真的从显存卸载了"分别在
+    各插件自己的测试文件里验证（test_embed.py::
+    TestEmbedderPluginLeaseLifecycle、test_rerank.py::
+    TestRerankerPluginReleaseGpu、official-visual-wemm 和
+    official-ocr-mineru-local 各自 tests/test_plugin.py 里的同名测试）。"""
+
+    def test_calls_release_gpu_on_enabled_consumers_and_skips_absent_ones(self):
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        reranker = self.runtime.plugins["official-reranker"].instance
+        with patch.object(embedder, "release_gpu") as embed_release, \
+                patch.object(reranker, "release_gpu") as rerank_release:
+            result = self.pipeline.release_gpu_memory()
+        embed_release.assert_called_once_with()
+        rerank_release.assert_called_once_with()
+        self.assertEqual(sorted(result["released"]), ["official-embedder-bge-m3", "official-reranker"])
+        # 这套测试环境（OFFICIAL_PHASE1_PLUGINS）本来就没装 WEMM/MinerU-local——
+        # 必须被跳过，不能报错（用户没开视觉导航/本机OCR，点释放显存不该报错）。
+        self.assertIn("official-visual-wemm", result["skipped"])
+        self.assertIn("official-ocr-mineru-local", result["skipped"])
+        self.assertEqual(result["errors"], {})
+
+    def test_a_failing_plugin_does_not_block_the_others(self):
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        reranker = self.runtime.plugins["official-reranker"].instance
+        with patch.object(embedder, "release_gpu", side_effect=RuntimeError("boom")), \
+                patch.object(reranker, "release_gpu") as rerank_release:
+            result = self.pipeline.release_gpu_memory()
+        rerank_release.assert_called_once_with()
+        self.assertEqual(result["released"], ["official-reranker"])
+        self.assertIn("official-embedder-bge-m3", result["errors"])
+        self.assertIn("boom", result["errors"]["official-embedder-bge-m3"])
+
+    def test_disabled_plugin_is_skipped_not_erred(self):
+        self.runtime.disable("official-reranker")
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        with patch.object(embedder, "release_gpu") as embed_release:
+            result = self.pipeline.release_gpu_memory()
+        embed_release.assert_called_once_with()
+        self.assertIn("official-reranker", result["skipped"])
+        self.assertNotIn("official-reranker", result["errors"])
+
+
 class TestExportImportLibrary(TestEndToEndSearchPipeline):
     """导出/导入是"把已建索引的库搬到另一台机器，不用重新跑一遍索引"的
     能力——见 core/pipeline.py 的 export_library/import_library 模块内

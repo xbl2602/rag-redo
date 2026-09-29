@@ -456,6 +456,47 @@ class TestRerankerPluginResetsLatch(unittest.TestCase):
         self.assertIsNone(plugin.engine)
 
 
+class TestRerankerPluginReleaseGpu(unittest.TestCase):
+    """手动"释放显存"按钮用（core/pipeline.py::release_gpu_memory，
+    2026-09-29 新能力，BC-16）——同 official-embedder-bge-m3/tests/
+    test_embed.py::TestEmbedderPluginLeaseLifecycle 的同名测试，这里不重复
+    展开设计理由：跟 on_disable 一样真卸载模型、归还名额，但不禁用插件、
+    不复位加载失败闩锁，下次重排透明重新加载。"""
+
+    def setUp(self) -> None:
+        self.logger = logging.getLogger("rag_redo.test.rerank.plugin.release_gpu")
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.propagate = False
+        self.logger.addHandler(logging.NullHandler())
+
+    def test_release_gpu_unloads_model_but_keeps_plugin_usable(self):
+        def _factory(*args, **kwargs):
+            return _FakeCrossEncoderModel()
+
+        plugin = RerankerPlugin()
+        ctx = _Ctx(self.logger)
+        plugin.on_load(ctx)
+        arb = ctx.resource_arbiter
+        with patch.dict(sys.modules, {"sentence_transformers": _fake_sentence_transformers(_factory)}), \
+                patch("official_reranker.rerank.gpu_arbiter.vram_free_gb", return_value=8.0), \
+                patch("torch.cuda.is_available", return_value=True):
+            plugin.engine.rerank("q", [("c1", "text")])
+        real = plugin.engine._reranker
+        self.assertIsNotNone(real._model)
+        self.assertEqual(arb.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
+
+        plugin.release_gpu()
+        self.assertIsNone(real._model, "释放显存必须真的把模型卸掉")
+        self.assertIsNone(arb.holder_of(GPU_RESOURCE_ID), "释放显存必须归还GPU名额")
+
+        # 插件本身仍然可用：不需要重新 on_enable，下次重排透明重新加载。
+        with patch.dict(sys.modules, {"sentence_transformers": _fake_sentence_transformers(_factory)}), \
+                patch("official_reranker.rerank.gpu_arbiter.vram_free_gb", return_value=8.0), \
+                patch("torch.cuda.is_available", return_value=True):
+            plugin.engine.rerank("q", [("c1", "text again")])
+        self.assertIsNotNone(real._model, "释放显存之后插件必须还能正常工作，不需要重新启用")
+
+
 class TestRerankerDegradeKeepsModelLoaded(unittest.TestCase):
     """降级到 CPU 之后模型必须留在内存里接着用，且名额当场归还。
 

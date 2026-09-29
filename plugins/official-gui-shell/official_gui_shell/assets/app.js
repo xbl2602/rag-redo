@@ -1245,6 +1245,12 @@ function doStop() {
 }
 $('btnStopIdx').addEventListener('click', doStop);
 $('iStop').addEventListener('click', function (e) { e.stopPropagation(); doStop(); });
+$('btnReleaseGpu').addEventListener('click', function () {
+  API.release_gpu_memory().then(function (res) {
+    if (res.released && res.released.length) toast('已释放显存：' + res.released.join('、'));
+    else toast('没有需要释放的显存（可能本来就是空的）', 'warn');
+  }).catch(function () { toast('释放显存失败，请查看日志', 'err'); });
+});
 
 /* ============ 提取试验台 ============ */
 var labPolling = false, labStart = 0;

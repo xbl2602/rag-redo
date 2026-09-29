@@ -2668,6 +2668,57 @@ class Pipeline:
                 result[plugin_id] = visual.status()
         return result
 
+    #: 会真正占用本机 GPU 显存的插件——检索侧 embedder+reranker 共用同一个
+    #: "gpu:0" 名额；WEMM/MinerU-local 各自在独立子进程里装自己的模型。
+    #: official-ocr-mineru-cloud 是纯云端 API，不占本机显存，不在这个列表里。
+    _GPU_CONSUMER_PLUGIN_IDS = (
+        "official-embedder-bge-m3",
+        "official-reranker",
+        "official-visual-wemm",
+        "official-ocr-mineru-local",
+    )
+
+    def release_gpu_memory(self) -> dict:
+        """手动立即释放显存（2026-09-29 操作者需求；旧项目 guiweb 没有对应
+        按钮，已在 docs/behavior_contract.json 登记为 BC-16 新能力）。
+
+        **只卸载模型、归还 GPU 名额，不碰子进程/插件启用状态/持久化配置**：
+        用户要的是"现在不占显存"，不是"把检索/视觉导航/OCR 关掉、以后还得
+        手动去设置页重新打开"——GUI 目前也没有运行中重新 enable 一个插件的
+        入口，真把插件 disable 掉会让这些功能卡死到下次重启整个 GUI 才能用
+        （2026-09-29 与操作者确认过这一点）。
+
+        - embedder/reranker（检索侧，`release_gpu()` 内部调用与
+          `on_disable()` 相同的 `release_gpu_slot()`）：模型从显存卸载，
+          `_ensure_loaded()` 的懒加载语义保证下一次真正检索/索引时会透明
+          重新装回来，用户无感，只是要多等几秒冷启动。
+        - official-visual-wemm/official-ocr-mineru-local（各自独立子
+          进程）：`release_gpu()` 内部调用软驱逐（`_soft_evict()`，与资源
+          仲裁器抢占时走的同一条路径）——请求子进程卸载模型释放显存，
+          子进程本身继续存活监听，下次查询会按需重新加载模型。
+
+        每个插件的释放动作互相独立：没启用/没找到就跳过（不是错误——比如
+        WEMM 后端本来就关着），某一个插件释放失败不能连累其它插件也释放
+        不到（同 `on_disable()` 收口的宽容纪律，try/except 逐个隔离）。"""
+        released: list[str] = []
+        skipped: list[str] = []
+        errors: dict[str, str] = {}
+        for plugin_id in self._GPU_CONSUMER_PLUGIN_IDS:
+            plugin = self.runtime.plugins.get(plugin_id)
+            if plugin is None or plugin.instance is None or plugin.state.value != "enabled":
+                skipped.append(plugin_id)
+                continue
+            release = getattr(plugin.instance, "release_gpu", None)
+            if release is None:
+                skipped.append(plugin_id)
+                continue
+            try:
+                release()
+                released.append(plugin_id)
+            except Exception as exc:  # noqa: BLE001 - 一个插件释放失败不能连累其它插件
+                errors[plugin_id] = f"{type(exc).__name__}: {exc}"
+        return {"released": released, "skipped": skipped, "errors": errors}
+
     def read_document(self, library_id: str, path: str) -> DocumentContent:
         """读取某文档的完整正文——对齐 obsidian-rag 的 `read_document`
         MCP 工具（2026-09-23 全面功能审计发现的缺口）：检索命中后想通读

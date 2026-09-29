@@ -231,6 +231,13 @@ class MineruLocalOcrPlugin:
             self._handle.stop()
             self._handle = None
 
+    def release_gpu(self) -> None:
+        """手动立即释放显存用（core/pipeline.py::release_gpu_memory，
+        2026-09-29 新能力，BC-16）——见 official-visual-wemm/plugin.py 同名
+        方法的说明：只请求子进程软驱逐，不影响 `pdf_scan_backend` 设置或
+        插件启用状态。"""
+        self._soft_evict()
+
     def _soft_evict(self) -> None:
         """见 official-visual-wemm/plugin.py 同名方法的说明——只请求软
         驱逐，不整个杀掉子进程；HTTP 失败 fail-open，不阻塞抢占方。"""

@@ -569,6 +569,23 @@ class TestApi(unittest.TestCase):
         self.assertIsNone(self.api._lib_mgr.store.get("lib1"))
         self.assertTrue((self.vault / "notes.md").exists(), "笔记文件永远保留")
 
+    # ---- GPU（精确 API：新能力，旧项目没有对应按钮，见 BC-16）--------------------------
+
+    def test_release_gpu_memory_delegates_to_pipeline(self):
+        expected = {"released": ["official-embedder-bge-m3"], "skipped": [], "errors": {}}
+        with patch.object(self.pipeline, "release_gpu_memory", return_value=expected) as mocked:
+            result = self.api.release_gpu_memory()
+        mocked.assert_called_once_with()
+        self.assertEqual(result, expected)
+
+    def test_release_gpu_memory_folds_pipeline_exception_instead_of_crashing(self):
+        """见模块 docstring：绝不让一次操作失败带崩整个窗口——就算编排层
+        本身抛异常，前端也该拿到一个可展示的结构，不是一个未捕获异常。"""
+        with patch.object(self.pipeline, "release_gpu_memory", side_effect=RuntimeError("boom")):
+            result = self.api.release_gpu_memory()
+        self.assertEqual(result["released"], [])
+        self.assertIn("boom", result["errors"]["_pipeline"])
+
 
 if __name__ == "__main__":
     unittest.main()

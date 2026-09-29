@@ -77,6 +77,14 @@ class RerankerPlugin:
             self._reset_latch(ctx)
         self.engine = None
 
+    def release_gpu(self) -> None:
+        """手动立即释放显存用（core/pipeline.py::release_gpu_memory，
+        2026-09-29 新能力，BC-16）——同 official-embedder-bge-m3 同名方法：
+        跟 `on_disable` 一样调用 `release_gpu_slot`，但不碰插件启用状态、
+        不复位加载失败闩锁，下一次真正重排时透明重新加载模型。"""
+        if self.engine is not None:
+            self.engine.release_gpu_slot()
+
     def _release_gpu_slot(self, ctx) -> None:
         """卸载模型 + 归还 GPU 名额，幂等；失败不拖垮宿主（同守护线程的宽容
         纪律）。"""

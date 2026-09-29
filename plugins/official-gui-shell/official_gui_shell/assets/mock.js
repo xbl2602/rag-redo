@@ -768,6 +768,11 @@
 
     get_static_path: function (name) {
       return Promise.resolve({ path: 'C:\\Users\\xbl26\\projects\\obsidian-rag\\data\\' + (name || 'gui_index.log') });
+    },
+
+    // 新能力（BC-16），旧项目没有对应按钮，演示模式简单模拟"卸载成功"。
+    release_gpu_memory: function () {
+      return Promise.resolve({ released: ['official-embedder-bge-m3', 'official-reranker'], skipped: [], errors: {} });
     }
   };
 

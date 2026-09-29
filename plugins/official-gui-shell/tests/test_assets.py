@@ -152,5 +152,26 @@ class TestNoBusinessLogicInFrontend(unittest.TestCase):
                 self.assertNotIn(token, self.app_js)
 
 
+class TestReleaseGpuButton(unittest.TestCase):
+    """BC-16：手动释放显存按钮——本仓库唯一一处刻意打破 BC-15『逐字节
+    复刻』的地方（2026-09-29 操作者确认，旧项目 guiweb 没有对应能力）。
+    `TestLegacyAssetParity.test_every_legacy_asset_is_byte_identical` 已经
+    用更新过的 bytes/sha256 覆盖了这三个文件的完整性，这里额外确认新增的
+    这一小块内容真的在场——防止以后有人为了让字节数对上又把它删掉。"""
+
+    def test_button_markup_is_in_index_html(self) -> None:
+        html = (ASSETS_DIR / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="btnReleaseGpu"', html)
+
+    def test_app_js_wires_the_button_to_the_new_api_method(self) -> None:
+        app_js = (ASSETS_DIR / "app.js").read_text(encoding="utf-8")
+        self.assertIn("$('btnReleaseGpu').addEventListener", app_js)
+        self.assertIn("API.release_gpu_memory()", app_js)
+
+    def test_mock_js_implements_the_method_for_demo_mode(self) -> None:
+        mock_js = (ASSETS_DIR / "mock.js").read_text(encoding="utf-8")
+        self.assertIn("release_gpu_memory: function", mock_js)
+
+
 if __name__ == "__main__":
     unittest.main()

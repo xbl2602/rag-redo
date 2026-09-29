@@ -79,6 +79,15 @@ class EmbedderPlugin:
         self._release_gpu_slot(ctx)
         self.embedder = None
 
+    def release_gpu(self) -> None:
+        """手动立即释放显存用（core/pipeline.py::release_gpu_memory，
+        2026-09-29 新能力，BC-16）——跟 `on_disable` 走的是同一份卸载逻辑
+        （`release_gpu_slot`），但**不碰插件启用状态**：模型就地卸载，
+        空闲卸载守护线程、`on_enable` 的其它状态都不受影响，下一次真正
+        编码时 `_ensure_loaded()` 的懒加载语义会透明地把模型重新装回来。"""
+        if self.embedder is not None:
+            self.embedder.release_gpu_slot()
+
     def _release_gpu_slot(self, ctx) -> None:
         """卸载模型 + 归还 GPU 名额，幂等；失败不拖垮宿主（同守护线程的宽容
         纪律）。"""

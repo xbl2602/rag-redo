@@ -291,3 +291,21 @@ class Api(_LegacyContractMixin):
         except Exception as exc:  # noqa: BLE001 - 见模块 docstring
             return {"ok": False, "error": str(exc)}
         return {"ok": True}
+
+    # ---- GPU（精确 API：新能力，旧项目没有对应按钮，见 BC-16）--------------------------
+
+    def release_gpu_memory(self) -> dict[str, Any]:
+        """手动立即释放显存——2026-09-29 操作者需求，旧项目 guiweb 没有对应
+        按钮（contracts.md 的 GPU 卡片只读展示），已登记为 BC-16 新能力，
+        不是契约方法（不占用 37 个契约名额），前端按精确 API 直接调用。
+
+        只卸载模型、归还 GPU 名额，不碰子进程/插件启用状态/持久化配置——
+        完整语义见 `core/pipeline.py::release_gpu_memory`。返回
+        `{released, skipped, errors}`：`released` 是这次真的卸载了模型的
+        插件 id 列表（可能是空列表，比如显存本来就是空的）；`skipped` 是
+        没启用/不支持这个操作的插件 id；`errors` 是释放失败的插件 id →
+        原因，某个插件失败不影响其它插件已经释放成功的部分。"""
+        try:
+            return self._pipeline.release_gpu_memory()
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring：绝不让一次操作失败带崩整个窗口
+            return {"released": [], "skipped": [], "errors": {"_pipeline": str(exc)}}

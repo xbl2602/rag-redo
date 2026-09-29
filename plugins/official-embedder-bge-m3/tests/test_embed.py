@@ -820,6 +820,24 @@ class TestEmbedderPluginLeaseLifecycle(_LeaseTestBase):
         self.assertIsNone(self.arb.holder_of(GPU_RESOURCE_ID))
         self.assertIsNone(enc._model)
 
+    def test_release_gpu_unloads_model_but_keeps_plugin_usable(self):
+        """手动"释放显存"按钮用（core/pipeline.py::release_gpu_memory，
+        2026-09-29 新能力，BC-16）——跟 on_disable 一样把模型真的卸掉、名额
+        归还，但**不是禁用插件**：不停空闲卸载守护线程、不用户手动重新
+        enable，下一次真正编码时必须透明地把模型重新装回来（这正是它和
+        on_disable 的区别——on_disable 之后这个插件在下次真正用到之前不会
+        自己再工作）。"""
+        plugin, ctx, enc = self._plugin_with_loaded_model()
+        plugin.release_gpu()
+        self.assertIsNone(enc._model, "释放显存必须真的把模型卸掉")
+        self.assertIsNone(self.arb.holder_of(GPU_RESOURCE_ID), "释放显存必须归还GPU名额")
+        # 插件本身仍然可用：不需要重新 on_enable，下次编码透明重新加载。
+        with patch.dict(sys.modules, {"sentence_transformers": _fake_sentence_transformers()}), patch(
+            _VRAM, return_value=8.0
+        ):
+            plugin.embed_texts(["again"])
+        self.assertIsNotNone(enc._model, "释放显存之后插件必须还能正常工作，不需要重新启用")
+
     def test_disable_with_outstanding_refs_unloads_first_then_returns_lease(self):
         """还有人在用（残留引用）也照样收尾：先卸载模型、再归还名额，并留日志
         说明当时还有多少引用——插件都要被停用了，留下一个"占着最高优先级名额

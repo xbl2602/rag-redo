@@ -1,5 +1,6 @@
 {
   "_comment": "BC-15 验收基准。从 obsidian-rag/guiweb/contracts.md v1 + guiweb/bridge.py 真实签名逐条冻结，供 rag-redo 独立 CI 校验（不依赖旧项目仓库在场）。params 为 pywebview 可见的位置参数名与顺序——pywebview 按位置/名把 JS 调用映射到 Python 形参，所以参数名和顺序都是契约的一部分。",
+  "_comment_bc16": "2026-09-29 操作者确认新增：index.html/app.js/mock.js 的 bytes/sha256 已按 BC-16（手动释放显存按钮，见 docs/behavior_contract.json）真实更新，不是漂移——旧项目从没有这个按钮，这是本仓库唯一一处刻意打破 BC-15『逐字节复刻』要求的地方，仅此一处、有据可查。app.css 未改动，哈希不变。",
   "legacy_source": {
     "contracts": "obsidian-rag/guiweb/contracts.md",
     "bridge": "obsidian-rag/guiweb/bridge.py",
@@ -8,10 +9,10 @@
   },
   "bridge_class": "Bridge",
   "assets": [
-    {"name": "index.html", "bytes": 36816, "sha256": "F937020BF88A85A988D998AC40A68463B7E8613588F13204565D01829C3C20C2"},
+    {"name": "index.html", "bytes": 37038, "sha256": "5C327B620430E1C2237F5062E540BF8C3906D54648DBBE4579AD21D74C3A92AD"},
     {"name": "app.css", "bytes": 63168, "sha256": "807956814009DCBB04A9C49CC291F1C04E33EEE8EE9AA80AEDE804A0A0297F06"},
-    {"name": "app.js", "bytes": 138371, "sha256": "3FB283C71814CF429F74AEDA591645FE77A298F66541634366FF7982FBC793F8"},
-    {"name": "mock.js", "bytes": 70041, "sha256": "B3C86F6D8F4EF6C1A822BAF53D4CEA61CA5F34B2DC1927BEBE42D9A0DCAFEE1C"}
+    {"name": "app.js", "bytes": 138752, "sha256": "038D4E649C7D7B71E010E47F15D33394C7994A2A0738654FB8AC97212133C5B9"},
+    {"name": "mock.js", "bytes": 70309, "sha256": "A9B9A064A7677D869375DAE79568A7AA3C064348D3475C7A13A5F03681AB540E"}
   ],
   "push_types": ["snapshot", "log", "alert", "notice", "preview"],
   "window": {

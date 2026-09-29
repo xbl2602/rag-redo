@@ -152,6 +152,27 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
         self.assertIsNone(self.rt.resource_arbiter.holder_of("gpu:0"))
         self.assertTrue(_process_is_gone(pid))
 
+    def test_release_gpu_soft_evicts_without_killing_subprocess(self):
+        """手动"释放显存"按钮用（core/pipeline.py::release_gpu_memory，
+        2026-09-29 新能力，BC-16）——同 official-visual-wemm 同名测试：子
+        进程（同一个 pid）继续存活，只是模型被请求卸载，下次真正提取时
+        子进程自己按需重新加载模型，不需要用户重新开启本机OCR或重启GUI。"""
+        pid_before = self.instance._handle._process.pid  # noqa: SLF001
+        self.instance.release_gpu()
+        self.assertIsNotNone(self.instance._handle)  # noqa: SLF001
+        self.assertEqual(self.instance._handle._process.pid, pid_before)  # noqa: SLF001
+        self.assertTrue(self.instance._handle.is_alive)
+        (self.tmp / "after-release.pdf").write_bytes(b"%PDF-fake-scanned-content")
+        doc = self.instance.extract("lib-after-release", "after-release.pdf", self.tmp)
+        self.assertIn("fake-ocr", doc.text)
+
+    def test_release_gpu_is_a_noop_when_subprocess_never_started(self):
+        """本机OCR后端本来就关着/子进程还没拉起来时，点"释放显存"必须是
+        安全的空操作，不能抛异常。"""
+        self.rt.disable("official-ocr-mineru-local")
+        self.instance.release_gpu()  # 不抛异常即通过
+        self.assertIsNone(self.instance._handle)  # noqa: SLF001
+
     def test_extract_after_disable_folds_to_failure_not_crash(self):
         self.rt.disable("official-ocr-mineru-local")
         doc = self.instance.extract("lib1", "whatever.pdf", self.tmp)

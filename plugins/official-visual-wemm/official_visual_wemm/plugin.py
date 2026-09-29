@@ -255,6 +255,14 @@ class VisualWemmPlugin:
             self._handle.stop()
             self._handle = None
 
+    def release_gpu(self) -> None:
+        """手动立即释放显存用（core/pipeline.py::release_gpu_memory，
+        2026-09-29 新能力，BC-16）——就是资源仲裁器抢占时走的同一条软驱逐
+        路径：只请求子进程卸载模型，子进程本身继续存活监听，不影响
+        `wemm_backend` 设置或插件启用状态。子进程没在跑/已经空闲就是
+        no-op（`_soft_evict` 内部已判断）。"""
+        self._soft_evict()
+
     def _soft_evict(self) -> None:
         """资源仲裁器的抢占回调：只请求子进程卸载模型释放显存，不杀子进程
         本身。HTTP 调用失败也绝不阻塞抢占方——fail-open，同

@@ -329,6 +329,30 @@ class TestVisualWemmPlugin(unittest.TestCase):
         self.instance.index_library("lib-after-preempt", self.vault, ["doc.pdf"])
         self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "official-visual-wemm")
 
+    def test_release_gpu_soft_evicts_without_killing_subprocess(self):
+        """手动"释放显存"按钮用（core/pipeline.py::release_gpu_memory，
+        2026-09-29 新能力，BC-16）——走的是和上一条测试同一条软驱逐路径，
+        区别只是触发方是用户主动点按钮，不是被别的消费者抢占：子进程本身
+        （同一个 pid）继续存活，只是模型被请求卸载，下次真正查询/索引时
+        子进程自己按需重新加载模型，不需要用户重新开启 WEMM 或重启 GUI。"""
+        pid_before = self.instance._handle._process.pid  # noqa: SLF001
+        self.instance.release_gpu()
+        self.assertIsNotNone(self.instance._handle)  # noqa: SLF001
+        self.assertEqual(self.instance._handle._process.pid, pid_before)  # noqa: SLF001
+        self.assertTrue(self.instance._handle.is_alive)
+        # 插件仍然可用：不需要重新 on_enable，子进程按需重新加载模型。
+        self.instance.index_library("lib-after-release", self.vault, ["doc.pdf"])
+        collection = self.instance._collection("lib-after-release")  # noqa: SLF001
+        self.assertEqual(collection.count(), 2)
+
+    def test_release_gpu_is_a_noop_when_subprocess_never_started(self):
+        """WEMM 后端本来就关着/子进程还没拉起来时，点"释放显存"必须是
+        安全的空操作，不能抛异常（用户不知道、也不需要知道内部有没有子
+        进程在跑）。"""
+        self.rt.disable("official-visual-wemm")
+        self.instance.release_gpu()  # 不抛异常即通过
+        self.assertIsNone(self.instance._handle)  # noqa: SLF001
+
 
 class TestVisualWemmBackendGate(unittest.TestCase):
     """缺陷 B 的复现组：`on_enable` 曾经在**没有任何开关判断**的情况下直接
