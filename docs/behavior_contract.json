@@ -274,19 +274,24 @@
       "status": "pass",
       "legacy_refs": [
         "obsidian-rag/gpu_arbiter.py:38-50",
-        "obsidian-rag/gpu_arbiter.py:131-143"
+        "obsidian-rag/gpu_arbiter.py:131-143",
+        "obsidian-rag/mineru_server.py:411-418",
+        "obsidian-rag/mineru_server.py:520"
       ],
       "redo_refs": [
         "rag-redo/core/resource_arbiter.py:46-375",
         "rag-redo/core/index_progress.py:252-829",
-        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py:97-180"
+        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py:97-180",
+        "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/server.py:_vram_snapshot",
+        "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/server.py:make_server"
       ],
       "test_refs": [
         "rag-redo/tests/test_resource_arbiter.py::TestCrossProcessResourceArbiter",
         "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_worker_process_takes_over_and_parent_can_reacquire_later",
-        "rag-redo/plugins/official-ocr-mineru-local/tests/test_plugin.py::TestMineruLocalOcrPlugin.test_worker_process_takes_over_and_parent_can_reacquire_later"
+        "rag-redo/plugins/official-ocr-mineru-local/tests/test_plugin.py::TestMineruLocalOcrPlugin.test_worker_process_takes_over_and_parent_can_reacquire_later",
+        "rag-redo/plugins/official-ocr-mineru-local/tests/test_plugin.py::TestMineruLocalServerAnswersWhileBusy"
       ],
-      "acceptance": "GUI、MCP、worker 同时运行时不能双驻留；优先级抢占必须作用于真实 holder；锁状态未知不能宣称资源空闲。",
+      "acceptance": "GUI、MCP、worker 同时运行时不能双驻留；优先级抢占必须作用于真实 holder；锁状态未知不能宣称资源空闲。【缺陷修复，恢复旧行为（2026-09-29）】本机 MinerU 服务必须能在解析进行中应答 /health，且 /health 不在请求线程里做显存探测：旧项目 mineru_server.py 用 ThreadingHTTPServer 且 /health 不做重活；rag-redo 曾用单线程 HTTPServer 并在 /health 里现场 import torch，真机 CPU 被打满时超出宿主 10 秒启动预算，插件“启用失败”、扫描件被整轮延后。现改为多线程服务 + 后台刷新显存快照。",
       "blocker": ""
     },
     {

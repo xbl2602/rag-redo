@@ -117,6 +117,30 @@ def _vram_free_gb(max_age: float = 5.0):
     return val
 
 
+_vram_refreshing = threading.Lock()
+
+
+def _vram_snapshot() -> float:
+    """给 /health 用的显存快照（GB）：**只读缓存，绝不在请求线程里做探测**。
+
+    2026-09-29 真机排查：本服务原先在 /health 里直接调 `_vram_free_gb()`，第一次调用要
+    在请求线程里 `import torch` 并初始化 CUDA；宿主机 CPU 被打满时这一步能拖过宿主的
+    10 秒启动预算，表现为“启用失败：子进程 10.0s 内没有通过 health_check”，本机 OCR 于是
+    整轮不可用、扫描件全被延后。旧项目 obsidian-rag/mineru_server.py 的 /health 是多线程
+    应答且不做重活；这里对齐：探测放到后台线程刷新，/health 立刻回上次的值（还没测过
+    就回 0.0——与旧探测失败时的 fail-open 口径一致）。"""
+    value, stamp = _vram_cache
+    if (not stamp or time.time() - stamp >= 5.0) and _vram_refreshing.acquire(blocking=False):
+        def _refresh() -> None:
+            try:
+                _vram_free_gb(max_age=0.0)
+            finally:
+                _vram_refreshing.release()
+
+        threading.Thread(target=_refresh, daemon=True, name="mineru-vram-probe").start()
+    return float(value or 0.0)
+
+
 def _wait_for_vram(min_free_gb: float, timeout_s: float = MINERU_VRAM_WAIT_SECONDS, poll_s: float = 10.0) -> bool:
     deadline = time.time() + timeout_s
     while True:
@@ -394,7 +418,7 @@ def _fake_ocr(full_path: Path) -> str:
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/health":
-            self._json(200, {"ok": True, "inner_loaded": _inner_alive(), "gpu_mem_gb": round(_vram_free_gb() or 0.0, 2)})
+            self._json(200, {"ok": True, "inner_loaded": _inner_alive(), "gpu_mem_gb": round(_vram_snapshot(), 2)})
         else:
             self._json(404, {"error": "not found"})
 
@@ -438,6 +462,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass  # 静默，避免污染核心进程的 stdout/stderr
 
 
+def make_server(port: int) -> http.server.ThreadingHTTPServer:
+    """多线程 HTTP 服务（旧项目 mineru_server.py 用的就是 ThreadingHTTPServer）。
+
+    单线程的 `HTTPServer` 一次只应答一个请求：/extract 解析一份 PDF 要几分钟，这期间
+    任何进程来问 /health（宿主 `is_alive` 探测、另一个进程启用本插件时的启动检查）都会
+    排队到超时。线程是 daemon（ThreadingHTTPServer 默认），进程退出时不会被它们拖住。"""
+    return http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+
 def _int_arg(name: str, default: int) -> int:
     if name in sys.argv:
         return int(sys.argv[sys.argv.index(name) + 1])
@@ -472,4 +505,4 @@ if __name__ == "__main__":
         f"max_pages={MINERU_MAX_PAGES})",
         file=sys.stderr,
     )
-    http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    make_server(port).serve_forever()

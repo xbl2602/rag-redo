@@ -344,5 +344,130 @@ class TestResolveMineruPythonWithoutFaking(unittest.TestCase):
         self.assertEqual(self.mod._resolve_mineru_python(settings=settings), env_path)
 
 
+class TestMineruLocalServerAnswersWhileBusy(unittest.TestCase):
+    """2026-09-29 真机复现：本机 MinerU 服务是单线程 HTTPServer，且 /health 里现场探测显存
+    （首次要 import torch）。宿主只给启动检查 10 秒、每次探测 1 秒——宿主机 CPU 被打满时
+    检查超时，插件“启用失败”，整轮扫描件因此被延后（Y2S1 库 47 个）。旧项目
+    obsidian-rag/mineru_server.py 是 ThreadingHTTPServer，/health 不做重活。
+
+    这里直接在进程内起服务端模块（不经子进程），验证两条：①解析卡着时 /health 仍秒回；
+    ②/health 不在请求线程里做显存探测。"""
+
+    def setUp(self) -> None:
+        import importlib.util
+        import threading
+        import urllib.request  # noqa: F401  (确保子模块已加载)
+
+        spec = importlib.util.spec_from_file_location(
+            "mineru_local_server_under_test",
+            REPO_ROOT / "plugins" / "official-ocr-mineru-local" / "official_ocr_mineru_local" / "server.py",
+        )
+        assert spec is not None and spec.loader is not None
+        self.server_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.server_mod)
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._env_backup = os.environ.get("RAG_REDO_FAKE_OCR")
+        os.environ["RAG_REDO_FAKE_OCR"] = "1"
+        self.addCleanup(self._restore_env)
+        self.httpd = self.server_mod.make_server(0)
+        self.port = self.httpd.server_address[1]
+        self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self._thread.start()
+        self.addCleanup(self._stop_server)
+
+    def _restore_env(self) -> None:
+        if self._env_backup is None:
+            os.environ.pop("RAG_REDO_FAKE_OCR", None)
+        else:
+            os.environ["RAG_REDO_FAKE_OCR"] = self._env_backup
+
+    def _stop_server(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self._thread.join(timeout=5)
+
+    def _health(self, timeout: float = 1.0) -> tuple[int, float]:
+        import time
+        import urllib.request
+
+        started = time.monotonic()
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=timeout) as resp:
+            resp.read()
+            return resp.status, time.monotonic() - started
+
+    def test_server_is_multithreaded(self):
+        import http.server
+
+        self.assertIsInstance(self.httpd, http.server.ThreadingHTTPServer)
+
+    def test_health_answers_within_a_second_while_an_extract_is_stuck(self):
+        import json
+        import threading
+        import urllib.request
+        from unittest import mock
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _stuck_ocr(_path):
+            entered.set()
+            release.wait(timeout=30)
+            return "ok"
+
+        pdf = self.tmp / "a.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+        result: dict = {}
+
+        def _post() -> None:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}/extract",
+                data=json.dumps({"path": "a.pdf", "root": str(self.tmp)}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=40) as resp:
+                result["body"] = json.loads(resp.read())
+
+        with mock.patch.object(self.server_mod, "_fake_ocr", _stuck_ocr):
+            poster = threading.Thread(target=_post, daemon=True)
+            poster.start()
+            self.assertTrue(entered.wait(timeout=10), "解析请求应该已经进到卡住的假 OCR 里")
+            try:
+                status, elapsed = self._health(timeout=1.0)
+            finally:
+                release.set()
+            poster.join(timeout=10)
+        self.assertEqual(status, 200)
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(result["body"]["text"], "ok")
+
+    def test_health_never_runs_the_vram_probe_on_the_request_thread(self):
+        import threading
+        import time
+        from unittest import mock
+
+        probe_threads: list[str] = []
+
+        def _slow_probe(max_age: float = 5.0):
+            probe_threads.append(threading.current_thread().name)
+            time.sleep(2.0)  # 老实现里这 2 秒（真实是 import torch）就压在 /health 的请求上
+            self.server_mod._vram_cache = (6.5, time.time())
+            return 6.5
+
+        self.server_mod._vram_cache = (None, 0.0)
+        with mock.patch.object(self.server_mod, "_vram_free_gb", _slow_probe):
+            status, elapsed = self._health(timeout=1.0)
+            self.assertEqual(status, 200)
+            self.assertLess(elapsed, 1.0)
+            deadline = time.monotonic() + 10
+            while not probe_threads and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(probe_threads, ["mineru-vram-probe"])
+            # 等后台探测跑完，避免线程漏到别的用例里
+            while self.server_mod._vram_refreshing.locked() and time.monotonic() < deadline:
+                time.sleep(0.05)
+
+
 if __name__ == "__main__":
     unittest.main()
