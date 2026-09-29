@@ -2,7 +2,9 @@
 
 ## 目标
 
-**（当前，2026-09-28 锁定）** 先把 GUI 相关的问题全部搞定——GUI 必须能真正启动、能让操作者上手测试（最高优先级：GUI 起不来，操作者就没法做任何实际测试）；GUI 之后，把 2026-09-28 完整审计（`PROBLEMS_2026-09-28.md` 的 A1–A22）里其余可以解决的问题一次性全部解决，全程不回归、按主题提交、不 push。
+**（当前，2026-09-29 晚锁定）** 全部执行和修复——把操作者真机增量重建 Y2S1 库时反馈的 7 个问题（显卡吃不满、CPU 吃满/两个模型同时占显存/转一个索引一个、总览页 WEMM/缓存/PDF 开关、WEMM 等中间环节是否真被调用、CamScanner 扫描件被误判为空、设置页缺 MinerU API Key 等、关 GUI 后显存与进程残留）对应的方案 A~E 及配套项一次性全部落地并修好：A 索引顺序改回“先全部转换切块→连续做向量→一次写入”，B 轮到 WEMM 前先让文字模型让出显卡，C 本机 MinerU 服务改为可并发应答且健康检查不再被拖慢，D 设置页补 MinerU API Key 等真实在用的键并让云端识别读设置，E 水印页不再冒充文字层，另加关窗回收日志与 MinerU 单文件 CPU/显卡实测。
+
+**（前序，2026-09-28 锁定，原样保留）** 先把 GUI 相关的问题全部搞定——GUI 必须能真正启动、能让操作者上手测试（最高优先级：GUI 起不来，操作者就没法做任何实际测试）；GUI 之后，把 2026-09-28 完整审计（`PROBLEMS_2026-09-28.md` 的 A1–A22）里其余可以解决的问题一次性全部解决，全程不回归、按主题提交、不 push。
 
 **（前序，原样保留）** 把 2026-09-23 全面功能审计（对照 obsidian-rag 16个MCP工具 + 约60个CFG配置项）里列出的全部A/B/C类缺口实现完，让 rag-redo 达到与 obsidian-rag 的功能对等，同时全程保持 33+ 个既有测试套件不回归。
 
@@ -64,15 +66,50 @@
 - **C12（文档闭环，人工确认）**：`docs/ROADMAP.md` 补记 2026-09-26～28 的实际工作与 BC-15 的真实状态；`docs/behavior_contract.json` 里 BC-15 的"当前实现/测试引用"与实况一致，状态不虚标。
   验证：人工通读——机器无法判定文档是否诚实，不做自动化 grep。**C12 与 C5 一样由操作者确认，我不自行勾选。**
 
+### 当前目标的验收标准（C13–C19，2026-09-29 晚新增）
+
+- **C13（A 索引顺序，BC-04/BC-05/BC-15）**：`index_library` 改为三段——①逐文件“提取→清洗→切块”并收集；②对全部待嵌块连续做向量（不再夹着提取/写入）；③统一写入向量库/词法库/清单。结果（块、清单、失败终态、返回报告）与改前逐项等价，停止/异常/崩溃仍不发布半成品 generation。
+  验证：`& $py tests\run.py --suite "$PWD\tests\test_pipeline_e2e.py"`；`& $py tests\run.py --suite "$PWD\tests\test_index_progress.py"`
+  预期：`$LASTEXITCODE -eq 0`；新增用例断言“嵌入器第一次被调用之前，所有待处理文件都已提取完”“deferred/失败/空文件的终态与旧路径一致”“中途异常不发布 generation”。
+
+- **C14（B WEMM 交接，BC-11/BC-15）**：有 PDF 需要建页库时，先让文字向量模型与重排模型释放显卡名额再交给 WEMM；没有 PDF 需要建页库时不白白释放。
+  验证：`& $py tests\run.py --suite "$PWD\tests\test_pipeline_e2e.py"`
+  预期：`$LASTEXITCODE -eq 0`；新增用例：有变更 PDF → 视觉索引开跑前 embedder/reranker 的 `release_gpu` 已被调用；纯 md 增量 → 不调用。
+
+- **C15（C 本机 MinerU 健康检查，BC-11）**：`official-ocr-mineru-local` 的服务改用 `ThreadingHTTPServer`；`/health` 不再在请求线程里导入 torch，长时间解析进行中 `/health` 仍秒回。
+  验证：`& $py tests\run.py --suite "$PWD\plugins\official-ocr-mineru-local\tests\test_plugin.py"`
+  预期：`$LASTEXITCODE -eq 0`；新增用例：`/extract` 卡住时并发请求 `/health` 在 1 秒内返回 200；源码不再使用单线程的 `http.server.HTTPServer(`。
+
+- **C16（D 设置页补键，BC-15/BC-01）**：设置页“PDF 与云端 OCR”组补上 `mineru_api_key`（保密字段，界面不回显明文，不进日志）与 `mineru_model_version`；MinerU 云端插件优先读设置、环境变量兜底。
+  验证：`& $py tests\run.py --suite "$PWD\plugins\official-gui-shell\tests\test_api.py"`；`& $py tests\run.py --suite "$PWD\plugins\official-gui-shell\tests\test_contracts_parity.py"`；`& $py tests\run.py --suite "$PWD\plugins\official-ocr-mineru-cloud\tests\test_plugin.py"`
+  预期：`$LASTEXITCODE -eq 0`；新增用例：保存→读回往返、保密字段不回显、设置里有 key 时无需环境变量即视为“有 key”、能力签名随 key 有无变化。
+
+- **C17（E 水印页，BC-01，操作者 2026-09-29 确认）**：PDF 每页文字都是同一句短话（如 “CamScanner”）时，视为无文字层，整本走 OCR 路由，不再被水印骗成“有文字→切块后为空”。
+  验证：`& $py tests\run.py --suite "$PWD\plugins\official-extractor-pdf-text\tests\test_extract.py"`
+  预期：`$LASTEXITCODE -eq 0`；新增用例：5 页全是 “CamScanner” → `failure_reason == "scanned"`；正常文字 PDF、带页码/页眉但内容各不相同的 PDF 不受影响；`docs/behavior_contract.json` 的 BC-01 登记该偏离并引用该测试。
+
+- **C18（关窗回收日志 + MinerU 实测）**：关窗时把“回收了几个子进程、用时多久”写进 GUI 日志；对一个小 PDF 单独实测 MinerU 的 CPU/显卡占用并记入 ROADMAP。
+  验证：`& $py tests\run.py --suite "$PWD\plugins\official-gui-shell\tests\test_boot.py"`；人工阅读 `docs/ROADMAP.md` 对应小节。
+  预期：`$LASTEXITCODE -eq 0`；新增用例断言关窗后日志含回收摘要；实测数字由本机真实跑出，未跑成则如实写“未测”。**实测数字的真伪只有操作者机器能复核，我不代勾。**
+
+- **C19（回归 + 契约 + 提交卫生）**：`& $py tests\run.py` 全绿（允许已知的“杀掉子进程后立刻查是否消失”类间歇用例单独重跑通过并如实说明）；`& $py tests\test_agents_contract.py` 通过；按主题分次提交，未 push，未提交 `data-real/`。
+  验证：`& $py tests\run.py`；`& $py tests\test_agents_contract.py`；`git status --porcelain`；`git log --oneline -12`
+  预期：全量回归 0；门禁 0；`git status --porcelain` 无源码改动（`docs/media/` 非我创建，不动不提交）。
+
+
 ## 范围
 
-**做**（按顺序：先 GUI，再其余）：
+**做（2026-09-29 晚新增，先于下面各项执行）**：方案 A~E（见 C13–C17）、关窗回收日志与 MinerU 单文件实测（C18）、随之而来的契约/ROADMAP/测试更新（C19）。
+
+**做**（前序，按顺序：先 GUI，再其余）：
 - GUI：A1（插件 invalid）、A7（进度/推送/`bind_window`/窗口规格/设置分组）、A5（契约键集）、A6（显示名 vs id）、A4（设置保存）、A8（选择树）、A10（提取试验台）、A12（KPI 口径）、A3（`test_api.py` 迁移）、A16（`core.paths` 遮蔽）
 - 其余：A2（`find_duplicates` 崩溃 + 越权）、A9（停止按钮间歇拒绝）、A11（CLI 缺 visual-wemm）、A14（门禁校验引用存在）、A17（SyntaxWarning）、A19/A20（测试进程与日志噪声）、A21（错误注释/docstring）、A22（`unpack` 体积上限 + 升级路径说明）
 - 补"走真实入口"的门禁，杜绝"直接实例化 + 只 grep 文本"的假绿
 - 按主题拆分提交现有未提交改动（不 push）；更新 ROADMAP 与 GOAL 进度
 
-**不做（明确排除，需要时再单独提出）**：
+**不做（2026-09-29 晚新增）**：不把显卡单批 8 段的旧项目安全上限调大；不限制 PDF 转文字器的 CPU 线程数；不恢复旧项目 13 组设置里“新版本本来没有对应功能”的键（`mineru_concurrency`/`mineru_rate_per_minute`/`pdf_text_backend` 等只在有真实实现时才补）；不 push。
+
+**不做（前序，明确排除，需要时再单独提出）**：
 - 不 push；不代勾 C5 / C12；不改动 C1–C5 已锁定的验收标准
 - A13（文本提取器 BOM 剥离 + CRLF→LF、单例守卫不做 PID 预检）：这是对旧行为的偏离，按 CLAUDE.md §3.3 必须先由操作者确认再写入行为契约——我只准备条目草案并请示，不自行宣称"已批准"
 - A18 中 `%TEMP%` 里 2615 个历史测试残留目录的存量清理（由操作者决定）；BC-15 是否翻为 `pass` 由操作者确认
@@ -100,3 +137,10 @@
 - [x] C10 其余审计项（A9/A11/A14/A17/A19/A20/A21/A22）——契约门禁 11 项全绿（含"失效引用必须转红"自测）；`-W error` 编译全库 176 个 `.py` 0 失败；`stop` 注入 `PermissionError` 用例通过；A22 `unpack` 体积上限已加（阈值 8 GiB，待操作者确认后登记契约）；A13 不在本项范围，草案待操作者决定
 - [x] C11 全量回归 + 按主题提交（A15）——`tests/run.py` 53/53、退出码 0；累积改动已按主题拆成多个提交（`git log e141ce4..HEAD`），敏感文件模式与凭据扫描无命中，`test_agents_contract` 通过（含 AGENTS.md/CLAUDE.md 同步），未 push
 - [ ] C12 文档闭环（人工确认，我不代勾）
+- [ ] C13 A 索引顺序改回“先全部转换切块→连续做向量→一次写入”
+- [ ] C14 B WEMM 交接前让文字模型让出显卡
+- [ ] C15 C 本机 MinerU 服务并发应答 + /health 秒回
+- [ ] C16 D 设置页补 MinerU API Key 等真实在用的键，云端读设置
+- [ ] C17 E 水印页不再冒充文字层（BC-01 登记）
+- [ ] C18 关窗回收日志 + MinerU 单文件实测（数字待本机实跑）
+- [ ] C19 全量回归 + 契约门禁 + 分次提交（不 push）
