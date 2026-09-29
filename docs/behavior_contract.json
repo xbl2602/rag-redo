@@ -82,7 +82,8 @@
       "redo_refs": [
         "rag-redo/core/pipeline.py::Pipeline.library_freshness",
         "rag-redo/core/pipeline.py::Pipeline.stale_libraries",
-        "rag-redo/plugins/official-mcp-server/official_mcp_server/tools.py::register_tools.ensure_agent_fresh"
+        "rag-redo/plugins/official-mcp-server/official_mcp_server/tools.py::register_tools.ensure_agent_fresh",
+        "rag-redo/core/pipeline.py::Pipeline.failure_will_retry"
       ],
       "test_refs": [
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_stale_libraries_detects_first_run_changes_additions_and_removals",
@@ -93,9 +94,11 @@
         "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_starts_background_refresh_for_nonempty_library",
         "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_skips_auto_sync_when_root_missing_keeps_old_results",
         "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_skips_auto_sync_when_dir_emptied_keeps_old_results",
-        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_degrades_to_old_index_when_auto_sync_fails"
+        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_search_degrades_to_old_index_when_auto_sync_fails",
+        "rag-redo/tests/test_pipeline_e2e.py::TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches.test_ocr_service_missing_for_a_round_rebuilds_nothing",
+        "rag-redo/tests/test_pipeline_e2e.py::TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches.test_switching_scan_backend_or_filling_in_a_key_rebuilds_nothing"
       ],
-      "acceptance": "搜索前必须检测变化；空库首跑同步，非空库后台增量并可继续使用旧索引，不得让搜索悄悄使用过期数据。库路径不存在（missing）与目录在但扫不到任何文件且旧索引有真实记录（emptied）必须跳过自动同步并保留旧索引（原因写入响应 notes）；同步本身失败时降级为旧索引检索+提示，不得让检索整体失败；从未索引过且目录为空是收敛态不触发重建。显式重建（GUI 完整重建/reindex_knowledge）无此保护，与旧项目一致。",
+      "acceptance": "搜索前必须检测变化；空库首跑同步，非空库后台增量并可继续使用旧索引，不得让搜索悄悄使用过期数据。库路径不存在（missing）与目录在但扫不到任何文件且旧索引有真实记录（emptied）必须跳过自动同步并保留旧索引（原因写入响应 notes）；同步本身失败时降级为旧索引检索+提示，不得让检索整体失败；从未索引过且目录为空是收敛态不触发重建。显式重建（GUI 完整重建/reindex_knowledge）无此保护，与旧项目一致。【缺陷修复（2026-09-29 晚）】已成功入库的文件不参与“失败重试”判定：此前成功入库的 PDF 没有失败原因，被归成 extract-failed 去比能力签名，本机 MinerU 某轮没起来或换了扫描件后端后，含 PDF 的库每次检索前都被判过期、白跑一轮同步；提取器签名的比较与 index_library 共用 index_integrity 的同一个判断（BC-12）。",
       "blocker": ""
     },
     {
@@ -331,19 +334,30 @@
       "status": "pass",
       "legacy_refs": [
         "obsidian-rag/index.py:609-630",
-        "obsidian-rag/index.py:1486-1599"
+        "obsidian-rag/index.py:1486-1599",
+        "obsidian-rag/extractors.py:165-176",
+        "obsidian-rag/extractors.py:316-357"
       ],
       "redo_refs": [
         "rag-redo/core/runtime.py::PluginRuntime.set_active_choice",
         "rag-redo/core/index_progress.py::IndexWorkerManager.set_active_choices",
         "rag-redo/core/pipeline.py::Pipeline.start_index_library",
-        "rag-redo/core/pipeline.py::Pipeline._pipeline_signatures"
+        "rag-redo/core/pipeline.py::Pipeline._pipeline_signatures",
+        "rag-redo/core/index_integrity.py::extractor_code_changed",
+        "rag-redo/core/index_integrity.py::stale_extractor_formats",
+        "rag-redo/core/pipeline.py::Pipeline._extractor_code_versions",
+        "rag-redo/core/pipeline.py::Pipeline._extractor_capabilities"
       ],
       "test_refs": [
         "rag-redo/tests/test_runtime.py::TestPluginRuntimeLifecycle.test_active_choice_switch_is_live_and_persisted_without_reinstall",
-        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_embedder_signature_change_reembeds_all_without_reextracting"
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_embedder_signature_change_reembeds_all_without_reextracting",
+        "rag-redo/tests/test_pipeline_e2e.py::TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches.test_pdf_extractor_upgrade_redoes_pdfs_but_leaves_notes_alone",
+        "rag-redo/tests/test_pipeline_e2e.py::TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches.test_upgraded_extractor_still_retries_terminal_records_of_its_format",
+        "rag-redo/tests/test_pipeline_e2e.py::TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches.test_ocr_service_missing_for_a_round_rebuilds_nothing",
+        "rag-redo/tests/test_pipeline_e2e.py::TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches.test_switching_scan_backend_or_filling_in_a_key_rebuilds_nothing",
+        "rag-redo/tests/test_pipeline_e2e.py::TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches.test_manifest_written_before_this_rule_does_not_trigger_a_rebuild"
       ],
-      "acceptance": "切换 active choice 后不需要重新安装；新 worker 获得同一快照；模型/chunker/存储版本变化会使旧 generation 受控失效。",
+      "acceptance": "切换 active choice 后不需要重新安装；新 worker 获得同一快照；模型/chunker/存储版本变化会使旧 generation 受控失效。【缺陷修复，恢复旧行为（2026-09-29 晚）】提取器的版本失效按格式计：只有提取器代码升级过的那种格式（清单里记的是插件目录里装着的全部提取器的 plugin.toml 版本，不管这一轮有没有启动成功、设置选了哪个后端）的文件重新提取、重新切块向量，其余格式不受牵连；该格式此前判出的终态也随之重试。提取器这一轮没启动成功（本机 MinerU 没在时限内起来会被索引子进程卸载）、被停用、新装一个，以及换扫描件后端、补 MinerU Key，都不算升级，只通过逐文件能力签名让 scanned/extract-failed 终态重试（BC-04）。旧项目 EXTRACT_VERSION 只进 PDF/DOCX 的提取缓存键（extractors.py:175），笔记从不因提取器变化重做。此前任何一种格式的提取器签名变化都整库重提：2026-09-29 真机增量把 Obsidian Vault（225 篇笔记、0 个 PDF）、agents、skills 的全部文件重新切块重算向量。本规则之前写的清单里 OCR 插件记的是设置（selected:后端:状态），比较时按“版本未知”处理，升级后第一次增量不因记法不同重做。检索前的过期判定（BC-03）用同一个判断。",
       "blocker": ""
     },
     {

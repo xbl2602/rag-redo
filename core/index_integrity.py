@@ -120,6 +120,54 @@ def consistency_drift(expected: int, actual: int | None) -> str | None:
     return None
 
 
+#: 2026-09-29 之前的清单里，两个 OCR 插件的提取器签名记的是 `index_signature()` 给出的
+#: “当时的设置”（`selected:<扫描后端>:<就绪/Key 状态>`），不是代码版本。比较时把这种旧记法
+#: 当作“版本未知”，不据此判定提取器升级——否则升级后第一次增量会把所有 PDF 白白重做一遍。
+_SETTING_STYLE_SIGNATURE_PREFIX = "selected:"
+
+
+def extractor_code_changed(recorded: Any, current: Any) -> bool:
+    """某一种格式的提取器**代码**是不是升级过（BC-12）。
+
+    只比两边都有的同一个插件的版本：提取器这一轮没启动成功（本机 MinerU 没在时限内起来，
+    索引子进程会把它卸载）、被停用或新装一个，都不说明“旧正文是旧逻辑产的”——这些情况
+    影响的只是“失败的文件现在能不能处理”，由逐文件的能力签名管（BC-04）。2026-09-29 真机：
+    此前任何这类变化都让四个库的全部文件（连 md 笔记）重新切块、重新算向量。"""
+    if not isinstance(recorded, list) or not isinstance(current, list):
+        return False
+
+    def _versions(entries: list) -> dict[str, str]:
+        return {
+            str(entry[0]): str(entry[1])
+            for entry in entries
+            if isinstance(entry, (list, tuple)) and len(entry) >= 2
+        }
+
+    before = _versions(recorded)
+    for plugin_id, version in _versions(current).items():
+        previous = before.get(plugin_id)
+        if previous is None or previous.startswith(_SETTING_STYLE_SIGNATURE_PREFIX):
+            continue
+        if previous != version:
+            return True
+    return False
+
+
+def stale_extractor_formats(
+    recorded: Mapping[str, Any] | None,
+    current: Mapping[str, Any],
+) -> set[str]:
+    """提取器代码升级过的格式（扩展名，不带点）。只有这些格式的文件要重新提取；
+    其余格式的文件不受牵连——对齐旧项目：`EXTRACT_VERSION` 只进 PDF/DOCX 的提取缓存键
+    （obsidian-rag/extractors.py:175），从不让 md 笔记重做。"""
+    recorded = recorded if isinstance(recorded, Mapping) else {}
+    return {
+        point.split(":", 1)[1]
+        for point in current
+        if point.startswith("extractor:") and extractor_code_changed(recorded.get(point), current.get(point))
+    }
+
+
 def signature_drift(
     manifest: Mapping[str, Any] | None,
     signatures: Mapping[str, Any],
@@ -132,13 +180,21 @@ def signature_drift(
     管线/各格式提取器），"任一签名变了"就等价于"旧索引是旧逻辑产的"。
     重建粒度仍然是受控的：`index_library()` 内部按
     `force_chunks`/`force_embed`/`force_lexical` 逐层判断，只重做受影响的部分。
+    提取器一项只认代码升级（`extractor_code_changed`），与 `index_library()` 用同一个判断，
+    免得“搜索前自动同步”说过期、索引那边却什么都不用做，每次搜索都白跑一轮。
     """
     if not isinstance(manifest, Mapping):
         return False
     recorded = manifest.get("signatures")
     if not isinstance(recorded, Mapping):
         return True  # 没有签名段的 manifest（外来/被裁剪过）不可信，按升级处理
-    return dict(recorded) != dict(signatures)
+    for point in set(recorded) | set(signatures):
+        if point.startswith("extractor:"):
+            if extractor_code_changed(recorded.get(point), signatures.get(point)):
+                return True
+        elif recorded.get(point) != signatures.get(point):
+            return True
+    return False
 
 
 def rebuild_reason(

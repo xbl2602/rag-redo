@@ -533,15 +533,41 @@ class Pipeline:
                 return text
         return None
 
-    def _pipeline_signatures(self) -> dict[str, list[list[str]]]:
-        signatures: dict[str, list[list[str]]] = {}
+    def _extractor_capabilities(self) -> dict[str, list[list[str]]]:
+        """每种格式**这一轮能用**的提取器及其设置（`index_signature()`：选了哪个扫描件后端、
+        有没有 Key、本机 MinerU 装没装好）。只喂给逐文件的能力签名，决定 scanned /
+        extract-failed 终态要不要重试（BC-04）；不决定“旧正文作不作废”——那看
+        `_extractor_code_versions()`。"""
+        capabilities: dict[str, list[list[str]]] = {}
         for point in self.runtime.registry.provider_points():
             if point == "visual_index" or not point.startswith("extractor:"):
                 continue
-            signatures[point] = [
+            capabilities[point] = [
                 self._plugin_signature(plugin_id)
                 for plugin_id in sorted(self.runtime.registry.providers_of(point))
             ]
+        return capabilities
+
+    def _extractor_code_versions(self) -> dict[str, list[list[str]]]:
+        """每种格式的提取器**代码版本**：插件目录里装着的全部提取器，不管这一轮有没有启动
+        成功、设置里选的是哪个后端。版本取 `plugin.toml` 的 version——与提取缓存的路由键
+        （`_extractor_cache_routes`）同一个来源，升级插件时两者一起变。
+
+        2026-09-29 真机：此前这里记的是“这一轮能用的提取器 + 它们的设置”，本机 MinerU
+        某一轮没起来、或者用户换了扫描件后端，都会让它变，于是四个库的全部文件（连 md
+        笔记）被当成“正文作废”重新切块、重新算向量（BC-12）。"""
+        versions: dict[str, list[list[str]]] = {}
+        for plugin_id in sorted(self.runtime.plugins):
+            manifest = self.runtime.plugins[plugin_id].manifest
+            if manifest is None:
+                continue
+            for point in sorted(manifest.provides):
+                if point.startswith("extractor:"):
+                    versions.setdefault(point, []).append([plugin_id, str(manifest.version)])
+        return versions
+
+    def _pipeline_signatures(self) -> dict[str, list[list[str]]]:
+        signatures: dict[str, list[list[str]]] = dict(self._extractor_code_versions())
         for point in ("chunker", "embedder", "lexical_index", "vector_store"):
             plugin_id = self.runtime.registry.active_of(point)
             signatures[point] = [self._plugin_signature(plugin_id)] if plugin_id else []
@@ -554,10 +580,10 @@ class Pipeline:
     def _extraction_capability_signature(
         self,
         path: str,
-        signatures: dict[str, list[list[str]]] | None = None,
+        capabilities: dict[str, list[list[str]]] | None = None,
     ) -> str:
         extension = Path(path).suffix.lower().lstrip(".")
-        active = signatures if signatures is not None else self._pipeline_signatures()
+        active = capabilities if capabilities is not None else self._extractor_capabilities()
         providers = tuple(
             (point, tuple(tuple(item) for item in active.get(point, [])))
             for point in sorted(active)
@@ -580,6 +606,13 @@ class Pipeline:
         status = str(record.get("status") or "")
         if status == "deferred":
             return True
+        if status == "indexed":
+            # 成功入库的文件没有“失败原因”，`normalize_failure_state("")` 会把空值归成
+            # extract-failed——不先挡住，它就被当成失败文件按能力签名比较。2026-09-29：
+            # 本机 MinerU 某轮没起来、或换了扫描件后端，含 PDF 的库就一直被
+            # `library_freshness` 判为过期，每次搜索前都白跑一轮同步（与 index_library
+            # 只对失败记录比能力签名的口径不一致）。
+            return False
         state = normalize_failure_state(
             str(record.get("failure_state") or record.get("failure_reason") or "")
         )
@@ -780,6 +813,7 @@ class Pipeline:
         old_manifest = self._manifest(library_id, previous)
         old_files = self._manifest_files(old_manifest)
         signatures = self._pipeline_signatures()
+        capabilities = self._extractor_capabilities()
         old_signatures = old_manifest.get("signatures", {}) if old_manifest else {}
 
         # ---- 一致性自愈（对齐 obsidian-rag/index.py:1903-1910）------------
@@ -824,25 +858,31 @@ class Pipeline:
         # 切块粒度/换提取器而**不重复烧 MinerU 配额**；真正"当作缓存不存在"
         # 的只有 `--fresh-extract`（index.py:2450-2455 先 purge 缓存再索引）。
         # 三个变量因此必须是：
-        #   force_extract = fresh_extract or 提取能力签名变化
+        #   force_extract = fresh_extract
         #       —— "本轮每个文件都要重新走一遍提取入口"。它是 LEGACY 那个
         #          `meta = {}` 的等价物：**只清空写盘链**（本轮往哪个 segment
         #          写），**不清空查找链**（可以从哪些 segment 读）——缓存命中
         #          时这次"重新提取"零成本，这才是"改切块粒度不烧配额"能成立
         #          的原因。真正清空查找链的只有 fresh_extract（见下方清空点）。
-        #   force_chunks  = full or rebuild_all or force_extract or
+        #   stale_extract_formats = 提取器**代码升级过**的格式（BC-12）
+        #       —— 只有这些格式的文件逐个重新提取（等同内容变了的文件，走普通
+        #          增量的写盘链），别的格式不受牵连。2026-09-29 真机：此前任何
+        #          一种格式的提取器签名变了（升级 PDF 提取器、本机 MinerU 某轮没
+        #          起来、换扫描件后端）都整库 force_extract，连 md 笔记也全部
+        #          重切块重嵌。设置/可用性的变化只影响“失败的文件能不能重试”，
+        #          由逐文件能力签名管，见 `_extractor_capabilities`。
+        #   force_chunks  = full or rebuild_all or fresh_extract or
         #                   切块器/文本管线签名变化
         #       —— full 与一致性自愈是"重切块 + 重嵌"（`full` 漏掉这一项会让
         #          `--full` 变成"什么也不做"，嵌入器一次都不被调用：LEGACY
         #          `meta = {}` 之后每个文件必然重新切块重嵌）。
         #   force_embed   = force_chunks or 嵌入器/向量库签名变化
         force_extract = fresh_extract
-        if old_manifest is not None:
-            force_extract = force_extract or any(
-                old_signatures.get(point) != signatures.get(point)
-                for point in signatures
-                if point.startswith("extractor:")
-            )
+        stale_extract_formats = (
+            index_integrity.stale_extractor_formats(old_signatures, signatures)
+            if old_manifest is not None
+            else set()
+        )
         force_chunks = full or rebuild_all or force_extract or (
             old_manifest is not None
             and (
@@ -912,9 +952,11 @@ class Pipeline:
                 "mtime_ns": -1,
                 "content_hash": "",
                 "fingerprint_error": "",
-                "capability_signature": self._extraction_capability_signature(path, signatures),
+                "capability_signature": self._extraction_capability_signature(path, capabilities),
                 "action": "excluded" if not included else "added",
             }
+            # 这个文件的正文要不要作废重提：用户要求重新解析，或它这种格式的提取器代码升级过。
+            file_force_extract = force_extract or Path(path).suffix.lower().lstrip(".") in stale_extract_formats
             if not included:
                 if (
                     format_allowlist is not None
@@ -952,7 +994,7 @@ class Pipeline:
                     except OSError as exc:
                         plan["fingerprint_error"] = f"读取文件失败：{type(exc).__name__}: {exc}"
                 if old.get("status") == "indexed":
-                    if force_extract or force_chunks or force_embed:
+                    if file_force_extract or force_chunks or force_embed:
                         plan["action"] = "rebuilt"
                     elif same_stat or plan["content_hash"] == old.get("content_hash"):
                         plan["action"] = "unchanged"
@@ -987,7 +1029,7 @@ class Pipeline:
                     plan["size"], plan["mtime_ns"], plan["content_hash"] = self._file_fingerprint(root / path)
                 except OSError as exc:
                     plan["fingerprint_error"] = f"读取文件失败：{type(exc).__name__}: {exc}"
-            plan["needs_source"] = plan["action"] in {"added", "changed", "retried"} or force_extract
+            plan["needs_source"] = plan["action"] in {"added", "changed", "retried"} or file_force_extract
             plan["needs_chunks"] = plan["needs_source"] or force_chunks or force_embed
             plan["needs_embed"] = plan["needs_chunks"]
             plans.append(plan)

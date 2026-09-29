@@ -1878,7 +1878,11 @@ class TestOcrChainTryFallback(unittest.TestCase):
         with patch.object(local, "extract", side_effect=AssertionError("OCR provider should not run")):
             report = self.pipeline.index_library("scan-lib")
         self.assertEqual(report.succeeded, 1)
-        self.assertEqual(report.changed, 1)
+        # 换扫描件后端不算提取器升级：已经识别好的文件原样保留，连切块/向量都不重做
+        # （2026-09-29 起；此前会把它当“正文作废”重建一遍，见
+        # TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches）。
+        self.assertEqual(report.changed, 0)
+        self.assertEqual(report.unchanged, 1)
 
     def test_scanned_pdf_falls_through_to_local_ocr_and_gets_indexed(self):
         report = self.pipeline.index_library("scan-lib")
@@ -1891,6 +1895,159 @@ class TestOcrChainTryFallback(unittest.TestCase):
         results = self.pipeline.search("scan-lib", "fake-ocr scanned-contract", top_k=5)
         self.assertTrue(results, "OCR恢复出的内容应该能被搜到，不是索引了但实际检索不到的死数据")
         self.assertIn("fake-ocr", results[0].text)
+
+
+class TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches(unittest.TestCase):
+    """2026-09-29 真机：点“增量重建”后四个库的全部文件（连 md 笔记）都被重新切块、重新算
+    向量——Obsidian Vault 225 个文件全部重做。原因是“任何一种格式的提取器签名变了”被当成
+    “所有文件的正文都作废”，而会让它变的不只是升级：①升级 PDF 提取器（修扫描件水印）；
+    ②本机 MinerU 某一轮没在时限内启动（索引子进程会把它卸载，PDF 提取器名单少一个），
+    下一轮又好了；③设置里换扫描件后端或补 MinerU Key。旧项目同类变化只让受影响格式的
+    提取缓存失效（obsidian-rag/extractors.py 缓存键 `<md5>.<route>.v<EXTRACT_VERSION>`
+    只管 PDF/DOCX），笔记从不因此重做（BC-12）。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._fake_ocr_env_backup = os.environ.get("RAG_REDO_FAKE_OCR")
+        os.environ["RAG_REDO_FAKE_OCR"] = "1"
+        self._api_key_backup = os.environ.pop("MINERU_API_KEY", None)
+        self.addCleanup(self._restore_env)
+
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        (self.vault / "plugin-notes.md").write_text("# 插件架构笔记\n\n插件 架构 设计。", encoding="utf-8")
+        (self.vault / "cooking.md").write_text("# 厨房笔记\n\n厨房 食谱 做法。", encoding="utf-8")
+        import pymupdf
+
+        doc = pymupdf.open()
+        doc.new_page().insert_text((72, 72), "text layer page about plugin architecture")
+        doc.save(str(self.vault / "text-layer.pdf"))
+        doc.close()
+        doc = pymupdf.open()
+        doc.new_page()  # 没有文字层：走本机 OCR（假结果）
+        doc.save(str(self.vault / "scanned.pdf"))
+        doc.close()
+
+        self.runtime = PluginRuntime(
+            REPO_ROOT / "plugins",
+            state_file=self.tmp / "plugins_state.json",
+            data_dir=self.tmp / "data",
+        )
+        self.runtime.scan()
+        self.runtime.settings.set("pdf_scan_backend", "mineru-local")
+        for plugin_id in OFFICIAL_PHASE1_PLUGINS + ["official-ocr-mineru-cloud", "official-ocr-mineru-local"]:
+            self.runtime.load(plugin_id)
+            self.runtime.enable(plugin_id)
+            state = self.runtime.plugins[plugin_id]
+            self.assertEqual(state.state, PluginState.ENABLED, f"{plugin_id}: {state.error}")
+        self.addCleanup(self.runtime.close)
+
+        from official_embedder_bge_m3.embed import BGEM3Embedder
+        from official_reranker.rerank import RerankerEngine
+
+        self.runtime.plugins["official-embedder-bge-m3"].instance.embedder = BGEM3Embedder(
+            encoder=_DeterministicFakeEncoder()
+        )
+        self.runtime.plugins["official-reranker"].instance.engine = RerankerEngine(reranker=_DeterministicFakeReranker())
+        self.pipeline = Pipeline(self.runtime)
+        lib_mgr = self.runtime.plugins["official-library-manager"].instance
+        lib_mgr.store.add_library("mixed-lib", "混合库", str(self.vault))
+        lib_mgr.store.set_policy("mixed-lib", enabled_extensions=[".md", ".pdf"])
+        first = self.pipeline.index_library("mixed-lib")
+        self.assertEqual(first.succeeded, 4, first.files)
+
+    def _restore_env(self) -> None:
+        if self._fake_ocr_env_backup is None:
+            os.environ.pop("RAG_REDO_FAKE_OCR", None)
+        else:
+            os.environ["RAG_REDO_FAKE_OCR"] = self._fake_ocr_env_backup
+        if self._api_key_backup is not None:
+            os.environ["MINERU_API_KEY"] = self._api_key_backup
+
+    def _reindex(self):
+        """再跑一轮增量，返回（报告，md 提取器被调用次数，被送去算向量的文件集合）。"""
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        text_extractor = self.runtime.plugins["official-extractor-text"].instance
+        with (
+            patch.object(text_extractor, "extract", wraps=text_extractor.extract) as md_extract,
+            patch.object(embedder, "embed_chunks", wraps=embedder.embed_chunks) as embed,
+        ):
+            report = self.pipeline.index_library("mixed-lib")
+        embedded = {chunk.path for call in embed.call_args_list for chunk in call.args[0]}
+        return report, md_extract.call_count, embedded
+
+    def _active_manifest(self) -> dict:
+        manifest = self.pipeline._manifest("mixed-lib", self.pipeline._generations.active("mixed-lib"))
+        self.assertIsNotNone(manifest)
+        return manifest
+
+    def _rewrite_pdf_signature(self, manifest: dict, values: dict[str, str]) -> None:
+        for entry in manifest["signatures"]["extractor:pdf"]:
+            if entry[0] in values:
+                entry[1] = values[entry[0]]
+
+    def test_pdf_extractor_upgrade_redoes_pdfs_but_leaves_notes_alone(self):
+        manifest = self._active_manifest()
+        self._rewrite_pdf_signature(manifest, {"official-extractor-pdf-text": "0.0.1"})
+        self.assertTrue(self.pipeline._manifests.write(manifest))
+        report, md_extracts, embedded = self._reindex()
+        self.assertEqual(md_extracts, 0)
+        self.assertEqual(embedded, {"text-layer.pdf", "scanned.pdf"})
+        self.assertEqual(report.unchanged, 2)
+        self.assertEqual(report.changed, 2)
+
+    def test_upgraded_extractor_still_retries_terminal_records_of_its_format(self):
+        """升级提取器也要让它当初判出的终态重试（§8.6）：Y2S1 那 7 个被水印骗成 empty 的
+        扫描件，就靠这一条在提取器升到 0.3.0 后重新走 OCR。"""
+        manifest = self._active_manifest()
+        manifest["files"]["scanned.pdf"].update(
+            status="terminal", failure_state="empty", failure_reason="empty", chunk_ids=[]
+        )
+        self._rewrite_pdf_signature(manifest, {"official-extractor-pdf-text": "0.0.1"})
+        self.assertTrue(self.pipeline._manifests.write(manifest))
+        _report, _md_extracts, embedded = self._reindex()
+        self.assertIn("scanned.pdf", embedded)
+        self.assertEqual(self._active_manifest()["files"]["scanned.pdf"]["status"], "indexed")
+
+    def test_ocr_service_missing_for_a_round_rebuilds_nothing(self):
+        """索引子进程里本机 MinerU 没在时限内起来，会被卸载（core/index_progress.py 的
+        “skipped unavailable plugin”）；下一轮它又起来了。两轮都不该重做任何文件，
+        也不该让“搜索前自动同步”误判库过期。"""
+        self.runtime.disable("official-ocr-mineru-local")
+        self.runtime.unload("official-ocr-mineru-local")
+        self.assertEqual(self.pipeline.stale_libraries("mixed-lib"), [])
+        report, md_extracts, embedded = self._reindex()
+        self.assertEqual((md_extracts, embedded, report.unchanged), (0, set(), 4))
+
+        self.runtime.load("official-ocr-mineru-local")
+        self.runtime.enable("official-ocr-mineru-local")
+        self.assertEqual(self.pipeline.stale_libraries("mixed-lib"), [])
+        report, md_extracts, embedded = self._reindex()
+        self.assertEqual((md_extracts, embedded, report.unchanged), (0, set(), 4))
+
+    def test_switching_scan_backend_or_filling_in_a_key_rebuilds_nothing(self):
+        self.runtime.settings.set("pdf_scan_backend", "mineru-cloud")
+        self.runtime.settings.set("mineru_api_key", "sk-test-not-a-real-key")
+        self.assertEqual(self.pipeline.stale_libraries("mixed-lib"), [])
+        report, md_extracts, embedded = self._reindex()
+        self.assertEqual((md_extracts, embedded, report.unchanged), (0, set(), 4))
+
+    def test_manifest_written_before_this_rule_does_not_trigger_a_rebuild(self):
+        """这条规则之前写的清单里，两个 OCR 插件记的是“当时的设置”（selected:后端:状态），
+        不是代码版本。升级后第一次增量不能因为记法不同就把 PDF 全部重做。"""
+        manifest = self._active_manifest()
+        self._rewrite_pdf_signature(
+            manifest,
+            {
+                "official-ocr-mineru-cloud": "selected:mineru-local:nokey",
+                "official-ocr-mineru-local": "selected:mineru-local:ready",
+            },
+        )
+        self.assertTrue(self.pipeline._manifests.write(manifest))
+        self.assertEqual(self.pipeline.stale_libraries("mixed-lib"), [])
+        report, md_extracts, embedded = self._reindex()
+        self.assertEqual((md_extracts, embedded, report.unchanged), (0, set(), 4))
 
 
 class _FakeLlmHttpClient:
