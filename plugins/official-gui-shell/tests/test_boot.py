@@ -139,6 +139,12 @@ class TestRuntimeBoot(_TempDataRoot):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             runtime = gm.build_runtime()
+            # WEMM/MinerU-local（DEFERRED_PLUGIN_IDS）故意只在 build_runtime() 里
+            # load、不 enable——真正 enable 挪到窗口打开之后的后台线程（见
+            # gui_main.py 里 DEFERRED_PLUGIN_IDS 的说明），这里手动补跑一次，
+            # 断言的是"这两个最终也能干净启用"，不是"build_runtime() 一次性
+            # 启用全部 20 个"这个已经不再成立的旧契约。
+            gm._enable_deferred_plugins(runtime)
         self.addCleanup(runtime.close)
         bad = {
             plugin_id: (runtime.plugins[plugin_id].state.value if plugin_id in runtime.plugins else "未发现",
@@ -150,6 +156,28 @@ class TestRuntimeBoot(_TempDataRoot):
         self.assertEqual(bad, {}, f"这些插件没能经真实运行时启用：{bad}\n入口告警：{stderr.getvalue()}")
         self.assertEqual(len(gm.REQUIRED_PLUGINS), 20)
         self.assertNotIn("警告", stderr.getvalue())
+
+    def test_build_runtime_defers_subprocess_service_plugins_so_the_window_is_not_blocked(self) -> None:
+        """2026-09-29 用户真实反馈修复：WEMM/MinerU-local 的 on_enable 会真的
+        Popen 子进程并阻塞轮询 health_check（最多 10s/个）——build_runtime()
+        同步 enable 全部 20 个插件时，窗口在 `_serve()` 建出来之前就要先扛完
+        这最多 ~20s，真机上就是"先黑屏好几秒才出界面"。这里钉住
+        build_runtime() 返回时，DEFERRED_PLUGIN_IDS 只到 loaded（provider 已
+        注册、Pipeline.__init__ 用得到），子进程还没拉起来——真正 enable 挪到
+        `_serve()` 建完窗口之后的后台线程（`_enable_deferred_plugins`）。"""
+        gm = _load_gui_main(self.tmp / "data", _fake_webview(_FakeWindow()))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            runtime = gm.build_runtime()
+        try:
+            for plugin_id in gm.DEFERRED_PLUGIN_IDS:
+                self.assertEqual(
+                    runtime.plugins[plugin_id].state, PluginState.LOADED,
+                    f"{plugin_id} 不该在 build_runtime() 里就被 enable（会阻塞窗口打开）",
+                )
+                self.assertIsNone(getattr(runtime.plugins[plugin_id].instance, "_handle", None))
+        finally:
+            runtime.close()
 
     def test_build_runtime_warns_loudly_on_invalid_plugin(self) -> None:
         """`invalid` 与 `failed` 同样要告警——此前只对 failed 说话，invalid 被静默放过。"""
@@ -310,6 +338,42 @@ class TestMainEntry(_TempDataRoot):
         # 收口不擦启用记录：下次启动仍能按记录恢复
         state = json.loads(paths.plugins_state_file(self.tmp / "data").read_text(encoding="utf-8"))
         self.assertIn("official-gui-shell", state["enabled"])
+
+    def test_deferred_plugin_enable_is_joined_before_runtime_close(self) -> None:
+        """`_serve()` 必须在 `runtime.close()` 之前等后台 enable 线程
+        （`_enable_deferred_plugins`）真正跑完——`PluginRuntime.close()` 只收口
+        状态已经是 enabled/disabled 的插件，线程还没跑完时插件state还停在
+        loaded，close() 会直接跳过它，WEMM/MinerU-local 拉起的子进程就成了
+        没人回收的游离进程。这里故意让后台 enable 线程人为变慢，钉住
+        "close() 一定发生在它跑完之后"这个顺序，不是靠真实计时凑巧对。"""
+        window = _FakeWindow()
+        webview_module = _fake_webview(window)
+        gm = _load_gui_main(self.tmp / "data", webview_module)
+
+        finished = threading.Event()
+        real_deferred = gm._enable_deferred_plugins
+
+        def _slow_deferred(runtime):
+            time.sleep(0.3)
+            real_deferred(runtime)
+            finished.set()
+
+        close_saw_finished: list[bool] = []
+        real_close = PluginRuntime.close
+
+        def _spy_close(runtime):
+            close_saw_finished.append(finished.is_set())
+            real_close(runtime)
+
+        with patch.object(gm, "_enable_deferred_plugins", _slow_deferred), \
+                patch.object(PluginRuntime, "close", _spy_close), \
+                _webview_installed(webview_module), contextlib.redirect_stderr(io.StringIO()):
+            gm.main()
+
+        self.assertEqual(
+            close_saw_finished, [True],
+            "runtime.close() 在后台 enable 线程跑完之前就执行了——子进程可能被漏收",
+        )
 
     def test_fatal_exit_because_a_required_plugin_is_down_also_closes_the_runtime(self) -> None:
         webview_module = _fake_webview(_FakeWindow(), wait_for_push=False)
