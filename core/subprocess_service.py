@@ -49,6 +49,10 @@ from typing import IO
 _DIAG_TAIL_BYTES = 256 * 1024
 _DIAG_READ_CHUNK = 64 * 1024
 
+#: 宿主写给子进程的环境变量：宿主自己的 pid。子进程（WEMM/MinerU 服务）盯着它，
+#: 宿主异常没了就自退出——见 `SubprocessServiceHandle._child_env`。
+PARENT_PID_ENV = "RAG_REDO_PARENT_PID"
+
 
 class EnvBootstrapError(Exception):
     """env_bootstrap 脚本执行失败（venv 创建失败/脚本报错/超时）。调用方
@@ -290,7 +294,7 @@ class SubprocessServiceHandle:
         self._process = subprocess.Popen(
             self._command,
             cwd=str(self._cwd) if self._cwd else None,
-            env=self._env,
+            env=self._child_env(),
             stdout=stdout_target,
             stderr=stderr_target,
             # Windows 上宿主（pythonw.exe/冻结 GUI exe）本身没有控制台；不带这个
@@ -329,6 +333,16 @@ class SubprocessServiceHandle:
         raise SubprocessServiceError(
             f"子进程 {self._startup_timeout}s 内没有通过 health_check: {last_error}{self._log_hint()}"
         )
+
+    def _child_env(self) -> dict[str, str]:
+        """子进程的环境：调用方给的（没给就继承当前环境）再加上 `RAG_REDO_PARENT_PID`。
+
+        子进程据此盯着宿主：宿主**异常没了**（崩溃、被“结束任务”、被强杀）来不及走
+        `stop()` 时，Windows 上子进程不会跟着走，会一直占着显存直到空闲自退出（半小时）。
+        2026-09-29 实测抓到过这样一个孤儿服务。宿主正常走 `stop()` 的路径不受影响。"""
+        env = dict(os.environ if self._env is None else self._env)
+        env[PARENT_PID_ENV] = str(os.getpid())
+        return env
 
     def _open_log_file(self) -> IO[bytes] | None:
         """打开（必要时创建）日志文件。**写不了日志绝不能让子进程起不来**

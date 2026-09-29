@@ -328,6 +328,51 @@ class TestSubprocessStdioRedirection(unittest.TestCase):
         self.assertIsNone(SubprocessServiceHandle((sys.executable, "-c", "pass")).log_file)
 
 
+class TestChildKnowsItsParent(unittest.TestCase):
+    """宿主把自己的 pid 通过 RAG_REDO_PARENT_PID 告诉子进程，子进程据此在宿主异常没了时自退出
+    （2026-09-29：实测抓到过一个宿主没了 29 分钟还活着的 WEMM 服务孤儿）。"""
+
+    _SCRIPT = "import os; print('PARENT=' + os.environ.get('RAG_REDO_PARENT_PID', '') + ' FOO=' + os.environ.get('FOO', ''))"
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _child_output(self, env=None) -> str:
+        import time
+
+        log = self.tmp / "child.log"
+        handle = SubprocessServiceHandle([sys.executable, "-c", self._SCRIPT], log_path=log, env=env)
+        handle.start()
+        deadline = time.monotonic() + 15
+        text = ""
+        while time.monotonic() < deadline:
+            text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+            if "PARENT=" in text:
+                break
+            time.sleep(0.05)
+        handle.stop()
+        return text
+
+    def test_child_is_told_the_hosts_pid(self):
+        self.assertIn(f"PARENT={os.getpid()} ", self._child_output())
+
+    def test_callers_env_is_kept_and_still_gets_the_parent_pid(self):
+        text = self._child_output(env=dict(os.environ, FOO="bar"))
+        self.assertIn(f"PARENT={os.getpid()} FOO=bar", text)
+
+    def test_default_env_is_still_inherited(self):
+        with patch.dict(os.environ, {"FOO": "inherited"}):
+            text = self._child_output()
+        self.assertIn(f"PARENT={os.getpid()} FOO=inherited", text)
+
+    def test_callers_env_dict_is_not_modified(self):
+        env = dict(os.environ, FOO="bar")
+        before = dict(env)
+        self._child_output(env=env)
+        self.assertEqual(env, before)
+
+
 class TestFindFreePort(unittest.TestCase):
     def test_returns_distinct_ports(self):
         ports = {find_free_port() for _ in range(5)}

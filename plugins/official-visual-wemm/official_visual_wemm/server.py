@@ -249,6 +249,70 @@ def _idle_exit_daemon() -> None:
             os._exit(0)
 
 
+PARENT_PID_ENV = "RAG_REDO_PARENT_PID"  # 由宿主（core/subprocess_service.py）在拉起本进程时写入
+_PARENT_POLL_SECONDS = 2.0
+
+
+def _pid_alive(pid: int) -> bool:
+    """`pid` 对应的进程还在吗（标准库实现——本进程跑在自己的解释器里，不能 import core）。
+    权限不够读不到（如宿主是管理员进程）按“还在”算，宁可不退出也不误杀。"""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.GetLastError() == 5  # ERROR_ACCESS_DENIED：进程存在只是够不着
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _watch_parent(parent_pid: int, *, interval: float = _PARENT_POLL_SECONDS, on_gone=None, sleep=time.sleep) -> None:
+    """阻塞到 `parent_pid` 不在了，然后调用 `on_gone()`（可注入，便于测试）。"""
+    while _pid_alive(parent_pid):
+        sleep(interval)
+    if on_gone is not None:
+        on_gone()
+
+
+def _exit_because_parent_is_gone() -> None:
+    print("[wemm] 启动本服务的宿主进程已经不在 -> 进程退出（释放显存）", file=sys.stderr)
+    try:
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 - 刷盘失败绝不能挡住退出
+        pass
+    os._exit(0)
+
+
+def _parent_watch_daemon() -> None:
+    """宿主进程（GUI/MCP/索引 worker）**异常没了**（崩溃、被“结束任务”杀掉、被强杀）时，
+    它没机会走 `on_disable` 去停本服务——Windows 上父进程退出不会带走子进程，本服务会
+    一直占着显存，直到 30 分钟后的空闲自退出。2026-09-29 实测就抓到过一个这样的孤儿
+    （宿主没了 29 分钟它还活着）。所以自己盯着宿主：宿主一没就自退出。没有
+    `RAG_REDO_PARENT_PID`（手动启动）时不启用，回到只靠空闲自退出的旧行为。"""
+    try:
+        parent_pid = int(os.environ.get(PARENT_PID_ENV, "") or 0)
+    except ValueError:
+        return
+    if parent_pid <= 0:
+        return
+    _watch_parent(parent_pid, on_gone=_exit_because_parent_is_gone)
+
+
 def build_messages(kind: str, content):
     if kind == "image":
         return [{"role": "user", "content": [{"type": "image", "image": content}]}]
@@ -404,5 +468,6 @@ if __name__ == "__main__":
         threading.Thread(target=_idle_unload_daemon, daemon=True, name="wemm-idle-unload").start()
     if WEMM_IDLE_EXIT_SECONDS > 0:
         threading.Thread(target=_idle_exit_daemon, daemon=True, name="wemm-idle-exit").start()
+    threading.Thread(target=_parent_watch_daemon, daemon=True, name="wemm-parent-watch").start()
     port = int(sys.argv[sys.argv.index("--port") + 1])
     http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()

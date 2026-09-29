@@ -686,5 +686,111 @@ class TestVisualWemmNavigateVeto(unittest.TestCase):
         self.assertTrue(str(status["log_file"]).startswith(str(self.tmp / "data")))
 
 
+class TestServerExitsWhenItsHostIsGone(unittest.TestCase):
+    """WEMM 看图服务盯着宿主进程：宿主异常没了（崩溃/被“结束任务”/被强杀）来不及走 stop() 时，
+    Windows 上子进程不会跟着走，会一直占着显存直到半小时后的空闲自退出。2026-09-29 实测抓到
+    过一个这样的孤儿（宿主没了 29 分钟它还活着），也是操作者反馈“关掉 GUI 之后显存没有及时
+    释放、进程没有关闭”的一条可能机制。宿主通过环境变量 RAG_REDO_PARENT_PID 告诉子进程自己的 pid。"""
+
+    def setUp(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "wemm_parent_watch_under_test",
+            REPO_ROOT / "plugins" / "official-visual-wemm" / "official_visual_wemm" / "server.py",
+        )
+        assert spec is not None and spec.loader is not None
+        self.server_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.server_mod)
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _finished_pid() -> int:
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        return proc.pid
+
+    def test_pid_alive_tells_a_live_process_from_a_finished_one(self) -> None:
+        self.assertTrue(self.server_mod._pid_alive(os.getpid()))
+        self.assertFalse(self.server_mod._pid_alive(self._finished_pid()))
+        self.assertFalse(self.server_mod._pid_alive(0))
+
+    def test_watch_parent_calls_on_gone_when_the_parent_is_already_dead(self) -> None:
+        called: list[int] = []
+        self.server_mod._watch_parent(self._finished_pid(), interval=0.01, on_gone=lambda: called.append(1))
+        self.assertEqual(called, [1])
+
+    def test_watch_parent_keeps_waiting_while_the_parent_lives(self) -> None:
+        class _Stop(Exception):
+            pass
+
+        polls: list[float] = []
+        called: list[int] = []
+
+        def _sleep(seconds: float) -> None:
+            polls.append(seconds)
+            if len(polls) >= 3:
+                raise _Stop
+
+        with self.assertRaises(_Stop):
+            self.server_mod._watch_parent(os.getpid(), interval=0.5, on_gone=lambda: called.append(1), sleep=_sleep)
+        self.assertEqual(polls, [0.5, 0.5, 0.5])
+        self.assertEqual(called, [])
+
+    def test_without_a_parent_pid_the_watch_is_off_and_returns_at_once(self) -> None:
+        from unittest import mock
+
+        for value in (None, "", "not-a-number", "0"):
+            env = {k: v for k, v in os.environ.items() if k != "RAG_REDO_PARENT_PID"}
+            if value is not None:
+                env["RAG_REDO_PARENT_PID"] = value
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch.object(self.server_mod, "_watch_parent", side_effect=AssertionError("must not watch")):
+                    self.server_mod._parent_watch_daemon()
+
+    @unittest.skipUnless(sys.platform == "win32" or hasattr(os, "killpg"), "需要真实进程语义")
+    def test_orphaned_server_really_exits_after_its_host_is_killed(self) -> None:
+        """端到端：宿主拉起真实服务子进程后被硬杀（没机会 stop），服务必须自己退出。"""
+        try:
+            import psutil
+        except ImportError:
+            self.skipTest("需要 psutil 枚举子进程树")
+        helper = self.tmp / "host.py"
+        helper.write_text(
+            "\n".join(
+                [
+                    "import os, sys, time",
+                    "sys.path.insert(0, r'%s')" % REPO_ROOT,
+                    "from core.subprocess_service import SubprocessServiceHandle",
+                    "os.environ['RAG_REDO_FAKE_WEMM'] = '1'",
+                    "handle = SubprocessServiceHandle(",
+                    "    [sys.executable, 'server.py', '--port', '{port}'],",
+                    "    health_check='http://127.0.0.1:{port}/health',",
+                    "    cwd=r'%s',"
+                    % (REPO_ROOT / "plugins" / "official-visual-wemm" / "official_visual_wemm"),
+                    "    log_path=r'%s'," % (self.tmp / "server.log"),
+                    "    startup_timeout=60.0,",
+                    ")",
+                    "handle.start()",
+                    "print('CHILD', handle._process.pid, flush=True)",
+                    "time.sleep(600)",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        host = subprocess.Popen([sys.executable, str(helper)], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: host.poll() is None and host.kill())
+        line = host.stdout.readline().strip()
+        self.assertTrue(line.startswith("CHILD"), line)
+        child = psutil.Process(int(line.split()[1]))
+        tree = [child] + child.children(recursive=True)
+        self.addCleanup(lambda: [p.kill() for p in tree if p.is_running()])
+        host.kill()  # TerminateProcess：宿主没有任何机会收口
+        host.wait(timeout=10)
+        gone, alive = psutil.wait_procs(tree, timeout=30)
+        self.assertEqual([p.pid for p in alive], [], "宿主没了之后服务进程树必须自己退出")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -304,7 +304,10 @@
         "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/server.py:_vram_snapshot",
         "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/server.py:make_server",
         "rag-redo/core/pipeline.py:_release_text_models_for_visual",
-        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py:index_library"
+        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py:index_library",
+        "rag-redo/core/subprocess_service.py:SubprocessServiceHandle._child_env",
+        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/server.py:_parent_watch_daemon",
+        "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/server.py:_parent_watch_daemon"
       ],
       "test_refs": [
         "rag-redo/tests/test_resource_arbiter.py::TestCrossProcessResourceArbiter",
@@ -314,9 +317,12 @@
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_visual_phase_gets_a_hook_that_makes_the_text_models_give_up_the_gpu",
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_one_text_model_failing_to_release_does_not_stop_the_other_or_raise",
         "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_before_serve_runs_before_the_service_is_needed_and_only_when_there_is_work",
-        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_a_failed_page_index_is_retried_next_round_even_when_the_pdf_is_unchanged"
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_a_failed_page_index_is_retried_next_round_even_when_the_pdf_is_unchanged",
+        "rag-redo/tests/test_subprocess_service.py::TestChildKnowsItsParent",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestServerExitsWhenItsHostIsGone.test_orphaned_server_really_exits_after_its_host_is_killed",
+        "rag-redo/plugins/official-ocr-mineru-local/tests/test_plugin.py::TestServerExitsWhenItsHostIsGone.test_orphaned_server_really_exits_after_its_host_is_killed"
       ],
-      "acceptance": "GUI、MCP、worker 同时运行时不能双驻留；优先级抢占必须作用于真实 holder；锁状态未知不能宣称资源空闲。【缺陷修复，恢复旧行为（2026-09-29）】本机 MinerU 服务必须能在解析进行中应答 /health，且 /health 不在请求线程里做显存探测：旧项目 mineru_server.py 用 ThreadingHTTPServer 且 /health 不做重活；rag-redo 曾用单线程 HTTPServer 并在 /health 里现场 import torch，真机 CPU 被打满时超出宿主 10 秒启动预算，插件“启用失败”、扫描件被整轮延后。现改为多线程服务 + 后台刷新显存快照。【缺陷修复，恢复旧行为（2026-09-29）】文字索引与页级视觉索引必须按旧项目的交接顺序错峰：①视觉插件“真有页要渲染”时才调用核心传入的 before_serve，核心据此让 bge 与 reranker 释放显卡名额（旧项目 _release_for_wemm）；无页可渲染时既不让路也不拉起看图服务（零拉起零开销）；②页级索引失败/部分成功的记录每轮重试，不再因“PDF 没变”永远跳过（旧项目 wemm_indexer 终态条目不走快速路径）。真机现象：4 个库日志全是“WEMM子进程未运行，页级索引本轮跳过”，70 个 PDF 页库全记失败，图谱里没有任何 WEMM 页节点。已成功且没变的 PDF 仍零渲染零编码。",
+      "acceptance": "GUI、MCP、worker 同时运行时不能双驻留；优先级抢占必须作用于真实 holder；锁状态未知不能宣称资源空闲。【缺陷修复，恢复旧行为（2026-09-29）】本机 MinerU 服务必须能在解析进行中应答 /health，且 /health 不在请求线程里做显存探测：旧项目 mineru_server.py 用 ThreadingHTTPServer 且 /health 不做重活；rag-redo 曾用单线程 HTTPServer 并在 /health 里现场 import torch，真机 CPU 被打满时超出宿主 10 秒启动预算，插件“启用失败”、扫描件被整轮延后。现改为多线程服务 + 后台刷新显存快照。【缺陷修复，恢复旧行为（2026-09-29）】文字索引与页级视觉索引必须按旧项目的交接顺序错峰：①视觉插件“真有页要渲染”时才调用核心传入的 before_serve，核心据此让 bge 与 reranker 释放显卡名额（旧项目 _release_for_wemm）；无页可渲染时既不让路也不拉起看图服务（零拉起零开销）；②页级索引失败/部分成功的记录每轮重试，不再因“PDF 没变”永远跳过（旧项目 wemm_indexer 终态条目不走快速路径）。真机现象：4 个库日志全是“WEMM子进程未运行，页级索引本轮跳过”，70 个 PDF 页库全记失败，图谱里没有任何 WEMM 页节点。已成功且没变的 PDF 仍零渲染零编码。【进程死亡兜底（2026-09-29，内部生命周期加固，非用户可见功能）】宿主进程（GUI/MCP/索引 worker）异常没了（崩溃、被“结束任务”、被强杀）来不及走 stop() 时，subprocess_service 子进程（WEMM 看图服务、本机 MinerU 服务）必须自己退出并释放显存，不能等半小时后的空闲自退出：宿主通过环境变量 RAG_REDO_PARENT_PID 告诉子进程自己的 pid，子进程每 2 秒确认宿主还在，不在就自退出（MinerU 服务连同它的内服务 mineru-api 一起按进程树结束）。旧项目服务只有空闲自退出，没有这条兜底。依据：2026-09-29 实测抓到一个宿主没了 29 分钟还活着的 WEMM 服务孤儿；真实 MinerU（模型已装进显存 3693MiB）宿主被硬杀后进程树 12.4 秒内全部消失、显存回到基线。宿主没有该环境变量（手动启动服务）时不启用监视。",
       "blocker": ""
     },
     {
