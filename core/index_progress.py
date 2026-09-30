@@ -328,69 +328,112 @@ def _prepare_worker_containment(launcher_pid: int) -> object | None:
     return job
 
 
-def _index_worker(
-    plugin_dir: str,
-    data_dir: str,
-    enabled_plugin_ids: tuple[str, ...],
-    active_choices: dict[str, str],
+class _WorkerRuntime:
+    """worker 进程里的插件运行时：第一个库真要用时才建，**整批共用**（模型只加载一次），
+    进程收尾时统一停用、卸载。
+
+    2026-09-30 真机（操作者确认，BC-15）：一次重建多个库时，此前每个库各起一个进程，每个都
+    要重新载入深度学习库（约 8 秒）、重新加载模型（3~30 秒）；旧项目是一个索引进程按库循环。"""
+
+    def __init__(
+        self,
+        plugin_dir: Path,
+        data_path: Path,
+        enabled_plugin_ids: tuple[str, ...],
+        active_choices: dict[str, str],
+    ) -> None:
+        self._plugin_dir = plugin_dir
+        self._data_path = data_path
+        self._enabled_plugin_ids = enabled_plugin_ids
+        self._active_choices = active_choices
+        self._runtime: PluginRuntime | None = None
+        self._activated: list[str] = []
+
+    def get(self) -> PluginRuntime:
+        if self._runtime is not None:
+            return self._runtime
+        runtime = PluginRuntime(self._plugin_dir, state_file=None, data_dir=self._data_path)
+        # 先记下来再逐个加载：中途抛异常时 close() 也能把已经起来的插件收掉
+        self._runtime = runtime
+        runtime.scan()
+        for point, plugin_id in self._active_choices.items():
+            runtime.registry.set_active(point, plugin_id)
+        for plugin_id in sorted(self._enabled_plugin_ids):
+            if plugin_id not in runtime.plugins:
+                print(f"index worker skipped missing plugin: {plugin_id}")
+                continue
+            runtime.load(plugin_id)
+            plugin = runtime.plugins[plugin_id]
+            if plugin.instance is not None:
+                self._activated.append(plugin_id)
+            if plugin.state == PluginState.LOADED:
+                runtime.enable(plugin_id)
+                plugin = runtime.plugins[plugin_id]
+            if plugin.state != PluginState.ENABLED:
+                print(
+                    f"index worker skipped unavailable plugin: {plugin_id}: "
+                    f"{plugin.state.value}"
+                )
+                try:
+                    runtime.unload(plugin_id)
+                except Exception:
+                    pass
+                if plugin_id in self._activated:
+                    self._activated.remove(plugin_id)
+        return runtime
+
+    def close(self) -> None:
+        if self._runtime is None:
+            return
+        for plugin_id in reversed(self._activated):
+            try:
+                self._runtime.disable(plugin_id)
+            except Exception:
+                pass
+            try:
+                self._runtime.unload(plugin_id)
+            except Exception:
+                pass
+        self._activated.clear()
+
+
+def _index_one_library(
+    worker_runtime: _WorkerRuntime,
+    data_path: Path,
     library_id: str,
     run_id: str,
     source: str,
     full: bool,
     format_allowlist: tuple[str, ...] | None,
     launcher_pid: int,
-    ack_path: str,
-    log_path: str,
+    ack_file: Path,
     heartbeat_interval: float,
     heartbeat_timeout: float,
-    stall_timeout: float,
-) -> None:
+) -> str:
+    """在本 worker 进程里索引一个库：持库锁 → 写进度 → 回执 → 索引 → 写终态 → 放锁。
+
+    返回 `"done"` / `"failed"`（索引抛了异常）/ `"refused"`（没接下这个库：同库别处在跑、
+    进度写不进）。**终态在这里就写**，不等插件收尾——批次里后面还有库时插件（模型）要留着；
+    以前终态排在插件收尾之后，收尾卡住界面就一直停在“运行中”。"""
     from .pipeline import Pipeline
 
-    ack_file = Path(ack_path)
-    data_path = Path(data_dir)
-    lock = FileByteLock(Path(data_dir) / "index_progress" / "locks" / f"{_status_key(library_id)}.lock")
-    acquired = False
-    containment = None
+    status_path = data_path / "index_progress" / f"{_status_key(library_id)}.json"
+    lock = FileByteLock(data_path / "index_progress" / "locks" / f"{_status_key(library_id)}.lock")
     try:
-        try:
-            _redirect_output(Path(log_path))
-        except OSError as exc:
-            _atomic_write_json(
-                ack_file,
-                {"accepted": False, "message": f"启动失败：无法打开工作进程日志：{type(exc).__name__}: {exc}"},
-            )
-            return
-        try:
-            containment = _prepare_worker_containment(launcher_pid)
-        except OSError as exc:
-            print(f"index worker containment degraded: {type(exc).__name__}: {exc}")
-        if os.name != "nt":
-            try:
-                os.setsid()
-            except OSError as exc:
-                _atomic_write_json(
-                    ack_file,
-                    {"accepted": False, "message": f"启动失败：无法建立独立进程组：{type(exc).__name__}: {exc}"},
-                )
-                return
-            if os.getppid() != launcher_pid:
-                raise SystemExit(128 + signal.SIGTERM)
-        try:
-            acquired = lock.acquire()
-        except OSError as exc:
-            _atomic_write_json(
-                ack_file,
-                {"accepted": False, "message": f"启动失败：无法获取库锁：{type(exc).__name__}: {exc}"},
-            )
-            return
-        if not acquired:
-            _atomic_write_json(
-                ack_file,
-                {"accepted": False, "message": f"库「{library_id}」已经有一个索引任务在跑"},
-            )
-            return
-
+        acquired = lock.acquire()
+    except OSError as exc:
+        _atomic_write_json(
+            ack_file,
+            {"accepted": False, "message": f"启动失败：无法获取库锁：{type(exc).__name__}: {exc}"},
+        )
+        return "refused"
+    if not acquired:
+        _atomic_write_json(
+            ack_file,
+            {"accepted": False, "message": f"库「{library_id}」已经有一个索引任务在跑"},
+        )
+        return "refused"
+    try:
         now = time.time()
         progress = IndexProgress(
             library_id=library_id,
@@ -406,21 +449,17 @@ def _index_worker(
             heartbeat_at=now,
             progress_at=now,
         )
-        if not _atomic_write_json(
-            data_path / "index_progress" / f"{_status_key(library_id)}.json",
-            dataclasses.asdict(progress),
-        ):
+        if not _atomic_write_json(status_path, dataclasses.asdict(progress)):
             _atomic_write_json(ack_file, {"accepted": False, "message": "启动失败：无法写入索引进度状态"})
-            return
+            return "refused"
         if not _atomic_write_json(
             ack_file,
             {"accepted": True, "message": "索引工作进程已启动", "worker_pid": os.getpid()},
         ):
-            return
+            return "refused"
 
         progress_lock = threading.Lock()
         heartbeat_stop = threading.Event()
-        heartbeat_thread: threading.Thread | None = None
 
         def _heartbeat() -> None:
             while not heartbeat_stop.wait(heartbeat_interval):
@@ -428,10 +467,7 @@ def _index_worker(
                     os._exit(129)
                 with progress_lock:
                     progress.heartbeat_at = time.time()
-                    _atomic_write_json(
-                        data_path / "index_progress" / f"{_status_key(library_id)}.json",
-                        dataclasses.asdict(progress),
-                    )
+                    _atomic_write_json(status_path, dataclasses.asdict(progress))
 
         def _on_progress(event: IndexProgressEvent) -> None:
             now = time.time()
@@ -450,13 +486,8 @@ def _index_worker(
                 else:
                     progress.stall_grace_until = None
                 progress.progress_at = now
-                _atomic_write_json(
-                    data_path / "index_progress" / f"{_status_key(library_id)}.json",
-                    dataclasses.asdict(progress),
-                )
+                _atomic_write_json(status_path, dataclasses.asdict(progress))
 
-        runtime = None
-        activated: list[str] = []
         terminal_stage = "failed"
         terminal_error: str | None = None
         terminal_succeeded = 0
@@ -470,33 +501,7 @@ def _index_worker(
         )
         heartbeat_thread.start()
         try:
-            runtime = PluginRuntime(Path(plugin_dir), state_file=None, data_dir=data_path)
-            runtime.scan()
-            for point, plugin_id in active_choices.items():
-                runtime.registry.set_active(point, plugin_id)
-            for plugin_id in sorted(enabled_plugin_ids):
-                if plugin_id not in runtime.plugins:
-                    print(f"index worker skipped missing plugin: {plugin_id}")
-                    continue
-                runtime.load(plugin_id)
-                plugin = runtime.plugins[plugin_id]
-                if plugin.instance is not None:
-                    activated.append(plugin_id)
-                if plugin.state == PluginState.LOADED:
-                    runtime.enable(plugin_id)
-                    plugin = runtime.plugins[plugin_id]
-                if plugin.state != PluginState.ENABLED:
-                    print(
-                        f"index worker skipped unavailable plugin: {plugin_id}: "
-                        f"{plugin.state.value}"
-                    )
-                    try:
-                        runtime.unload(plugin_id)
-                    except Exception:
-                        pass
-                    if plugin_id in activated:
-                        activated.remove(plugin_id)
-            report = Pipeline(runtime).index_library(
+            report = Pipeline(worker_runtime.get()).index_library(
                 library_id,
                 generation_id=run_id,
                 full=full,
@@ -522,19 +527,8 @@ def _index_worker(
             except Exception:  # noqa: BLE001
                 pass
         finally:
-            if runtime is not None:
-                for plugin_id in reversed(activated):
-                    try:
-                        runtime.disable(plugin_id)
-                    except Exception:
-                        pass
-                    try:
-                        runtime.unload(plugin_id)
-                    except Exception:
-                        pass
             heartbeat_stop.set()
-            if heartbeat_thread is not None:
-                heartbeat_thread.join(timeout=max(1.0, heartbeat_timeout))
+            heartbeat_thread.join(timeout=max(1.0, heartbeat_timeout))
             with progress_lock:
                 progress.stage = terminal_stage
                 progress.error = terminal_error
@@ -552,10 +546,111 @@ def _index_worker(
                 else:
                     progress.message = terminal_error or "索引失败"
                 snapshot = dataclasses.asdict(progress)
-            _atomic_write_json(data_path / "index_progress" / f"{_status_key(library_id)}.json", snapshot)
+            _atomic_write_json(status_path, snapshot)
+        return "done" if terminal_stage == "done" else "failed"
     finally:
-        if acquired:
-            lock.release()
+        lock.release()
+
+
+def _next_library(control, launcher_pid: int) -> tuple[str, str, str] | None:
+    """批次 worker 做完一个库后，等发起方派下一个：`("next", 库, run_id, 回执路径)`。
+    发起方说收工、管道断了、发起进程没了 → None（进程收尾退出）。"""
+    while True:
+        if launcher_pid > 0 and not pid_alive(launcher_pid):
+            return None
+        try:
+            if not control.poll(1.0):
+                continue
+            message = control.recv()
+        except (EOFError, OSError):
+            return None
+        if isinstance(message, tuple) and len(message) == 4 and message[0] == "next":
+            return str(message[1]), str(message[2]), str(message[3])
+        return None
+
+
+def _index_worker(
+    plugin_dir: str,
+    data_dir: str,
+    enabled_plugin_ids: tuple[str, ...],
+    active_choices: dict[str, str],
+    library_id: str,
+    run_id: str,
+    source: str,
+    full: bool,
+    format_allowlist: tuple[str, ...] | None,
+    launcher_pid: int,
+    ack_path: str,
+    log_path: str,
+    heartbeat_interval: float,
+    heartbeat_timeout: float,
+    stall_timeout: float,
+    control=None,
+) -> None:
+    """索引工作进程入口。`control` 为 None：只索引这一个库就退出（单库启动、MCP、CLI）。
+    `control` 是批次管道的子进程端：做完一个库回报 `("finished", run_id, 结果)`，接着等发起方
+    派下一个库，整批共用一份插件运行时（模型只加载一次）；某个库抛了异常就不再接活，进程
+    收尾退出，由发起方为后面的库另起新进程——出过错的进程状态不可信。"""
+    ack_file = Path(ack_path)
+    data_path = Path(data_dir)
+    try:
+        _redirect_output(Path(log_path))
+    except OSError as exc:
+        _atomic_write_json(
+            ack_file,
+            {"accepted": False, "message": f"启动失败：无法打开工作进程日志：{type(exc).__name__}: {exc}"},
+        )
+        return
+    containment = None  # Windows 作业对象句柄：进程退出时连带收掉它拉起的子进程，随进程存活
+    try:
+        containment = _prepare_worker_containment(launcher_pid)
+    except OSError as exc:
+        print(f"index worker containment degraded: {type(exc).__name__}: {exc}")
+    if os.name != "nt":
+        try:
+            os.setsid()
+        except OSError as exc:
+            _atomic_write_json(
+                ack_file,
+                {"accepted": False, "message": f"启动失败：无法建立独立进程组：{type(exc).__name__}: {exc}"},
+            )
+            return
+        if os.getppid() != launcher_pid:
+            raise SystemExit(128 + signal.SIGTERM)
+    worker_runtime = _WorkerRuntime(Path(plugin_dir), data_path, tuple(enabled_plugin_ids), dict(active_choices))
+    try:
+        job: tuple[str, str, str] | None = (library_id, run_id, ack_path)
+        while job is not None:
+            job_library, job_run, job_ack = job
+            outcome = _index_one_library(
+                worker_runtime,
+                data_path,
+                job_library,
+                job_run,
+                source,
+                full,
+                format_allowlist,
+                launcher_pid,
+                Path(job_ack),
+                heartbeat_interval,
+                heartbeat_timeout,
+            )
+            if control is None:
+                break
+            try:
+                control.send(("finished", job_run, outcome))
+            except (OSError, ValueError):
+                break
+            if outcome == "failed":
+                break
+            job = _next_library(control, launcher_pid)
+    finally:
+        worker_runtime.close()
+        if control is not None:
+            try:
+                control.close()
+            except OSError:
+                pass
 
 
 def _status_key(library_id: str) -> str:
@@ -569,7 +664,8 @@ class _Batch:
 
     `queue` 是还没轮到的库（按顺序）；正在跑的那个库不在里面，它的 run_id 记在
     `current_run_id`，停止时据此认出"这是哪一批的"。`cancelled` 被置位后，批次线程
-    不再起新的 worker。
+    不再派新的库。整批在同一个 worker 进程里跑（`process`，管道父端 `control`）；
+    `idle` = 这个 worker 活着、手上没活、在等下一个库。
     """
 
     source: str
@@ -579,6 +675,9 @@ class _Batch:
     created_at: float
     cancelled: threading.Event = dataclasses.field(default_factory=threading.Event)
     current_run_id: str = ""
+    process: BaseProcess | None = None
+    control: object | None = None
+    idle: bool = False
 
 
 class IndexWorkerManager:
@@ -680,12 +779,24 @@ class IndexWorkerManager:
         self._reap_finished()
         if not _from_batch and self._is_queued(library_id):
             return IndexStartResult(False, f"库「{library_id}」已经在索引队列里排队")
+        return self._spawn(library_id, source, full, format_allowlist)
+
+    def _spawn(
+        self,
+        library_id: str,
+        source: str,
+        full: bool,
+        format_allowlist: tuple[str, ...] | None,
+        control=None,
+    ) -> IndexStartResult:
+        """起一个新的 worker 进程索引 `library_id`。`control` 是批次管道的子进程端：给了就是
+        批次 worker，做完这个库不退出、等发起方派下一个（见 `_index_worker`）。"""
         run_id = uuid.uuid4().hex
         try:
             self._data_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return IndexStartResult(False, f"启动失败：无法创建数据目录：{type(exc).__name__}: {exc}")
-        ack_path = self._data_dir / "index_progress" / "acks" / f"{run_id}.json"
+        ack_path = self._ack_path(run_id)
         context = multiprocessing.get_context("spawn")
         process = context.Process(
             target=_index_worker,
@@ -705,6 +816,7 @@ class IndexWorkerManager:
                 self._heartbeat_interval,
                 self._heartbeat_timeout,
                 self._stall_timeout,
+                control,
             ),
             daemon=False,
         )
@@ -716,7 +828,22 @@ class IndexWorkerManager:
         with self._lock:
             self._workers[run_id] = process
             self._worker_libraries[run_id] = library_id
+        return self._await_ack(process, library_id, run_id, ack_path, keep_worker_on_refusal=False)
 
+    def _ack_path(self, run_id: str) -> Path:
+        return self._data_dir / "index_progress" / "acks" / f"{run_id}.json"
+
+    def _await_ack(
+        self,
+        process: BaseProcess,
+        library_id: str,
+        run_id: str,
+        ack_path: Path,
+        *,
+        keep_worker_on_refusal: bool,
+    ) -> IndexStartResult:
+        """等 worker 对这个库的回执。`keep_worker_on_refusal`：批次 worker 接活被拒（同库别处
+        在跑）时它本身是健康的、还在等下一个库，不能杀；新起的进程被拒则收掉。"""
         deadline = time.monotonic() + self._ack_timeout
         while True:
             ack = _read_json(ack_path)
@@ -728,9 +855,10 @@ class IndexWorkerManager:
                 except OSError:
                     pass
                 if not accepted:
-                    process.join(timeout=2)
-                    if process.is_alive():
-                        _terminate_worker(process)
+                    if not keep_worker_on_refusal:
+                        process.join(timeout=2)
+                        if process.is_alive():
+                            _terminate_worker(process)
                     self._forget(run_id, process)
                     self._mark_terminal(library_id, run_id, "failed", message, message)
                     return IndexStartResult(False, message)
@@ -793,8 +921,10 @@ class IndexWorkerManager:
         """一次点击索引多个库：**依次**一个一个跑（对齐旧项目 `index.py` 的逐库循环）。
 
         第一个库立刻起 worker，返回它的启动结果（起不来就整批不开始，原样返回失败原因）；
-        其余库进内存队列，由批次线程在前一个 worker 退出后再起下一个。某个库失败或起不来
-        不影响后面的库（旧项目：`索引失败（继续下一库）`）。只有一个库时等价于 `start()`。
+        其余库进内存队列，由批次线程在前一个库跑完后派给**同一个** worker 进程（插件与模型
+        只加载一次，2026-09-30 操作者确认，BC-15）。某个库失败或起不来不影响后面的库（旧项目：
+        `索引失败（继续下一库）`）；失败的那个进程不再接活，后面的库换新进程。只有一个库时
+        等价于 `start()`。
         """
         ids = list(dict.fromkeys(library_ids))
         if not ids:
@@ -815,7 +945,8 @@ class IndexWorkerManager:
         # 不会出现别的调用在这个空档里把它抢先单独开一份。
         with self._lock:
             self._batches.append(batch)
-        first = self.start(ids[0], source, full, format_allowlist=format_allowlist, _from_batch=True)
+        self._reap_finished()
+        first = self._spawn_for_batch(batch, ids[0])
         if not first.started:
             with self._lock:
                 if batch in self._batches:
@@ -835,37 +966,123 @@ class IndexWorkerManager:
             first.worker_pid,
         )
 
-    def _wait_run_end(self, batch: _Batch, run_id: str) -> None:
-        """等这个 run 的 worker 进程退出（或整批被取消）。"""
+    def _spawn_for_batch(self, batch: _Batch, library_id: str) -> IndexStartResult:
+        """为批次起一个新的 worker 进程（带管道，做完一个库等下一个）。"""
+        parent_end, child_end = multiprocessing.get_context("spawn").Pipe()
+        result = self._spawn(library_id, batch.source, batch.full, batch.format_allowlist, control=child_end)
+        # 父进程这边必须关掉子进程端：否则 worker 死了，这头永远等不到管道断开
+        child_end.close()
+        if result.started:
+            with self._lock:
+                batch.process = self._workers.get(result.run_id)
+            batch.control = parent_end
+        else:
+            parent_end.close()
+            batch.process = None
+            batch.control = None
+        batch.idle = False
+        return result
+
+    def _continue_batch(self, batch: _Batch, library_id: str) -> IndexStartResult:
+        """把下一个库派给批次里空着手的 worker（模型还在它那里）。"""
+        process = batch.process
+        if process is None or batch.control is None:
+            return IndexStartResult(False, "批次 worker 已经不在")
+        run_id = uuid.uuid4().hex
+        ack_path = self._ack_path(run_id)
         with self._lock:
-            process = self._workers.get(run_id)
+            self._workers[run_id] = process
+            self._worker_libraries[run_id] = library_id
+        try:
+            batch.control.send(("next", library_id, run_id, str(ack_path)))
+        except (OSError, ValueError) as exc:
+            self._forget(run_id, process)
+            self._drop_batch_worker(batch)
+            return IndexStartResult(False, f"批次 worker 已经不在：{type(exc).__name__}")
+        batch.idle = False
+        result = self._await_ack(process, library_id, run_id, ack_path, keep_worker_on_refusal=True)
+        if not result.started:
+            # 被拒（同库别处在跑）：worker 还健康，接着等下一个；worker 没了/超时被收：换新进程
+            batch.idle = process.is_alive()
+            if not batch.idle:
+                self._drop_batch_worker(batch)
+        return result
+
+    def _drop_batch_worker(self, batch: _Batch) -> None:
+        """批次不再用这个 worker：告诉它收工（它会停用插件、卸模型后退出），关掉管道。"""
+        control = batch.control
+        batch.control = None
+        batch.process = None
+        batch.idle = False
+        if control is None:
+            return
+        try:
+            control.send(("stop",))
+        except (OSError, ValueError):
+            pass
+        try:
+            control.close()
+        except OSError:
+            pass
+
+    def _wait_run_end(self, batch: _Batch) -> bool:
+        """等当前这个库跑完。返回 worker 是否还活着、空着手等下一个库。
+
+        worker 做完一个库会从管道回报 `("finished", run_id, 结果)`；它出过错（结果 failed）
+        或者崩了（管道断开、进程没了），就等它退干净——异常退出没来得及写终态的，在这里经
+        `_reap_finished` 补成 failed——再告诉批次线程为下一个库换新进程。"""
+        run_id = batch.current_run_id
+        process = batch.process
+        if not run_id:
+            return batch.idle and process is not None and process.is_alive()
+        idle = False
+        while not batch.cancelled.is_set():
+            control = batch.control
+            if control is None:
+                if process is None or not process.is_alive():
+                    break
+                time.sleep(0.2)
+                continue
+            try:
+                message = control.recv() if control.poll(0.2) else None
+            except (EOFError, OSError):
+                batch.control = None
+                continue
+            if isinstance(message, tuple) and len(message) == 3 and message[:2] == ("finished", run_id):
+                idle = message[2] != "failed"
+                break
+        if batch.cancelled.is_set():
+            return False
+        if idle:
+            self._forget(run_id, process)
+            batch.idle = True
+            return True
         while process is not None and process.is_alive():
             if batch.cancelled.wait(0.2):
-                return
+                return False
         if process is not None:
             process.join(timeout=1)
-        # worker 异常退出没来得及写终态时，在这里补成 failed，别让下一个库起来时上一个还挂着"运行中"
         self._reap_finished()
+        self._forget(run_id, process)
+        self._drop_batch_worker(batch)
+        return False
 
     def _run_batch(self, batch: _Batch) -> None:
         try:
             while True:
-                self._wait_run_end(batch, batch.current_run_id)
+                idle = self._wait_run_end(batch)
                 if batch.cancelled.is_set():
                     return
                 with self._lock:
                     if not batch.queue:
                         return
                     library_id = batch.queue[0]
-                result = self.start(
-                    library_id,
-                    batch.source,
-                    batch.full,
-                    format_allowlist=batch.format_allowlist,
-                    _from_batch=True,
-                )
+                if idle:
+                    result = self._continue_batch(batch, library_id)
+                else:
+                    result = self._spawn_for_batch(batch, library_id)
                 with self._lock:
-                    # 取消（停止/关闭）可能在 start() 期间发生：队列已被清空就不再动它
+                    # 取消（停止/关闭）可能在派活期间发生：队列已被清空就不再动它
                     if batch.queue and batch.queue[0] == library_id:
                         batch.queue.pop(0)
                 if batch.cancelled.is_set():
@@ -880,6 +1097,7 @@ class IndexWorkerManager:
             with self._lock:
                 if batch in self._batches:
                     self._batches.remove(batch)
+            self._drop_batch_worker(batch)
 
     def _cancel_batches_of_run(self, run_id: str) -> None:
         """停止了某个在跑的 worker：它所在批次里还没轮到的库一并取消（整批停）。"""

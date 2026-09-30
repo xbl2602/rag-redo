@@ -43,6 +43,8 @@ PLUGIN_SOURCE = textwrap.dedent(
             self.roots = roots
             self.mode = (self._data_dir / "worker_mode.txt").read_text(encoding="utf-8").strip()
             (self._data_dir / "worker_utf8.txt").write_text(str(sys.flags.utf8_mode), encoding="utf-8")
+            with (self._data_dir / "worker_loads.txt").open("a", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()}" + chr(10))  # 插件（真机上 = 模型）在哪个进程里加载了几次
             if self.mode == "early_crash":
                 os._exit(24)
             if self.mode == "foreign":
@@ -113,6 +115,8 @@ PLUGIN_SOURCE = textwrap.dedent(
                 raise RuntimeError("worker exploded")
             if self.mode == "fail_lib1" and chunks and chunks[0].library_id == "lib1":
                 raise RuntimeError("lib1 exploded")
+            if self.mode == "crash_lib1" and chunks and chunks[0].library_id == "lib1":
+                os._exit(23)
             if self.mode == "long_lib1" and chunks and chunks[0].library_id == "lib1":
                 time.sleep(2.0)
             return [
@@ -479,7 +483,14 @@ class TestIndexWorkerManager(unittest.TestCase):
     # ---- 一次重建多个库：依次串行（旧项目 index.py `__main__` 的逐库循环）--------
     #
     # 此前 GUI 对每个库各起一个 worker，4 个库 = 4 份模型同时占显卡/CPU（2026-09-29
-    # 真机复现）。`start_batch`：第一个立刻起，其余排队，前一个退出才起下一个。
+    # 真机复现）。`start_batch`：第一个立刻起，其余排队，前一个跑完才轮到下一个。
+    # 2026-09-30 起（操作者确认，BC-15）整批在**同一个** worker 进程里依次跑，模型只加载
+    # 一次——与旧项目"一次点击一个索引进程、按库循环"一致；某个库失败或进程崩了，
+    # 后面的库换一个新进程接着跑。
+
+    def _loads(self) -> list[str]:
+        path = self.data_dir / "worker_loads.txt"
+        return path.read_text(encoding="utf-8").split() if path.exists() else []
 
     def _batch_idle(self, timeout_s: float = 8.0) -> bool:
         return _wait_until(lambda: not self.manager._batches, timeout_s)
@@ -506,8 +517,29 @@ class TestIndexWorkerManager(unittest.TestCase):
         self.assertGreaterEqual(
             second["started_at"], first["finished_at"], "lib2 必须在 lib1 结束之后才开始，不能同时跑"
         )
-        self.assertNotEqual(first["worker_pid"], second["worker_pid"])
+        self.assertEqual(first["worker_pid"], second["worker_pid"], "整批在同一个 worker 进程里跑")
         self.assertTrue(self._batch_idle(), "整批结束后批次线程应退出、队列清空")
+        self.assertTrue(_wait_until(lambda: not pid_alive(first["worker_pid"]), 8.0), "整批跑完 worker 要退出")
+
+    def test_batch_loads_plugins_and_models_only_once(self):
+        """真机：每个库各起一个进程时，每个库都要重新载入深度学习库、重新加载模型（每次 10~35 秒）。"""
+        result = self.manager.start_batch(["lib1", "lib2"], source="test")
+        self.assertTrue(result.started, result.message)
+        self._wait_stage("lib1", "done")
+        self._wait_stage("lib2", "done")
+        self.assertTrue(self._batch_idle())
+        self.assertEqual(len(self._loads()), 1, f"整批只加载一次插件：{self._loads()}")
+
+    def test_after_a_worker_crash_the_rest_of_the_batch_runs_in_a_new_process(self):
+        self._set_mode("crash_lib1")
+        result = self.manager.start_batch(["lib1", "lib2"], source="test")
+        self.assertTrue(result.started, result.message)
+        crashed = self._wait_stage("lib1", "failed")
+        self.assertIn("异常退出", crashed["message"])
+        done = self._wait_stage("lib2", "done")
+        self.assertNotEqual(crashed["worker_pid"], done["worker_pid"], "崩了的进程不能再用，后面的库换新进程")
+        self.assertEqual(done["succeeded"], 1)
+        self.assertTrue(self._batch_idle())
 
     def test_batch_continues_with_the_next_library_after_one_fails(self):
         self._set_mode("fail_lib1")
@@ -517,6 +549,7 @@ class TestIndexWorkerManager(unittest.TestCase):
         self.assertIn("lib1 exploded", failed["error"])
         done = self._wait_stage("lib2", "done")  # 旧项目：索引失败（继续下一库）
         self.assertEqual(done["succeeded"], 1)
+        self.assertNotEqual(failed["worker_pid"], done["worker_pid"], "出过错的进程状态不可信，后面的库换新进程")
 
     def test_stopping_the_running_library_cancels_the_rest_of_the_batch(self):
         self._set_mode("long_lib1")
