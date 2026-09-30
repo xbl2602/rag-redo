@@ -11,13 +11,22 @@ OSError；损坏快照 ValueError/RuntimeError）一律回退联网加载，首�
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Callable
+
+#: transformers 从 `.bin` 权重加载时，会另起线程去问 huggingface.co 有没有现成的 safetensors
+#: 版本、没有就请官方机器人开转换 PR——`local_files_only=True` 拦不住它。2026-09-30 真机
+#: cProfile：bge-m3 的本地快照只有 pytorch_model.bin，每次冷加载都发 4 个请求、约 2 秒。
+#: 本项目承诺处理全在本机（AGENTS.md §1.3），这一步必须关掉；transformers 每次加载时现读它，
+#: 用户自己显式设了值就尊重用户的。
+DISABLE_HUB_CONVERSION_ENV = "DISABLE_SAFETENSORS_CONVERSION"
 
 
 def load_pretrained(
     factory: Callable[..., Any], model_id: str, *, log=None, **kwargs: Any
 ) -> Any:
     """离线优先加载 HF 模型：先只读本地缓存，本地缓存不可用再回退联网。"""
+    os.environ.setdefault(DISABLE_HUB_CONVERSION_ENV, "1")
     try:
         return factory(model_id, local_files_only=True, **kwargs)
     except (OSError, ValueError, RuntimeError) as exc:

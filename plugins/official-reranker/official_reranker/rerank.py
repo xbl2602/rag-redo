@@ -28,8 +28,8 @@ obsidian-rag/retriever.py:231 `release_reranker` 只在**真要卸模型**时调
 且它唯一的生产调用点是 `index.py:1784-1788` 的 `before_serve`——"真的要
 渲染页面才把检索侧让开"）。
 
-现在名额与真实驻留严格配对：真装进显存才 acquire、真卸载（含空闲卸载/慢批
-降级/被抢占/插件停用）就 release，落到 CPU 的三条降级路径不留名额。并发/
+现在名额与真实驻留严格配对：真装进显存才 acquire、真离开显存（含空闲卸载/慢批
+降级/被抢占挪内存/插件停用）就 release，落到 CPU 的三条降级路径不留名额。并发/
 连续使用同一个模型用**进程内引用计数**收敛成一次 acquire、归零才 release
 （实现与 embed.py 同款，跨插件禁止 import，两边各有一份是刻意的）。
 
@@ -58,6 +58,12 @@ official-embedder-bge-m3/embed.py 是刻意的小重复，两边必须同款，�
    于是每一次 `score()` 结束引用都会归零；如果这里图省事调用收尾用的
    `release_gpu_slot()`（它无条件卸模型），降级到 CPU 之后就变成"每次检索都
    重新加载一遍几 GB 的重排模型"。见 `_drop_user_ref`。
+
+**被抢显卡时挪到内存，而不是扔掉（2026-09-30 操作者确认，BC-11，与 embedder 同款）**：
+`on_preempt` 走 `_park`（模型搬到内存，显存全部让出、名额归还），下次用时 `_unpark`
+搬回显卡（实测约 0.4 秒），不再重新加载。只有被抢这一条挪内存；空闲满时限（暂存在内存里
+的也算）、手动「释放显存」、慢批降级、插件停用仍整个卸载。理由与场景见 embed.py 模块
+docstring 同名一节。
 """
 from __future__ import annotations
 
@@ -110,6 +116,7 @@ class _RealReranker:
         self._lease_refs = 0       # "gpu:0" 的在用引用数（每次 score 一个 + 模型驻留一个）
         self._gpu_resident = False  # 手上这个模型是不是真的在显存里
         self._slot_owner = False    # 本对象是不是"真拿到名额"的那个（同进程另一个模型拿着时不归还）
+        self._parked = False        # 被抢显卡后挪到内存暂存着（下次用先搬回显卡，见模块 docstring）
         # 加载失败闩锁：本进程内不再重试（对齐 obsidian-rag/retriever.py:249-264
         # 的 _reranker_failed）。见 reset_load_failure()。
         self._failed = False
@@ -143,6 +150,8 @@ class _RealReranker:
                 "重排器模型此前加载失败并已闩锁，本进程内不再重试"
                 "（对齐 obsidian-rag/retriever.py:249-264）"
             )
+        if self._model is not None and self._parked:
+            self._unpark()
         if self._model is None:
             try:
                 from sentence_transformers import CrossEncoder  # noqa: PLC0415 - 故意懒加载
@@ -235,7 +244,7 @@ class _RealReranker:
                 GPU_RESOURCE_ID,
                 GPU_HOLDER_ID,
                 priority=GPU_PRIORITY,
-                on_preempt=self._unload,
+                on_preempt=self._park,
             )
             if not acquired:
                 self._log_degrade("GPU 名额抢占失败（有更高优先级持有者）", free_gb)
@@ -391,6 +400,67 @@ class _RealReranker:
                 if time.time() - self._last_use > IDLE_UNLOAD_SECONDS and self._model is not None:
                     self._unload_locked()
 
+    def _park(self) -> None:
+        """`on_preempt` 回调：别的进程要用显卡——模型挪到内存、显存全部让出、名额归还，
+        但不扔掉（同 embed.py::_RealEncoder._park）。锁序同 `_unload`。"""
+        with self._lock, gpu_arbiter.GPU_LOCK:
+            self._park_locked()
+
+    def _park_locked(self) -> None:
+        if self._model is None or not self._gpu_resident:
+            # 不在显存里：没有显存可让，模型原样留着，只把名额收干净。
+            self._drop_slot_if_nothing_resident()
+            return
+        try:
+            self._model.to("cpu")
+        except Exception as exc:  # noqa: BLE001 - 挪不动就退回整个卸载，让路本身不能失败
+            self._log(f"重排器挪到内存失败（{type(exc).__name__}），改为整个卸载")
+            self._unload_locked()
+            return
+        self._gpu_resident = False
+        self._parked = True
+        with self._refs_lock:
+            if self._lease_refs > 0:
+                self._lease_refs -= 1
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        self._log("重排器让出显卡：模型暂存到内存，下次用时搬回（空闲满时限仍整个卸载）")
+        self._drop_slot_if_nothing_resident()
+
+    def _unpark(self) -> None:
+        """把暂存在内存里的模型搬回显卡（调用方已持 `self._lock`）。设备判定、失败降级与
+        embed.py::_RealEncoder._unpark 相同：判下来用 CPU 就原地用；搬回失败冷却 + 留在 CPU；
+        连挪回 CPU 都失败就整个丢掉，交给 `_ensure_loaded` 重新加载。搬回失败不算"加载失败"，
+        不触发本进程的加载失败闩锁。"""
+        device = self._select_device()
+        try:
+            with gpu_arbiter.GPU_LOCK:
+                if device == "cuda":
+                    try:
+                        self._model.to("cuda")
+                    except Exception as exc:  # noqa: BLE001 - 同首次加载的 CUDA 失败降级
+                        self._cooldown_gate.cooldown(str(exc))
+                        self._log(f"重排器搬回显卡失败（{type(exc).__name__}），降级 CPU")
+                        device = "cpu"
+                        try:
+                            self._model.to("cpu")
+                        except Exception:  # noqa: BLE001 - 半截在显卡上的模型不能再用
+                            self._model = None
+                self._parked = False
+                if self._model is not None:
+                    self._cooldown_gate.report_device(device)
+                    if device == "cuda":
+                        self._mark_gpu_resident()
+                    self._log(f"重排器模型已从内存搬回（device={device}）")
+        finally:
+            with gpu_arbiter.GPU_LOCK:
+                self._drop_slot_if_nothing_resident()
+
     def _unload(self) -> None:
         """卸载模型。**锁顺序：self._lock → gpu_arbiter.GPU_LOCK**（同
         embed.py::_RealEncoder._unload 的理由：on_preempt 回调走这条路径，
@@ -401,13 +471,14 @@ class _RealReranker:
 
     def _unload_locked(self) -> None:
         """真卸载（调用方已持 `self._lock` + `GPU_LOCK`）：清模型 → 放掉"驻留"
-        引用 → 引用归零就把名额还回去。被抢占（on_preempt）、空闲卸载、慢批
-        降级、插件停用四条路径全都收敛到这里，所以"模型离开显存 ⟺ 名额被
+        引用 → 引用归零就把名额还回去。空闲卸载、慢批降级、插件停用（以及挪内存
+        失败时的被抢占）全都收敛到这里，所以"模型离开显存 ⟺ 名额被
         归还"是结构性保证，而不是每条调用点各自记得写一遍的约定。"""
         if self._model is None:
             # 幂等：没有模型可卸时不重复扣引用（否则会把别人的使用中引用扣成 0）。
             return
         self._model = None
+        self._parked = False
         if self._gpu_resident:
             self._gpu_resident = False
             with self._refs_lock:

@@ -260,10 +260,22 @@ class TestRealRerankerVramCriterion(unittest.TestCase):
 
 
 class _FakeCrossEncoderModel:
-    """假 cross-encoder：只要求 predict 能返回可排序的分数。"""
+    """假 cross-encoder：只要求 predict 能返回可排序的分数；`.to()` 记下搬去过哪些设备。"""
+
+    def __init__(self, device: str = "cuda") -> None:
+        self.device = device
+        self.moves: list[str] = []
+        self.fail_to: set[str] = set()
 
     def predict(self, pairs, batch_size=16):
         return [0.5] * len(pairs)
+
+    def to(self, device):
+        if device in self.fail_to:
+            raise RuntimeError(f"CUDA out of memory（模拟搬到 {device} 失败）")
+        self.moves.append(device)
+        self.device = device
+        return self
 
 
 def _held_locks(trace: list[str]) -> "collections.Counter[str]":
@@ -561,6 +573,71 @@ class TestRerankerModelsDir(unittest.TestCase):
         self._score_recording_cache_folders(lambda: plugin.engine.rerank("q", [("c1", "t")]), folders)
         self.assertEqual(folders, [str(default_models_dir(""))])
         self.assertEqual(default_models_dir("").name, "models", "默认必须是项目内的 models 文件夹")
+
+
+class TestRerankerPreemptedModelWaitsInRam(unittest.TestCase):
+    """被抢显卡时挪到内存、再用时搬回（BC-11，2026-09-30 操作者确认，与 embedder 同款）；
+    空闲满时限、手动释放、插件停用仍整个卸载。"""
+
+    def _loaded(self):
+        loads: list[_FakeCrossEncoderModel] = []
+
+        def _factory(model_id, **kwargs):
+            model = _FakeCrossEncoderModel(kwargs.get("device", "cpu"))
+            loads.append(model)
+            return model
+
+        arb = ResourceArbiter()
+        reranker = _RealReranker(resource_arbiter=arb, cooldown_gate=_stub_gate_ready())
+        patcher = patch.dict(sys.modules, {"sentence_transformers": _fake_sentence_transformers(_factory)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        vram = patch("official_reranker.rerank.gpu_arbiter.vram_free_gb", return_value=8.0)
+        vram.start()
+        self.addCleanup(vram.stop)
+        reranker.score("q", ["a"])
+        self.assertEqual(arb.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
+        return reranker, arb, loads
+
+    def test_preempted_reranker_waits_in_ram_and_comes_back_without_reloading(self):
+        reranker, arb, loads = self._loaded()
+        model = loads[0]
+        self.assertTrue(arb.acquire(GPU_RESOURCE_ID, "somebody-else", priority=1000))
+        self.assertIs(reranker._model, model, "被抢时模型留在内存里，不扔")
+        self.assertEqual(model.device, "cpu")
+        self.assertTrue(reranker._parked)
+        self.assertFalse(reranker._gpu_resident)
+        arb.release(GPU_RESOURCE_ID, "somebody-else")
+        reranker.score("q", ["b"])
+        self.assertEqual(len(loads), 1, "再用时不重新加载")
+        self.assertEqual(model.moves, ["cpu", "cuda"])
+        self.assertTrue(reranker._gpu_resident)
+        self.assertEqual(arb.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
+
+    def test_parked_reranker_is_fully_unloaded_after_idle_timeout(self):
+        reranker, _arb, _loads = self._loaded()
+        reranker._park()
+        reranker._last_use = time.time() - 10_000
+        reranker.idle_check()
+        self.assertIsNone(reranker._model)
+        self.assertFalse(reranker._parked)
+
+    def test_parking_failure_falls_back_to_full_unload(self):
+        reranker, arb, loads = self._loaded()
+        loads[0].fail_to.add("cpu")
+        reranker._park()
+        self.assertIsNone(reranker._model)
+        self.assertIsNone(arb.holder_of(GPU_RESOURCE_ID))
+        self.assertFalse(reranker.load_failed, "让路失败不是加载失败，不能闩锁")
+
+    def test_park_takes_plugin_lock_before_gpu_lock(self):
+        """`_park` 是 on_preempt 回调，锁序必须与 `_unload` 一样（self._lock → GPU_LOCK）。"""
+        trace: list[str] = []
+        rr = _RealReranker(resource_arbiter=ResourceArbiter(), cooldown_gate=_stub_gate_ready())
+        rr._lock = _TracingLock("self_lock", trace)  # type: ignore[assignment]
+        with patch("official_reranker.rerank.gpu_arbiter.GPU_LOCK", _TracingLock("gpu_lock", trace)):
+            rr._park()
+        self.assertEqual(trace[:2], ["enter:self_lock", "enter:gpu_lock"], f"锁序错误：{trace}")
 
 
 class TestRerankerDegradeKeepsModelLoaded(unittest.TestCase):

@@ -480,9 +480,18 @@ class _FakeSentenceTransformerModel:
 
     def __init__(self, device: str = "cuda") -> None:
         self.device = device
+        self.moves: list[str] = []  # `.to()` 搬过哪些设备（被抢显卡挪内存 / 再用时搬回）
+        self.fail_to: set[str] = set()  # 往这些设备搬时模拟失败（显存不够等）
 
     def parameters(self):
         return [types.SimpleNamespace(dtype="torch.float16")]
+
+    def to(self, device):
+        if device in self.fail_to:
+            raise RuntimeError(f"CUDA out of memory（模拟搬到 {device} 失败）")
+        self.moves.append(device)
+        self.device = device
+        return self
 
     def encode(self, texts, normalize_embeddings=False, batch_size=0):
         if normalize_embeddings is not True:
@@ -686,10 +695,82 @@ class TestGpuLeaseFollowsRealResidency(_LeaseTestBase):
                 GPU_RESOURCE_ID, "somebody-else", priority=1000, on_preempt=enc._unload
             )
         )
-        self.assertIsNone(enc._model)
+        # 在位者被抢时跑的是它自己登记的回调（2026-09-30 起是挪内存 `_park`，BC-11）
+        self.assertFalse(enc._gpu_resident)
+        self.assertTrue(enc._parked)
         self.assertFalse(enc._slot_owner)
         enc.release_gpu_slot()
         self.assertEqual(self.arb.holder_of(GPU_RESOURCE_ID), "somebody-else")
+
+
+class TestPreemptedModelWaitsInRam(_LeaseTestBase):
+    """被抢显卡时挪内存（BC-11，2026-09-30 操作者确认）：只有被抢这一条挪内存，其余卸载
+    入口（空闲满时限 / 手动释放显存 / 插件停用）仍然整个卸掉；搬来搬去失败不能把状态搞乱。"""
+
+    def _loaded(self, model=None):
+        model = model or _FakeSentenceTransformerModel("cuda")
+        enc = self._encoder()
+        with patch.dict(
+            sys.modules, {"sentence_transformers": _fake_sentence_transformers(lambda mid, **kw: model)}
+        ), patch(_VRAM, return_value=8.0):
+            enc.encode(["a"])
+        self.assertTrue(enc._gpu_resident)
+        return enc, model
+
+    def test_preempt_frees_the_gpu_and_the_lease_but_keeps_the_model(self):
+        enc, model = self._loaded()
+        self.assertTrue(self.arb.acquire(GPU_RESOURCE_ID, "somebody-else", priority=1000, on_preempt=enc._park))
+        self.assertIs(enc._model, model)
+        self.assertEqual(model.device, "cpu")
+        self.assertFalse(enc._gpu_resident)
+        self.assertFalse(enc._slot_owner)
+        self.assertEqual(enc._lease_refs, 0, "离开显存就不再持'驻留'引用")
+        self.assertEqual(self.arb.holder_of(GPU_RESOURCE_ID), "somebody-else")
+
+    def test_model_parked_in_ram_is_still_fully_unloaded_after_idle_timeout(self):
+        """操作者要求：满 5 分钟空闲照旧整个卸载——暂存在内存里的也一样。"""
+        enc, _model = self._loaded()
+        enc._park()
+        enc._last_use = time.time() - 10_000
+        enc.idle_check()
+        self.assertIsNone(enc._model)
+        self.assertFalse(enc._parked)
+
+    def test_manual_release_still_unloads_entirely(self):
+        """操作者要求：手动「释放显存」（BC-16）维持整个卸载，不挪内存。"""
+        enc, _model = self._loaded()
+        enc.release_gpu_slot()
+        self.assertIsNone(enc._model)
+        self.assertFalse(enc._parked)
+        self.assertIsNone(self.arb.holder_of(GPU_RESOURCE_ID))
+
+    def test_parking_failure_falls_back_to_full_unload(self):
+        model = _FakeSentenceTransformerModel("cuda")
+        model.fail_to.add("cpu")
+        enc, _ = self._loaded(model)
+        enc._park()
+        self.assertIsNone(enc._model, "挪不动就整个卸载，让路本身不能失败")
+        self.assertFalse(enc._gpu_resident)
+        self.assertIsNone(self.arb.holder_of(GPU_RESOURCE_ID))
+
+    def test_failing_to_move_back_to_gpu_cools_down_and_keeps_serving_on_cpu(self):
+        gate = _StubRecordingGate()
+        model = _FakeSentenceTransformerModel("cuda")
+        enc = self._encoder(cooldown_gate=gate)
+        with patch.dict(
+            sys.modules, {"sentence_transformers": _fake_sentence_transformers(lambda mid, **kw: model)}
+        ), patch(_VRAM, return_value=8.0):
+            enc.encode(["a"])
+            enc._park()
+            model.fail_to.add("cuda")
+            vectors = enc.encode(["b"])
+        self.assertEqual(len(vectors), 1, "搬不回显卡也照样出结果（在 CPU 上）")
+        self.assertIs(enc._model, model, "不重新加载")
+        self.assertEqual(model.device, "cpu")
+        self.assertFalse(enc._parked)
+        self.assertFalse(enc._gpu_resident)
+        self.assertEqual(len(gate.cooldowns), 1, "搬回失败按 CUDA 失败进冷却期")
+        self.assertIsNone(self.arb.holder_of(GPU_RESOURCE_ID), "落在 CPU 上绝不留名额")
 
 
 class TestGpuLeaseNotLeakedOnDegradePaths(_LeaseTestBase):
@@ -956,14 +1037,49 @@ class TestGpuLeaseCrossProcess(unittest.TestCase):
         started = time.time()
         self._embed(enc_mcp, "mcp")  # 有界等待：preempt_timeout_s=5s
         self.assertLess(time.time() - started, 20.0, "跨进程让路必须是有界的，不得永久挂死")
-        self.assertIsNone(enc_gui._model, "让路方必须真的把模型卸掉")
+        # 让路 = 真的离开显存（2026-09-30 起挪到内存暂存，不再整个扔掉，BC-11）
+        self.assertFalse(enc_gui._gpu_resident, "让路方必须真的让出显存")
+        self.assertEqual(enc_gui._model.device, "cpu", "让路方的模型挪到了内存")
         self.assertIsNone(arb_gui.holder_of(GPU_RESOURCE_ID), "让路方同时交出名额")
         self.assertEqual(arb_mcp.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
         # 反方向同样成立：GUI 下一次检索再把名额抢回来，串行而不是双份常驻。
         self._embed(enc_gui, "gui-again")
-        self.assertIsNone(enc_mcp._model)
+        self.assertFalse(enc_mcp._gpu_resident)
+        self.assertEqual(enc_mcp._model.device, "cpu")
         self.assertEqual(arb_gui.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
         self.assertIsNone(arb_mcp.holder_of(GPU_RESOURCE_ID))
+
+    def test_preempted_model_waits_in_ram_and_comes_back_without_reloading(self):
+        """2026-09-30 操作者确认（BC-11）：在界面里搜过、再点重建（索引进程要显卡）、索引完
+        再搜——改造前让路 = 整个卸载，再搜要重新加载 10~40 秒。现在被抢时挪到内存，再用时
+        搬回显卡，不重新加载。"""
+        loads = []
+
+        def _factory(model_id, **kw):
+            model = _FakeSentenceTransformerModel(kw.get("device", "cpu"))
+            loads.append(model)
+            return model
+
+        arb_gui, arb_worker = self._arbiter(), self._arbiter()
+        enc_gui = self._encoder(arb_gui)
+        enc_worker = self._encoder(arb_worker)
+        with patch.dict(sys.modules, {"sentence_transformers": _fake_sentence_transformers(_factory)}), patch(
+            _VRAM, return_value=8.0
+        ):
+            enc_gui.encode(["界面里搜一次"])
+            gui_model = enc_gui._model
+            enc_worker.encode(["索引进程要显卡"])
+            self.assertIs(enc_gui._model, gui_model, "被抢时模型留在内存里，不扔")
+            self.assertTrue(enc_gui._parked)
+            self.assertEqual(gui_model.moves, ["cpu"])
+            enc_gui.encode(["索引完再搜"])
+        self.assertEqual(len(loads), 2, "两边各只加载过一次，再搜不重新加载")
+        self.assertIs(enc_gui._model, gui_model)
+        self.assertEqual(gui_model.moves, ["cpu", "cuda"], "再用时从内存搬回显卡")
+        self.assertFalse(enc_gui._parked)
+        self.assertTrue(enc_gui._gpu_resident)
+        self.assertEqual(arb_gui.holder_of(GPU_RESOURCE_ID), GPU_HOLDER_ID)
+        self.assertEqual(enc_worker._model.device, "cpu", "这回轮到索引进程那边挪到内存")
 
     def test_scenario_other_side_only_enabled_lets_wemm_take_the_lease(self):
         """场景二：另一边只是"插件启用、还没检索过"→ 它不占名额 → WEMM

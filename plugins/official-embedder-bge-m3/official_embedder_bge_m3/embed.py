@@ -40,7 +40,7 @@ core/subprocess_service.py::resolve_plugin_python 的 docstring 提到的
 **锁序（AGENTS.md §7，改这两个文件前必读）**：全局唯一顺序是
 `self._lock → gpu_arbiter.GPU_LOCK → self._refs_lock → ResourceArbiter 内部锁`
 （`core/resource_arbiter.py` 模块 docstring 有完整版），**绝不反向**。
-而 on_preempt 回调（`self._unload`）必须按同一顺序拿锁——写成
+而 on_preempt 回调（`self._park`，挪不动时退回 `self._unload`）必须按同一顺序拿锁——写成
 `GPU_LOCK → self._lock` 就与 `encode()` 构成 ABBA，两把锁都无超时，
 结果是冷加载线程与抢占回调线程互等到天荒地老，`encode()` 永不返回。
 `self._refs_lock`（引用计数，见下）是这条链末端的**叶子锁**：只在函数内部
@@ -96,8 +96,20 @@ GPU"——这与 AGENTS.md §7「锁不能代替真实的跨进程 holder 协调
 都是"名额可以还了"的时刻。如果这里顺手把模型也卸掉（收尾期的写法），用户
 看到的现象就是"每次检索都重新加载一遍几 GB 的模型"——降级到 CPU 之后索引
 慢到不可用。模型什么时候真的离开内存，只有三个入口：空闲超时
-（`idle_check`）、被别人抢占（`on_preempt`）、插件停用（`on_disable`/
-`on_unload`）。名额归零和模型卸载是**两件事**，各走各的入口。
+（`idle_check`）、慢批降级、插件停用（`on_disable`/`on_unload`）；被别人抢占
+（`on_preempt`）只让模型离开显存、挪到内存（见下一节）。名额归零和模型卸载是**两件事**，各走各的入口。
+
+**被抢显卡时挪到内存，而不是扔掉（2026-09-30 操作者确认，BC-11）**：会来抢文字
+模型名额的，实际上只有**另一个进程里的同一组文字模型**（GUI、MCP、后台索引进程
+共用 `GPU_HOLDER_ID`，跨进程同 holder 可以互相让路；WEMM/MinerU 优先级低抢不动）。
+典型场景：在界面里搜过（模型在 GUI 进程显存里）→ 点重建（索引进程要用显卡，GUI
+这边被要求让路）→ 索引完再搜。改造前让路 = 整个卸载，再搜要重新载库、读 2GB 权重，
+真机 10~40 秒；现在 `on_preempt` 走 `_park`：模型搬到内存（显存照样全部让出、名额
+照样归还，对抢方来说与卸载没有区别），下次用时 `_unpark` 搬回显卡，实测约 0.4 秒。
+代价是暂存期间多占约 1GB 内存。**只有被抢这一条路径挪内存**：空闲满 `IDLE_UNLOAD_SECONDS`
+（暂存在内存里的也算）、手动「释放显存」（BC-16）、慢批降级、插件停用，仍然整个卸载。
+搬回显卡前的设备判定与首次加载完全一样（冷却期 / 名额 / 物理显存），判下来用 CPU
+就原地在内存里用，与"首次加载就落在 CPU"同一语义。
 
 "只有真拿到名额的那个对象才归还名额"：embedder 与 reranker 共用一个
 `GPU_HOLDER_ID`（同一次检索里两个模型本来就要一起住显存，旧项目也是 bge-m3 +
@@ -179,6 +191,7 @@ class _RealEncoder:
         self._lease_refs = 0      # "gpu:0" 的在用引用数（每次 encode 一个 + 模型驻留一个）
         self._gpu_resident = False  # 手上这个模型是不是真的在显存里
         self._slot_owner = False    # 本对象是不是"真拿到名额"的那个（同进程另一个模型拿着时不归还）
+        self._parked = False        # 被抢显卡后挪到内存暂存着（下次用先搬回显卡，见模块 docstring）
 
     def _log(self, message: str) -> None:
         if self._logger is not None:
@@ -202,6 +215,8 @@ class _RealEncoder:
         )
 
     def _ensure_loaded(self):
+        if self._model is not None and self._parked:
+            self._unpark()
         if self._model is None:
             from sentence_transformers import SentenceTransformer  # noqa: PLC0415 - 故意懒加载，见模块 docstring
 
@@ -323,7 +338,7 @@ class _RealEncoder:
                 GPU_RESOURCE_ID,
                 GPU_HOLDER_ID,
                 priority=GPU_PRIORITY,
-                on_preempt=self._unload,
+                on_preempt=self._park,
             )
             if not acquired:
                 self._log_degrade("GPU 名额抢占失败（有更高优先级持有者）", free_gb)
@@ -382,9 +397,9 @@ class _RealEncoder:
         模型在 CPU 内存里时没有"驻留"引用，于是每一次 `encode()` 结束引用
         都会归零；如果这里图省事调用 `release_gpu_slot()`（它是"插件停用"
         的收口入口，无条件卸模型），降级到 CPU 之后就会变成"每次检索都重新
-        加载一遍几 GB 模型"。模型什么时候真的离开内存，只由空闲超时、被抢占
-        和插件停用三个入口决定（见 `idle_check` / `_unload` /
-        `release_gpu_slot`）。
+        加载一遍几 GB 模型"。模型什么时候真的离开内存，只由空闲超时、慢批降级
+        和插件停用决定（见 `idle_check` / `_unload` / `release_gpu_slot`）；
+        被抢占只离开显存（`_park`）。
         """
         with self._refs_lock:
             if self._lease_refs > 0:
@@ -546,6 +561,72 @@ class _RealEncoder:
                 if time.time() - self._last_use > IDLE_UNLOAD_SECONDS and self._model is not None:
                     self._unload_locked()
 
+    def _park(self) -> None:
+        """`on_preempt` 回调：别的进程要用显卡——把模型挪到内存，显存全部让出、名额归还，
+        但不扔掉模型（模块 docstring 的"被抢显卡时挪到内存"一节）。锁序与 `_unload`
+        相同（`self._lock → GPU_LOCK`），理由见 `_unload`。"""
+        with self._lock, gpu_arbiter.GPU_LOCK:
+            self._park_locked()
+
+    def _park_locked(self) -> None:
+        if self._model is None or not self._gpu_resident:
+            # 不在显存里（没加载 / 本来就在 CPU 上跑）：没有显存可让，模型原样留着，
+            # 只把名额收干净（这时名额只可能是某次使用中引用顺带挂着的）。
+            self._drop_slot_if_nothing_resident()
+            return
+        try:
+            self._model.to("cpu")
+        except Exception as exc:  # noqa: BLE001 - 挪不动就退回原来的整个卸载，让路本身不能失败
+            self._log(f"BGE-M3 挪到内存失败（{type(exc).__name__}），改为整个卸载")
+            self._unload_locked()
+            return
+        self._gpu_resident = False
+        self._parked = True
+        self._device = "cpu"
+        with self._refs_lock:
+            if self._lease_refs > 0:
+                self._lease_refs -= 1
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        self._log("BGE-M3 让出显卡：模型暂存到内存，下次用时搬回（空闲满时限仍整个卸载）")
+        self._drop_slot_if_nothing_resident()
+
+    def _unpark(self) -> None:
+        """把暂存在内存里的模型搬回显卡（调用方已持 `self._lock`，由 `_ensure_loaded` 调）。
+
+        设备判定走 `_select_device`，与首次加载一样（其中可能阻塞的名额申请在 `GPU_LOCK`
+        之外）；判下来用 CPU 就原地在内存里用。搬回失败按"CUDA 初始化失败"处理：冷却 + 留在
+        CPU；连挪回 CPU 都失败（模型一半在显卡上）就整个丢掉，交给 `_ensure_loaded` 重新加载。"""
+        device = self._select_device()
+        try:
+            with gpu_arbiter.GPU_LOCK:
+                if device == "cuda":
+                    try:
+                        self._model.to("cuda")
+                    except Exception as exc:  # noqa: BLE001 - 同首次加载的 CUDA 失败降级
+                        self._cooldown_gate.cooldown(str(exc))
+                        self._log(f"BGE-M3 搬回显卡失败（{type(exc).__name__}），降级 CPU")
+                        device = "cpu"
+                        try:
+                            self._model.to("cpu")
+                        except Exception:  # noqa: BLE001 - 半截在显卡上的模型不能再用
+                            self._model = None
+                self._parked = False
+                if self._model is not None:
+                    self._device = device
+                    self._cooldown_gate.report_device(device)
+                    if device == "cuda":
+                        self._mark_gpu_resident()
+                    self._log(f"BGE-M3模型已从内存搬回（device={device}）")
+        finally:
+            with gpu_arbiter.GPU_LOCK:
+                self._drop_slot_if_nothing_resident()
+
     def _unload(self) -> None:
         """卸载模型。**锁顺序：self._lock → gpu_arbiter.GPU_LOCK**（模块
         docstring 的全局锁序第一段）。
@@ -564,13 +645,14 @@ class _RealEncoder:
         """真卸载（调用方已持 `self._lock` + `GPU_LOCK`）：清模型 → 放掉"驻留"
         引用 → 引用归零就把名额还回去。
 
-        被抢占（on_preempt）、空闲卸载、慢批降级、插件停用四条路径全都收敛到
+        空闲卸载、慢批降级、插件停用（以及挪内存失败时的被抢占）全都收敛到
         这里，所以"模型离开显存 ⟺ 名额被归还"是一条结构性保证，而不是每条
-        调用点各自记得写一遍的约定。"""
+        调用点各自记得写一遍的约定。暂存在内存里的模型也从这里整个丢掉。"""
         if self._model is None:
             # 幂等：没有模型可卸时不重复扣引用（否则会把别人的使用中引用扣成 0）。
             return
         self._model = None
+        self._parked = False
         if self._gpu_resident:
             self._gpu_resident = False
             with self._refs_lock:
