@@ -212,6 +212,68 @@ class ChromaVectorStore:
             )
         }
 
+    def file_vectors(
+        self,
+        library_id: str,
+        chunk_groups: "dict[str, list[str]]",
+        generation: str | None = None,
+        *,
+        batch: int = 2000,
+    ):
+        """按文件汇总内容向量（BC-18 总览星图用）：每个文件 = 它全部块向量的平均再归一化。
+
+        只按 id 分批取向量（不取正文、不取元数据），内存只随"文件数 × 维度"增长，
+        不随块数增长——`get_all` 会把整库正文和向量全变成 Python 对象，大库能吃掉几百 MB。
+        读路径：集合不存在返回空结果，绝不创建空集合（理由见 `_existing_collection`）。
+        Chroma 1.x 返回的向量是 numpy 数组，一律 `np.asarray` 统一处理，不做真值判断
+        （numpy 数组的真值判断会抛"歧义真值"错误，AGENTS.md §9）。"""
+        import numpy as np
+
+        from core.contracts import FileVectorSet
+
+        paths = [path for path, ids in chunk_groups.items() if ids]
+        coll = self._existing_collection(library_id, generation) if paths else None
+        owner: dict[str, int] = {}
+        for index, path in enumerate(paths):
+            for chunk_id in chunk_groups[path]:
+                owner.setdefault(chunk_id, index)
+        sums: "np.ndarray | None" = None
+        counts = np.zeros(len(paths), dtype=np.int64)
+        if coll is not None:
+            ids = list(owner)
+            step = max(1, int(batch))
+            for start in range(0, len(ids), step):
+                result = coll.get(ids=ids[start:start + step], include=["embeddings"])
+                got_ids = result.get("ids")
+                got_vecs = result.get("embeddings")
+                if got_ids is None or got_vecs is None or len(got_ids) == 0:
+                    continue
+                vecs = np.asarray(got_vecs, dtype=np.float32)
+                if vecs.ndim != 2 or vecs.shape[0] != len(got_ids):
+                    continue
+                if sums is None:
+                    sums = np.zeros((len(paths), vecs.shape[1]), dtype=np.float32)
+                rows = np.fromiter((owner[i] for i in got_ids), dtype=np.int64, count=len(got_ids))
+                np.add.at(sums, rows, vecs)
+                np.add.at(counts, rows, 1)
+        keep = np.nonzero(counts > 0)[0]
+        dim = 0 if sums is None else int(sums.shape[1])
+        if sums is None or len(keep) == 0:
+            vectors = np.zeros((0, dim), dtype=np.float32)
+        else:
+            vectors = sums[keep] / counts[keep, None].astype(np.float32)
+            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+            vectors = (vectors / np.maximum(norms, 1e-12)).astype(np.float32)
+        return FileVectorSet(
+            library_id=library_id,
+            generation=generation,
+            paths=tuple(paths[i] for i in keep.tolist()),
+            vectors=vectors,
+            dim=dim,
+            produced_by="official-vector-store-chroma",
+            store_version=VECTOR_STORE_VERSION,
+        )
+
     def delete(
         self,
         library_id: str,

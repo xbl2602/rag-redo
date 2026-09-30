@@ -19,28 +19,19 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from core.singleton import pid_alive  # noqa: E402
 from core.runtime import PluginRuntime, PluginState  # noqa: E402
 
 
 def _process_is_gone(pid: int) -> bool:
-    """跨平台的"这个 pid 是不是真的没了"检查，理由同
-    tests/test_runtime.py 里同名函数——POSIX 的 os.kill(pid, 0) 信号-0
-    探测语义在 Windows 上不成立（直接抛 OSError 而不是
-    ProcessLookupError），得走 Win32 OpenProcess API。"""
-    if os.name == "nt":
-        import ctypes
+    """"这个 pid 是不是真的没了"：直接问 `core/singleton.py::pid_alive`（看进程是不是已经
+    结束），测试里不另写一份判断（AGENTS.md §4.5、§7）。
 
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return True
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    return False
+    以前这里各自写成“OpenProcess 打得开就算还活着”，在 Windows 上判不准：进程被杀掉之后，
+    只要别处还有人握着它的句柄，这个进程对象就还在、照样打得开，要过零点几秒才真正消失。
+    2026-10-01 在整套回归里抓到过：`stop()` 之后立刻查，退出码已经是 1（被 taskkill 杀掉），
+    却仍被判“还活着”，1 秒后再查就没了——“停止子进程”那条测试时好时坏就是这个原因。"""
+    return not pid_alive(pid)
 
 
 class TestMineruLocalOcrPlugin(unittest.TestCase):
@@ -442,31 +433,36 @@ class TestMineruLocalServerAnswersWhileBusy(unittest.TestCase):
         self.assertLess(elapsed, 1.0)
         self.assertEqual(result["body"]["text"], "ok")
 
-    def test_health_never_runs_the_vram_probe_on_the_request_thread(self):
-        import threading
-        import time
+    def test_health_never_runs_the_vram_probe_at_all(self):
+        """/health 既不在请求线程做重活，也**不在后台偷偷探测**。
+
+        2026-09-29 真机三轮：①最初在 /health 里现场探测 → `import torch` 压在请求线程上，
+        宿主机 CPU 忙时超出 10 秒启动预算，表现为"启用失败"、扫描件整轮延后；②改成后台
+        线程探测 → /health 快了，但**壳进程启动就建起 CUDA 上下文并常驻**，只为显示一个
+        数字。GUI 与索引 worker 各起一个本服务，两份上下文约 1.4GB，把要装 5GB 模型的
+        WEMM 挤到门槛外（真机卡在「空闲显存 5.5GB < 需求 5.5GB」）。③现在：只有真要装
+        模型时（`_wait_for_vram`）才探测，那时 CUDA 上下文本来就必须有。
+        """
         from unittest import mock
 
-        probe_threads: list[str] = []
-
-        def _slow_probe(max_age: float = 5.0):
-            probe_threads.append(threading.current_thread().name)
-            time.sleep(2.0)  # 老实现里这 2 秒（真实是 import torch）就压在 /health 的请求上
-            self.server_mod._vram_cache = (6.5, time.time())
-            return 6.5
-
         self.server_mod._vram_cache = (None, 0.0)
-        with mock.patch.object(self.server_mod, "_vram_free_gb", _slow_probe):
+        with mock.patch.object(self.server_mod, "_vram_free_gb") as probe:
             status, elapsed = self._health(timeout=1.0)
             self.assertEqual(status, 200)
             self.assertLess(elapsed, 1.0)
-            deadline = time.monotonic() + 10
-            while not probe_threads and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertEqual(probe_threads, ["mineru-vram-probe"])
-            # 等后台探测跑完，避免线程漏到别的用例里
-            while self.server_mod._vram_refreshing.locked() and time.monotonic() < deadline:
-                time.sleep(0.05)
+            probe.assert_not_called()  # /health 不许以任何形式触发探测
+
+    def test_health_reports_the_cached_value_once_something_has_probed(self):
+        """真解析过一次之后，/health 直接回缓存值，不再自己探。"""
+        import json
+        import time
+        import urllib.request
+
+        self.server_mod._vram_cache = (6.5, time.time())
+        self.addCleanup(setattr, self.server_mod, "_vram_cache", (None, 0.0))
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=5.0) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        self.assertEqual(body.get("gpu_mem_gb"), 6.5)
 
 
 class TestServerExitsWhenItsHostIsGone(unittest.TestCase):
@@ -573,6 +569,211 @@ class TestServerExitsWhenItsHostIsGone(unittest.TestCase):
         host.wait(timeout=10)
         gone, alive = psutil.wait_procs(tree, timeout=30)
         self.assertEqual([p.pid for p in alive], [], "宿主没了之后服务进程树必须自己退出")
+
+
+class TestServerBatchesScansWithinVramLimits(unittest.TestCase):
+    """几份扫描件合成一批交给 MinerU（2026-09-29 操作者确认“尝试，但务必做好显存管理”）。
+    本机实测：8 份 60 页一份一份送 68.8 秒、合批 33.5～40.5 秒，整卡显存峰值只多 0.1～0.3GB。
+    这里在进程内直接测服务端的分组、显存把关和出错退回（不起真实 MinerU）。"""
+
+    def setUp(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "mineru_local_server_batch_under_test",
+            REPO_ROOT / "plugins" / "official-ocr-mineru-local" / "official_ocr_mineru_local" / "server.py",
+        )
+        assert spec is not None and spec.loader is not None
+        self.server = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.server)
+        self.pages: dict[str, int | None] = {}
+
+    def _paths(self, **pages) -> list[Path]:
+        self.pages.update(pages)
+        return [Path(name) for name in pages]
+
+    def _patched(self, *, allowed=True, many=None, single=None):
+        from unittest import mock
+
+        single = single or (lambda path, timeout: (f"single:{Path(path).name}", None))
+        return [
+            mock.patch.object(self.server, "_count_pages", lambda path: self.pages.get(Path(path).name)),
+            mock.patch.object(self.server, "_batch_allowed", (lambda: allowed) if not callable(allowed) else allowed),
+            mock.patch.object(self.server, "_do_parse_many", mock.Mock(side_effect=many)),
+            mock.patch.object(self.server, "_do_parse", mock.Mock(side_effect=single)),
+        ]
+
+    def _run(self, paths, **kwargs):
+        patches = self._patched(**kwargs)
+        mocks = [p.start() for p in patches]
+        try:
+            return self.server._real_ocr_many(paths), mocks[2], mocks[3]
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def test_groups_keep_order_and_stay_within_file_and_page_limits(self):
+        plan = self.server._plan_batches
+        self.assertEqual(plan([5, 2, 3, 11], max_files=8, max_pages=64), [[0, 1, 2, 3]])
+        self.assertEqual(plan([40, 30, 10], max_files=8, max_pages=64), [[0], [1, 2]])
+        self.assertEqual(plan([1] * 10, max_files=8, max_pages=64), [list(range(8)), [8, 9]])
+        # 页数未知、单份就超过一批上限：单独一组，和今天一份一份送一样
+        self.assertEqual(plan([5, None, 90, 5], max_files=8, max_pages=64), [[0], [1], [2], [3]])
+        self.assertEqual(plan([5, 5], max_files=1, max_pages=64), [[0], [1]])
+
+    def test_small_scans_are_parsed_in_one_request(self):
+        paths = self._paths(**{"a.pdf": 5, "b.pdf": 2, "c.pdf": 6})
+        outcomes, many, single = self._run(paths, many=lambda ps, timeout: ([f"batch:{p.name}" for p in ps], None))
+        self.assertEqual([o[0] for o in outcomes], ["batch:a.pdf", "batch:b.pdf", "batch:c.pdf"])
+        self.assertEqual(many.call_count, 1)
+        self.assertEqual(single.call_count, 0)
+
+    def test_a_failed_batch_falls_back_to_one_file_at_a_time(self):
+        paths = self._paths(**{"a.pdf": 5, "b.pdf": 2})
+        outcomes, many, single = self._run(paths, many=lambda ps, timeout: (None, "inner-error: HTTP 500"))
+        self.assertEqual([o[0] for o in outcomes], ["single:a.pdf", "single:b.pdf"])
+        self.assertEqual(single.call_count, 2)
+        self.assertIsNone(self.server._batch_off_reason)
+
+    def test_out_of_memory_turns_batching_off_for_the_rest_of_the_process(self):
+        from unittest import mock
+
+        paths = self._paths(**{"a.pdf": 5, "b.pdf": 2})
+        oom = "inner-error: HTTP 500 CUDA out of memory. Tried to allocate 512.00 MiB"
+        outcomes, _many, single = self._run(paths, many=lambda ps, timeout: (None, oom))
+        self.assertEqual(single.call_count, 2)
+        self.assertEqual(self.server._batch_off_reason, oom)
+        with mock.patch.object(self.server, "_ensure_inner", side_effect=AssertionError("不该再为合批装模型")):
+            self.assertFalse(self.server._batch_allowed())
+
+    def test_only_the_file_that_came_back_empty_is_retried_alone(self):
+        paths = self._paths(**{"a.pdf": 5, "b.pdf": 2, "c.pdf": 3})
+        outcomes, _many, single = self._run(
+            paths, many=lambda ps, timeout: (["batch:a", None, "batch:c"], None)
+        )
+        self.assertEqual([o[0] for o in outcomes], ["batch:a", "single:b.pdf", "batch:c"])
+        self.assertEqual(single.call_count, 1)
+
+    def test_not_enough_free_vram_means_one_file_at_a_time(self):
+        from unittest import mock
+
+        with (
+            mock.patch.object(self.server, "_ensure_inner", return_value="http://127.0.0.1:1"),
+            mock.patch.object(self.server, "_vram_free_gb", return_value=0.6),
+        ):
+            self.assertFalse(self.server._batch_allowed())
+        with (
+            mock.patch.object(self.server, "_ensure_inner", return_value="http://127.0.0.1:1"),
+            mock.patch.object(self.server, "_vram_free_gb", return_value=3.4),
+        ):
+            self.assertTrue(self.server._batch_allowed())
+
+    def test_vram_is_checked_after_the_models_are_loaded(self):
+        from unittest import mock
+
+        order: list[str] = []
+        with (
+            mock.patch.object(self.server, "_ensure_inner", side_effect=lambda: order.append("load") or "u"),
+            mock.patch.object(self.server, "_vram_free_gb", side_effect=lambda max_age=5.0: order.append("probe") or 3.0),
+        ):
+            self.server._batch_allowed()
+        self.assertEqual(order, ["load", "probe"])
+
+    def test_oversized_file_is_refused_without_parsing(self):
+        paths = self._paths(**{"huge.pdf": 999, "a.pdf": 5})
+        outcomes, many, single = self._run(paths)
+        self.assertIsNone(outcomes[0][0])
+        self.assertIn("too-many-pages", outcomes[0][1])
+        self.assertEqual(outcomes[1][0], "single:a.pdf")
+        self.assertEqual(many.call_count, 0)
+
+    def test_free_vram_probe_prefers_torch_because_nvidia_smi_under_reports(self):
+        """torch 优先、nvidia-smi 兜底——顺序不能反。
+
+        2026-09-29 本机实测（WDDM 笔记本，RTX 5060 Laptop，总 8151 MiB）：两者相差约
+        5.2 GiB，torch 报空闲 6.878 GiB、nvidia-smi 报 1.681 GiB。nvidia-smi 在 WDDM 上把
+        大量系统内存计入显存占用，读数严重偏低。拿它当唯一判据，`_wait_for_vram(4.5)`
+        会间歇性"等不到显存"，表现为扫描件偶发转写失败。
+        """
+        from unittest import mock
+
+        class _FakeCuda:
+            @staticmethod
+            def is_available() -> bool:
+                return True
+
+            @staticmethod
+            def mem_get_info() -> tuple[int, int]:
+                return (6 * 1024**3, 7 * 1024**3)  # 6.0 GiB free
+
+        fake_torch = type("_Torch", (), {"cuda": _FakeCuda})
+        smi = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"1024\n", stderr=b"")
+        with (
+            mock.patch.dict(sys.modules, {"torch": fake_torch}),
+            mock.patch.object(self.server.subprocess, "run", return_value=smi) as run_mock,
+        ):
+            self.assertAlmostEqual(self.server._vram_free_gb(max_age=0.0), 6.0)
+        run_mock.assert_not_called()  # torch 答得上就不该去问 nvidia-smi
+
+    def test_free_vram_probe_falls_back_to_nvidia_smi_when_torch_is_unavailable(self):
+        """torch 装不上/不可用时仍要能探测（fail-open 的另一头：nvidia-smi 兜底）。"""
+        from unittest import mock
+
+        class _NoCuda:
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+        fake_torch = type("_Torch", (), {"cuda": _NoCuda})
+        smi = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"5120\n", stderr=b"")
+        with (
+            mock.patch.dict(sys.modules, {"torch": fake_torch}),
+            mock.patch.object(self.server.subprocess, "run", return_value=smi),
+        ):
+            self.assertAlmostEqual(self.server._vram_free_gb(max_age=0.0), 5.0)
+
+    def test_free_vram_probe_falls_back_to_nvidia_smi_when_torch_raises(self):
+        """torch 抛异常（驱动问题/上下文建不起来）时也不能让整条探测链断掉。"""
+        from unittest import mock
+
+        class _BoomCuda:
+            @staticmethod
+            def is_available() -> bool:
+                raise RuntimeError("no CUDA driver")
+
+        fake_torch = type("_Torch", (), {"cuda": _BoomCuda})
+        smi = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"3072\n", stderr=b"")
+        with (
+            mock.patch.dict(sys.modules, {"torch": fake_torch}),
+            mock.patch.object(self.server.subprocess, "run", return_value=smi),
+        ):
+            self.assertAlmostEqual(self.server._vram_free_gb(max_age=0.0), 3.0)
+
+
+class TestPluginExtractMany(unittest.TestCase):
+    """宿主这一侧的 `extract_many`：走真实子进程（假识别），每一份的结果形状与 `extract` 一样。"""
+
+    setUp = TestMineruLocalOcrPlugin.setUp
+    _restore_env = TestMineruLocalOcrPlugin._restore_env
+
+    def test_returns_one_document_per_path_in_order(self):
+        (self.tmp / "a.pdf").write_bytes(b"%PDF-fake-a")
+        (self.tmp / "b.pdf").write_bytes(b"%PDF-fake-b")
+        (self.tmp / "note.md").write_text("x", encoding="utf-8")
+        docs = self.instance.extract_many("lib", ["a.pdf", "note.md", "missing.pdf", "b.pdf"], self.tmp)
+        self.assertEqual([d.path for d in docs], ["a.pdf", "note.md", "missing.pdf", "b.pdf"])
+        self.assertIn("fake-ocr", docs[0].text)
+        self.assertIsNone(docs[1].text)
+        self.assertIsNone(docs[2].text)
+        self.assertIn("fake-ocr", docs[3].text)
+        self.assertEqual(docs[0].extracted_by, "official-ocr-mineru-local")
+        self.assertTrue(docs[0].content_hash)
+
+    def test_too_many_pages_is_classified_as_scanned_like_the_legacy_router(self):
+        doc = self.instance._document(
+            "lib", "huge.pdf", {"text": None, "failure_reason": "RuntimeError: too-many-pages: 250 页超过上限 200 页"}, "h"
+        )
+        self.assertTrue(doc.failure_reason.startswith("scanned:"), doc.failure_reason)
 
 
 if __name__ == "__main__":

@@ -363,7 +363,13 @@ class _LegacyContractMixin:
                 "chunks": total_chunks,
                 "vault_files": self._cached(("vault_files",), VAULT_FILES_TTL_S, self._vault_file_count),
                 "progress": progress,
-                "wemm_live": self._wemm_live_cached(),
+                # 看图服务是**可选能力**（`wemm_backend=off` 或插件没启用时它不在
+                # providers 里），它坏了不该让整帧快照变成 `{"error": ...}`——
+                # 那是 GUI 每秒推一帧的心跳，坏一帧等于界面全白、进度条一起消失。
+                # 退化成一个"服务不可用"的字面量，前端本来就按"没活着"渲染。
+                # （2026-09-29 补显存提示时发现的既有脆弱点：这里原来裸调，
+                #  `test_a_broken_vram_probe_never_empties_the_whole_snapshot` 钉住。）
+                "wemm_live": self._wemm_live_safe(),
                 "gpu": {
                     "ok": bool(gpu.get("ok")),
                     "mem_used_mb": gpu.get("mem_used_mb"),
@@ -505,12 +511,38 @@ class _LegacyContractMixin:
         })
         return base
 
-    @staticmethod
-    def _heartbeat_note(status: dict[str, Any], phase: str, heartbeat: str) -> str | None:
+    def _heartbeat_note(self, status: dict[str, Any], phase: str, heartbeat: str) -> str | None:
         """心跳胶囊文案（旧 `store.heartbeat_note`）：DEAD 优先——红胶囊配"宽限内"
-        文案自相矛盾；提取阶段 → 转换提示；停滞宽限内 → 合法长静默提示。"""
+        文案自相矛盾；**页级视觉索引被显存挡下 → 写清需要多少/现在多少**；
+        提取阶段 → 转换提示；停滞宽限内 → 合法长静默提示。"""
         if heartbeat == "dead":
             return None
+        # 显存提示走兜底：`_vram_note` 内部已经兜了它自己那一层，但这里再兜一次
+        # 是因为「一个可选能力的提示文案」绝不该有能力把**整帧快照**变成
+        # `{"error": ...}`（`get_snapshot` 的失败兜底就是这么判的）。文案是锦上添花，
+        # 拿不到就退回下面那些普通文案。
+        try:
+            vram = self._vram_note()
+        except Exception:  # noqa: BLE001 - 见上：可选能力的提示不能连坐整帧快照
+            vram = None
+        if vram is not None:
+            # 优先于下面所有文案：显存被挡是**用户自己能解决或自己决定**的事，
+            # 不告诉他"心跳正常/正在加载"就等于静默失效（2026-09-29 真机就是这么
+            # 让人对着一个不动的进度条等了半小时）。
+            return vram
+        # 页级视觉索引进度：这一段的口径是文字索引的 files_done/files_total，那两个数
+        # 在进入视觉阶段前就已经是最终值（真机 Y2S1：78/78、100%），于是编 7645 页的
+        # 那 30 分钟里界面一个数都不变。插件改把页级进度写进 `message`，这里透给
+        # `heartbeat_note`——**前端是逐字节冻结的（BC-15），而它本来就会渲染
+        # heartbeat_note**，所以不需要改前端就能让用户看见「页级视觉索引 3186/7645 页」。
+        #
+        # 判断要看**原始 phase**（`status["phase"] == "visual"`），不能看传进来的
+        # `phase`——那个已经被 `_PHASE_MAP` 映射成 `writing` 了，拿它比永远不成立。
+        # 只在视觉阶段透出：其它阶段的 message 各有各的用处与位置，全量透出会串。
+        if str(status.get("phase") or "") == "visual":
+            detail = str(status.get("message") or "").strip()
+            if detail:
+                return detail
         if phase == "converting":
             return "文档转换中（大文件耗时属预期）"
         until = status.get("stall_grace_until")
@@ -518,6 +550,62 @@ class _LegacyContractMixin:
             quiet = max(0, int(time.time() - float(status.get("progress_at") or 0.0)))
             return f"模型加载/写库中（已安静 {quiet}s，宽限内）"
         return None
+
+    def _wemm_live_safe(self) -> dict[str, Any]:
+        """`_wemm_live_cached` 的兜底版：任何异常都退化成"服务不可用"字面量。
+
+        存在的理由是**快照健壮性**（AGENTS.md §4.4/§5 的"结构保证"精神）：看图服务是
+        可选能力，它或它的缓存/线程任何一环出问题，都只该让 `wemm_live` 这一项变成
+        "没活着"，而不是让 `get_snapshot()` 整个抛出去——上层对快照失败的兜底是返回
+        `{"error": ...}`，而快照是 GUI 每秒推一帧的心跳，坏一帧等于界面全白、
+        连进度条和库列表一起消失。2026-09-29 加显存提示时被测试逮到这条脆弱路径。
+        """
+        try:
+            return self._wemm_live_cached()
+        except Exception:  # noqa: BLE001 - 可选能力坏了不能连坐整帧快照
+            return {"alive": False, "loaded": False, "gpu_mem_gb": None, "vram": None}
+
+    def _vram_note(self) -> str | None:
+        """页级视觉索引的显存提示文案；没被挡过就 None（只读，不拉模型）。
+
+        取自 `official-visual-wemm` 的 `status()["vram"]`（那个插件自己报的，见
+        plugin.py::status），经 `Pipeline::visual_status()` 取——**和
+        `_probe_wemm_live` 用的是同一个入口**，所以两者永远一致，不会一个说够一个
+        说不够。
+
+        走缓存而不是现调：`visual_status()` 会对服务 `/health` 发最长 5 秒的请求，
+        快照每秒推一次，不能同步跑（这是 `_wemm_live_cached` docstring 里写明的）。
+
+        **任何异常都退化成 None（不显示）**：这条路径会碰到一个可选插件的全部状态
+        （子进程存活、/health、GPU 探测、缓存锁），任何一环坏了都不该让**整个快照**
+        变成空——快照是 GUI 每秒推一帧的，坏一帧等于界面全白。这里宁可少显示一句
+        显存提示，也不要为了显示它把整帧搞没（2026-09-29 加这条时踩过：测试桩只 mock
+        了 `index_status`，`visual_status` 真的去调插件，于是 7 个快照用例全红）。
+        绝不在拿不到数据时编数字给用户看。
+        """
+        try:
+            live = self._wemm_live_cached()
+        except Exception:  # noqa: BLE001 - 可选能力的状态取不到就不显示，不能拖垮整帧快照
+            return None
+        vram = live.get("vram") if isinstance(live, dict) else None
+        if not isinstance(vram, dict):
+            return None
+        blocked = vram.get("blocked")
+        if not isinstance(blocked, dict):
+            return None
+        required = blocked.get("required_gb")
+        free = blocked.get("free_gb")
+        if required is None and free is None:
+            return "页级视觉导航：显卡内存不足（当前空闲显存探测失败，无法判断是否装得下）"
+        tail = (
+            "已开强制加载仍失败，可关掉占显存的程序后重试"
+            if blocked.get("forced")
+            else "可关掉占显存的程序后重试，或在设置里开启「强制加载页级视觉导航」"
+        )
+        return (
+            f"页级视觉导航未运行：需要 {required}GB 显存，当前 {free}GB；"
+            f"文字索引不受影响。{tail}"
+        )
 
     def _issue_counts(self, library_id: str) -> dict[str, int]:
         """单库失败汇总 `{reason: 文件数}`（旧 `meta_issues_for`）。"""
@@ -571,7 +659,7 @@ class _LegacyContractMixin:
     def _wemm_live_cached(self) -> dict[str, Any]:
         """看图服务实况（只读探测）。`visual_status()` 会对服务 `/health` 发一次最长 5 秒
         的请求，不能放在每秒的快照里同步跑——后台线程刷新缓存，快照读缓存。"""
-        default = {"alive": False, "loaded": False, "gpu_mem_gb": None}
+        default = {"alive": False, "loaded": False, "gpu_mem_gb": None, "vram": None}
         now = time.monotonic()
         with self._cache_lock:
             hit = self._cache.get(("wemm_live",))
@@ -584,7 +672,7 @@ class _LegacyContractMixin:
         return hit[1] if hit is not None else default
 
     def _probe_wemm_live(self) -> None:
-        value = {"alive": False, "loaded": False, "gpu_mem_gb": None}
+        value = {"alive": False, "loaded": False, "gpu_mem_gb": None, "vram": None}
         try:
             for status in self._pipeline.visual_status().values():  # type: ignore[attr-defined]
                 if not isinstance(status, dict):
@@ -594,6 +682,12 @@ class _LegacyContractMixin:
                     "alive": bool(status.get("subprocess_alive")),
                     "loaded": bool(service.get("loaded")),
                     "gpu_mem_gb": service.get("gpu_mem_gb"),
+                    # 2026-09-29 新增：把插件自报的显存门槛与最近一次"被挡下"的记录
+                    # 一并带进缓存，供 `_vram_note()` 在进度条上写清"需要多少/现在
+                    # 多少"。放在这里而不是新开一个探测，是因为它已经在这个后台线程
+                    # 里跑过 `visual_status()` 了——同一份数据、同一份缓存，不会出现
+                    # 一个说够一个说不够（§4.5 同一判断只有一个权威实现）。
+                    "vram": status.get("vram") if isinstance(status.get("vram"), dict) else None,
                 }
                 break
         except Exception:  # noqa: BLE001

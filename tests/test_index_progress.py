@@ -634,6 +634,14 @@ class TestIndexWorkerManager(unittest.TestCase):
         path = self.data_dir / "index_worker.log"
         return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
 
+    def test_a_finished_round_writes_one_conversion_cache_line_into_the_log(self):
+        """BC-19：每轮一行“转换缓存”账，开发者不开窗口也能看到转文字/页库复用、新做、还缺多少。"""
+        result = self.manager.start("lib1", source="test")
+        self.assertTrue(result.started, result.message)
+        self._wait_stage("lib1", "done")
+        expected = "[lib1] 转换缓存：转文字 复用 0 / 新转 0 / 缺 0；页库 没开"
+        self.assertTrue(_wait_until(lambda: expected in self._read_log(), 5.0), self._read_log())
+
     def test_worker_failure_leaves_a_library_line_and_the_traceback_in_the_log(self):
         """崩了不能只剩进度文件里的一句摘要：日志里要有"哪个库、什么错"和完整堆栈。"""
         self._set_mode("fail")

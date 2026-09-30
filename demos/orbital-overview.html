@@ -1,0 +1,1351 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>总览页 · 轨道星图 demo（RAG NAVIGATION）</title>
+<style>
+  :root{ --ink:#dfe9f5; --dim:#8ba0b8; --line:rgba(140,180,220,.18); --panel:rgba(8,14,24,.74); }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;color:var(--ink);
+    font:13px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;}
+  body{
+    background:
+      radial-gradient(1100px 780px at 50% 46%, rgba(28,66,116,.20), transparent 62%),
+      radial-gradient(900px 700px at 16% 86%, rgba(92,40,120,.12), transparent 60%),
+      radial-gradient(800px 600px at 86% 12%, rgba(18,88,110,.12), transparent 60%),
+      #000;
+  }
+  #c{position:fixed;inset:0;display:block}
+  .panel{position:fixed;background:var(--panel);border:1px solid var(--line);
+    border-radius:10px;padding:10px 12px;backdrop-filter:blur(8px);
+    box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  #hud{left:14px;top:14px;width:300px;max-height:calc(100vh - 100px);overflow:auto}
+  #ctl{right:14px;top:14px;width:246px;max-height:calc(100vh - 28px);overflow:auto}
+  #tip{position:fixed;pointer-events:none;display:none;z-index:9;
+    background:rgba(6,10,18,.95);border:1px solid rgba(150,200,240,.35);
+    border-radius:8px;padding:7px 10px;max-width:340px;box-shadow:0 6px 24px rgba(0,0,0,.65)}
+  #tip b{display:block;font-size:12.5px;margin-bottom:3px;word-break:break-all}
+  #tip span{color:var(--dim);font-size:11.5px}
+  h4{margin:0 0 6px;font-size:11px;letter-spacing:.13em;color:#7fd4ff;font-weight:600}
+  table{width:100%;border-collapse:collapse;font-size:11.5px}
+  td{padding:1.5px 0;vertical-align:top}
+  td.n{text-align:right;color:var(--dim);font-variant-numeric:tabular-nums;padding-left:8px;white-space:nowrap}
+  .sw{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;
+    vertical-align:middle;box-shadow:0 0 6px currentColor}
+  .librow td:first-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:120px}
+  .sep{height:1px;background:var(--line);margin:9px 0}
+  .grp{margin:12px 0 6px;padding-top:9px;border-top:1px solid var(--line);font-size:11.5px;color:#cfe9ff;font-weight:600;letter-spacing:.08em}
+  label.r{display:flex;align-items:center;gap:7px;margin:4px 0;font-size:11.5px;color:var(--dim);cursor:pointer}
+  label.r input{accent-color:#4fc3ff;margin:0}
+  input[type=range]{width:100%;accent-color:#4fc3ff}
+  select{width:100%;background:#0b1420;color:#dfe9f5;border:1px solid #234;padding:4px;border-radius:6px}
+  .kv{display:flex;justify-content:space-between;font-size:11.5px;color:var(--dim);gap:10px}
+  .kv b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+  #hint{left:14px;bottom:14px;color:var(--dim);font-size:11px;padding:5px 10px}
+  #boot{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:rgba(0,0,0,.9);z-index:20;color:#8fd8ff;letter-spacing:.1em}
+  #boot.hide{display:none}
+  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+    background:rgba(0,0,0,.95);z-index:30;padding:40px;text-align:center;line-height:1.9;color:#ff9a9a}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud" class="panel"></div>
+<div id="ctl" class="panel"></div>
+<div id="hint" class="panel">左键拖拽旋转 · 滚轮缩放 · 右键平移 · 悬停查看点的信息</div>
+<div id="tip"></div>
+<div id="boot">正在生成合成星图…</div>
+<div id="err"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+function fatal(msg){
+  const el = document.getElementById('err');
+  el.style.display = 'flex';
+  el.textContent = msg;
+  document.getElementById('boot').classList.add('hide');
+}
+addEventListener('error', e => fatal('运行出错：' + (e.error?.stack || e.message)));
+addEventListener('unhandledrejection', e => fatal('运行出错：' + (e.reason?.stack || e.reason)));
+
+/* ============================================================
+   0. 工具
+   ============================================================ */
+const TAU = Math.PI * 2, DIM = 32, PITERS = 12;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const fmt = n => n.toLocaleString('en-US');
+function mulberry32(a){
+  return function(){
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const gauss = rng => Math.sqrt(-2 * Math.log(1 - rng())) * Math.cos(TAU * rng());
+function angDiff(a, b){
+  let d = (a - b) % TAU;
+  if (d > Math.PI) d -= TAU; else if (d < -Math.PI) d += TAU;
+  return d;
+}
+/* 自写着色：自己解析成 sRGB 分量直接输出，不依赖 three 内部的 colorspace chunk */
+function hex2rgb(hex){
+  const h = hex.slice(1);
+  return [parseInt(h.slice(0,2),16)/255, parseInt(h.slice(2,4),16)/255, parseInt(h.slice(4,6),16)/255];
+}
+const PALETTE = [
+  '#38e1ff','#4d8cff','#7a6bff','#b06bff','#e05cff','#ff5c9e','#ff6b6b','#ff9147',
+  '#ffb03a','#ffe066','#c6f24e','#5fe08a','#2fe0c0','#9ad0ff','#d4a0ff','#ffb3c7',
+];
+const TOPIC_NAMES = [
+  '插件架构','混合检索','向量模型','文档提取','知识管理','索引流程','GUI 交互','MCP 协议',
+  'GPU 调度','测试规范','课程讲义','论文笔记','项目管理','学习方法','数据存储','日志诊断',
+  '切块策略','重排模型','权限门禁','运维排障','视觉索引','提示词工程','缓存策略','模型评测',
+];
+const WORDS = ['运行时','数据流','配置','索引','检索','渲染','调度','契约','缓存','门禁',
+  '采集','清洗','嵌入','融合','诊断','授权','切块','存储','查询','图谱'];
+const STATUS = [
+  { label:'已索引', dim:1.00 }, { label:'未索引', dim:0.50 },
+  { label:'待 OCR', dim:0.64 }, { label:'提取失败', dim:0.32 },
+];
+const KIND_NAME = ['Markdown', 'PDF', 'Word'];
+const KIND_MD = 0, KIND_PDF = 1, KIND_DOCX = 2;
+
+const PRESETS = [
+  { name:'真实量级 ×1', k:1.0 },
+  { name:'十万级 ×2.4', k:2.4 },
+  { name:'极限 ×5', k:5.0 },
+];
+/* R 是写死的轨道半径，只在关掉"按点数自动排轨道"时使用；默认由 layoutOrbits 按点数算 */
+const LIB_DEFS = [
+  { name:'Obsidian Vault', color:'#57d7ff', R: 8.4, tiltX:  7, tiltZ:  4, node:  0, files:6068, cpf:5.2,  pdf:0.05, docx:0.02, topics:16 },
+  { name:'agents',         color:'#7cff9e', R:12.8, tiltX:-11, tiltZ:  7, node: 47, files: 420, cpf:5.7,  pdf:0.00, docx:0.03, topics:10 },
+  { name:'skills',         color:'#ffc46b', R:17.2, tiltX: 16, tiltZ:-6, node:112, files: 340, cpf:5.6,  pdf:0.00, docx:0.05, topics:11 },
+  { name:'Y2S1',           color:'#ff87c2', R:21.6, tiltX:-19, tiltZ:  9, node: 26, files:  78, cpf:11.5, pdf:0.95, docx:0.05, topics: 9 },
+];
+/* 环带形态：一根截面是圆的实心光管，粗细由沿环的点密度驱动 —— 哪里语义相近的内容多、点密，
+   哪里就略微鼓起一点；起伏是连续的，从细到粗平滑过渡，不会断成一颗颗球。
+   不同主题的点沿环向互相渗进去（颜色交融），交界处是混色，而不是一刀切的色块。
+   以下都是"半径为 14 时的标定值"，实际按 sqrt(lib.R/14) 缩放。 */
+const TUBE_R0      = 0.36;   // 管半径（密度等于中位数处）
+const BULGE_K      = 0.6;    // 鼓起指数：管半径 ∝ 相对密度^(0.6 × 鼓起程度)
+const THIN_FLOOR   = 0.4;    // 最稀处最细收到管半径的几成：环始终连续，不会断
+const THICK_CEIL   = 6;      // 安全上限：再密也不超过管半径的几倍
+const GAP_FLOOR    = 0.15;   // 相邻文件间距的底数：越大越均匀，越小越按语义挤
+const GAP_REF      = 0.5;    // 语义距离的参考尺度（余弦距离）
+const BELT_REF_R   = 14;     // 标定半径
+const DENS_BINS    = 1024;   // 沿环的采样分辨率（拖滑块时每帧要重算，够用就好）
+const WEDGE        = 32;     // 拾取用的角楔数（每楔一段连续索引）
+
+const KIND_FILE = 0, KIND_CHUNK = 1, KIND_PAGE = 2, KIND_BG = 3;
+/* 点要比管子细得多，管子的轮廓才是光滑的；点太大，细管会被撑成一串疙瘩 */
+const SIZE_FILE = [0.065, 0.14], SIZE_CHUNK = 0.034, SIZE_PAGE = 0.026;
+const PAL_RGB = PALETTE.map(hex2rgb);
+const NLIB         = LIB_DEFS.length;
+/* 密度 = 这个库的点数 ÷ 光管体积。管半径 r0 = TUBE_R0·√(R/14)·环带粗细·粗细补偿，
+   体积 = 2πR·π r0² = ORBIT_VOL_K·R²·(环带粗细·粗细补偿)²。
+   所以"等密度"的轨道半径 ∝ √点数：点数翻 4 倍，半径翻 2 倍。 */
+const ORBIT_VOL_K  = 2 * Math.PI * Math.PI * TUBE_R0 * TUBE_R0 / BELT_REF_R;
+const FTEX_W       = 4096;   // 文件锚点纹理的宽度（一格一个文件，按行折叠）
+
+/* 环形高斯平滑，可以一次处理几条同长的数组（沿环密度和三路颜色一起抹）。
+   σ 不太大时直接卷积：先把首尾各补 r 格，内层循环里就不用取余（取余是拖滑块时最大的开销）；
+   σ 很大时用三遍滑动平均近似高斯（每遍 O(n)，和 σ 无关，误差约为峰值的 6%），比整圈还宽时就是整圈平均。
+   滑块范围放大 10 倍以后 σ 可以比整圈还宽：老写法会把页面卡死，下标还会越界变成 NaN。 */
+function smoothWrap(arrs, sigma){
+  if (!Array.isArray(arrs)) arrs = [arrs];
+  const n = arrs[0].length;
+  if (sigma <= 64){
+    const r = Math.min(n >> 1, Math.max(1, Math.ceil(sigma * 3)));
+    const k = new Float64Array(2 * r + 1);
+    let wsum = 0;
+    for (let d = -r; d <= r; d++){ const w = Math.exp(-(d*d)/(2*sigma*sigma)); k[d + r] = w; wsum += w; }
+    for (let d = 0; d <= 2 * r; d++) k[d] /= wsum;
+    const ext = new Float64Array(n + 2 * r);
+    for (const a of arrs){
+      for (let j = 0; j < n + 2 * r; j++) ext[j] = a[((j - r) % n + n) % n];
+      for (let i = 0; i < n; i++){
+        let s = 0;
+        for (let d = 0; d <= 2 * r; d++) s += ext[i + d] * k[d];
+        a[i] = s;
+      }
+    }
+    return;
+  }
+  let w = Math.round(Math.sqrt(4 * sigma * sigma + 1));   // 三遍宽 w 的滑动平均，方差 = 3(w²−1)/12 ≈ σ²
+  if (w % 2 === 0) w++;
+  for (const a of arrs){
+    if (w >= n){                                           // 比整圈还宽：就是整圈平均
+      let m = 0; for (let i = 0; i < n; i++) m += a[i];
+      a.fill(m / n);
+      continue;
+    }
+    const half = w >> 1, tmp = new Float64Array(n);
+    for (let pass = 0; pass < 3; pass++){
+      let run = 0;
+      for (let d = -half; d <= half; d++) run += a[(d + n) % n];
+      for (let i = 0; i < n; i++){
+        tmp[i] = run / w;
+        run += a[(i + half + 1) % n] - a[(i - half + n) % n];
+      }
+      a.set(tmp);
+    }
+  }
+}
+
+/* ---------- 形状：一个库的光管由三样东西决定 ----------
+   ① 每个文件沿环的位置（锚点）；② 沿环每一处的管半径（剖面）；③ 每个点相对自己文件的随机偏移。
+   ③ 在换数据时生成一次，之后永远不动；① ② 由滑块决定，在 CPU 上几毫秒就能算完，写进两张小纹理。
+   顶点着色器每帧把三者合成点的位置，所以拖任何形状滑块都只是改纹理和几个 uniform：
+   点会跟着滑块连续地滑到新位置，而不是重新随机撒一遍、整体刷新（操作者明确要"同步改变"）。 */
+
+/* 换数据时做一次：语义距离、每个文件的点数与颜色、松散度，以及各种复用的缓冲区 */
+function prepareLibrary(lib, rng){
+  const N = lib.nFiles, order = lib.order, nb = DENS_BINS;
+  lib.dPrev = new Float32Array(N);
+  lib.wOrd = new Float32Array(N);
+  lib.rgbOrd = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++){
+    const f = order[i], c = PAL_RGB[lib.topic[f] % PAL_RGB.length];
+    lib.dPrev[i] = Math.max(0, 1 - vdot(lib.vec, order[(i + N - 1) % N], f));
+    lib.wOrd[i] = 1 + lib.nChunksOf[f] + lib.nPagesOf[f];
+    lib.rgbOrd[i * 3] = c[0]; lib.rgbOrd[i * 3 + 1] = c[1]; lib.rgbOrd[i * 3 + 2] = c[2];
+  }
+  /* 松散度：与左右邻居质心的余弦相似度，越不像越暗一点。窗口和用滑动累加。
+     （原版多除了一次邻居个数，结果恒≈0，这一项从没生效过；这里按注释本意修正。） */
+  const W = Math.max(4, Math.round(N / 60));
+  const accV = new Float64Array(DIM);
+  lib.loose = new Float32Array(N);
+  const addV = (j, sgn) => { const o = order[j] * DIM; for (let d = 0; d < DIM; d++) accV[d] += sgn * lib.vec[o + d]; };
+  for (let j = 0; j <= Math.min(N - 1, W); j++) addV(j, 1);
+  for (let i = 0; i < N; i++){
+    if (i > 0){
+      if (i + W <= N - 1) addV(i + W, 1);
+      if (i - W - 1 >= 0) addV(i - W - 1, -1);
+    }
+    let ss = 0; for (let d = 0; d < DIM; d++) ss += accV[d] * accV[d];
+    ss = Math.sqrt(ss) || 1;
+    const o = order[i] * DIM;
+    let dp = 0; for (let d = 0; d < DIM; d++) dp += lib.vec[o + d] * accV[d];
+    lib.loose[i] = clamp(dp / ss, -1, 1);
+  }
+  lib.nPts = 0;
+  for (let i = 0; i < N; i++) lib.nPts += lib.wOrd[i];
+  lib.phaseT = rng();                                    // 随机起点（按整圈的比例存：轨道半径会变），免得每个库的接缝都在同一个角度
+  lib.thin = 1;                                          // 管子粗细补偿（密度落在区间外时由 layoutOrbits 调）
+  lib.kappa = 1.3;                                       // 管子最粗处 ÷ r0，上一次形状计算的结果；排轨道时估算管子外沿用
+  lib.rot = 0;                                           // 累计公转角：半径变了、速度变了都不会跳
+  lib.anchor = new Float64Array(N);
+  lib.gap = new Float64Array(N);
+  lib.lam = new Float64Array(nb); lib.cr = new Float64Array(nb); lib.cg = new Float64Array(nb); lib.cb = new Float64Array(nb);
+  lib.rad = new Float64Array(nb);
+}
+
+/* 按当前滑块算 ① 锚点 和 ② 剖面，写进纹理数据（调用方负责标记纹理需要上传） */
+function shapeLibrary(lib, fileData, profData){
+  const R = lib.R, N = lib.nFiles, C = TAU * R, nb = DENS_BINS, h = C / nb;
+  const r0 = TUBE_R0 * Math.sqrt(R / BELT_REF_R) * ui.spread * lib.thin;
+  const mixS = Math.max(0.02, ui.mix) * r0;              // 每个文件的点沿环向散开多宽：越宽，相邻主题的颜色混得越开
+
+  /* ① 锚点：相邻两个文件的间距 = (底数 + 语义距离)^聚合强度，再按比例铺满整圈。
+        聚合强度 0 = 均匀铺开，粗细只随各文件的块数起伏；越大，相近的文件挨得越紧、那一段越密。
+        顺序是 seriation 的结果，所以角上相邻 = 语义相邻。
+        底数不能去掉：没有它，很像的文件会挤到一个点上，每个主题缩成一颗单色的球（操作者明确不要）。 */
+  const s = lib.anchor, gap = lib.gap;
+  let gsum = 0;
+  for (let i = 0; i < N; i++){ gap[i] = Math.pow(GAP_FLOOR + Math.min(3, lib.dPrev[i] / GAP_REF), ui.gather); gsum += gap[i]; }
+  let acc = lib.phaseT * C;
+  for (let i = 0; i < N; i++){ acc += gap[i] * C / gsum; s[i] = acc; fileData[lib.fileBase + i] = acc; }
+
+  /* ② 沿环的点密度（权重 = 这个文件带来的总点数），按"点实际散开的宽度"抹开：
+        管子粗细跟着点真正落下的地方走，而不是跟着文件中心走。颜色也同样抹开，给体积光用。 */
+  const { lam, cr, cg, cb, rad } = lib;
+  lam.fill(0); cr.fill(0); cg.fill(0); cb.fill(0);
+  for (let i = 0; i < N; i++){
+    let k = Math.floor(s[i] / h) % nb; if (k < 0) k += nb;
+    const w = lib.wOrd[i];
+    lam[k] += w; cr[k] += w * lib.rgbOrd[i * 3]; cg[k] += w * lib.rgbOrd[i * 3 + 1]; cb[k] += w * lib.rgbOrd[i * 3 + 2];
+  }
+  const sigL = Math.sqrt(mixS * mixS + (1.5 * r0) ** 2) / h;
+  smoothWrap([lam, cr, cg, cb], sigL);
+
+  /* ③ 管半径 = r0 × 相对密度^κ（κ = 0.6 × 鼓起程度）。密度翻一倍，管子粗约 50%；默认下最密处约 1.5–2 倍。
+        两头用平滑的 max / min 收住：最稀处不细于 THIN_FLOOR，最密处不粗于 THICK_CEIL，
+        处处可导，所以从细到粗是顺的，没有折角。 */
+  let ref = 0;
+  { const tmp = Float64Array.from(lam).sort(); ref = Math.max(1e-9, tmp[nb >> 1]); }
+  const kap = BULGE_K * ui.bulge, P = 4;
+  for (let k = 0; k < nb; k++){
+    let x = Math.pow(Math.max(1e-6, lam[k] / ref), kap);
+    x = Math.pow(x ** P + THIN_FLOOR ** P, 1 / P);
+    x = 1 / Math.pow(x ** -P + THICK_CEIL ** -P, 1 / P);
+    rad[k] = r0 * x;
+  }
+  smoothWrap(rad, Math.max(1, 0.5 * r0 / h));            // 抹掉采样台阶，轮廓更顺
+  let maxR = 0;
+  const row0 = lib.li * 2 * nb * 4, row1 = row0 + nb * 4;
+  for (let k = 0; k < nb; k++){
+    const l = Math.max(1e-9, lam[k]);
+    maxR = Math.max(maxR, rad[k]);
+    profData[row0 + k * 4] = rad[k];
+    profData[row0 + k * 4 + 1] = l / ref;
+    profData[row1 + k * 4] = cr[k] / l; profData[row1 + k * 4 + 1] = cg[k] / l; profData[row1 + k * 4 + 2] = cb[k] / l;
+  }
+
+  /* 拾取用的角楔：点按文件顺序连续写入，每个楔对应一段连续索引。
+     起点随机，所以楔编号会在中途绕回 0 一次，一个楔可能被拆成两段，粗筛不受影响。 */
+  const wedges = [];
+  let cur = -1, st = 0;
+  for (let i = 0; i < N; i++){
+    let a = (s[i] / R) % TAU; if (a < 0) a += TAU;
+    const wd = Math.min(WEDGE - 1, Math.floor(a / TAU * WEDGE));
+    if (wd !== cur){
+      if (cur >= 0) wedges.push({ start:st, end:lib.fileStart[i], w:cur });
+      cur = wd; st = lib.fileStart[i];
+    }
+  }
+  if (cur >= 0) wedges.push({ start:st, end:lib.fileStart[N], w:cur });
+  lib.wedges = wedges;
+  lib.r0 = r0; lib.mixS = mixS; lib.h = h; lib.maxR = maxR; lib.kappa = maxR / r0;
+  lib.pickPad = maxR + 3 * mixS + 0.5;                   // 拾取包围球要盖住沿环向散开的点
+  lib.profile = { rad, h, r0, C, s };                    // 调试 / 校验用
+}
+/* ---------- 轨道：按点数定半径，让密度落在合适的区间，且相邻轨道不贴在一起 ----------
+   1. 理想半径：让每个库的密度都等于目标密度，R* = √(点数 ÷ (目标密度 × ORBIT_VOL_K × 环带粗细²))。
+      点少的库在内圈，点多的在外圈。
+   2. 间距：相邻两条轨道的管子外沿之间至少留"轨道最小间距"，最内圈的管子外沿离中心至少"最内轨道"。
+      挤的时候两边各让一半（松弛迭代），最后再从内往外推一遍，保证约束一定满足。
+      不同轨道倾角不同，但都绕同一个中心：半径差够大，任意两点的距离就至少是半径差，不会穿插。
+   3. 补偿：为了留间距，某个库被推得偏外（太稀）或偏内（太密），密度跑出
+      [目标 ÷ 容许范围, 目标 × 容许范围] 时，把它的管子调细或调粗，把密度拉回区间边上。
+      管子粗细变了外沿也变，所以整个过程重复三遍。
+   关掉"按密度自动排轨道"时，回到每个库写死的半径，不做补偿（方便对比）。 */
+function layoutOrbits(){
+  if (!ui.autoOrbit){
+    for (const lib of libs){ lib.R = lib.def.R; lib.thin = 1; }
+  } else {
+    const ord = libs.slice().sort((a, b) => a.nPts - b.nPts);
+    const k = ORBIT_VOL_K * ui.spread * ui.spread, dens = Math.max(1e-6, ui.dens);
+    const R = ord.map(l => Math.sqrt(l.nPts / (k * dens)));
+    const thin = ord.map(() => 1);
+    for (let pass = 0; pass < 3; pass++){
+      const ext = ord.map((l, i) => TUBE_R0 * Math.sqrt(Math.max(R[i], 0.1) / BELT_REF_R) * ui.spread * thin[i] * l.kappa);
+      const sep = i => ui.orbitGap + ext[i] + ext[i + 1];
+      for (let it = 0; it < 80; it++){
+        for (let i = 0; i + 1 < R.length; i++){
+          const need = sep(i) - (R[i + 1] - R[i]);
+          if (need > 0){ R[i] -= need / 2; R[i + 1] += need / 2; }
+        }
+        R[0] = Math.max(R[0], ui.rMin + ext[0]);
+      }
+      R[0] = Math.max(R[0], ui.rMin + ext[0]);
+      for (let i = 0; i + 1 < R.length; i++) R[i + 1] = Math.max(R[i + 1], R[i] + sep(i));
+      const lo = dens / ui.densTol, hi = dens * ui.densTol;
+      for (let i = 0; i < R.length; i++){
+        const raw = ord[i].nPts / (k * R[i] * R[i]);       // 不补偿时的密度
+        thin[i] = raw < lo ? Math.sqrt(raw / lo) : (raw > hi ? Math.sqrt(raw / hi) : 1);
+        thin[i] = clamp(thin[i], 0.15, 6);
+      }
+    }
+    ord.forEach((l, i) => { l.R = R[i]; l.thin = thin[i]; });
+  }
+  for (const lib of libs){
+    const k = ORBIT_VOL_K * (ui.spread * lib.thin) ** 2;
+    lib.dens = lib.nPts / (k * lib.R * lib.R);
+    lib.speed = 0.15 * Math.sqrt(8.2 / lib.R);           // 外圈转得慢；角度是累计的，所以速度变了不会跳
+    lib.ring.scale.setScalar(lib.R);
+    lib.label.position.copy(lib.U).multiplyScalar(lib.R + 1.9).addScaledVector(lib.N, 0.7);
+  }
+}
+function updateOrbitHud(){
+  for (const lib of libs){
+    const el = document.getElementById('orb-' + lib.li);
+    if (!el) continue;
+    const rel = lib.dens / ui.dens;
+    const tube = lib.thin < 0.98 ? `细 ${lib.thin.toFixed(2)}×` : (lib.thin > 1.02 ? `粗 ${lib.thin.toFixed(2)}×` : '—');
+    el.innerHTML = `<td><span class="sw" style="background:${lib.color};color:${lib.color}"></span>${lib.name}</td>`
+      + `<td class="n">${lib.R.toFixed(1)}</td><td class="n">${rel.toFixed(2)}×</td><td class="n">${tube}</td>`;
+  }
+}
+
+/* CPU 侧的管半径插值，和着色器里的 prof() 是同一个公式（拾取要和画面一致） */
+function radAt(lib, x){
+  const nb = DENS_BINS, u = x / lib.h - 0.5, k0 = Math.floor(u), t = u - k0, a = ((k0 % nb) + nb) % nb;
+  return lib.rad[a] * (1 - t) + lib.rad[(a + 1) % nb] * t;
+}
+
+/* ============================================================
+   1. 合成数据
+   ============================================================ */
+function makeLibrary(def, li, k, rng){
+  const sqrtK = li === 0 ? Math.sqrt(k) : k;
+  const nFiles = Math.max(6, Math.round(def.files * sqrtK));
+  const cpf = def.cpf * sqrtK;
+  const topics = TOPIC_NAMES.slice(0, def.topics);
+  const cw = []; let acc = 0;
+  for (let i = 0; i < topics.length; i++){ acc += 1 / Math.pow(i + 1.4, 0.85); cw.push(acc); }
+  for (let i = 0; i < cw.length; i++) cw[i] /= acc;
+  cw[cw.length - 1] = 1;
+  const pickTopic = () => { const r = rng(); for (let i = 0; i < cw.length; i++) if (r <= cw[i]) return i; return cw.length - 1; };
+
+  const unit = v => {
+    let s = 0; for (let d = 0; d < DIM; d++) s += v[d] * v[d];
+    s = Math.sqrt(s) || 1;
+    for (let d = 0; d < DIM; d++) v[d] /= s;
+    return v;
+  };
+  const cent = topics.map(() => {
+    const v = new Float32Array(DIM);
+    for (let d = 0; d < DIM; d++) v[d] = rng() * 2 - 1;
+    return unit(v);
+  });
+  /* 每个主题下 1–3 个子团：一半很紧（同一系列讲义、同一组设计文档），一半松一些。
+     真实语料里正是这种"很像的一小撮"让环上那一段更密、略微鼓起；另有 14% 的文件只沾主题的边。 */
+  const subs = cent.map(c => {
+    const k = 1 + Math.floor(rng() * 3), arr = [];
+    let ws = 0;
+    for (let j = 0; j < k; j++){
+      const v = new Float32Array(DIM);
+      for (let d = 0; d < DIM; d++) v[d] = c[d] + gauss(rng) * 0.12;
+      const w = 0.3 + rng() * rng() * 2.5;
+      ws += w;
+      arr.push({ c:unit(v), sd:rng() < 0.5 ? 0.020 + rng() * 0.025 : 0.055 + rng() * 0.05, w });
+    }
+    let a = 0;
+    for (const x of arr){ a += x.w / ws; x.cw = a; }
+    arr[arr.length - 1].cw = 1;
+    return arr;
+  });
+
+  const lib = {
+    def, li, name:def.name, color:def.color, R:def.R, topics, nFiles,
+    vec:new Float32Array(nFiles * DIM),
+    fname:new Array(nFiles), kind:new Uint8Array(nFiles),
+    topic:new Uint8Array(nFiles), status:new Uint8Array(nFiles),
+    nChunksOf:new Int32Array(nFiles), nPagesOf:new Int32Array(nFiles),
+    clusters:[], order:null, speed:0,
+  };
+  lib.U = new THREE.Vector3(1, 0, 0);
+  lib.V = new THREE.Vector3(0, 0, 1);
+  const rot = new THREE.Matrix4().makeRotationFromEuler(
+    new THREE.Euler(THREE.MathUtils.degToRad(def.tiltX), 0, THREE.MathUtils.degToRad(def.tiltZ), 'XYZ'));
+  lib.U.applyMatrix4(rot); lib.V.applyMatrix4(rot);
+  const m2 = new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(def.node));
+  lib.U.applyMatrix4(m2); lib.V.applyMatrix4(m2);
+  lib.N = new THREE.Vector3().crossVectors(lib.U, lib.V).normalize();
+  lib.speed = 0.15 * Math.sqrt(8.2 / def.R);
+
+  for (let i = 0; i < nFiles; i++){
+    const t = pickTopic();
+    lib.topic[i] = t;
+    const r = rng();
+    const kind = r < def.pdf ? KIND_PDF : (r < def.pdf + def.docx ? KIND_DOCX : KIND_MD);
+    lib.kind[i] = kind;
+    const s = rng();
+    lib.status[i] = s < 0.030 ? 3 : (s < 0.050 ? 2 : (s < 0.105 ? 1 : 0));
+    const word = WORDS[Math.floor(rng() * WORDS.length)];
+    lib.fname[i] = kind === KIND_PDF ? `第${String(1 + (i % 24)).padStart(2,'0')}讲 ${topics[t]}${word}.pdf`
+      : kind === KIND_DOCX ? `${topics[t]}${word}纪要.docx`
+      : `${topics[t]}${word}${Math.floor(rng()*900+100)}.md`;
+    lib.nChunksOf[i] = Math.max(0, Math.round(cpf * (0.25 + rng() * rng() * 3.2)));
+    lib.nPagesOf[i] = (kind === KIND_PDF && lib.status[i] !== 3) ? 6 + Math.floor(rng() * rng() * 46) : 0;
+    let c = cent[t], sigma = 0.16;
+    if (rng() >= 0.14){
+      const ss = subs[t], r2 = rng();
+      let j = 0; while (j < ss.length - 1 && r2 > ss[j].cw) j++;
+      c = ss[j].c; sigma = ss[j].sd;
+    }
+    const o = i * DIM;
+    let ns = 0;
+    for (let d = 0; d < DIM; d++){ const v = c[d] + gauss(rng) * sigma; lib.vec[o + d] = v; ns += v * v; }
+    ns = Math.sqrt(ns) || 1;
+    for (let d = 0; d < DIM; d++) lib.vec[o + d] /= ns;
+  }
+  for (let i = 0; i < nFiles; i++){
+    if (lib.status[i] === 3){ lib.nChunksOf[i] = 0; lib.nPagesOf[i] = 0; }
+    else if (lib.status[i] === 2) lib.nChunksOf[i] = 0;
+  }
+  return lib;
+}
+
+/* ============================================================
+   2. 语义聚类：一维 seriation + 局部一致性下陷处切团
+   ============================================================ */
+function seriate(vec, n, minRun, rng){
+  const order = new Int32Array(n);
+  for (let i = 0; i < n; i++) order[i] = i;
+  const mean = new Float32Array(DIM), u = new Float32Array(DIM), tmp = new Float32Array(DIM);
+  const proj = new Float64Array(n), buf = new Int32Array(n);
+  const stack = [[0, n]];
+  while (stack.length){
+    const [a, b] = stack.pop(), m = b - a;
+    if (m <= minRun) continue;
+    mean.fill(0);
+    for (let i = a; i < b; i++){ const o = order[i] * DIM; for (let d = 0; d < DIM; d++) mean[d] += vec[o + d]; }
+    for (let d = 0; d < DIM; d++) mean[d] /= m;
+    for (let d = 0; d < DIM; d++) u[d] = rng() * 2 - 1;
+    let un = 0; for (let d = 0; d < DIM; d++) un += u[d] * u[d];
+    un = Math.sqrt(un) || 1; for (let d = 0; d < DIM; d++) u[d] /= un;
+    for (let it = 0; it < PITERS; it++){
+      tmp.fill(0);
+      for (let i = a; i < b; i++){
+        const o = order[i] * DIM;
+        let p = 0;
+        for (let d = 0; d < DIM; d++) p += (vec[o + d] - mean[d]) * u[d];
+        for (let d = 0; d < DIM; d++) tmp[d] += p * (vec[o + d] - mean[d]);
+      }
+      let tn = 0; for (let d = 0; d < DIM; d++) tn += tmp[d] * tmp[d];
+      tn = Math.sqrt(tn);
+      if (tn < 1e-12) break;
+      for (let d = 0; d < DIM; d++) u[d] = tmp[d] / tn;
+    }
+    for (let i = a; i < b; i++){
+      const o = order[i] * DIM;
+      let p = 0;
+      for (let d = 0; d < DIM; d++) p += (vec[o + d] - mean[d]) * u[d];
+      proj[i] = p;
+    }
+    const sorted = Float64Array.from(proj.subarray(a, b)).sort();
+    const med = sorted[sorted.length >> 1];
+    let lo = a, hi = b - 1;
+    for (let i = a; i < b; i++){ if (proj[i] <= med) buf[lo++] = order[i]; else buf[hi--] = order[i]; }
+    for (let i = a; i < b; i++) order[i] = buf[i];
+    stack.push([a, lo], [lo, b]);
+  }
+  return order;
+}
+const vdot = (V, a, b) => { let s = 0; for (let d = 0; d < DIM; d++) s += V[a*DIM+d] * V[b*DIM+d]; return s; };
+
+/* 排一个"相似即相邻"的一维顺序：环上角度相邻 = 语义相邻，
+   于是某段角度上的点天然就是同语义邻居，密度统计才有意义。 */
+function semanticOrder(lib, rng){
+  lib.order = seriate(lib.vec, lib.nFiles, Math.max(3, Math.round(lib.nFiles * 0.002)), rng);
+  return lib.order;
+}
+
+
+/* ============================================================
+   3. 场景
+   ============================================================ */
+const canvas = document.getElementById('c');
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true, powerPreference:'high-performance' });
+} catch (e){ fatal('拿不到 WebGL 上下文：' + e); throw e; }
+if (!renderer.capabilities.isWebGL2) fatal('这个 demo 需要 WebGL2（顶点着色器里要读浮点纹理）。');
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 0);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(46, 1, 0.3, 3000);
+camera.position.set(0, 29, 51);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true; controls.dampingFactor = 0.07;
+controls.minDistance = 2.2; controls.maxDistance = 200;
+controls.rotateSpeed = 0.62; controls.zoomSpeed = 0.9;
+
+/* 默认值由操作者 2026-09-30 定下，之后正式实现也用这一组：
+   鼓起程度 0.15、聚合强度 5.2、颜色交融 5.0、体积光 0.35，其余外观为 1；
+   轨道与密度：目标密度 2750、密度容许范围 2、轨道最小间距 1、最内轨道离中心 1。 */
+const ui = { size:1.0, speed:1.0, mask:[1,1,1], preset:1, spread:1.0, bulge:0.15, gather:5.2, mix:5.0, body:0.35, bg:1.0,
+  autoOrbit:true, dens:2750, densTol:2.0, orbitGap:1.0, rMin:1.0 };
+
+/* 形状数据的两张纹理：文件锚点（一格一个文件）、沿环剖面（每个库两行：半径与相对密度 / 抹匀后的颜色） */
+const fileTex = new THREE.DataTexture(new Float32Array(FTEX_W), FTEX_W, 1, THREE.RedFormat, THREE.FloatType);
+const profTex = new THREE.DataTexture(new Float32Array(DENS_BINS * 2 * NLIB * 4), DENS_BINS, 2 * NLIB, THREE.RGBAFormat, THREE.FloatType);
+for (const t of [fileTex, profTex]){ t.minFilter = t.magFilter = THREE.NearestFilter; t.generateMipmaps = false; t.needsUpdate = true; }
+
+const U = {
+  uTime:{value:0}, uClock:{value:0}, uSizeK:{value:1}, uHover:{value:-1}, uKindMask:{value:new THREE.Vector3(1,1,1)},
+  uBody:{value:ui.body}, uBg:{value:ui.bg}, uPR:{value:1},
+  uFile:{value:fileTex}, uProf:{value:profTex},
+  uLibA:{value:Array.from({ length:NLIB }, () => new THREE.Vector4())},   // R, 周长, 管半径 r0, 沿环散开宽度
+  uLibB:{value:Array.from({ length:NLIB }, () => new THREE.Vector4())},   // 累计公转角, 剖面所在行
+  uLibU:{value:Array.from({ length:NLIB }, () => new THREE.Vector3())},
+  uLibV:{value:Array.from({ length:NLIB }, () => new THREE.Vector3())},
+};
+/* 纯加色，而且不写画布透明度。three 自带的 AdditiveBlending 会把透明度也叠满，
+   画布在体积光方片覆盖的范围里变成不透明黑，背景渐变被挖出一个个黑圆盘。 */
+const ADD = { blending:THREE.CustomBlending, blendEquation:THREE.AddEquation,
+  blendSrc:THREE.OneFactor, blendDst:THREE.OneFactor,
+  blendSrcAlpha:THREE.ZeroFactor, blendDstAlpha:THREE.OneFactor,
+  depthWrite:false, transparent:true };
+
+/* 点和体积光共用的一段：读库参数、按弧长在剖面上线性插值（和 CPU 的 radAt 同一个公式） */
+const SHAPE_GLSL = `
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+uniform sampler2D uFile, uProf;
+uniform vec4 uLibA[${NLIB}], uLibB[${NLIB}];
+uniform vec3 uLibU[${NLIB}], uLibV[${NLIB}];
+const float NB = ${DENS_BINS}.0;
+vec4 prof(float s, float C, int row){
+  float u = s / C * NB - 0.5;
+  float k0 = floor(u), t = u - k0;
+  int a = int(mod(k0, NB)), b = int(mod(k0 + 1.0, NB));
+  return mix(texelFetch(uProf, ivec2(a, row), 0), texelFetch(uProf, ivec2(b, row), 0), t);
+}`;
+
+const POINT_VS = SHAPE_GLSL + `
+uniform float uTime, uSizeK, uHover;
+uniform vec3 uKindMask;
+attribute vec4 aSamp;      // x=文件全局序号 y=沿环偏移（单位：散开宽度） z,w=截面偏移（单位：当地管半径）
+attribute vec2 aMeta;      // x=库序号 y=世界直径
+attribute vec3 aColor;     // 主题色 × 状态 / 类别 / 松散度（不随滑块变）
+attribute float aKind, aIdx;
+varying vec3 vColor;
+varying float vFade, vPx, vSpike;
+void main(){
+  vSpike = aKind < 0.5 ? 0.5 : 0.0;
+  float on = aKind < 0.5 ? uKindMask.x : (aKind < 1.5 ? uKindMask.y : uKindMask.z);
+  if (on < 0.5){ gl_Position = vec4(0.0, 0.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
+  int li = int(aMeta.x + 0.5);
+  vec4 A = uLibA[li], B = uLibB[li];
+  int fi = int(aSamp.x + 0.5);
+  float s = texelFetch(uFile, ivec2(fi % ${FTEX_W}, fi / ${FTEX_W}), 0).r + aSamp.y * A.w;
+  vec4 pr = prof(s, A.y, int(B.y + 0.5));
+  float ang = s / A.x + B.x;
+  vec3 Uv = uLibU[li], Vv = uLibV[li];
+  vec3 p = (Uv * cos(ang) + Vv * sin(ang)) * (A.x + aSamp.z * pr.x) + cross(Uv, Vv) * (aSamp.w * pr.x);
+  vec4 mv = modelViewMatrix * vec4(p, 1.0);
+  gl_Position = projectionMatrix * mv;
+  float hit = step(abs(aIdx - uHover), 0.5);
+  vPx = aMeta.y * (1.0 + 1.4 * hit) * uSizeK / max(0.001, -mv.z);
+  gl_PointSize = max(1.0, vPx);
+  /* 越密的地方单个点越暗：叠加以后仍然是"管芯发白、往外带色"，而不是一片过曝的白 */
+  float dim = clamp(0.62 * inversesqrt(max(0.5, pr.y)), 0.06, 0.8);
+  vColor = mix(aColor * dim, vec3(1.0), 0.75 * hit);
+  vFade = clamp(1.3 - (-mv.z) / 210.0, 0.22, 1.0);
+}`;
+const POINT_FS = `
+varying vec3 vColor;
+varying float vFade, vPx, vSpike;
+void main(){
+  vec2 q = gl_PointCoord - 0.5;
+  float d = length(q) * 2.0;
+  if (d > 1.0) discard;
+  float core = pow(max(0.0, 1.0 - d), 2.2);
+  float halo = smoothstep(1.0, 0.04, d) * 0.26;
+  /* 只有屏幕上够大的点才画十字星芒 —— 放大后细节就靠它；块和页不要，否则近看是一片闪粉 */
+  float bar = max(0.0, 1.0 - min(abs(q.x), abs(q.y)) * 26.0) * max(0.0, 1.0 - d * 1.05);
+  float spike = bar * smoothstep(5.0, 17.0, vPx) * vSpike;
+  gl_FragColor = vec4(vColor * (core + halo + spike) * vFade, 1.0);
+}`;
+const pointMat = new THREE.ShaderMaterial({ uniforms:U, vertexShader:POINT_VS, fragmentShader:POINT_FS, ...ADD });
+
+/* ---------- 体积光：每个库沿环每一格一片正对镜头的方片 ----------
+   每片按"视线穿过一个小球的厚度"出亮度（中心最亮、往外渐淡），一串重叠起来就是一根有体积的光管。
+   方片个数固定（每库 DENS_BINS 片），形状全从剖面纹理读，所以滑块改了也不用重建网格。
+   管子粗时相邻方片重叠太多，只保留每 m 片中的一片（m 取 2 的幂，保持约 4 层重叠），亮度按 m 补回。 */
+const BODY_EXT = 1.8;
+const BODY_VS = SHAPE_GLSL + `
+uniform float uTime;
+attribute vec2 iKey;       // x=库序号 y=第几格
+varying vec2 vQ;
+varying vec3 vCol;
+varying float vGain;
+const float EXT = ${BODY_EXT.toFixed(2)};
+void main(){
+  int li = int(iKey.x + 0.5), k = int(iKey.y + 0.5);
+  vec4 A = uLibA[li], B = uLibB[li];
+  int row = int(B.y + 0.5);
+  vec4 pr = texelFetch(uProf, ivec2(k, row), 0);
+  float h = A.y / NB, r = max(pr.x, 1e-4), q = pr.y;
+  float m = exp2(floor(log2(max(1.0, 0.3 * r / h))));
+  if (mod(iKey.y, m) > 0.5){ gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vGain = 0.0; return; }
+  float ang = (iKey.y + 0.5) * h / A.x + B.x;
+  vec3 c = (uLibU[li] * cos(ang) + uLibV[li] * sin(ang)) * A.x;
+  vec4 mv = modelViewMatrix * vec4(c, 1.0);
+  mv.xy += position.xy * 2.0 * r * EXT;
+  vQ = position.xy * 2.0 * EXT;
+  vCol = texelFetch(uProf, ivec2(k, row + 1), 0).rgb;
+  /* 细管本身也要是一根看得见的光管；密处更亮 */
+  float I = q >= 1.0 ? min(1.0, 0.42 + 0.16 * log(q)) : 0.42 * clamp(sqrt(q), 0.55, 1.0);
+  vGain = I * m * h / (1.2 * r) * clamp(1.3 - (-mv.z) / 210.0, 0.22, 1.0);
+  gl_Position = projectionMatrix * mv;
+}`;
+const BODY_FS = `
+uniform float uBody;
+varying vec2 vQ;
+varying vec3 vCol;
+varying float vGain;
+const float EXT = ${BODY_EXT.toFixed(2)};
+void main(){
+  float b = length(vQ);
+  if (b > EXT) discard;
+  float fill = pow(max(0.0, 1.0 - b * b), 0.75);            // 小球的体积厚度：指数小 = 更"实"，轮廓更清楚
+  float core = pow(1.0 + b * b / 0.05, -1.5);                // 越往里越密，管芯发白
+  float halo = exp(-b * b / 1.2) * 0.05;                     // 很薄的一层柔光，不糊掉轮廓
+  vec3 col = vCol * (fill * 0.55 + halo) + mix(vCol, vec3(1.0), 0.55) * core * 0.40;
+  col *= smoothstep(EXT, EXT - 0.4, b);
+  gl_FragColor = vec4(col * vGain * uBody, 1.0);
+}`;
+const bodyMat = new THREE.ShaderMaterial({ uniforms:U, vertexShader:BODY_VS, fragmentShader:BODY_FS, ...ADD });
+
+/* ============================================================
+   3b. 背景：天空（星云 + 银河带）、远处的星、轨道之间的星尘
+   天空和远星跟着镜头走（永远在无穷远），只随视角转；星尘在场景里，转视角时有纵深。
+   亮度统一受"背景亮度"滑块控制，拖动即时生效。
+   ============================================================ */
+const BAND_N = new THREE.Vector3(0.34, 0.83, 0.44).normalize();      // 银河带所在大圆的法线
+const SKY_VS = `
+varying vec3 vDir;
+void main(){
+  vDir = position;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`;
+const SKY_FS = `
+uniform float uBg;
+uniform vec3 uBandN;
+varying vec3 vDir;
+float hash(vec3 p){ p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float noise(vec3 x){
+  vec3 i = floor(x), f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x), mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+             mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x), mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+float fbm(vec3 p){ float a = 0.5, s = 0.0; for (int i = 0; i < 5; i++){ s += a * noise(p); p = p * 2.03 + 11.7; a *= 0.5; } return s; }
+void main(){
+  vec3 d = normalize(vDir);
+  float lat = dot(d, uBandN);
+  float band = exp(-lat * lat / 0.03);
+  float n1 = fbm(d * 2.4 + 3.0);
+  float n2 = fbm(d * 4.8 + n1 * 1.7);
+  float cloud = smoothstep(0.42, 0.82, n2);
+  float hue = fbm(d * 1.4 + 7.0);
+  vec3 neb = mix(vec3(0.20, 0.07, 0.36), vec3(0.03, 0.20, 0.34), smoothstep(0.38, 0.62, hue));
+  neb = mix(neb, vec3(0.36, 0.08, 0.20), smoothstep(0.60, 0.78, hue));
+  vec3 col = neb * cloud * (0.30 + 0.70 * band) * 0.55;
+  float lane = smoothstep(0.40, 0.72, fbm(d * 7.0 + 1.3));
+  col += vec3(0.09, 0.11, 0.16) * band * (0.5 + 0.5 * n1) * (1.0 - 0.65 * lane);
+  col += vec3(0.020, 0.028, 0.050) * (0.6 + 0.4 * n1);       // 全天一层极淡的底光，不再是死黑
+  gl_FragColor = vec4(col * uBg, 1.0);
+}`;
+const STAR_VS = `
+uniform float uClock, uBg, uPR;
+attribute float aSize, aTw;
+attribute vec3 aColor;
+varying vec3 vC;
+varying float vS;
+void main(){
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  float tw = 0.72 + 0.28 * sin(uClock * (0.5 + fract(aTw * 7.31) * 2.3) + aTw * 6.2831);
+  vS = aSize * uPR;
+  gl_PointSize = vS;
+  vC = aColor * tw * uBg;
+}`;
+const STAR_FS = `
+varying vec3 vC;
+varying float vS;
+void main(){
+  vec2 q = gl_PointCoord - 0.5;
+  float d = length(q) * 2.0;
+  if (d > 1.0) discard;
+  float core = exp(-d * d * 9.0), halo = exp(-d * d * 2.6) * 0.30;
+  float bar = max(0.0, 1.0 - min(abs(q.x), abs(q.y)) * 16.0) * max(0.0, 1.0 - d) * smoothstep(3.5, 7.0, vS) * 0.55;
+  gl_FragColor = vec4(vC * (core + halo + bar), 1.0);
+}`;
+const DUST_VS = `
+uniform float uTime, uSizeK, uBg;
+attribute vec4 aD;          // x=到中心距离 y=初始角 z=高度 w=世界直径
+attribute vec3 aColor;
+varying vec3 vC;
+void main(){
+  float a = aD.y + uTime * 0.11 * inversesqrt(max(aD.x, 1.0));   // 内快外慢，缓慢打转
+  vec4 mv = modelViewMatrix * vec4(aD.x * cos(a), aD.z, aD.x * sin(a), 1.0);
+  gl_Position = projectionMatrix * mv;
+  float px = aD.w * uSizeK / max(0.001, -mv.z);
+  gl_PointSize = max(1.0, px);
+  vC = aColor * uBg * clamp(px, 0.35, 1.0) * clamp(1.3 - (-mv.z) / 210.0, 0.22, 1.0);
+}`;
+const DUST_FS = `
+varying vec3 vC;
+void main(){
+  float d = length(gl_PointCoord - 0.5) * 2.0;
+  if (d > 1.0) discard;
+  gl_FragColor = vec4(vC * pow(1.0 - d, 1.8), 1.0);
+}`;
+const skyGroup = new THREE.Group();                        // 跟着镜头走
+const dustGroup = new THREE.Group();
+scene.add(skyGroup, dustGroup);
+{
+  const sky = new THREE.Mesh(new THREE.SphereGeometry(1400, 48, 24), new THREE.ShaderMaterial({
+    uniforms:{ uBg:U.uBg, uBandN:{ value:BAND_N } }, vertexShader:SKY_VS, fragmentShader:SKY_FS,
+    side:THREE.BackSide, depthTest:false, ...ADD,
+  }));
+  sky.renderOrder = -10;
+  skyGroup.add(sky);
+
+  const rng = mulberry32(0x57a25);
+  const TEMP = [[0.61,0.69,1.0],[0.67,0.75,1.0],[0.79,0.84,1.0],[0.97,0.97,1.0],[1.0,0.96,0.92],[1.0,0.82,0.63],[1.0,0.80,0.44]];
+  const TW = [0.06, 0.10, 0.16, 0.26, 0.20, 0.14, 0.08];
+  const pickT = () => { let r = rng(), i = 0; while (i < TW.length - 1 && r > TW[i]){ r -= TW[i]; i++; } return TEMP[i]; };
+  const nField = 9000, nBand = 8000, n = nField + nBand;
+  const pos = new Float32Array(n * 3), col = new Float32Array(n * 3), size = new Float32Array(n), tw = new Float32Array(n);
+  /* 银河带所在平面的一组基 */
+  const e1 = new THREE.Vector3(1, 0, 0).cross(BAND_N).normalize(), e2 = BAND_N.clone().cross(e1).normalize();
+  for (let i = 0; i < n; i++){
+    let x, y, z;
+    if (i < nField){
+      const u = rng() * 2 - 1, th = rng() * TAU, s = Math.sqrt(1 - u * u);
+      x = s * Math.cos(th); y = u; z = s * Math.sin(th);
+    } else {
+      const th = rng() * TAU, lat = clamp(gauss(rng) * 0.10, -0.5, 0.5), cl = Math.cos(lat), sl = Math.sin(lat);
+      x = (e1.x * Math.cos(th) + e2.x * Math.sin(th)) * cl + BAND_N.x * sl;
+      y = (e1.y * Math.cos(th) + e2.y * Math.sin(th)) * cl + BAND_N.y * sl;
+      z = (e1.z * Math.cos(th) + e2.z * Math.sin(th)) * cl + BAND_N.z * sl;
+    }
+    const R = 1000;
+    pos[i * 3] = x * R; pos[i * 3 + 1] = y * R; pos[i * 3 + 2] = z * R;
+    /* 亮度按幂律分布：绝大多数是暗的小星，偶尔一颗很亮 */
+    const m = Math.pow(rng(), 3.2);
+    const c = pickT(), b = (i < nField ? 0.30 : 0.22) + 0.95 * m;
+    col[i * 3] = c[0] * b; col[i * 3 + 1] = c[1] * b; col[i * 3 + 2] = c[2] * b;
+    size[i] = 1.1 + 4.2 * m + rng() * 0.6;
+    tw[i] = rng();
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('aColor', new THREE.BufferAttribute(col, 3));
+  g.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+  g.setAttribute('aTw', new THREE.BufferAttribute(tw, 1));
+  const stars = new THREE.Points(g, new THREE.ShaderMaterial({ uniforms:U, vertexShader:STAR_VS, fragmentShader:STAR_FS, depthTest:false, ...ADD }));
+  stars.frustumCulled = false; stars.renderOrder = -9;
+  skyGroup.add(stars);
+
+  /* 星尘：轨道之间一层很淡的微粒，厚度随半径略增，缓慢打转 */
+  const nd = 6000, aD = new Float32Array(nd * 4), dc = new Float32Array(nd * 3);
+  for (let i = 0; i < nd; i++){
+    const r = Math.sqrt(3 * 3 + rng() * (34 * 34 - 3 * 3));
+    aD[i * 4] = r; aD[i * 4 + 1] = rng() * TAU; aD[i * 4 + 2] = clamp(gauss(rng) * (0.8 + 0.07 * r), -6, 6);
+    aD[i * 4 + 3] = 0.03 + 0.06 * Math.pow(rng(), 2);
+    const t = rng(), b = 0.10 + 0.22 * Math.pow(rng(), 2);
+    dc[i * 3] = (0.55 + 0.35 * t) * b; dc[i * 3 + 1] = (0.62 + 0.1 * t) * b; dc[i * 3 + 2] = (1.0 - 0.1 * t) * b;
+  }
+  const dg = new THREE.BufferGeometry();
+  dg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(nd * 3), 3));
+  dg.setAttribute('aD', new THREE.BufferAttribute(aD, 4));
+  dg.setAttribute('aColor', new THREE.BufferAttribute(dc, 3));
+  const dust = new THREE.Points(dg, new THREE.ShaderMaterial({ uniforms:U, vertexShader:DUST_VS, fragmentShader:DUST_FS, ...ADD }));
+  dust.frustumCulled = false;
+  dustGroup.add(dust);
+}
+
+
+const LINE_VS = `
+uniform float uTime, uSpin;
+attribute vec3 aNrm;
+varying float vFace, vPulse;
+void main(){
+  float c = cos(uTime * uSpin), s = sin(uTime * uSpin);
+  vec3 p = vec3(position.x, position.y * c - position.z * s, position.y * s + position.z * c);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+  vFace = 0.09 + 0.91 * smoothstep(-0.4, 0.8, normalize(normalMatrix * aNrm).z);
+  vPulse = 0.82 + 0.18 * sin(uTime * 0.9);
+}`;
+const LINE_FS = `
+uniform vec3 uColor;
+uniform float uOpacity;
+varying float vFace, vPulse;
+void main(){ gl_FragColor = vec4(uColor * vFace * vPulse * uOpacity, 1.0); }`;
+function makeWire(pos, nrm, color, opacity, spin){
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('aNrm', new THREE.Float32BufferAttribute(nrm, 3));
+  return new THREE.LineSegments(g, new THREE.ShaderMaterial({
+    uniforms:{ uTime:U.uTime, uSpin:{value:spin},
+      uColor:{value:new THREE.Vector3(...hex2rgb(color))}, uOpacity:{value:opacity} },
+    vertexShader:LINE_VS, fragmentShader:LINE_FS, ...ADD,
+  }));
+}
+/* WireframeGeometry 只产出 position，不带 normal；球心在原点时法线就是归一化后的位置 */
+function normalsFromPos(arr){
+  const out = new Float32Array(arr.length);
+  for (let i = 0; i < arr.length; i += 3){
+    const s = Math.hypot(arr[i], arr[i+1], arr[i+2]) || 1;
+    out[i] = arr[i]/s; out[i+1] = arr[i+1]/s; out[i+2] = arr[i+2]/s;
+  }
+  return out;
+}
+function latLong(radius, latSeg, lonSeg){
+  const pos = [], nrm = [];
+  const P = (deg, t) => { const a = deg*Math.PI/180, r = Math.cos(a)*radius;
+    return [r*Math.cos(t), Math.sin(a)*radius, r*Math.sin(t)]; };
+  for (let i = 0; i <= latSeg; i++){
+    const deg = -86 + 172*i/latSeg;
+    for (let j = 0; j < lonSeg; j++){
+      const a = P(deg, TAU*j/lonSeg), b = P(deg, TAU*(j+1)/lonSeg);
+      pos.push(...a, ...b); nrm.push(...a, ...b);
+    }
+  }
+  for (let j = 0; j < lonSeg; j++){
+    const t = TAU*j/lonSeg;
+    for (let i = 0; i < latSeg; i++){
+      const a = P(-86 + 172*i/latSeg, t), b = P(-86 + 172*(i+1)/latSeg, t);
+      pos.push(...a, ...b); nrm.push(...a, ...b);
+    }
+  }
+  return { pos, nrm };
+}
+const starGroup = new THREE.Group();
+{
+  const ll = latLong(1.35, 16, 28);
+  starGroup.add(makeWire(ll.pos, ll.nrm, '#cdefff', 0.95, 0.21));
+  for (const [radius, detail, color, opacity, spin] of [[1.62, 1, '#5fc8ff', 0.55, -0.14], [1.92, 0, '#8a72ff', 0.34, 0.10]]){
+    const g = new THREE.WireframeGeometry(new THREE.IcosahedronGeometry(radius, detail)).attributes.position.array;
+    starGroup.add(makeWire(g, normalsFromPos(g), color, opacity, spin));
+  }
+  const eq = [];
+  for (let j = 0; j < 180; j++){
+    const t0 = TAU*j/180, t1 = TAU*(j+1)/180;
+    eq.push(Math.cos(t0)*2.2, 0, Math.sin(t0)*2.2, Math.cos(t1)*2.2, 0, Math.sin(t1)*2.2);
+  }
+  starGroup.add(makeWire(eq, eq, '#4aa8ff', 0.6, 0));
+  const s = document.createElement('canvas'); s.width = s.height = 256;
+  const c = s.getContext('2d');
+  const g = c.createRadialGradient(128, 128, 0, 128, 128, 128);
+  g.addColorStop(0, 'rgba(155,220,255,.6)');
+  g.addColorStop(0.22, 'rgba(90,170,255,.18)');
+  g.addColorStop(1, 'rgba(60,120,255,0)');
+  c.fillStyle = g; c.fillRect(0, 0, 256, 256);
+  const tex = new THREE.CanvasTexture(s);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map:tex, blending:THREE.AdditiveBlending,
+    depthWrite:false, depthTest:false, transparent:true }));
+  sp.scale.set(11, 11, 1);
+  starGroup.add(sp);
+  scene.add(starGroup);
+}
+const ringGroup = new THREE.Group(), labelGroup = new THREE.Group();
+scene.add(ringGroup, labelGroup);
+function makeLabel(text, color){
+  const s = document.createElement('canvas'); s.width = 512; s.height = 128;
+  const c = s.getContext('2d');
+  c.font = '600 54px "Segoe UI","Microsoft YaHei",sans-serif';
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.shadowColor = color; c.shadowBlur = 24; c.fillStyle = color; c.fillText(text, 256, 64);
+  c.shadowBlur = 0; c.fillStyle = '#eaf6ff'; c.fillText(text, 256, 64);
+  const tex = new THREE.CanvasTexture(s);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map:tex, transparent:true, depthWrite:false, depthTest:false }));
+  sp.scale.set(5.4, 1.35, 1);
+  return sp;
+}
+
+/* ============================================================
+   4. 构建（只在换压力档、也就是换一批数据时做）与形状更新（拖滑块时每帧最多一次）
+   ============================================================ */
+let points = null, bodyMesh = null, libs = [], dataCount = 0;
+let A = null, P = null;    // A: 点的静态属性；P: 拾取用的元数据
+let shapeDirty = false;
+
+function buildAll(presetIdx){
+  const k = PRESETS[presetIdx].k;
+  const rng = mulberry32(0x5eed ^ Math.round(k * 9973));
+  const lrng = mulberry32(0x1a70 ^ Math.round(k * 9973));
+  if (points){ points.geometry.dispose(); scene.remove(points); points = null; }
+  if (bodyMesh){ bodyMesh.geometry.dispose(); scene.remove(bodyMesh); bodyMesh = null; }
+  for (const o of [...ringGroup.children]){ o.geometry.dispose(); o.material.dispose(); ringGroup.remove(o); }
+  for (const o of [...labelGroup.children]){ o.material.map?.dispose(); o.material.dispose(); labelGroup.remove(o); }
+  libs = LIB_DEFS.map((def, li) => { const l = makeLibrary(def, li, k, rng); semanticOrder(l, rng); return l; });
+
+  let n = 0, nf = 0;
+  for (const lib of libs){
+    lib.fileBase = nf; nf += lib.nFiles;
+    for (let f = 0; f < lib.nFiles; f++) n += 1 + lib.nChunksOf[f] + lib.nPagesOf[f];
+  }
+  dataCount = n;
+
+  /* 文件锚点纹理按需要的行数重新分配。尺寸变了必须先 dispose：three 在 WebGL2 下用不可变存储
+     （texStorage2D），同一张纹理之后只能按原尺寸更新，直接换大图会报错。 */
+  const fh = Math.max(1, Math.ceil(nf / FTEX_W));
+  if (fileTex.image.height !== fh){
+    fileTex.dispose();
+    fileTex.image = { data:new Float32Array(FTEX_W * fh), width:FTEX_W, height:fh };
+  }
+  fileTex.needsUpdate = true;
+
+  const aSamp = new Float32Array(n * 4), aMeta = new Float32Array(n * 2), aColor = new Float32Array(n * 3);
+  const aKind = new Float32Array(n), aIdx = new Float32Array(n);
+  const pLib = new Int8Array(n), pKind = new Uint8Array(n), pFile = new Int32Array(n), pOrd = new Int32Array(n);
+  const pSub = new Int32Array(n), pTopic = new Uint8Array(n), pStatus = new Uint8Array(n);
+  A = { aSamp };
+  P = { pLib, pKind, pFile, pOrd, pSub, pTopic, pStatus };
+
+  /* ③ 每个点相对自己文件的偏移：沿环向一个截断在 ±3 的高斯数（乘"散开宽度"），
+     截面上一个截断在 0.97 的高斯二维数（乘当地管半径，宽 0.45）。只生成这一次，之后拖滑块都不再动它们，
+     所以画面是连续变形而不是重新撒点。块和页各自独立落点：它们是点的大头，颜色能不能混开主要看它们。 */
+  let w = 0;
+  const emit = (lib, i, f, size, kind, sub, factor) => {
+    const j4 = w * 4;
+    aSamp[j4] = lib.fileBase + i;
+    aSamp[j4 + 1] = clamp(gauss(lrng), -3, 3);
+    let cx = 0, cz = 0, ok = false;
+    for (let t = 0; t < 8 && !ok; t++){
+      cx = gauss(lrng) * 0.45; cz = gauss(lrng) * 0.45;
+      ok = cx * cx + cz * cz <= 0.97 * 0.97;
+    }
+    if (!ok){ const u = 0.97 * Math.sqrt(lrng()), th = lrng() * TAU; cx = u * Math.cos(th); cz = u * Math.sin(th); }
+    aSamp[j4 + 2] = cx; aSamp[j4 + 3] = cz;
+    aMeta[w * 2] = lib.li; aMeta[w * 2 + 1] = size;
+    const topic = lib.topic[f], rgb = PAL_RGB[topic % PAL_RGB.length];
+    aColor[w * 3] = rgb[0] * factor; aColor[w * 3 + 1] = rgb[1] * factor; aColor[w * 3 + 2] = rgb[2] * factor;
+    aKind[w] = kind; aIdx[w] = w;
+    pLib[w] = lib.li; pKind[w] = kind; pFile[w] = f; pOrd[w] = i; pSub[w] = sub; pTopic[w] = topic;
+    pStatus[w] = kind === KIND_FILE ? lib.status[f] : 0;
+    w++;
+  };
+
+  for (const lib of libs){
+    prepareLibrary(lib, lrng);
+    const N = lib.nFiles;
+    lib.fileStart = new Int32Array(N + 1);
+    for (let i = 0; i < N; i++){
+      lib.fileStart[i] = w;
+      const f = lib.order[i], lf = 1 - 0.22 * clamp((0.85 - lib.loose[i]) / 0.7, 0, 1);   // 越不像邻居越"松"，暗一点
+      const size = SIZE_FILE[0] + (SIZE_FILE[1] - SIZE_FILE[0]) * Math.min(1, lib.nChunksOf[f] / 45);
+      emit(lib, i, f, size, KIND_FILE, 0, STATUS[lib.status[f]].dim * lf);
+      for (let c = 0; c < lib.nChunksOf[f]; c++) emit(lib, i, f, SIZE_CHUNK, KIND_CHUNK, c + 1, 0.90 * lf);
+      for (let p = 0; p < lib.nPagesOf[f]; p++) emit(lib, i, f, SIZE_PAGE, KIND_PAGE, p + 1, 0.82 * lf);
+    }
+    lib.fileStart[N] = w;
+
+    U.uLibB.value[lib.li].set(0, lib.li * 2, 0, 0);
+    U.uLibU.value[lib.li].copy(lib.U);
+    U.uLibV.value[lib.li].copy(lib.V);
+
+    /* 轨道参考线：单位圆，按当前半径缩放（半径会随滑块变） */
+    const pts = [];
+    for (let j = 0; j <= 260; j++){
+      const t = TAU*j/260;
+      pts.push(new THREE.Vector3().addScaledVector(lib.U, Math.cos(t)).addScaledVector(lib.V, Math.sin(t)));
+    }
+    lib.ring = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+      new THREE.LineBasicMaterial({ color:new THREE.Color(lib.color), transparent:true, opacity:0.22,
+        blending:THREE.AdditiveBlending, depthWrite:false }));
+    ringGroup.add(lib.ring);
+    lib.label = makeLabel(lib.name, lib.color);
+    labelGroup.add(lib.label);
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3));   // 只为让 three 知道点数；位置全在着色器里算
+  g.setAttribute('aSamp', new THREE.BufferAttribute(aSamp, 4));
+  g.setAttribute('aMeta', new THREE.BufferAttribute(aMeta, 2));
+  g.setAttribute('aColor', new THREE.BufferAttribute(aColor, 3));
+  g.setAttribute('aKind', new THREE.BufferAttribute(aKind, 1));
+  g.setAttribute('aIdx', new THREE.BufferAttribute(aIdx, 1));
+  points = new THREE.Points(g, pointMat);
+  points.frustumCulled = false;
+  scene.add(points);
+
+  const plane = new THREE.PlaneGeometry(1, 1);
+  const bg = new THREE.InstancedBufferGeometry();
+  bg.index = plane.index;
+  bg.setAttribute('position', plane.attributes.position);
+  const m = NLIB * DENS_BINS, iKey = new Float32Array(m * 2);
+  for (let li = 0, q = 0; li < NLIB; li++) for (let kb = 0; kb < DENS_BINS; kb++, q++){ iKey[q * 2] = li; iKey[q * 2 + 1] = kb; }
+  bg.setAttribute('iKey', new THREE.InstancedBufferAttribute(iKey, 2));
+  bg.instanceCount = m;
+  bodyMesh = new THREE.Mesh(bg, bodyMat);
+  bodyMesh.frustumCulled = false;
+  scene.add(bodyMesh);
+
+  applyShape();
+  renderHud();
+}
+
+/* 按当前滑块重算所有库的锚点和剖面，上传两张纹理、更新库参数。拖滑块时每帧最多做一次。 */
+function applyShape(){
+  if (!libs.length) return;
+  const fd = fileTex.image.data, pd = profTex.image.data;
+  /* 排轨道要用到管子最粗处（κ），κ 又是形状算出来的：先排、再算形状；κ 变化超过 5% 就再排一次 */
+  for (let pass = 0; pass < 2; pass++){
+    const before = libs.map(l => l.kappa);
+    layoutOrbits();
+    for (const lib of libs){
+      shapeLibrary(lib, fd, pd);
+      U.uLibA.value[lib.li].set(lib.R, TAU * lib.R, lib.r0, lib.mixS);
+    }
+    if (!ui.autoOrbit || libs.every((l, i) => Math.abs(l.kappa - before[i]) < 0.05 * before[i])) break;
+  }
+  fileTex.needsUpdate = true;
+  profTex.needsUpdate = true;
+  updateOrbitHud();
+}
+const requestShape = () => { shapeDirty = true; };
+
+
+/* ============================================================
+   5. HUD
+   ============================================================ */
+const hud = document.getElementById('hud'), ctl = document.getElementById('ctl');
+/* 滑块一律用对数刻度：范围是原来的 1/10 到 10 倍（操作者要求），默认值附近仍然调得细。
+   允许 0 的滑块，最左端那一格就是 0。所有滑块都是拖动时同步生效：
+   外观类直接改 uniform；形状类标记一下，下一帧重算锚点和剖面（几毫秒），点连续滑到新位置。 */
+const SL_STEPS = 1000;
+const SLIDERS = [
+  { group:'外观与形状' },
+  { key:'size',     label:'点大小',       lo:0.04, hi:24, unit:'×', live:() => resize() },
+  { key:'speed',    label:'公转速度',     lo:0.01, hi:30, unit:'×', zero:true, live:() => {} },
+  { key:'spread',   label:'环带粗细',     lo:0.05, hi:18, unit:'×', live:requestShape },
+  { key:'bulge',    label:'鼓起程度',     lo:0.01, hi:20, unit:'×', zero:true, live:requestShape },
+  { key:'gather',   label:'聚合强度',     lo:0.01, hi:52, zero:true, live:requestShape },
+  { key:'mix',      label:'颜色交融',     lo:0.02, hi:50, live:requestShape },
+  { key:'body',     label:'体积光',       lo:0.01, hi:20, unit:'×', zero:true, live:() => { U.uBody.value = ui.body; } },
+  { group:'轨道与密度', toggle:'autoOrbit', toggleLabel:'按点数自动排轨道（关掉 = 原来写死的半径）' },
+  { key:'dens',     label:'目标密度',     lo:50, hi:50000, unit:' 点/单位体积', live:requestShape,
+    tip:'管子里的点有多挤。调大 → 各条轨道往里收、更挤；调小 → 往外放、更松' },
+  { key:'densTol',  label:'密度容许范围', lo:1, hi:20, unit:'×', live:requestShape,
+    tip:'密度可以偏离目标多少倍。为了留间距被迫偏离更多时，把管子调细 / 调粗补回来；1 = 严格等于目标' },
+  { key:'orbitGap', label:'轨道最小间距', lo:0.1, hi:12, zero:true, live:requestShape,
+    tip:'相邻两条轨道的管子外沿之间至少留多远' },
+  { key:'rMin',     label:'最内轨道离中心', lo:0.1, hi:40, live:requestShape,
+    tip:'最内圈的管子外沿离中心至少多远（中心线框球半径约 2.2）' },
+  { group:'背景' },
+  { key:'bg',       label:'背景亮度',     lo:0.01, hi:10, unit:'×', zero:true, live:() => { U.uBg.value = ui.bg; } },
+];
+function sliderVal(sl, pos){
+  if (sl.zero){
+    if (pos <= 0) return 0;
+    return sl.lo * Math.pow(sl.hi / sl.lo, (pos - 1) / (SL_STEPS - 1));
+  }
+  return sl.lo * Math.pow(sl.hi / sl.lo, pos / SL_STEPS);
+}
+function sliderPos(sl, v){
+  if (sl.zero && v <= 0) return 0;
+  const t = Math.log(clamp(v, sl.lo, sl.hi) / sl.lo) / Math.log(sl.hi / sl.lo);
+  return Math.round(sl.zero ? 1 + t * (SL_STEPS - 1) : t * SL_STEPS);
+}
+const fmtSlider = v => v === 0 ? '0' : v < 0.1 ? v.toFixed(3) : v < 10 ? v.toFixed(2) : v < 1000 ? v.toFixed(1) : fmt(Math.round(v));
+function renderHud(){
+  let tf = 0, tc = 0, tp = 0, rows = '', legend = new Map();
+  for (const lib of libs){
+    let c = 0, p = 0;
+    for (let f = 0; f < lib.nFiles; f++){ c += lib.nChunksOf[f]; p += lib.nPagesOf[f]; }
+    tf += lib.nFiles; tc += c; tp += p;
+    rows += `<tr class="librow"><td><span class="sw" style="background:${lib.color};color:${lib.color}"></span>${lib.name}</td>`
+      + `<td class="n">${fmt(lib.nFiles)}</td><td class="n">${fmt(c)}</td><td class="n">${fmt(p)}</td></tr>`;
+    const cnt = new Map();
+    for (let i = 0; i < lib.nFiles; i++) cnt.set(lib.topic[i], (cnt.get(lib.topic[i]) || 0) + 1);
+    for (const [t, n] of cnt){
+      const key = lib.topics[t], cur = legend.get(key);
+      legend.set(key, { n:(cur?.n || 0) + n, hex:PALETTE[t % PALETTE.length] });
+    }
+  }
+  const lg = [...legend.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 10)
+    .map(([name, v]) => `<tr><td><span class="sw" style="background:${v.hex};color:${v.hex}"></span>${name}</td><td class="n">${fmt(v.n)} 文件</td></tr>`)
+    .join('');
+  hud.innerHTML = `
+    <h4>总览 · 轨道星图 demo</h4>
+    <div class="kv"><span>数据点</span><b>${fmt(dataCount)}</b></div>
+    <div class="kv"><span>帧率</span><b id="v-fps">–</b></div>
+    <div class="kv"><span>draw call</span><b id="v-dc">–</b></div>
+    <div class="sep"></div>
+    <h4>每个库一条独立轨道</h4>
+    <table><tr><td></td><td class="n">文件</td><td class="n">块</td><td class="n">页</td></tr>${rows}</table>
+    <div class="sep"></div>
+    <h4>轨道与密度</h4>
+    <table><tr><td></td><td class="n">半径</td><td class="n">密度/目标</td><td class="n">管子</td></tr>
+      ${libs.map(l => `<tr class="librow" id="orb-${l.li}"></tr>`).join('')}</table>
+    <div class="sep"></div>
+    <h4>语义色（按文件数前 10）</h4>
+    <table>${lg}</table>
+    <div class="sep"></div>
+    <div style="color:#6b8099;font-size:11px;line-height:1.8">
+      环上的角度按语义排序：角度相邻 = 语义相邻。<br>
+      越像的文件在环上挨得越近 → 那一段点更密 → 光管在那里略微鼓起、更亮。<br>
+      粗细是点密度算出来的，起伏连续平滑；相邻主题的点互相渗透，交界处是混色。<br>
+      大点 = 文件；块和页落在它附近。暗点 = 未索引 / 待 OCR / 提取失败。
+    </div>`;
+  ctl.innerHTML = `
+    <h4>压力档</h4>
+    <select id="s-preset">${PRESETS.map((p, i) => `<option value="${i}" ${i === ui.preset ? 'selected' : ''}>${p.name}</option>`).join('')}</select>
+    ${SLIDERS.map(sl => sl.group
+      ? `<div class="grp">${sl.group}</div>` + (sl.toggle ? `<label class="r"><input type="checkbox" id="t-${sl.toggle}" ${ui[sl.toggle] ? 'checked' : ''}> ${sl.toggleLabel}</label>` : '')
+      : `<h4 title="${sl.tip || ''}">${sl.label} <span id="v-${sl.key}"></span></h4>
+    <input id="s-${sl.key}" type="range" min="0" max="${SL_STEPS}" step="1" value="${sliderPos(sl, ui[sl.key])}" title="${sl.tip || ''}">`).join('')}
+    <div class="sep"></div>
+    <h4>图层</h4>
+    <label class="r"><input type="checkbox" id="k0" ${ui.mask[0] ? 'checked' : ''}> 文件（大）</label>
+    <label class="r"><input type="checkbox" id="k1" ${ui.mask[1] ? 'checked' : ''}> 块</label>
+    <label class="r"><input type="checkbox" id="k2" ${ui.mask[2] ? 'checked' : ''}> 页（最小，PDF 专有）</label>
+    <div class="sep"></div>
+    <h4>辅助线</h4>
+    <label class="r"><input type="checkbox" id="k3" ${ringGroup.visible ? 'checked' : ''}> 轨道参考线与库名</label>`;
+  document.getElementById('s-preset').onchange = e => { ui.preset = +e.target.value; rebuild(); };
+  for (const sl of SLIDERS){
+    if (sl.toggle){
+      document.getElementById('t-' + sl.toggle).onchange = e => { ui[sl.toggle] = e.target.checked; requestShape(); };
+    }
+    if (sl.group) continue;
+    const el = document.getElementById('s-' + sl.key), lab = document.getElementById('v-' + sl.key);
+    const show = () => { lab.textContent = fmtSlider(ui[sl.key]) + (sl.unit || ''); };
+    el.addEventListener('input', () => { ui[sl.key] = sliderVal(sl, +el.value); show(); sl.live(); });
+    show();
+  }
+  for (let k = 0; k < 3; k++)
+    document.getElementById('k'+k).onchange = e => { ui.mask[k] = e.target.checked ? 1 : 0; U.uKindMask.value.set(...ui.mask); };
+  document.getElementById('k3').onchange = e => { ringGroup.visible = labelGroup.visible = e.target.checked; };
+  updateOrbitHud();
+}
+
+/* ============================================================
+   6. 拾取：先按角楔包围球粗筛，再逐点算与射线的距离。
+   点的位置在 CPU 上用和着色器同一套公式重算（锚点 + 固定偏移 × 当前宽度 / 管半径），所以和画面完全一致。
+   ============================================================ */
+const tip = document.getElementById('tip');
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+let mouseXY = null;
+canvas.addEventListener('pointermove', e => { mouseXY = { x:e.clientX, y:e.clientY }; });
+canvas.addEventListener('pointerleave', () => { mouseXY = null; });
+
+function raySphere(O, D, c, r){
+  const ox = c.x - O.x, oy = c.y - O.y, oz = c.z - O.z;
+  const tca = ox*D.x + oy*D.y + oz*D.z;
+  if (tca < 0) return -1;
+  const d2 = ox*ox + oy*oy + oz*oz - tca*tca;
+  return d2 <= r*r ? tca : -1;
+}
+function ringPoint(lib, ang, rad, hgt, out){
+  const cs = Math.cos(ang)*rad, sn = Math.sin(ang)*rad;
+  out.set(lib.U.x*cs + lib.V.x*sn + lib.N.x*hgt,
+          lib.U.y*cs + lib.V.y*sn + lib.N.y*hgt,
+          lib.U.z*cs + lib.V.z*sn + lib.N.z*hgt);
+}
+function pick(){
+  U.uHover.value = -1;
+  if (!mouseXY || !A || !libs.length){ tip.style.display = 'none'; return; }
+  const r = canvas.getBoundingClientRect();
+  ndc.set((mouseXY.x - r.left) / r.width * 2 - 1, -((mouseXY.y - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const O = ray.ray.origin, D = ray.ray.direction;
+  const { aSamp } = A;
+  const { pLib, pKind, pFile, pOrd, pSub, pTopic, pStatus } = P;
+  let best = -1, bestD2 = 0.05;      // 命中半径（世界单位）的平方
+  const c = new THREE.Vector3();
+
+  for (const lib of libs){
+    const halfArc = TAU / WEDGE / 2;
+    const bound = lib.R * Math.sin(halfArc) + lib.pickPad;
+    const R = lib.R, Ux = lib.U.x, Uy = lib.U.y, Uz = lib.U.z, Vx = lib.V.x, Vy = lib.V.y, Vz = lib.V.z;
+    const Nx = lib.N.x, Ny = lib.N.y, Nz = lib.N.z;
+    for (const wg of lib.wedges){
+      const mid = (wg.w + 0.5) * TAU / WEDGE;
+      ringPoint(lib, mid + lib.rot, R, 0, c);
+      if (raySphere(O, D, c, bound) < 0) continue;
+      for (let i = wg.start; i < wg.end; i++){
+        const k = pKind[i];
+        if (!(k === 0 ? ui.mask[0] : k === 1 ? ui.mask[1] : ui.mask[2])) continue;
+        const s = lib.anchor[pOrd[i]] + aSamp[i*4+1] * lib.mixS, rr = radAt(lib, s);
+        const th = s / R + lib.rot, rad = R + aSamp[i*4+2] * rr, hh = aSamp[i*4+3] * rr;
+        const cs = Math.cos(th) * rad, sn = Math.sin(th) * rad;
+        const X = Ux*cs + Vx*sn + Nx*hh, Y = Uy*cs + Vy*sn + Ny*hh, Z = Uz*cs + Vz*sn + Nz*hh;
+        const ox = X - O.x, oy = Y - O.y, oz = Z - O.z;
+        const tc = ox*D.x + oy*D.y + oz*D.z;
+        if (tc < 0) continue;
+        const d2 = ox*ox + oy*oy + oz*oz - tc*tc;
+        if (d2 < bestD2){ bestD2 = d2; best = i; }
+      }
+    }
+  }
+  if (best < 0){ tip.style.display = 'none'; return; }
+  U.uHover.value = best;
+  const lib = libs[pLib[best]], k = pKind[best], f = pFile[best];
+  let html = `<b>${lib.fname[f]}</b><span>${lib.name} · ${['文件','块','页'][k]}`;
+  if (k === KIND_FILE) html += ` · ${KIND_NAME[lib.kind[f]]} · ${fmt(lib.nChunksOf[f])} 块`;
+  if (k === KIND_CHUNK) html += ` #${pSub[best]}`;
+  if (k === KIND_PAGE) html += ` 第 ${pSub[best]} 页`;
+  html += ` · 主题「${lib.topics[pTopic[best]]}」`;
+  if (k === KIND_FILE) html += `<br>状态：${STATUS[pStatus[best]].label}`;
+  html += '</span>';
+  tip.innerHTML = html;
+  tip.style.display = 'block';
+  let x = mouseXY.x + 16, y = mouseXY.y + 16;
+  if (x + tip.offsetWidth > innerWidth - 8) x = mouseXY.x - tip.offsetWidth - 14;
+  if (y + tip.offsetHeight > innerHeight - 8) y = mouseXY.y - tip.offsetHeight - 14;
+  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+}
+
+/* ============================================================
+   7. 主循环
+   ============================================================ */
+let last = performance.now(), acc = 0, frames = 0;
+function resize(){
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  U.uPR.value = renderer.getPixelRatio();
+  U.uSizeK.value = h * renderer.getPixelRatio() / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2)) * ui.size;
+}
+addEventListener('resize', resize);
+function tick(now){
+  requestAnimationFrame(tick);
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  /* 公转时间按速度累加（而不是 时钟 × 速度），拖速度滑块时轨道不会跳 */
+  U.uTime.value += dt * ui.speed;
+  for (const lib of libs){ lib.rot += dt * ui.speed * lib.speed; U.uLibB.value[lib.li].x = lib.rot; }
+  U.uClock.value += dt;
+  if (shapeDirty){ shapeDirty = false; applyShape(); }
+  controls.update();
+  skyGroup.position.copy(camera.position);
+  if (mouseXY) pick();
+  renderer.render(scene, camera);
+  acc += dt; frames++;
+  if (acc >= 0.5){
+    const a = document.getElementById('v-fps'), b = document.getElementById('v-dc');
+    if (a) a.textContent = (frames / acc).toFixed(0);
+    if (b) b.textContent = renderer.info.render.calls;
+    acc = 0; frames = 0;
+  }
+}
+/* 只有换压力档（换一批数据）才走这里；拖滑块从不触发重建 */
+function rebuild(){
+  const boot = document.getElementById('boot');
+  boot.classList.remove('hide');
+  boot.textContent = '正在生成…';
+  setTimeout(() => {
+    const t0 = performance.now();
+    buildAll(ui.preset);
+    const ms = Math.round(performance.now() - t0);
+    const b = document.getElementById('v-dc');
+    if (b) b.title = `生成 + 布局耗时 ${ms}ms`;
+    console.log(`[orbital] ${fmt(dataCount)} 点，构建+布局 ${ms}ms（${PRESETS[ui.preset].name}）`);
+    boot.classList.add('hide');
+  }, 40);
+}
+window.__libs = () => libs;
+window.__U = U;
+window.__applyShape = applyShape;
+/* 调试：把镜头对准某个库管子第 rank 粗的那一处（按当前公转角度） */
+window.__focusBead = (li = 1, rank = 0, dist = 3.2) => {
+  const lib = libs[li], ks = Array.from(lib.rad.keys()).sort((x, y) => lib.rad[y] - lib.rad[x]);
+  const a = (ks[rank] + 0.5) * lib.h / lib.R + lib.rot;
+  const c = new THREE.Vector3().addScaledVector(lib.U, lib.R * Math.cos(a)).addScaledVector(lib.V, lib.R * Math.sin(a));
+  const t = new THREE.Vector3().addScaledVector(lib.U, -Math.sin(a)).addScaledVector(lib.V, Math.cos(a));
+  const side = new THREE.Vector3().crossVectors(t, lib.N).normalize();
+  camera.position.copy(c).addScaledVector(side, -dist).addScaledVector(lib.N, dist * 0.35);
+  controls.target.copy(c); controls.update();
+  return { r:lib.rad[ks[rank]], r0:lib.r0 };
+};
+window.__cam = (x, y, z, tx = 0, ty = 0, tz = 0) => { camera.position.set(x, y, z); controls.target.set(tx, ty, tz); controls.update(); };
+resize();
+rebuild();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

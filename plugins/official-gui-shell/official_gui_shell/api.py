@@ -23,9 +23,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import base64
+import os
+import subprocess
+
 from core.atomic import atomic_write_bytes
+from core.conversion_cache import missing_pages, needs_attention, page_ranges, reason_text
 from core.pipeline import DEFAULT_CONFIDENCE_WARN_THRESHOLD, Pipeline, confidence_tier
-from official_gui_shell.contract_bridge import _LegacyContractMixin
+from official_gui_shell.contract_bridge import _LegacyContractMixin, _exc_text
 from official_gui_shell.settings_schema import (  # noqa: F401 - 保持旧的导入路径可用
     FIELDS,
     SETTING_FIELD_META,
@@ -35,6 +40,46 @@ from official_gui_shell.settings_schema import (  # noqa: F401 - 保持旧的导
 
 def _setting_is_secret(key: str) -> bool:
     return setting_is_secret(key)
+
+
+#: 转换缓存清单的缓存时间（秒）：清单要把整个库枚举一遍、逐个看缓存文件，库卡片每次重画
+#: 都现算太浪费；索引一结束桥接层会整体作废缓存（`_invalidate_cache`），不会看到旧数。
+CONVERSION_CACHES_TTL_S = 15.0
+
+
+def _conversion_row(item: Any) -> dict[str, Any]:
+    """清单里的一行：原因代码配好人话（`core.conversion_cache.reason_text`，只此一份）。"""
+    text_label, text_next = reason_text(item.text_reason)
+    pages_label, pages_next = reason_text(item.pages_reason)
+    return {
+        "rel": item.path,
+        "ext": item.extension,
+        "attention": needs_attention(item),
+        "text": {
+            "state": item.text_state,
+            "reason": item.text_reason,
+            "label": text_label,
+            "next": text_next,
+            "route": item.text_route,
+            "route_name": item.text_route_name,
+            "route_version": item.text_route_version,
+            "bytes": item.text_bytes,
+            "updated": item.text_updated,
+            "file": item.text_file,
+        },
+        "pages": {
+            "state": item.pages_state,
+            "reason": item.pages_reason,
+            "label": pages_label,
+            "next": pages_next,
+            "detail": item.pages_detail,
+            "count": len(item.pages),
+            "total": item.page_count,
+            "have": page_ranges(item.pages),
+            "missing": page_ranges(missing_pages(item)),
+            "first": item.pages[0] if item.pages else None,
+        },
+    }
 
 
 class Api(_LegacyContractMixin):
@@ -309,3 +354,199 @@ class Api(_LegacyContractMixin):
             return self._pipeline.release_gpu_memory()
         except Exception as exc:  # noqa: BLE001 - 见模块 docstring：绝不让一次操作失败带崩整个窗口
             return {"released": [], "skipped": [], "errors": {"_pipeline": str(exc)}}
+
+    # ---- 转换缓存看得见（精确 API：新能力，旧项目没有，见 BC-19）------------------------
+    #
+    # 库用显示名（`lib`）进出，和前端别处一致。全部只读：不转换、不加载模型；只有“试搜”
+    # 会用到页库模型（占显卡，闲置后按页库服务自己的规则卸载），界面在按钮旁写明。
+
+    def _conversion_reports(self, library_id: str) -> Any:
+        key = ("conversion_caches", library_id or "all")
+        return self._cached(key, CONVERSION_CACHES_TTL_S, lambda: self._pipeline.conversion_caches(library_id or "all"))
+
+    def _conversion_summary(self, report: Any) -> dict[str, Any]:
+        return {
+            "lib": self._name_of(report.library_id),
+            "text_done": report.text_done,
+            "text_total": report.text_total,
+            "text_bytes": report.text_bytes,
+            "text_attention": sum(1 for item in report.files if item.text_state != "done"),
+            "pages_enabled": report.pages_enabled,
+            "pdf_total": report.pdf_total,
+            "pages_done": report.pages_done,
+            "page_vectors": report.page_vectors,
+            "page_bytes": report.page_bytes_estimate,
+            "pages_attention": sum(1 for item in report.files if item.pages_state in {"none", "partial", "failed"}),
+            "text_dir": report.text_dir,
+            "catalog": report.catalog_file,
+            "pages_dir": report.pages_dir,
+            "vram_gb": report.page_vram_gb,
+            "idle_unload_s": report.page_idle_unload_seconds,
+            "error": report.error,
+        }
+
+    def conversion_caches(self, lib: str = "") -> dict[str, Any]:
+        """各库“转换缓存”的汇总（库卡片那一行用）；给了 `lib` 时再附上这个库逐文件的清单
+        （诊断页“转换缓存”表用）。`rows` 每行带 `attention`（“只看缺的”按它筛），原因
+        都已配好人话和下一步。"""
+        try:
+            library_id = self._resolve_library(lib) if lib else ""
+            reports = self._conversion_reports(library_id)
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring：绝不让一次操作失败带崩整个窗口
+            return {"libs": [], "rows": [], "error": _exc_text(exc)}
+        result: dict[str, Any] = {"libs": [self._conversion_summary(report) for report in reports], "rows": [], "error": None}
+        if library_id and reports:
+            result["rows"] = [_conversion_row(item) for item in reports[0].files]
+        return result
+
+    def _conversion_item(self, lib: str, rel: str) -> tuple[str, Any, Any]:
+        library_id = self._resolve_library(lib)
+        reports = self._conversion_reports(library_id)
+        report = reports[0] if reports else None
+        item = next((entry for entry in (report.files if report else ()) if entry.path == rel), None)
+        if report is None or item is None:
+            raise KeyError(f"「{rel}」不是这个库里需要转换的文件")
+        return library_id, report, item
+
+    def conversion_cache_file(self, lib: str, rel: str) -> dict[str, Any]:
+        """一份文件的转换缓存详情（文件详情面板用）：清单那一行 + 正文字数（现读这一份
+        缓存文件数出来）+ 页库存放位置与试搜要占的显存。"""
+        try:
+            _library_id, report, item = self._conversion_item(lib, rel)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": _exc_text(exc)}
+        row = _conversion_row(item)
+        chars = None
+        if item.text_file:
+            try:
+                chars = len(Path(item.text_file).read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError):
+                chars = None
+        row["text"]["chars"] = chars
+        return {
+            "ok": True,
+            "lib": self._name_of(report.library_id),
+            **row,
+            "pages_enabled": report.pages_enabled,
+            "pages_dir": report.pages_dir,
+            "vram_gb": report.page_vram_gb,
+            "idle_unload_s": report.page_idle_unload_seconds,
+            "error": None,
+        }
+
+    def open_cache_folder(self, lib: str) -> dict[str, Any]:
+        """先把这个库的 `缓存目录.md` 刷新成最新，再在资源管理器里打开转文字缓存文件夹。"""
+        try:
+            library_id = self._resolve_library(lib)
+            catalog = self._pipeline.write_conversion_catalog(library_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": _exc_text(exc)}
+        folder = catalog.parent
+        opener = getattr(os, "startfile", None)
+        if not callable(opener):
+            return {"ok": True, "opened": False, "path": str(folder), "catalog": str(catalog)}
+        try:
+            opener(str(folder))
+        except OSError as exc:
+            return {"ok": False, "error": f"打开文件夹失败：{type(exc).__name__}"}
+        return {"ok": True, "opened": True, "path": str(folder), "catalog": str(catalog)}
+
+    def reveal_cache_file(self, lib: str, rel: str) -> dict[str, Any]:
+        """在资源管理器里选中这份文件的正文缓存文件（只认清单里报出来的那个位置，
+        不接受前端传任意路径）。"""
+        try:
+            _library_id, report, item = self._conversion_item(lib, rel)
+            if not item.text_file:
+                raise ValueError(reason_text(item.text_reason)[0] or "这份文件还没有转好的正文")
+            target = Path(item.text_file).resolve()
+            root = Path(report.text_dir).resolve()
+            if root not in target.parents or not target.is_file():
+                raise ValueError("缓存文件不在这个库的缓存文件夹里")
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": _exc_text(exc)}
+        if os.name != "nt":
+            return {"ok": True, "opened": False, "path": str(target)}
+        try:
+            subprocess.Popen(["explorer", "/select,", str(target)])  # noqa: S603,S607 - 固定程序 + 已校验的本机路径
+        except OSError as exc:
+            return {"ok": False, "error": f"打开资源管理器失败：{type(exc).__name__}"}
+        return {"ok": True, "opened": True, "path": str(target)}
+
+    def page_preview(self, lib: str, rel: str, page: int) -> dict[str, Any]:
+        """PDF 第 `page` 页的小图（`data:image/png;base64,...`）。用 CPU 现画一张，
+        不存盘、不占显卡；前端看完就丢。"""
+        try:
+            library_id = self._resolve_library(lib)
+            png = self._pipeline.page_preview(library_id, rel, int(page))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": _exc_text(exc)}
+        return {"ok": True, "page": int(page), "data_url": "data:image/png;base64," + base64.b64encode(png).decode("ascii")}
+
+    def page_try_search(self, lib: str, rel: str, query: str, top_k: int = 5) -> dict[str, Any]:
+        """只在这一份 PDF 的页库里试搜一句话，看它找出哪几页——用来判断这份页库好不好使。
+        会用到页库模型（占显卡，闲置后自动卸载，也可以手动“释放显存”）；没能查（页库没开、
+        显卡正忙、服务没起来）时 `error` 写明原因，不会假装“没找到”。"""
+        if not str(query or "").strip():
+            return {"ok": False, "hits": [], "error": "先输入一句要找的内容"}
+        try:
+            library_id = self._resolve_library(lib)
+            hits = self._pipeline.navigate(library_id, str(query), top_k=max(1, min(int(top_k), 20)), path=rel)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "hits": [], "error": _exc_text(exc)}
+        return {"ok": True, "hits": [{"page": hit.page_index + 1, "rank": index + 1} for index, hit in enumerate(hits)], "error": None}
+
+    # ---- 总览星图（精确 API：新能力，旧项目没有，见 BC-18）----------------------------
+
+    def overview_map(self, libraries: str = "") -> dict[str, Any]:
+        """图谱页"轨道星图"的数据：每个库一组**按列存放**的数组（第 i 个文件在每一列的
+        第 i 位），顺序就是星图上沿光管排开的顺序。上万个文件时按列比按对象省一半以上的
+        传输量，前端也能直接拿去填显卡缓冲。
+
+        只读已存好的向量，不加载任何模型（`core/pipeline.py::overview_map`）。库用显示名
+        （`lib`），前端打开文件时原样回传；范围写错、编排层出错都折叠成 `error`，不抛异常。"""
+        empty: dict[str, Any] = {
+            "libs": [], "groups": [], "stats": {"libs": 0, "files": 0, "points": 0},
+            "layout_version": "", "error": None,
+        }
+        try:
+            scope = self._resolve_scope(libraries) or "all"
+        except Exception as exc:  # noqa: BLE001 - 范围写错给人话，不让前端拿到异常
+            return {**empty, "error": _exc_text(exc)}
+        try:
+            response = self._pipeline.overview_map(scope)
+        except Exception as exc:  # noqa: BLE001 - 见模块 docstring：绝不让一次操作失败带崩整个窗口
+            return {**empty, "error": f"总览读取失败：{type(exc).__name__}"}
+        libs: list[dict[str, Any]] = []
+        files_total = points_total = 0
+        for lib in response.libraries:
+            files = lib.files
+            libs.append({
+                "lib": self._name_of(lib.library_id),
+                "points": lib.points,
+                "rel": [f.path for f in files],
+                "type": [f.node_type for f in files],
+                "chunks": [f.chunks for f in files],
+                "pages": [f.pages for f in files],
+                "state": [f.state for f in files],
+                "group": [f.group for f in files],
+                "gap": [f.gap for f in files],
+                "loose": [f.loose for f in files],
+                "updated": [f.updated_ns / 1_000_000_000 if f.updated_ns is not None else None for f in files],
+                "fail": [f.failure_reason for f in files],
+            })
+            files_total += len(files)
+            points_total += lib.points
+        return {
+            "libs": libs,
+            "groups": [
+                {
+                    "group": g.group,
+                    "size": g.size,
+                    "samples": [{"lib": self._name_of(library_id), "rel": path} for library_id, path in g.samples],
+                }
+                for g in response.groups
+            ],
+            "stats": {"libs": len(libs), "files": files_total, "points": points_total},
+            "layout_version": response.layout_version,
+            "error": response.error,
+        }

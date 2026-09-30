@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Obsidian RAG</title>
 <link rel="stylesheet" href="app.css">
+<script type="importmap">{"imports":{"three":"./vendor/three/three.module.min.js"}}</script>
 </head>
 <body>
 <div class="orb orb-a"></div>
@@ -90,78 +91,41 @@
 <!-- ============ 主体 ============ -->
 <main class="main"><div class="wrap">
 
-  <!-- ===== 图谱（默认视图，全库常驻） ===== -->
-  <section class="view on" id="view-graph" aria-label="全库知识图谱">
-    <div class="g-stage" id="gStage">
-      <div class="g-world" id="gWorld">
-        <div class="g-dots"></div>
-        <svg class="g-edges" aria-hidden="true">
-          <defs id="gDefs"></defs>
-          <g id="gBoundsG"></g>
-          <g id="gOwnG"></g><g id="gSemG"></g><g id="gBilatG"></g><g id="gRedgeG"></g><g id="gOrbitG"></g><g id="gRippleG"></g>
-        </svg>
-        <div class="g-nodes" id="gNodes"></div>
-        <div id="gTags"></div>
-      </div>
-    </div>
+  <!-- ===== 图谱：总览星图（默认视图；BC-18，渲染在 starmap/starmap.js，只在看得见时占用显卡） ===== -->
+  <section class="view on" id="view-graph" aria-label="总览星图">
+    <div class="sm-stage" id="smStage"><div class="sm-labels" id="smLabels"></div></div>
+    <div class="sm-empty" id="smEmpty" role="status" aria-live="polite"><b id="smEmptyTitle">正在读取总览…</b><span id="smEmptyText"></span></div>
 
-    <!-- 搜索岛 -->
+    <!-- 搜索岛：提交后跳到检索页显示结果（星图里的"从问题扩散"留到检索重构） -->
     <div class="g-dock">
       <div class="g-island">
         <span class="g-dock-ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></span>
-        <input class="g-input" id="gq" type="text" placeholder="向全库提问，结果从问题节点荡开" aria-label="图谱语义检索">
+        <input class="g-input" id="gq" type="text" placeholder="向全库提问，在检索页查看结果" aria-label="检索">
         <select id="gTopk" aria-label="返回条数"><option>3</option><option selected>5</option><option>8</option><option>10</option><option>15</option></select>
         <button class="btn btn-primary btn-sm" id="gGo">检索</button>
       </div>
-      <div class="g-hints" id="gHints"></div>
     </div>
 
-    <!-- 图层面板 -->
-    <div class="g-panel" aria-label="图层">
-      <div class="gp-head"><b class="grotesk">图层</b><span class="gp-sum mono" id="gpSum">加载中</span></div>
-      <div class="gp-cap">边</div>
-      <div class="gp-row"><span>显式双链</span><label class="switch"><input type="checkbox" id="lyBilat" checked><i></i></label></div>
-      <div class="gp-row" style="flex-wrap:wrap">
-        <div class="gp-rowline"><span>语义相似边</span><label class="switch"><input type="checkbox" id="lySem"><i></i></label></div>
-        <div class="gp-slider" style="width:100%"><input type="range" id="semTh" min="0.50" max="0.85" step="0.01" value="0.62" aria-label="语义边相似度阈值"><span class="mono" id="semThVal">0.62</span></div>
-        <div class="gp-hint" id="semCount">开启后需加载嵌入模型</div>
-      </div>
-      <div class="gp-row"><span>归属边</span><label class="switch"><input type="checkbox" id="lyOwn" checked><i></i></label></div>
-      <div class="gp-cap">节点</div>
-      <div class="gp-row"><span>WEMM 页节点</span><label class="switch"><input type="checkbox" id="lyPage"><i></i></label></div>
-      <div class="gp-row"><span>PDF→MD 缓存</span><label class="switch"><input type="checkbox" id="lyCache" checked><i></i></label></div>
-      <div class="gp-row"><span>PDF 原件</span><label class="switch"><input type="checkbox" id="lyPdf" checked><i></i></label></div>
-      <div class="gp-cap">显示</div>
-      <div class="gp-row"><span>着色</span><div class="g-seg" id="gColorSeg" role="group" aria-label="着色模式"><button type="button" data-cm="lib" class="on">按库</button><button type="button" data-cm="state">按生效</button><button type="button" data-cm="mono">单色</button></div></div>
-      <div class="gp-row"><span>库边界</span><label class="switch"><input type="checkbox" id="lyBounds" checked><i></i></label></div>
+    <!-- 调节面板 -->
+    <div class="g-panel sm-panel" id="smPanel" aria-label="星图调节">
+      <div class="gp-head"><b class="grotesk">星图调节</b><button type="button" class="sm-fold" id="smFold" aria-expanded="true" aria-label="收起调节面板">收起</button></div>
+      <div class="sm-panel-body" id="smPanelBody"></div>
     </div>
 
-    <!-- 图例 + 说明 -->
+    <!-- 图例：内容分组 -->
     <div class="g-legend">
-      <span class="gl-item"><i class="g-mark shape-md"></i><span>md 笔记</span></span>
-      <span class="gl-item"><i class="g-mark shape-pdf"></i><span>PDF 原件</span></span>
-      <span class="gl-item"><i class="g-mark shape-cache"></i><span>PDF→MD 缓存</span></span>
-      <span class="gl-item"><i class="g-mark shape-page"></i><span>WEMM 页节点</span></span>
-      <span class="gl-libs" id="gLegendLibs"></span>
-      <span class="gl-libs" id="gLegendState" style="display:none">
-        <span class="gl-lib"><i style="background:#34D399"></i><span>全链路生效</span></span>
-        <span class="gl-lib"><i style="background:#7DB8FF"></i><span>缺 WEMM</span></span>
-        <span class="gl-lib"><i style="background:transparent;border:1px dashed var(--sec)"></i><span>未识别</span></span>
-        <span class="gl-lib"><i style="background:#F87171"></i><span>失败</span></span>
-      </span>
-      <span class="gl-libs" id="gLegendMono" style="display:none">
-        <span class="gl-lib"><i style="background:var(--s4);border:1px solid var(--hair-strong)"></i><span>单色</span></span>
-      </span>
-      <button class="g-info-btn" id="gInfoBtn" aria-label="图谱力学说明" aria-expanded="false">i</button>
+      <span class="gl-libs sm-groups" id="smGroups"></span>
+      <button class="g-info-btn" id="gInfoBtn" aria-label="星图说明" aria-expanded="false">i</button>
     </div>
 
     <div class="g-physics" id="gPhysics">
-      <h4>图谱力学</h4>
-      <div class="gf-item"><b>语义引力</b><span>节点按主题向量聚落，相似笔记互相吸引，不画线也受力。</span></div>
-      <div class="gf-item"><b>库锚点</b><span>每个库有一个空间锚点，同库聚成一落；跨库强相似形成「桥」。</span></div>
-      <div class="gf-item"><b>短程斥力</b><span>靠得太近的节点互相推开，维持可读间距。</span></div>
-      <div class="gf-item"><b>边弹簧</b><span>显式双链与归属边像弹簧，把相连节点拉向固定距离。</span></div>
-      <div class="gf-note">语义边图层来自嵌入模型实时计算，首次开启需加载模型（约 30-60 秒），阈值滑杆控制画线门槛。</div>
+      <h4>星图怎么看</h4>
+      <div class="gf-item"><b>光管</b><span>每个库是一根绕中心转的光管；资料越多，轨道越靠外。</span></div>
+      <div class="gf-item"><b>顺序</b><span>沿着光管挨在一起的文件，内容也相近。</span></div>
+      <div class="gf-item"><b>鼓起</b><span>内容相近的文件挤得越紧，那一段点越密，光管就略微鼓起、更亮。</span></div>
+      <div class="gf-item"><b>颜色</b><span>同一类内容同一种颜色，跨库也一样；相邻两类在交界处互相渗透。</span></div>
+      <div class="gf-item"><b>亮暗</b><span>大点是文件，小点是它的块和页；暗的是还没索引、排队识别或失败的文件。</span></div>
+      <div class="gf-note">只在这个页面打开时占用显卡；切到别的页面或窗口最小化一会儿，就把显卡资源全部交还。</div>
     </div>
 
     <!-- 缩放 dock -->
@@ -359,8 +323,23 @@
   <section class="view" id="view-diag">
     <div class="page-head">
       <h1>诊断</h1>
-      <p>失败溯源、页级视觉导航服务状态、近似去重与备份演练</p>
+      <p>转换缓存、失败溯源、页级视觉导航服务状态、近似去重与备份演练</p>
     </div>
+
+    <div class="shell sec" id="ccSec"><div class="core tbl-shell"><div class="tbl-core">
+      <div class="sec-head" style="padding:14px 16px 0;margin-bottom:0"><h2>转换缓存</h2>
+        <div class="cc-tools">
+          <label class="cc-only"><input type="checkbox" id="ccOnly"> 只看缺的</label>
+          <select id="ccLib" aria-label="选择库"></select>
+          <button class="btn btn-sm" id="ccOpenDir">打开缓存文件夹</button>
+        </div>
+      </div>
+      <div class="cc-sum" id="ccSum">PDF、Word 转成文字了没有、页库建了没有、存在哪、多大</div>
+      <table style="margin-top:6px">
+        <thead><tr><th style="width:44%">文件</th><th>转文字</th><th style="width:26%">页库</th></tr></thead>
+        <tbody id="ccBody"></tbody>
+      </table>
+    </div></div></div>
 
     <div class="shell sec"><div class="core tbl-shell"><div class="tbl-core">
       <div class="sec-head" style="padding:14px 16px 0;margin-bottom:0"><h2>失败明细</h2>
@@ -382,13 +361,7 @@
         <button class="btn btn-sm" id="wemmProbeBtn">探测服务</button>
       </div>
       <div class="wemm-probe-out" id="wemmProbeOut"></div>
-      <div class="sec-head" style="padding:8px 18px 4px"><h5 class="wemm-sub">页库明细</h5>
-        <select id="wemmLibSel" aria-label="选择库"></select>
-      </div>
-      <div class="tbl-core"><table>
-        <thead><tr><th style="width:56%">文件</th><th>页数</th><th style="width:26%">状态</th></tr></thead>
-        <tbody id="wemmBody"></tbody>
-      </table></div>
+      <div class="cc-moved">每份 PDF 的页库明细已并入上方「转换缓存」清单。</div>
     </div></div>
 
     <div class="shell sec"><div class="core">
@@ -433,8 +406,8 @@
 
 </div></main>
 
-<!-- ============ 图谱 Inspector（380px 玻璃） ============ -->
-<aside class="read g-ins" id="gIns" aria-label="节点详情">
+<!-- ============ 图谱文件详情（380px 玻璃） ============ -->
+<aside class="read g-ins" id="gIns" aria-label="文件详情">
   <div class="read-head">
     <div class="read-head-top">
       <div style="flex:1;min-width:0">
@@ -665,5 +638,6 @@
 
 <script src="mock.js"></script>
 <script src="app.js"></script>
+<script type="module" src="starmap/starmap.js"></script>
 </body>
 </html>

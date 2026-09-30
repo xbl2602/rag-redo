@@ -116,6 +116,50 @@ class TestBusinessCli(unittest.TestCase):
             code, out = self._run("dedup", "--library", "test-lib")
             self.assertEqual(code, 0, out)
 
+    def test_caches_command_lists_what_is_missing_without_starting_the_page_service(self):
+        """BC-19：命令行一条命令看每个库两种缓存的数量、位置、大小、缺哪些；只读，页库插件
+        只加载不启用（启用会抢显卡、拉起看图服务）。"""
+        import core.cli as cli
+        from docx import Document
+
+        document = Document()
+        document.add_paragraph("Word 正文：插件架构")
+        document.save(str(self.vault / "b.docx"))
+        original_boot = cli._boot_pipeline
+        booted = []
+
+        def _boot_with_fakes(args):
+            runtime, pipeline = original_boot(args)
+            _inject_fakes(runtime)
+            booted.append((args.command, runtime))
+            return runtime, pipeline
+
+        with patch.object(cli, "_boot_pipeline", side_effect=_boot_with_fakes):
+            self._run("libraries", "add", str(self.vault), "--id", "test-lib")
+            code, out = self._run("index", "--library", "test-lib")
+            self.assertEqual(code, 0, out)
+            self.assertIn("转换缓存：转文字 复用 0 / 新转 1 / 缺 0", out)
+            code, out = self._run("caches", "--library", "test-lib")
+            self.assertEqual(code, 0, out)
+            self.assertIn("转文字：1/1 份已转好", out)
+            self.assertIn("目录文件：", out)
+            self.assertIn("（没有缺的）", out)
+            self.assertNotIn("b.docx", out, "缺省只列缺的")
+            code, out = self._run("caches", "--all-files")
+            self.assertEqual(code, 0, out)
+            self.assertIn("✓ b.docx  转文字", out)
+            code, _out = self._run("caches", "--library", "no-such-lib")
+            self.assertEqual(code, 1)
+        self.assertNotIn("official-visual-wemm", cli._plugins_for("caches"))
+        self.assertEqual(cli._LOAD_ONLY_PLUGINS["caches"], ("official-visual-wemm",))
+        wemm_states = [
+            runtime.plugins["official-visual-wemm"].state.value
+            for command, runtime in booted
+            if command == "caches" and "official-visual-wemm" in runtime.plugins
+        ]
+        self.assertTrue(wemm_states)
+        self.assertNotIn("enabled", wemm_states, "只读诊断不许启用页库插件（会抢显卡）")
+
     def test_fresh_extract_flag_reaches_the_real_pipeline_verbatim(self):
         """CLI ↔ **真的** `core/pipeline.py::index_library` 的接线。
 

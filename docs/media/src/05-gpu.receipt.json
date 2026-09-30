@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "sequence",
+  "input": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\05-gpu.sequence.json",
+  "output": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\05-gpu.html",
+  "specification": {
+    "sha256": "0b2414b3121e9cb68a1a544f11ff89533b9a1221e0a4dd1b305da1a2549cfb63",
+    "bytes": 3963
+  },
+  "artifact": {
+    "sha256": "9efa429c18396d320623505f29150c046a390e274ce7202668effd69b698ae0f",
+    "bytes": 806837
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "standard",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

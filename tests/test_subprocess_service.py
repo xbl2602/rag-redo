@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from core.singleton import pid_alive
 from core.subprocess_service import SubprocessServiceError, SubprocessServiceHandle, find_free_port
 
 _ECHO_SERVER = '''
@@ -90,24 +91,14 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
 def _process_is_gone(pid: int) -> bool:
-    """跨平台的"这个 pid 是不是真的没了"检查，理由同 test_runtime.py 里
-    同名函数——POSIX 的 os.kill(pid, 0) 信号-0 探测语义在 Windows 上不
-    成立（直接抛 OSError 而不是 ProcessLookupError），得走 Win32
-    OpenProcess API。"""
-    if os.name == "nt":
-        import ctypes
+    """"这个 pid 是不是真的没了"：直接问 `core/singleton.py::pid_alive`（看进程是不是已经
+    结束），测试里不另写一份判断（AGENTS.md §4.5、§7）。
 
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return True
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    return False
+    以前这里各自写成“OpenProcess 打得开就算还活着”，在 Windows 上判不准：进程被杀掉之后，
+    只要别处还有人握着它的句柄，这个进程对象就还在、照样打得开，要过零点几秒才真正消失。
+    2026-10-01 在整套回归里抓到过：`stop()` 之后立刻查，退出码已经是 1（被 taskkill 杀掉），
+    却仍被判“还活着”，1 秒后再查就没了——“停止子进程”那条测试时好时坏就是这个原因。"""
+    return not pid_alive(pid)
 
 
 class TestSubprocessServiceHandle(unittest.TestCase):

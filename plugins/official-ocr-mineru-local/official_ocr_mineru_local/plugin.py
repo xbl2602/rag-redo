@@ -295,11 +295,57 @@ class MineruLocalOcrPlugin:
             result = self._handle.call("extract", {"path": path, "root": str(root)}, timeout=timeout)
         except SubprocessServiceError as exc:
             return self._fail(library_id, path, f"extract-failed: {type(exc).__name__}", content_hash)
+        return self._document(library_id, path, result, content_hash)
 
+    def extract_many(self, library_id: str, paths: list[str], root: Path) -> list[ExtractedDocument]:
+        """几份扫描件一次交给子进程（2026-09-29 操作者确认）：子进程按页数把它们合成一批或几批，
+        显存不够、合批出错就退回一份一份解（见 server.py::_real_ocr_many）。返回与 `paths`
+        一一对应，每一份的成功/失败形状与 `extract` 完全相同——编排层按单份的规矩处理。"""
+        docs: list[ExtractedDocument | None] = [None] * len(paths)
+        hashes: dict[int, str] = {}
+        todo: list[int] = []
+        timeout = 60.0
+        for index, path in enumerate(paths):
+            full_path = root / path
+            if full_path.suffix.lower() != ".pdf":
+                docs[index] = self._fail(library_id, path, "不是PDF，本机OCR跳过")
+                continue
+            try:
+                hashes[index] = _content_hash(full_path.read_bytes())
+            except OSError as exc:
+                docs[index] = self._fail(library_id, path, f"读取失败: {type(exc).__name__}: {exc}")
+                continue
+            todo.append(index)
+            timeout += _mineru_local_timeout(_count_pages(full_path))
+        if todo and not self._ensure_alive():
+            for index in todo:
+                docs[index] = self._fail(library_id, paths[index], "deferred")
+            todo = []
+        if todo:
+            try:
+                result = self._handle.call(
+                    "extract_many",
+                    {"paths": [paths[index] for index in todo], "root": str(root)},
+                    timeout=timeout,
+                )
+                items = result.get("results")
+                if not isinstance(items, list) or len(items) != len(todo):
+                    raise SubprocessServiceError("本机OCR批量结果条数对不上")
+            except SubprocessServiceError as exc:
+                for index in todo:
+                    docs[index] = self._fail(library_id, paths[index], f"extract-failed: {type(exc).__name__}", hashes[index])
+            else:
+                for index, item in zip(todo, items):
+                    docs[index] = self._document(library_id, paths[index], item if isinstance(item, dict) else {}, hashes[index])
+        return [doc if doc is not None else self._fail(library_id, paths[i], "extract-failed") for i, doc in enumerate(docs)]
+
+    def _document(self, library_id: str, path: str, result: dict, content_hash: str) -> ExtractedDocument:
         text = result.get("text")
         if text is None:
             reason = str(result.get("failure_reason") or "本机OCR未返回文本")
-            category = "scanned" if reason.startswith("too-many-pages:") else "extract-failed"
+            # 子进程回的原因带异常类型前缀（"RuntimeError: too-many-pages: ..."），所以查“包含”
+            # 而不是“开头是”：超页上限要落 scanned（诊断页提示拆分），对齐旧项目 extractors.py:602-603。
+            category = "scanned" if "too-many-pages:" in reason else "extract-failed"
             return self._fail(library_id, path, f"{category}:{reason}", content_hash)
         if not text.strip():
             return self._fail(library_id, path, "empty", content_hash)

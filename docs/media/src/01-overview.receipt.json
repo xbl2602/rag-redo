@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "architecture",
+  "input": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\01-overview.architecture.json",
+  "output": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\01-overview.html",
+  "specification": {
+    "sha256": "f4f22634e04e15d2cc5f495d9cc04a7531c86db4ee3af10ae9e32a696a7c552c",
+    "bytes": 4132
+  },
+  "artifact": {
+    "sha256": "e4d0e2d0da5ba79258300bee4d624f54fdb79643da545d0fd28be503b76721bc",
+    "bytes": 805243
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "standard",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

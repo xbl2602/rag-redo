@@ -584,6 +584,38 @@ class TestProgressSnapshot(unittest.TestCase):
                          (False, "idle", "idle", "idle"))
         self.assertIsNone(progress["elapsed"])
 
+    def test_a_broken_vram_probe_never_empties_the_whole_snapshot(self) -> None:
+        """可选能力（页级视觉导航）出问题时，**整帧快照不能跟着废掉**。
+
+        2026-09-29 加显存提示时踩的坑：给 `_heartbeat_note` 补了 `self._vram_note()`
+        调用，却忘了它是 `@staticmethod` —— `self` 在静态方法里不存在，
+        AttributeError 一路冒到 `get_snapshot()` 的兜底，**整帧返回空字典**。
+        表现是 GUI 每秒推一帧、每帧都空：界面全白、`progress` 键都查不到，
+        而 7 个快照用例集体变红，排查时完全看不出是"多了一行 self 调用"。
+
+        快照是 GUI 的心跳，坏一帧的代价远大于少显示一句显存提示——所以这条钉住
+        "取不到就退化，绝不连坐"。
+        """
+        boom = RuntimeError("视觉插件状态取不到")
+
+        def _explode(self, *a, **kw):
+            raise boom
+
+        # 炸在最底下那层（真去调插件的那次调用）：`_wemm_live_cached` 与
+        # `_vram_note` 都要经过它，两条路都得退化，缺一条这条用例就红。
+        with patch.object(self.env.pipeline, "visual_status", _explode):
+            snap = self._snapshot_with(self._status())
+
+        self.assertIn("progress", snap, "一个可选能力出错就把整帧快照搞空了")
+        self.assertTrue(snap["progress"]["running"])
+        # 退化时不能编数字给用户看：显存提示消失，退回普通的阶段文案
+        # （`heartbeat_note` 契约是"提示文案"，不是"必须非空"，所以这里断言它不含
+        #  显存字样即可——文案本身由阶段决定，不该被这条用例钉死）。
+        note = snap["progress"]["heartbeat_note"]
+        self.assertNotIn("显存", note or "")
+        # 看图服务那一项也要是"没活着"字面量，而不是让上层去解析一个异常
+        self.assertEqual(snap["wemm_live"]["alive"], False)
+
     def test_running_maps_core_status_into_the_legacy_shape(self) -> None:
         snap = self._snapshot_with(self._status())
         progress = snap["progress"]

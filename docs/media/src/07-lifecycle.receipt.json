@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "lifecycle",
+  "input": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\07-lifecycle.lifecycle.json",
+  "output": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\07-lifecycle.html",
+  "specification": {
+    "sha256": "5ef444593ff431396c2370f3f9a968dcccec74fb3e7e95fd732a874813327c02",
+    "bytes": 3719
+  },
+  "artifact": {
+    "sha256": "1bb6ecf834cedc525510a20ec089c6ded8d1aa086784210ac5a22b504faed5a2",
+    "bytes": 804709
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "standard",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

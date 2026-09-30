@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 
 from . import paths
+from .conversion_cache import format_round_summary, human_bytes, needs_attention, pages_summary, reason_text
 from .runtime import PluginRuntime
 from .singleton import FileByteLock, ProcessSingletonGuard
 
@@ -82,7 +83,12 @@ _VISUAL_COMMANDS = frozenset({"index", "export", "import"})
 #: 不需要页级视觉的命令（`libraries` / `dedup`）启用的插件集。
 REQUIRED_PLUGINS = [p for p in BUSINESS_PLUGINS if p not in _VISUAL_PLUGIN_IDS]
 
-_BUSINESS_COMMANDS = {"index", "libraries", "export", "import", "dedup"}
+_BUSINESS_COMMANDS = {"index", "libraries", "export", "import", "dedup", "caches"}
+
+#: 只**加载**、不启用的插件（按命令）。`caches` 要读页库每个 PDF 建了几页，但它是只读诊断：
+#: 页库插件一启用就会抢显卡名额、拉起看图服务（显存敏感，每 MB 都算）。只加载时它只打开
+#: 自己的状态文件和数据库，不碰显卡（BC-19）。
+_LOAD_ONLY_PLUGINS: dict[str, tuple[str, ...]] = {"caches": ("official-visual-wemm",)}
 
 
 def _plugins_for(command: str) -> list[str]:
@@ -140,6 +146,10 @@ def _boot_pipeline(args: argparse.Namespace):
         state = runtime.plugins[plugin_id]
         if state.state.value == "failed":
             print(f"警告：插件 {plugin_id} 启用失败: {state.error}", file=sys.stderr)
+    for plugin_id in _LOAD_ONLY_PLUGINS.get(args.command, ()):
+        plugin = runtime.plugins.get(plugin_id)
+        if plugin is not None and plugin.state.value == "discovered":
+            runtime.load(plugin_id)
     from .pipeline import Pipeline
 
     return runtime, Pipeline(runtime)
@@ -417,6 +427,8 @@ def _dispatch_business(args: argparse.Namespace, pipeline) -> int:
             f" / 删除 {report.removed} / 重试 {report.retried}"
         )
         print(f"  成功 {report.succeeded} / 失败 {report.failed} / 延后 {report.deferred}")
+        if getattr(report, "conversion", None) is not None:
+            print(f"  {format_round_summary(report.conversion)}")
         for file_report in report.files:
             if file_report.extract_failure:
                 print(f"  ✗ {file_report.path}: {file_report.extract_failure}")
@@ -443,6 +455,9 @@ def _dispatch_business(args: argparse.Namespace, pipeline) -> int:
         print(f"已导入为新库：{new_id}（root={args.root}）")
         return 0
 
+    if args.command == "caches":
+        return _print_conversion_caches(pipeline, lib_mgr, args)
+
     if args.command == "dedup":
         groups = pipeline.find_duplicates(args.library, threshold=args.threshold)
         clusters = [g for groups in groups.values() for g in groups]
@@ -454,6 +469,52 @@ def _dispatch_business(args: argparse.Namespace, pipeline) -> int:
             print(f"  · {'  ≈  '.join(group)}")
         return 0
 
+    return 0
+
+
+def _print_conversion_caches(pipeline, lib_mgr, args: argparse.Namespace) -> int:
+    """`caches`：每个库的转换缓存清单（BC-19）。只读：不转换、不加载模型、不拉起页库服务。"""
+    if args.library and lib_mgr.store.get(args.library) is None:
+        print(f"错误：未知库 {args.library}（库列表见 libraries list）", file=sys.stderr)
+        return 1
+    for report in pipeline.conversion_caches(args.library or "all"):
+        print(f"[{report.name}] {report.library_id}")
+        if report.error:
+            print(f"  {report.error}")
+            continue
+        print(
+            f"  转文字：{report.text_done}/{report.text_total} 份已转好，共 {human_bytes(report.text_bytes)}"
+            f"  → {report.text_dir}"
+        )
+        print(f"  目录文件：{report.catalog_file}")
+        if report.pages_enabled:
+            where = f"  → {report.pages_dir}" if report.pages_dir else ""
+            print(
+                f"  页库：{report.pages_done}/{report.pdf_total} 份 PDF 已建，共 {report.page_vectors} 页，"
+                f"约 {human_bytes(report.page_bytes_estimate)}{where}"
+            )
+        else:
+            print("  页库：没开")
+        shown = [item for item in report.files if args.all_files or needs_attention(item)]
+        if not shown:
+            print("  （没有缺的）" if not args.all_files else "  （这个库里没有需要转换的文件）")
+        for item in shown:
+            if item.text_state == "done":
+                route = item.text_route_name or item.text_route or ""
+                text = f"转文字 {route} · {human_bytes(item.text_bytes)}"
+            else:
+                label, step = reason_text(item.text_reason)
+                text = f"转文字：{label}（{step}）"
+            if item.pages_state in {"n/a", "off"}:
+                pages = ""  # 不是 PDF，或页库没开（上面那行已经说了）
+            elif item.pages_state == "done":
+                pages = f" | 页库 {pages_summary(item)}"
+            else:
+                pages = f" | 页库：{reason_text(item.pages_reason)[0]}"
+                if item.pages:
+                    pages += f"（已有 {pages_summary(item)}）"
+            mark = "!" if needs_attention(item) else "✓"
+            print(f"  {mark} {item.path}  {text}{pages}")
     return 0
 
 
@@ -523,6 +584,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_import.add_argument("archive", help="导出归档路径")
     p_import.add_argument("--root", required=True, help="新库的笔记目录")
     p_import.add_argument("--library-id", default="", help="新库 id（缺省取归档内记录）")
+
+    p_caches = sub.add_parser(
+        "caches", help="转换缓存清单：PDF/Word 转文字了没有、页库建了没有、存在哪、多大（只读，不占显卡）"
+    )
+    p_caches.add_argument("--library", default="", help="只看这个库（缺省看全部库）")
+    p_caches.add_argument("--all-files", action="store_true", help="逐个列出全部需要转换的文件（缺省只列缺的）")
 
     p_dedup = sub.add_parser("dedup", help="近似重复检测（只读建议，对齐旧 dedup.py CLI）")
     p_dedup.add_argument("--library", required=True)

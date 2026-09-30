@@ -148,5 +148,179 @@ class TestChunkDocument(unittest.TestCase):
         self.assertEqual(chunk_document(""), [])
 
 
+def _filler(chars: int, tag: str = "填充") -> str:
+    """约 chars 个字的一段话，由若干完整的句子组成（每句以 。 结尾，句子内容各不相同）。"""
+    out: list[str] = []
+    i = 0
+    while sum(len(s) for s in out) < chars:
+        out.append(f"这是{tag}第{i}句。")
+        i += 1
+    return "".join(out)
+
+
+class TestDisplayFormulaIsNeverCut(unittest.TestCase):
+    """BC-07（2026-09-30 操作者批准）：`$$…$$` 公式块与表格一样"宁大勿断"。
+
+    起因：本机 MinerU 识别结果的体检里，有 32 块只含半个公式（开头的 `$$` 与结尾的 `$$` 被切进了
+    不同的块）——公式里的空行会被当成段落边界，超长公式又会被句子切分器在 `. ` 处切断。
+    """
+
+    def test_blank_line_inside_a_formula_does_not_split_it(self):
+        formula = "$$\na = b\n\nc = d\n$$"
+        text = f"# 节\n\n{_filler(300)}\n\n{formula}\n\n{_filler(300, '后文')}"
+        pieces = chunk_document(text, max_chars=200)
+        holders = [p for p in pieces if "a = b" in p.text]
+        self.assertEqual(len(holders), 1)
+        self.assertIn("c = d", holders[0].text, "公式中间的空行不能把它切成两块")
+
+    def test_a_huge_formula_full_of_sentence_endings_stays_whole(self):
+        formula = "$$" + " x. 1" * 400 + "$$"  # 每个 ". 1" 都像句界
+        text = f"# 节\n\n{_filler(300)}\n\n{formula}\n\n{_filler(300, '后文')}"
+        pieces = chunk_document(text, max_chars=200)
+        self.assertEqual(sum(1 for p in pieces if formula in p.text), 1, "超长公式必须整块保留")
+
+    def test_a_hash_line_inside_a_formula_is_not_a_heading(self):
+        text = f"# 节\n\n$$\n# 不是标题\nx = 1\n$$\n\n{_filler(300)}"
+        pieces = chunk_document(text, max_chars=200)
+        self.assertEqual({p.heading_breadcrumb for p in pieces}, {"节"})
+
+    def test_an_unmatched_double_dollar_does_not_swallow_the_rest(self):
+        paragraphs = [f"$$ 没有配对的标记，{_filler(100, '首段')}"] + [
+            _filler(150, f"第{i}段") for i in range(5)
+        ]
+        pieces = chunk_document("# 节\n\n" + "\n\n".join(paragraphs), max_chars=200)
+        last = next(p for p in pieces if "第4段" in p.text)
+        self.assertNotIn("没有配对", last.text, "找不到结尾 $$ 时当普通段落，不能把后文吞进去")
+        self.assertGreater(len(pieces), 3)
+
+
+class TestFormulaGetsItsContext(unittest.TestCase):
+    """公式块不再单独成块：并到前面的引出句和后面的"式中…"说明（参考 RAGFlow 把上下文窗口并进
+    表格/图片块、Docling 把标题与图注拼进嵌入文本的做法；不用大模型）。"""
+
+    def _piece_with(self, pieces, needle):
+        found = [p for p in pieces if needle in p.text]
+        self.assertEqual(len(found), 1, f"{needle!r} 应恰好出现在一块里：{[p.text[:30] for p in pieces]}")
+        return found[0]
+
+    def test_formula_carries_the_sentence_that_introduces_it(self):
+        text = f"# 节\n\n{_filler(300)}\n\n由式(3)得：\n\n$$\nx = y\n$$\n\n{_filler(300, '后文')}"
+        piece = self._piece_with(chunk_document(text, max_chars=200), "x = y")
+        self.assertIn("由式(3)得", piece.text)
+
+    def test_formula_carries_the_where_clause_after_it(self):
+        text = f"# 节\n\n{_filler(300)}\n\n$$\nx = y\n$$\n\n式中 x 为位移，y 为速度。\n\n{_filler(300, '后文')}"
+        piece = self._piece_with(chunk_document(text, max_chars=200), "x = y")
+        self.assertIn("式中 x 为位移", piece.text)
+
+    def test_a_short_line_after_a_formula_goes_with_it(self):
+        text = f"# 节\n\n{_filler(300)}\n\n$$\nx = y\n$$\n\n(7 marks)\n\n{_filler(300, '后文')}"
+        piece = self._piece_with(chunk_document(text, max_chars=200), "x = y")
+        self.assertIn("(7 marks)", piece.text)
+
+    def test_a_long_unrelated_paragraph_after_a_formula_is_not_pulled_in(self):
+        after = _filler(150, "无关")
+        text = f"# 节\n\n{_filler(300)}\n\n$$\nx = y\n$$\n\n{after}\n\n{_filler(300, '后文')}"
+        piece = self._piece_with(chunk_document(text, max_chars=200), "x = y")
+        self.assertNotIn("无关", piece.text)
+
+    def test_consecutive_formulas_stay_together_with_their_introduction(self):
+        text = (
+            f"# 节\n\n{_filler(300)}\n\n推导如下：\n\n$$\na = 1\n$$\n\n$$\nb = 2\n$$\n\n$$\nc = 3\n$$"
+            f"\n\n{_filler(300, '后文')}"
+        )
+        piece = self._piece_with(chunk_document(text, max_chars=200), "a = 1")
+        for needle in ("推导如下", "b = 2", "c = 3"):
+            self.assertIn(needle, piece.text)
+
+    def test_a_long_derivation_chain_is_capped(self):
+        formulas = "\n\n".join(f"$$\nterm{i} = {'x' * 90}\n$$" for i in range(30))
+        text = f"# 节\n\n{_filler(300)}\n\n{formulas}"
+        pieces = chunk_document(text, max_chars=200)
+        self.assertGreater(len(pieces), 3)
+        self.assertLessEqual(max(len(p.text) for p in pieces), 2 * 200, "推导链最多拼到 2×上限")
+
+    def test_no_chunk_is_a_bare_formula_when_an_introduction_exists(self):
+        parts = []
+        for i in range(6):
+            parts.append(f"{_filler(120, f'引出{i}')}\n\n$$\ny{i} = f(x{i})\n$$")
+        pieces = chunk_document("# 节\n\n" + "\n\n".join(parts), max_chars=200)
+        for p in pieces:
+            self.assertFalse(p.text.strip().startswith("$$"), f"出现了没有上文的孤立公式块：{p.text[:40]!r}")
+
+    def test_a_long_introduction_only_lends_its_last_sentences(self):
+        intro = "".join(f"这是引出第{i}句。" for i in range(40))  # 远超 max_chars
+        text = f"# 节\n\n{intro}\n\n$$\nx = y\n$$"
+        pieces = chunk_document(text, max_chars=200)
+        piece = next(p for p in pieces if "x = y" in p.text)
+        self.assertIn("这是引出第39句。", piece.text, "公式要带着紧挨它的那一句")
+        self.assertNotIn("这是引出第0句。", piece.text, "整段超长的上文不能全拖进公式块")
+        self.assertLess(len(piece.text), 2 * 200)
+
+    def test_a_formula_right_after_a_table_is_taken_as_the_table_tail(self):
+        table = "\n".join(f"| 行{i} | 值{i} |" for i in range(6))
+        text = f"# 节\n\n{_filler(300)}\n\n{table}\n\n$$\nq = m c T\n$$\n\n{_filler(300, '后文')}"
+        piece = next(p for p in chunk_document(text, max_chars=200) if "| 行0 |" in p.text)
+        self.assertIn("q = m c T", piece.text)
+
+
+class TestSmallParagraphsArePacked(unittest.TestCase):
+    """BC-07（2026-09-30 操作者批准）：同一节里的碎小段落合并到接近上限再成块（参考 Docling 的
+    merge_peers、Unstructured 的 combine_text_under_n_chars）。此前章节一长，每个自然段各自成块，
+    "Figure 2"、页眉、孤立的一行字都成了单独的块（体检：短于 30 字的块占 21%）。"""
+
+    def test_small_paragraphs_in_a_long_section_share_chunks(self):
+        paragraphs = [f"第{i}段，很短。" for i in range(20)]
+        pieces = chunk_document("# 节\n\n" + "\n\n".join(paragraphs), max_chars=100)
+        self.assertLessEqual(len(pieces), 4, [p.text for p in pieces])
+        # 有一侧是碎小段时允许略超上限（×1.25），免得在上限边缘留下孤零零的碎块
+        self.assertLessEqual(max(len(p.text) for p in pieces), 125)
+
+    def test_paragraph_order_is_preserved_after_packing(self):
+        paragraphs = [f"第{i:02d}段，很短。" for i in range(20)]
+        pieces = chunk_document("# 节\n\n" + "\n\n".join(paragraphs), max_chars=100)
+        joined = "\n\n".join(p.text for p in pieces)
+        self.assertEqual([m for m in paragraphs if m in joined], paragraphs)
+        self.assertEqual(joined.replace("\n\n", ""), "".join(paragraphs))
+
+    def test_a_tiny_caption_joins_a_neighbour_instead_of_standing_alone(self):
+        text = f"# 节\n\n{_filler(90, '甲')}\n\nFigure 2\n\n{_filler(90, '乙')}\n\n{_filler(90, '丙')}"
+        pieces = chunk_document(text, max_chars=120)
+        self.assertNotIn("Figure 2", [p.text.strip() for p in pieces])
+        self.assertTrue(any("Figure 2" in p.text and len(p.text) > 30 for p in pieces))
+
+    def test_packed_chunks_stay_close_to_the_limit(self):
+        paragraphs = [_filler(45, f"段{i}") for i in range(30)]
+        pieces = chunk_document("# 节\n\n" + "\n\n".join(paragraphs), max_chars=200)
+        self.assertLessEqual(max(len(p.text) for p in pieces), int(200 * 1.25))
+        self.assertLess(len(pieces), 15, "30 个 45 字的段落应被合并成一半以下的块数")
+
+    def test_packing_never_crosses_a_section_boundary(self):
+        text = (
+            "# 甲\n\n" + "\n\n".join(f"甲{i}段，很短。" for i in range(15))
+            + "\n\n# 乙\n\n" + "\n\n".join(f"乙{i}段，很短。" for i in range(15))
+        )
+        for piece in chunk_document(text, max_chars=60):
+            self.assertFalse("甲" in piece.text and "乙" in piece.text, piece.text)
+
+    def test_a_short_section_is_still_one_chunk(self):
+        pieces = chunk_document("# 节\n\n" + "\n\n".join(f"第{i}段。" for i in range(5)), max_chars=800)
+        self.assertEqual(len(pieces), 1)
+
+    def test_table_and_list_rules_still_hold_after_packing(self):
+        table = "\n".join(f"| 行{i} | 值{i} |" for i in range(10))
+        items = "\n".join(f"- 列表项第{i}条，带一点内容。" for i in range(10))
+        text = f"# 节\n\n导语一句。\n\n{table}\n\n表后一句。\n\n{items}\n\n结尾一句。"
+        pieces = chunk_document(text, max_chars=80)
+        holder = next(p for p in pieces if "| 行0 |" in p.text)
+        self.assertEqual(holder.text.count("| 行"), 10, "表格仍然整张不切")
+        self.assertIn("导语一句", holder.text)
+        self.assertIn("表后一句", holder.text)
+        for p in pieces:
+            for line in p.text.splitlines():
+                if line.startswith("-"):
+                    self.assertTrue(line.endswith("。"), f"列表项被拦腰切断：{line!r}")
+
+
 if __name__ == "__main__":
     unittest.main()

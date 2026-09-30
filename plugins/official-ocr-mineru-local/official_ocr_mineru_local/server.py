@@ -3,7 +3,8 @@
 
 真正解析走 MinerU 官方 `mineru.cli.api_client.ReusableLocalAPIServer`（和
 `mineru-api` 命令背后是同一套东西）——本服务只是一层"壳"：绑端口、做单次
-串行调度（8GB卡一次只解一份，叠加会爆显存）、管这个内服务自己的懒加载/
+串行调度（8GB卡一次只跑一个请求，叠加会爆显存；2026-09-29 起一个请求可以是
+几份小扫描件合成的一批，上限与显存把关见 `_real_ocr_many`）、管这个内服务自己的懒加载/
 两级空闲释放/`/evict` 软驱逐，真正的PDF解析逻辑完全在 MinerU 官方代码里，
 这里不重新实现。第一个请求才懒拉起内服务，空闲自动停掉释放显存，壳进程
 自己超时也退出——8GB 卡上与 WEMM/bge-m3 错峰，绝不共存。行为对齐旧项目
@@ -70,6 +71,16 @@ MINERU_VRAM_WAIT_SECONDS = 300.0
 MINERU_UNLOAD_AFTER_SECONDS = 300  # 空闲卸载内服务（保留壳进程释放显存），0=不自动卸载
 MINERU_IDLE_EXIT_SECONDS = 1800  # 内服务已停后再空闲这么久，壳进程自退出，0=常驻不退出
 MINERU_MAX_PAGES = 200  # 单文件页数上限，超限直接拒收提示人工拆分——串行锁下大文件会卡死整轮
+# ---- 合批（2026-09-29 操作者确认“尝试，但务必做好显存管理”）----------------------------
+# 实测（本机 8GB 卡、pipeline 后端、8 份小扫描件共 60 页）：一份一份送 68.8 秒，合成一批
+# 33.5～40.5 秒；显卡平均占用 17% → 25～29%；整卡显存峰值 4.70GB → 4.77～4.97GB。
+# 显存为什么只多一点：MinerU 每次交给显卡的量（batch ratio）按显卡**总**显存定档，与一次送
+# 几份无关；多份文件的页面按“处理窗口”（MINERU_PROCESSING_WINDOW_SIZE，默认 64 页）凑批。
+# 这里把每批上限卡在一个窗口以内，一批占用的内存就与今天单送一份 64 页文件相同。
+MINERU_BATCH_MAX_FILES = 8  # 一批最多几份（--batch-files；1 = 不合批，回到一份一份送）
+MINERU_BATCH_MAX_PAGES = 64  # 一批最多几页（--batch-pages）：不超过 MinerU 的一个处理窗口
+MINERU_BATCH_MIN_FREE_VRAM_GB = 1.0  # 模型装好后显卡至少还空着这么多，才合批（实测合批比单份多用 0.1～0.3GB）
+_batch_off_reason: "str | None" = None  # 合批时出过显存不足：本进程余下时间只一份一份解
 
 _api_server = None  # mineru.cli.api_client.ReusableLocalAPIServer 实例，懒建（见 _get_api_server）
 _API_LOCK = threading.Lock()  # 串行锁：一次只解一份，防止显存叠加
@@ -82,7 +93,19 @@ _vram_cache: tuple[float | None, float] = (None, 0.0)
 
 def _vram_free_gb(max_age: float = 5.0):
     """当前空闲显存（GB），探测失败返回 None（fail-open）——
-    core/gpu_arbiter.py::vram_free_gb 的自包含副本，见模块 docstring。"""
+    core/gpu_arbiter.py::vram_free_gb 的自包含副本，见模块 docstring。
+
+    **torch 优先、nvidia-smi 兜底**（与 official-visual-wemm/server.py 和旧项目
+    `obsidian-rag/gpu_arbiter.py::vram_free_gb` 同款）。不要改成 nvidia-smi 优先：
+    2026-09-29 本机实测两者相差约 5.2 GiB（RTX 5060 Laptop，总 8151 MiB）——
+    torch 报空闲 6.878 GiB，nvidia-smi 报 1.681 GiB。WDDM 笔记本上 nvidia-smi 把大量
+    系统内存计入显存占用，读数严重偏低；拿它当唯一判据会让 `_wait_for_vram(4.5)`
+    间歇性"等不到显存"，表现为扫描件偶发转写失败。
+
+    代价是壳进程调一次 `torch.cuda.mem_get_info()` 会建起自己的 CUDA 上下文、常驻约
+    85MB（本机实测）。这 1% 的占用换来读数准确，值得；而且那 85MB 会被算进"已用"，
+    读数因此略偏保守——保守方向对显存闸门是安全的。`_vram_cache` 限定 5s 内复用，
+    不必反复建上下文。"""
     global _vram_cache
     now = time.time()
     if _vram_cache[1] and now - _vram_cache[1] < max_age:
@@ -111,8 +134,7 @@ def _vram_free_gb(max_age: float = 5.0):
             if nums:
                 val = nums[0] / 1024.0
         except Exception:
-            _vram_cache = (None, now)
-            return None
+            val = None
     _vram_cache = (val, now)
     return val
 
@@ -121,23 +143,21 @@ _vram_refreshing = threading.Lock()
 
 
 def _vram_snapshot() -> float:
-    """给 /health 用的显存快照（GB）：**只读缓存，绝不在请求线程里做探测**。
+    """给 /health 用的显存快读（GB）——**只读缓存，绝不在这里触发探测**。
 
-    2026-09-29 真机排查：本服务原先在 /health 里直接调 `_vram_free_gb()`，第一次调用要
-    在请求线程里 `import torch` 并初始化 CUDA；宿主机 CPU 被打满时这一步能拖过宿主的
-    10 秒启动预算，表现为“启用失败：子进程 10.0s 内没有通过 health_check”，本机 OCR 于是
-    整轮不可用、扫描件全被延后。旧项目 obsidian-rag/mineru_server.py 的 /health 是多线程
-    应答且不做重活；这里对齐：探测放到后台线程刷新，/health 立刻回上次的值（还没测过
-    就回 0.0——与旧探测失败时的 fail-open 口径一致）。"""
-    value, stamp = _vram_cache
-    if (not stamp or time.time() - stamp >= 5.0) and _vram_refreshing.acquire(blocking=False):
-        def _refresh() -> None:
-            try:
-                _vram_free_gb(max_age=0.0)
-            finally:
-                _vram_refreshing.release()
+    2026-09-29 真机两轮：①本服务原先在 /health 里现场调 `_vram_free_gb()`，第一次调用
+    要在请求线程里 `import torch` 并初始化 CUDA；宿主机 CPU 负载高时超出宿主 10 秒启动
+    预算，表现为"启用失败"、扫描件整轮延后。②改成后台线程探测后，/health 快了，但
+    **壳进程在启动时就建起自己的 CUDA 上下文并常驻**——它只负责调度调度和显示一个数字，
+    却实打实占着显存，把真正要装 5GB 模型的 WEMM 挤到门槛外（真机实测：GUI 与索引
+    worker 各起一个本服务，两份上下文加起来约 1.4GB，WEMM 卡在
+    「空闲显存 5.5GB < 需求 5.5GB」）。
 
-        threading.Thread(target=_refresh, daemon=True, name="mineru-vram-probe").start()
+    现在：**只有真要装模型时（`_wait_for_vram`）才探测**，那时 CUDA 上下文本来就必须有。
+    探测走 torch（读数准，见 `_vram_free_gb` 的 docstring）。还没探测过就回 0.0——
+    与真探测失败时的 fail-open 口径一致，也对齐旧项目 `obsidian-rag/mineru_server.py`
+    的 /health「多线程应答」而不做重活。"""
+    value, _stamp = _vram_cache
     return float(value or 0.0)
 
 
@@ -385,25 +405,47 @@ def _mineru_local_timeout(pages) -> float:
     return 300.0 + 30.0 * max(0, n)
 
 
-def _multipart_body(pdf_path, fields):
-    """手拼 multipart/form-data（只用标准库，不耦合 httpx 版本）。"""
+_PARSE_FIELDS = {
+    "backend": "pipeline",
+    "parse_method": "auto",
+    "lang_list": "ch",
+    "formula_enable": "true",
+    "table_enable": "true",
+    "return_md": "true",
+    "response_format_zip": "false",
+    "return_middle_json": "false",
+    "return_model_output": "false",
+    "return_content_list": "false",
+    "return_images": "false",
+}
+
+
+def _multipart_body(pdf_paths, fields, upload_names=None):
+    """手拼 multipart/form-data（只用标准库，不耦合 httpx 版本）。一次可带多份 PDF：
+    MinerU 的 /file_parse 按上传文件名（去扩展名）分别返回结果，所以合批时用
+    `upload_names` 给每份起不重名的名字（doc0.pdf、doc1.pdf……），免得两份同名文件的
+    结果互相覆盖。"""
+    if isinstance(pdf_paths, (str, os.PathLike)):
+        pdf_paths = [pdf_paths]
+    names = list(upload_names) if upload_names else [os.path.basename(p) for p in pdf_paths]
     boundary = "----mineruLocal%s" % int(time.time() * 1000)
-    fname = os.path.basename(pdf_path)
-    with open(pdf_path, "rb") as f:
-        data = f.read()
     parts = []
     for k, v in fields.items():
         parts.append(
             ("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" % (boundary, k, v)).encode("utf-8")
         )
-    parts.append(
-        (
-            "--%s\r\nContent-Disposition: form-data; name=\"files\"; "
-            "filename=\"%s\"\r\nContent-Type: application/pdf\r\n\r\n" % (boundary, fname)
-        ).encode("utf-8")
-    )
-    parts.append(data)
-    parts.append(("\r\n--%s--\r\n" % boundary).encode("utf-8"))
+    for pdf_path, fname in zip(pdf_paths, names):
+        with open(pdf_path, "rb") as f:
+            data = f.read()
+        parts.append(
+            (
+                "--%s\r\nContent-Disposition: form-data; name=\"files\"; "
+                "filename=\"%s\"\r\nContent-Type: application/pdf\r\n\r\n" % (boundary, fname)
+            ).encode("utf-8")
+        )
+        parts.append(data)
+        parts.append(b"\r\n")
+    parts.append(("--%s--\r\n" % boundary).encode("utf-8"))
     return b"".join(parts), boundary
 
 
@@ -437,26 +479,10 @@ def _extract_md(payload) -> "str | None":
     return None
 
 
-def _do_parse(pdf_path, timeout_s) -> "tuple[str | None, str | None]":
-    """解析一份 PDF → (md|None, 短码错误|None)。调用方须已持有 _API_LOCK
-    （串行锁，8GB卡一次只解一份，防显存叠加）。"""
-    global _last_use
-    t0 = time.time()
+def _post_file_parse(pdf_paths, timeout_s, upload_names=None) -> "tuple[dict | None, str | None]":
+    """把一份或几份 PDF 交给内服务 /file_parse，返回（响应 JSON，短码错误）。"""
     base_url = _ensure_inner()
-    fields = {
-        "backend": "pipeline",
-        "parse_method": "auto",
-        "lang_list": "ch",
-        "formula_enable": "true",
-        "table_enable": "true",
-        "return_md": "true",
-        "response_format_zip": "false",
-        "return_middle_json": "false",
-        "return_model_output": "false",
-        "return_content_list": "false",
-        "return_images": "false",
-    }
-    body, boundary = _multipart_body(pdf_path, fields)
+    body, boundary = _multipart_body(pdf_paths, _PARSE_FIELDS, upload_names)
     req = urllib.request.Request(
         base_url.rstrip("/") + "/file_parse",
         data=body,
@@ -466,16 +492,33 @@ def _do_parse(pdf_path, timeout_s) -> "tuple[str | None, str | None]":
         with urllib.request.urlopen(req, timeout=timeout_s) as r:
             status = r.status
             raw = r.read()
+    except urllib.error.HTTPError as e:
+        # 4xx/5xx 在 urllib 里是异常：把内服务回的错误摘要带出来（显存不足要靠它认出来）
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            detail = ""
+        if e.code == 409:
+            return None, "parse-failed: 内服务解析失败（文件损坏或版面异常）"
+        return None, f"inner-error: HTTP {e.code} {detail}".rstrip()
     except Exception as e:
         return None, f"inner-error: {type(e).__name__}（内服务调用失败）"
-    if status == 409:
-        return None, "parse-failed: 内服务解析失败（文件损坏或版面异常）"
     if status != 200:
         return None, f"inner-error: HTTP {status}"
     try:
-        payload = json.loads(raw.decode("utf-8"))
+        return json.loads(raw.decode("utf-8")), None
     except Exception:
         return None, "inner-error: 内服务返回非 JSON"
+
+
+def _do_parse(pdf_path, timeout_s) -> "tuple[str | None, str | None]":
+    """解析一份 PDF → (md|None, 短码错误|None)。调用方须已持有 _API_LOCK
+    （串行锁，8GB卡一次只解一个请求，防显存叠加）。"""
+    global _last_use
+    t0 = time.time()
+    payload, err = _post_file_parse(pdf_path, timeout_s)
+    if err is not None:
+        return None, err
     md = _extract_md(payload)
     if not md:
         return None, "empty-result: 内服务成功但无正文（图片页无字或全空页）"
@@ -483,6 +526,81 @@ def _do_parse(pdf_path, timeout_s) -> "tuple[str | None, str | None]":
     print(f"[mineru-local] 解析成功：{Path(pdf_path).name}（{secs}s）", file=sys.stderr)
     _last_use = time.time()
     return md, None
+
+
+def _do_parse_many(pdf_paths, timeout_s) -> "tuple[list | None, str | None]":
+    """几份 PDF 合成一个请求 → (每份的 md 或 None, 整批的短码错误)。调用方须已持有 _API_LOCK。
+    某一份没出正文只把那一份记成 None（由调用方单独再解一次），不连累同批其他份。"""
+    global _last_use
+    t0 = time.time()
+    names = ["doc%d.pdf" % i for i in range(len(pdf_paths))]
+    payload, err = _post_file_parse(pdf_paths, timeout_s, names)
+    if err is not None:
+        return None, err
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, dict):
+        return None, "inner-error: 合批响应里没有 results"
+    mds = []
+    for name in names:
+        entry = results.get(name[: -len(".pdf")])
+        md = entry.get("md_content") if isinstance(entry, dict) else None
+        mds.append(md if isinstance(md, str) and md.strip() else None)
+    secs = round(time.time() - t0, 1)
+    print(
+        f"[mineru-local] 合批解析完成：{len(pdf_paths)} 份，出正文 {sum(1 for m in mds if m)} 份（{secs}s）："
+        + "、".join(Path(p).name for p in pdf_paths),
+        file=sys.stderr,
+    )
+    _last_use = time.time()
+    return mds, None
+
+
+def _plan_batches(page_counts, *, max_files: int, max_pages: int) -> "list[list[int]]":
+    """按原顺序把文件分组（返回下标）：每组不超过 `max_files` 份、页数合计不超过 `max_pages`。
+    页数未知或单份就超过上限的文件单独一组（和今天一样一份一份送）。"""
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_pages = 0
+    for index, pages in enumerate(page_counts):
+        if max_files <= 1 or pages is None or pages > max_pages:
+            if current:
+                groups.append(current)
+                current, current_pages = [], 0
+            groups.append([index])
+            continue
+        if current and (len(current) >= max_files or current_pages + pages > max_pages):
+            groups.append(current)
+            current, current_pages = [], 0
+        current.append(index)
+        current_pages += pages
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _batch_allowed() -> bool:
+    """这一批能不能合着送。调用方须已持有 _API_LOCK；这里先确保内服务（模型）已经装好，
+    这样看到的是“模型装好之后还剩多少显存”，不是装之前的虚高值。"""
+    if MINERU_BATCH_MAX_FILES <= 1 or _batch_off_reason:
+        return False
+    _ensure_inner()
+    free = _vram_free_gb(max_age=0.0)
+    if free is not None and free < MINERU_BATCH_MIN_FREE_VRAM_GB:
+        print(
+            f"[mineru-local] 空闲显存 {free:.1f}GB < {MINERU_BATCH_MIN_FREE_VRAM_GB:.1f}GB，这一批改为一份一份解",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _note_batch_failure(err: str) -> None:
+    """合批失败都会退回一份一份解；如果是显存不足，本进程余下时间干脆不再合批。"""
+    global _batch_off_reason
+    print(f"[mineru-local] 合批失败，退回一份一份解：{err}", file=sys.stderr)
+    if "out of memory" in err.lower():
+        _batch_off_reason = err
+        print("[mineru-local] 合批时显存不足 -> 本服务余下时间只一份一份解", file=sys.stderr)
 
 
 def _real_ocr(full_path: Path) -> str:
@@ -502,6 +620,64 @@ def _real_ocr(full_path: Path) -> str:
     if md is None:
         raise RuntimeError(err or "unknown")
     return md
+
+
+def _real_ocr_many(full_paths: "list[Path]") -> "list[tuple[str | None, str | None]]":
+    """几份 PDF 一起解 → 每份（md 或 None，失败原因或 None），顺序与输入一致。
+
+    显存管理（操作者 2026-09-29 的硬要求）：①每批不超过 MINERU_BATCH_MAX_FILES 份、
+    MINERU_BATCH_MAX_PAGES 页（一个 MinerU 处理窗口）；②仍然一次只跑一个请求（_API_LOCK），
+    模型装载前照旧等空闲显存 ≥ MINERU_MIN_VRAM_GB；③模型装好后空闲显存不足
+    MINERU_BATCH_MIN_FREE_VRAM_GB 就不合批；④合批出任何错都把这一批退回一份一份解，
+    是显存不足则本进程余下时间不再合批；⑤合批里某一份没出正文，只把那一份单独再解一次。"""
+    global _active_requests
+    outcomes: "list[tuple[str | None, str | None] | None]" = [None] * len(full_paths)
+    page_counts: "list[int | None]" = []
+    for index, full_path in enumerate(full_paths):
+        pages = _count_pages(full_path)
+        page_counts.append(pages)
+        if pages is not None and pages > MINERU_MAX_PAGES:
+            outcomes[index] = (
+                None,
+                f"too-many-pages: {pages} 页超过上限 {MINERU_MAX_PAGES} 页，请人工拆分后重建（串行锁下大文件会卡死整轮）",
+            )
+        elif pages is not None and pages <= 0:
+            outcomes[index] = (None, "empty-pdf: 无有效页面")
+    todo = [index for index in range(len(full_paths)) if outcomes[index] is None]
+    groups = _plan_batches(
+        [page_counts[index] for index in todo],
+        max_files=MINERU_BATCH_MAX_FILES,
+        max_pages=MINERU_BATCH_MAX_PAGES,
+    )
+    _active_requests += 1
+    try:
+        for group in groups:
+            members = [todo[position] for position in group]
+            if len(members) > 1:
+                try:
+                    with _API_LOCK:
+                        if _batch_allowed():
+                            timeout = sum(_mineru_local_timeout(page_counts[index]) for index in members)
+                            mds, err = _do_parse_many([full_paths[index] for index in members], timeout)
+                            if err is not None:
+                                _note_batch_failure(err)
+                            else:
+                                for index, md in zip(members, mds):
+                                    if md:
+                                        outcomes[index] = (md, None)
+                except Exception as exc:  # noqa: BLE001 - 合批这一步出任何错都退回单份，不连累整批
+                    _note_batch_failure(f"{type(exc).__name__}: {exc}")
+            for index in members:
+                if outcomes[index] is not None:
+                    continue
+                try:
+                    with _API_LOCK:
+                        outcomes[index] = _do_parse(full_paths[index], _mineru_local_timeout(page_counts[index]))
+                except Exception as exc:  # noqa: BLE001 - 单份失败折叠成这一份的原因，别的份照常
+                    outcomes[index] = (None, str(exc) if isinstance(exc, RuntimeError) else f"{type(exc).__name__}: {exc}")
+    finally:
+        _active_requests -= 1
+    return [outcome if outcome is not None else (None, "unknown") for outcome in outcomes]
 
 
 def _fake_ocr(full_path: Path) -> str:
@@ -526,6 +702,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         _stop_inner_locked()
             self._json(200, {"ok": True, "evicted": had})
             return
+        if self.path == "/extract_many":
+            self._extract_many()
+            return
         if self.path != "/extract":
             self._json(404, {"error": "not found"})
             return
@@ -542,6 +721,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"text": text, "failure_reason": None})
         except Exception as exc:  # noqa: BLE001 - 子进程这一侧也不能让异常直接炸掉HTTP响应
             self._json(200, {"text": None, "failure_reason": f"{type(exc).__name__}: {exc}"})
+
+    def _extract_many(self) -> None:
+        """POST /extract_many {root, paths:[...]} → {results:[{text, failure_reason}, ...]}，顺序同
+        `paths`。每一份的失败形状与 /extract 相同（failure_reason 以 "RuntimeError: " 开头）。"""
+        length = int(self.headers.get("Content-Length", 0))
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        root = Path(payload.get("root", ""))
+        rel_paths = [str(p) for p in (payload.get("paths") or [])]
+        results: "list[dict | None]" = [None] * len(rel_paths)
+        todo: "list[int]" = []
+        for index, rel in enumerate(rel_paths):
+            full_path = root / rel
+            if full_path.exists():
+                todo.append(index)
+            else:
+                results[index] = {"text": None, "failure_reason": f"FileNotFoundError: {full_path}"}
+        try:
+            if os.environ.get("RAG_REDO_FAKE_OCR"):
+                outcomes = [(_fake_ocr(root / rel_paths[index]), None) for index in todo]
+            else:
+                outcomes = _real_ocr_many([root / rel_paths[index] for index in todo])
+            for index, (text, err) in zip(todo, outcomes):
+                results[index] = (
+                    {"text": text, "failure_reason": None}
+                    if text is not None
+                    else {"text": None, "failure_reason": f"RuntimeError: {err or 'unknown'}"}
+                )
+        except Exception as exc:  # noqa: BLE001 - 子进程这一侧也不能让异常直接炸掉HTTP响应
+            for index in todo:
+                if results[index] is None:
+                    results[index] = {"text": None, "failure_reason": f"{type(exc).__name__}: {exc}"}
+        self._json(200, {"results": results})
 
     def _json(self, code: int, obj: dict) -> None:
         body = json.dumps(obj).encode("utf-8")
@@ -586,6 +797,8 @@ if __name__ == "__main__":
     MINERU_MIN_VRAM_GB = _float_arg("--min-vram", MINERU_MIN_VRAM_GB)
     MINERU_VRAM_WAIT_SECONDS = _float_arg("--vram-wait", MINERU_VRAM_WAIT_SECONDS)
     MINERU_MAX_PAGES = _int_arg("--max-pages", MINERU_MAX_PAGES)
+    MINERU_BATCH_MAX_FILES = _int_arg("--batch-files", MINERU_BATCH_MAX_FILES)
+    MINERU_BATCH_MAX_PAGES = _int_arg("--batch-pages", MINERU_BATCH_MAX_PAGES)
     if MINERU_UNLOAD_AFTER_SECONDS > 0:
         threading.Thread(target=_idle_unload_daemon, daemon=True, name="mineru-idle-unload").start()
     if MINERU_IDLE_EXIT_SECONDS > 0:
@@ -596,7 +809,7 @@ if __name__ == "__main__":
         f"[mineru-local] server listening on http://127.0.0.1:{port} "
         f"(lazy inner mineru-api, unload_after={MINERU_UNLOAD_AFTER_SECONDS}s, "
         f"idle_exit={MINERU_IDLE_EXIT_SECONDS}s, min_vram={MINERU_MIN_VRAM_GB}GB, "
-        f"max_pages={MINERU_MAX_PAGES})",
+        f"max_pages={MINERU_MAX_PAGES}, batch={MINERU_BATCH_MAX_FILES} files/{MINERU_BATCH_MAX_PAGES} pages)",
         file=sys.stderr,
     )
     make_server(port).serve_forever()

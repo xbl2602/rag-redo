@@ -57,6 +57,16 @@ class ExtractedDocument:
             )
 
 
+# extractor:<ext> 插件的接口：必备 `extract(library_id, path, root) -> ExtractedDocument`；
+# 可选 `is_active() -> bool`（设置里没选它时跳过）、`index_signature() -> str`（能力签名）。
+#
+# 可选 `extract_many(library_id, paths, root) -> list[ExtractedDocument]`（2026-09-29 起，
+# 目前只有本机 MinerU 实现）：一次交几份文件，返回与 `paths` 一一对应、顺序相同的结果，
+# 每一份的成功/失败形状与逐份调用 `extract` 完全一样（服务暂时不可用就每份都是 "deferred"）；
+# 不抛异常。编排层只在同时有 ≥2 份等着它时才用，只攒到一份照旧调 `extract`；它抛了异常或
+# 条数对不上，编排层就把这几份退回逐份 `extract`。合批的分组上限与显存把关由插件自己负责。
+
+
 # ---- 切块阶段 ------------------------------------------------------------
 
 
@@ -185,6 +195,42 @@ class VisualPageState:
     status: str
     failure_reason: str | None
     pages: tuple[int, ...]
+    #: 这份 PDF 一共几页（2026-09-30 起页库记录里才有；更早建的记录为 None）。
+    #: “转换缓存”清单靠它写出“28/36 页”、列出缺哪几页（BC-19）。
+    page_count: int | None = None
+    #: 这份 PDF 的页向量是在哪一轮（generation）编出来的（压缩搬家不算重编）。等于当前
+    #: generation = 本轮新建，否则是沿用之前的——每轮日志里“页库 复用/新建”就按它数（BC-19）。
+    #: 更早的记录没有这一项，为 None，按“沿用”算。
+    built_in: str | None = None
+
+
+@dataclass(frozen=True)
+class VisualProgress:
+    """`visual_index` 扩展点回报给核心的**页级进度**（2026-09-29 新增）。
+
+    **为什么需要它**：页级视觉索引的进度条口径是文字索引的
+    `files_done/files_total`——那一段跑完就已经是 78/78、100% 了。于是渲染页的
+    索引跑 7645 页的这 30 分钟里，界面上**一个数字都不会变**，看起来完全像冻住
+    （真机 2026-09-29 就是这样让人以为卡死）。旧项目有页级进度回调
+    （`wemm_indexer.py` 问题47，文件级粒度），rag-redo 移植时漏了。
+
+    **失败语义**：插件**只在还能正常往下走时**上报；页级调用抛异常/服务不可达时
+    不再上报，由插件自己决定本轮怎么收尾（记失败终态并正常返回，见 BC-04）。
+    核心侧收到任何异常都吞掉——进度上报失败绝不能把页级索引带崩。
+
+    **上报节奏由插件自己节流**（默认 ~2 秒一次）：页级循环每页都会走完，逐页
+    写进度文件会把磁盘 IO 变成瓶颈。这里记的是"已经编完多少页"，是**累计值**，
+    重复上报同一个值不算错，插件不必自己算差值。
+    """
+
+    pages_done: int
+    pages_total: int
+    current_path: str = ""
+
+    @property
+    def text(self) -> str:
+        """给界面看的一行文案（前端逐字节冻结，只能用 `heartbeat_note` 这种既有字段）。"""
+        return f"页级视觉索引 {self.pages_done}/{self.pages_total} 页"
 
 
 @dataclass(frozen=True)
@@ -250,6 +296,162 @@ class SemanticGraphEdge:
 class SemanticGraphResponse:
     edges: tuple[SemanticGraphEdge, ...]
     error: str | None = None
+
+
+# ---- 总览星图读模型（BC-18）---------------------------------------------------
+#
+# GUI 总览页把每个库画成一根光管：文件按内容排序（相邻 = 内容相近），按内容分组上色。
+# 排序和分组要用"每个文件一个内容向量"，这份向量直接从 vector_store 里已经存好的块向量
+# 平均出来——只读、纯 CPU、不经过嵌入模型，所以打开总览页不会占用显存。
+
+
+@dataclass(frozen=True)
+class FileVectorSet:
+    """vector_store 按文件汇总的内容向量：每个文件 = 它全部块向量的平均，再做 L2 归一化。
+
+    `vectors` 是 numpy float32 数组，形状 (len(paths), dim)，行与 `paths` 一一对应；
+    一个块向量都没找到的文件不出现（调用方把它当"没有内容向量"处理）。"""
+
+    library_id: str
+    generation: str | None
+    paths: tuple[str, ...]
+    vectors: object  # numpy.ndarray，float32，(N, dim)
+    dim: int
+    produced_by: str
+    store_version: str
+
+
+@dataclass(frozen=True)
+class OverviewFile:
+    """总览星图里的一个文件。`gap` 与 `loose` 只在有内容向量时有意义，否则分别为 1.0 / 0.0。"""
+
+    path: str
+    node_id: str  # 与 graph() 的节点 id 相同（库id|路径），详情面板靠它对上
+    node_type: str
+    chunks: int
+    pages: int  # 页级视觉索引已收录的页数（没有就是 0）
+    state: str  # "indexed" 已索引 / "pending" 未索引 / "ocr" 待 OCR / "failed" 提取失败
+    failure_reason: str | None
+    updated_ns: int | None
+    group: int  # 内容分组编号（跨库统一；0 = 最大的一组）；-1 = 没有内容向量
+    gap: float  # 与排序中前一个文件的内容差距（1 − 余弦相似度，0~2）
+    loose: float  # 与前后邻居平均内容的余弦相似度（-1~1），越低越"零散"
+
+
+@dataclass(frozen=True)
+class OverviewLibrary:
+    library_id: str
+    files: tuple[OverviewFile, ...]  # 已排好顺序：有内容向量的按内容排，其余按路径接在后面
+    points: int  # 这个库在星图里的总点数 = 文件数 + 块数 + 页数
+
+
+@dataclass(frozen=True)
+class OverviewGroup:
+    group: int
+    size: int  # 这一组有多少个文件
+    samples: tuple[tuple[str, str], ...]  # 离组中心最近的几个文件：(库id, 路径)，给图例用
+
+
+@dataclass(frozen=True)
+class OverviewMapResponse:
+    libraries: tuple[OverviewLibrary, ...]
+    groups: tuple[OverviewGroup, ...]
+    built_by: str
+    layout_version: str
+    error: str | None = None
+
+
+# ---- 转换缓存清单（BC-19，core/conversion_cache.py 产出）--------------------
+#
+# 用户和开发者要能一眼确认“PDF/Word 转成文字了没有、WEMM 页库建了没有、存在哪、多大”。
+# 这两份缓存本来就在：转文字缓存由核心写（core/extract_cache.py），页库由 visual_index
+# 插件写。这里只是把它们**读出来**摆在一起，不改任何存法，也不触发任何转换或模型加载。
+
+
+@dataclass(frozen=True)
+class ConversionCacheFile:
+    """一份“需要转换”的文件（不是纯文字的格式：PDF、Word……）两种缓存的现状。
+
+    `text_state`：done（有转好的正文）/ pending（还没轮到或在等转换服务，会自动补上）/
+    failed（转换失败的终态）/ missing（索引记着转好了，正文文件却不见了）。
+    `pages_state`：n/a（不是 PDF，页库只做 PDF）/ off（页库没开）/ none（还没建）/
+    done / partial（部分页面没编上）/ failed。
+    原因一律是稳定代码（`*_reason`），界面、命令行、目录文件都用
+    `core.conversion_cache.reason_text()` 翻成人话，不各写一份。"""
+
+    path: str
+    extension: str
+    text_state: str
+    text_reason: str | None = None
+    text_route: str | None = None  # 产出正文的提取器插件 id
+    text_route_version: str | None = None
+    text_route_name: str | None = None  # 该插件在 plugin.toml 里的名字（界面直接显示）
+    text_file: str | None = None  # 正文缓存文件的绝对路径
+    text_bytes: int = 0
+    text_updated: float | None = None  # 缓存文件的修改时间（Unix 秒）
+    pages_state: str = "n/a"
+    pages_reason: str | None = None
+    pages_detail: str | None = None  # 页库插件记下的原始说明（例如显存不足的两个数字）
+    pages: tuple[int, ...] = ()  # 已进页库的页码，从 1 起
+    page_count: int | None = None  # PDF 总页数（页库记录里有才有）
+    pages_rebuilt: bool = False  # 页向量是本轮新建的（False = 沿用上一轮）
+
+
+@dataclass(frozen=True)
+class ConversionCacheLibrary:
+    library_id: str
+    name: str
+    files: tuple[ConversionCacheFile, ...]
+    text_dir: str  # 这个库的转文字缓存文件夹
+    catalog_file: str  # 缓存目录.md 的位置（每轮索引完成后刷新）
+    pages_enabled: bool
+    pages_dir: str | None = None  # 页库数据所在文件夹（页库插件没启用时为 None）
+    page_bytes_estimate: int = 0  # 页库在硬盘上的大约大小（页向量存在数据库里，只能估）
+    page_vram_gb: float | None = None  # 建页库/试搜要占的显存
+    page_idle_unload_seconds: int | None = None  # 页库模型闲置多久自动卸载
+    #: 这个库的清单没能读出来（例如库目录不在了）时的原因（只含类型，不透传原文）；
+    #: 其余库照常出结果。
+    error: str | None = None
+    built_by: str = "core.conversion_cache"
+    report_version: str = "1"
+
+    @property
+    def text_total(self) -> int:
+        return len(self.files)
+
+    @property
+    def text_done(self) -> int:
+        return sum(1 for item in self.files if item.text_state == "done")
+
+    @property
+    def text_bytes(self) -> int:
+        return sum(item.text_bytes for item in self.files if item.text_state == "done")
+
+    @property
+    def pdf_total(self) -> int:
+        return sum(1 for item in self.files if item.pages_state != "n/a")
+
+    @property
+    def pages_done(self) -> int:
+        return sum(1 for item in self.files if item.pages_state == "done")
+
+    @property
+    def page_vectors(self) -> int:
+        return sum(len(item.pages) for item in self.files if item.pages_state in {"done", "partial"})
+
+
+@dataclass(frozen=True)
+class ConversionRoundSummary:
+    """一轮索引结束时的“转换缓存”一行账（写进索引日志，BC-19）：多少份沿用了已有缓存、
+    多少份这轮新转/新建、跑完还缺多少。只数“需要转换”的文件；页库没开时页库三项都是 0。"""
+
+    text_reused: int
+    text_new: int
+    text_missing: int
+    pages_enabled: bool
+    pages_reused: int = 0
+    pages_new: int = 0
+    pages_missing: int = 0
 
 
 # ---- 页级视觉导航（visual_index 扩展点，比如 official-visual-wemm）--------

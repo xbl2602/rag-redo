@@ -16,6 +16,7 @@ test_boot.py（真实运行时加载 + 真实 gui_main.main()）与 test_contrac
 """
 from __future__ import annotations
 
+import json
 import sys
 import time
 import unittest
@@ -586,6 +587,179 @@ class TestApi(unittest.TestCase):
         self.assertEqual(result["released"], [])
         self.assertIn("boom", result["errors"]["_pipeline"])
 
+    # ---- 总览星图（精确 API：新能力，旧项目没有，见 BC-18）-----------------------------
+
+    def test_overview_map_returns_column_arrays_keyed_by_display_name(self):
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        (self.vault / "other.md").write_text("# 另一篇\n\n和插件无关的内容。", encoding="utf-8")
+        self.pipeline.index_library("lib1")
+        result = self.api.overview_map("")
+        self.assertIsNone(result["error"])
+        self.assertEqual([lib["lib"] for lib in result["libs"]], ["测试库"], "前端拿显示名去打开文件")
+        lib = result["libs"][0]
+        columns = ("rel", "type", "chunks", "pages", "state", "group", "gap", "loose", "updated", "fail")
+        self.assertEqual({len(lib[c]) for c in columns}, {2}, "每一列长度一致，按下标对齐")
+        self.assertEqual(set(lib["rel"]), {"notes.md", "other.md"})
+        self.assertTrue(all(g >= 0 for g in lib["group"]))
+        self.assertEqual(lib["points"], sum(1 + c + p for c, p in zip(lib["chunks"], lib["pages"])))
+        self.assertEqual(result["stats"], {"libs": 1, "files": 2, "points": lib["points"]})
+        self.assertTrue(all(s["lib"] == "测试库" for g in result["groups"] for s in g["samples"]))
+        json.dumps(result)  # pywebview 用 json.dumps 序列化返回值
+
+    def test_overview_map_folds_pipeline_exception_and_unknown_scope(self):
+        with patch.object(self.pipeline, "overview_map", side_effect=RuntimeError("boom")):
+            broken = self.api.overview_map("")
+        self.assertEqual(broken["libs"], [])
+        self.assertIn("RuntimeError", broken["error"])
+        unknown = self.api.overview_map("不存在的库")
+        self.assertEqual(unknown["libs"], [])
+        self.assertTrue(unknown["error"])
+
+
+    # ---- 转换缓存看得见（BC-19）---------------------------------------------
+
+    def _conversion_fixture(self):
+        """一个库：一份转好的 Word、一份缺正文的 PDF（页库开着但没建全）。缓存文件是真文件。"""
+        from core.contracts import ConversionCacheFile, ConversionCacheLibrary
+
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        text_dir = self.tmp / "extracted" / "lib1"
+        (text_dir / "g1").mkdir(parents=True)
+        cached = text_dir / "g1" / "abc.official-extractor-docx%3A1.0.0.txt"
+        cached.write_text("转好的正文" * 3, encoding="utf-8")
+        report = ConversionCacheLibrary(
+            library_id="lib1",
+            name="测试库",
+            files=(
+                ConversionCacheFile(
+                    path="a.docx", extension="docx", text_state="done", text_route="official-extractor-docx",
+                    text_route_version="1.0.0", text_route_name="Word 提取", text_file=str(cached),
+                    text_bytes=cached.stat().st_size, text_updated=1_790_000_000.0,
+                ),
+                ConversionCacheFile(
+                    path="scan.pdf", extension="pdf", text_state="pending", text_reason="scanned",
+                    pages_state="partial", pages_reason="pages-partial", pages=(1, 2, 4), page_count=5,
+                    pages_detail="部分页面编码失败",
+                ),
+            ),
+            text_dir=str(text_dir),
+            catalog_file=str(text_dir / "缓存目录.md"),
+            pages_enabled=True,
+            pages_dir=str(self.tmp / "visual"),
+            page_bytes_estimate=3 * 4608,
+            page_vram_gb=6.3,
+            page_idle_unload_seconds=300,
+        )
+        return report, cached
+
+    def test_conversion_caches_summarise_libraries_and_list_one_library_file_by_file(self):
+        report, _cached = self._conversion_fixture()
+        with patch.object(self.pipeline, "conversion_caches", return_value=(report,)) as reader:
+            summary = self.api.conversion_caches("")
+            detail = self.api.conversion_caches("测试库")
+        self.assertEqual(reader.call_args_list[0].args, ("all",))
+        self.assertEqual(reader.call_args_list[1].args, ("lib1",))
+        self.assertIsNone(summary["error"])
+        self.assertEqual(summary["rows"], [], "不指定库时只给汇总，库卡片用")
+        lib = summary["libs"][0]
+        self.assertEqual(lib["lib"], "测试库")
+        self.assertEqual((lib["text_done"], lib["text_total"], lib["text_attention"]), (1, 2, 1))
+        self.assertEqual((lib["pdf_total"], lib["pages_done"], lib["pages_attention"], lib["page_vectors"]), (1, 0, 1, 3))
+        self.assertEqual((lib["vram_gb"], lib["idle_unload_s"]), (6.3, 300))
+        rows = {row["rel"]: row for row in detail["rows"]}
+        self.assertFalse(rows["a.docx"]["attention"])
+        self.assertEqual(rows["a.docx"]["text"]["route_name"], "Word 提取")
+        self.assertEqual(rows["a.docx"]["pages"]["state"], "n/a")
+        scan = rows["scan.pdf"]
+        self.assertTrue(scan["attention"])
+        self.assertEqual(scan["text"]["label"], "扫描件，等文字识别")
+        self.assertTrue(scan["text"]["next"], "缺了要写下一步怎么办")
+        self.assertEqual(
+            (scan["pages"]["have"], scan["pages"]["missing"], scan["pages"]["count"], scan["pages"]["total"]),
+            ("1–2、4", "3、5", 3, 5),
+        )
+        self.assertEqual(scan["pages"]["label"], "有页面没编上")
+        json.dumps(detail)  # pywebview 用 json.dumps 序列化返回值
+
+    def test_conversion_caches_are_reused_briefly_and_refreshed_when_indexing_ends(self):
+        report, _cached = self._conversion_fixture()
+        with patch.object(self.pipeline, "conversion_caches", return_value=(report,)) as reader:
+            self.api.conversion_caches("")
+            self.api.conversion_caches("")
+            self.assertEqual(reader.call_count, 1, "库卡片每次重画不该都把整个库枚举一遍")
+            self.api._invalidate_cache()  # noqa: SLF001 - 索引结束时桥接层就是这样作废的
+            self.api.conversion_caches("")
+            self.assertEqual(reader.call_count, 2)
+
+    def test_conversion_cache_file_counts_characters_and_folds_unknown_files(self):
+        report, cached = self._conversion_fixture()
+        with patch.object(self.pipeline, "conversion_caches", return_value=(report,)):
+            got = self.api.conversion_cache_file("测试库", "a.docx")
+            missing = self.api.conversion_cache_file("测试库", "不在清单里.pdf")
+        self.assertTrue(got["ok"])
+        self.assertEqual(got["text"]["chars"], len(cached.read_text(encoding="utf-8")))
+        self.assertEqual((got["vram_gb"], got["idle_unload_s"]), (6.3, 300))
+        self.assertFalse(missing["ok"])
+        self.assertIn("不是这个库里需要转换的文件", missing["error"])
+
+    def test_reveal_cache_file_only_selects_the_file_the_list_reported(self):
+        import official_gui_shell.api as api_module
+
+        report, cached = self._conversion_fixture()
+        with (
+            patch.object(self.pipeline, "conversion_caches", return_value=(report,)),
+            patch.object(api_module.subprocess, "Popen") as popen,
+        ):
+            shown = self.api.reveal_cache_file("测试库", "a.docx")
+            not_converted = self.api.reveal_cache_file("测试库", "scan.pdf")
+        self.assertTrue(shown["ok"])
+        if api_module.os.name == "nt":
+            popen.assert_called_once_with(["explorer", "/select,", str(cached.resolve())])
+        else:
+            popen.assert_not_called()
+            self.assertFalse(shown["opened"])
+        self.assertFalse(not_converted["ok"])
+        self.assertEqual(not_converted["error"], "扫描件，等文字识别")
+
+    def test_open_cache_folder_refreshes_the_catalog_before_opening(self):
+        import official_gui_shell.api as api_module
+
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        self.pipeline.index_library("lib1")
+        with patch.object(api_module.os, "startfile", create=True) as startfile:
+            result = self.api.open_cache_folder("测试库")
+        self.assertTrue(result["ok"], result)
+        catalog = Path(result["catalog"])
+        self.assertTrue(catalog.is_file())
+        self.assertEqual(catalog.parent, Path(result["path"]))
+        startfile.assert_called_once_with(result["path"])
+        self.assertIn("测试库", catalog.read_text(encoding="utf-8"))
+        self.assertFalse(self.api.open_cache_folder("不存在的库")["ok"])
+
+    def test_page_preview_and_try_search_fold_every_failure_into_a_message(self):
+        from core.contracts import PageHit
+
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        not_pdf = self.api.page_preview("测试库", "notes.md", 1)
+        self.assertFalse(not_pdf["ok"])
+        self.assertIn("PDF", not_pdf["error"])
+        with patch.object(self.pipeline, "page_preview", return_value=b"x") as preview:
+            ok = self.api.page_preview("测试库", "a.pdf", "3")
+        preview.assert_called_once_with("lib1", "a.pdf", 3)
+        self.assertEqual(ok, {"ok": True, "page": 3, "data_url": "data:image/png;base64,eA=="})
+        self.assertEqual(self.api.page_try_search("测试库", "a.pdf", "  ")["error"], "先输入一句要找的内容")
+        hits = [
+            PageHit(library_id="lib1", path="a.pdf", abs_path="/x/a.pdf", page_index=4, score=0.9),
+            PageHit(library_id="lib1", path="a.pdf", abs_path="/x/a.pdf", page_index=0, score=0.5),
+        ]
+        with patch.object(self.pipeline, "navigate", return_value=hits) as navigate:
+            found = self.api.page_try_search("测试库", "a.pdf", "注意力机制", top_k=99)
+        navigate.assert_called_once_with("lib1", "注意力机制", top_k=20, path="a.pdf")
+        self.assertEqual(found["hits"], [{"page": 5, "rank": 1}, {"page": 1, "rank": 2}])
+        with patch.object(self.pipeline, "navigate", side_effect=RuntimeError("（WEMM 视觉导航未开启）")):
+            vetoed = self.api.page_try_search("测试库", "a.pdf", "注意力机制")
+        self.assertEqual((vetoed["ok"], vetoed["hits"]), (False, []))
+        self.assertIn("未开启", vetoed["error"])
 
 if __name__ == "__main__":
     unittest.main()

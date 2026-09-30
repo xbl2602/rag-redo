@@ -23,6 +23,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import mimetypes
 import os
 import shutil
 import sys
@@ -260,6 +261,13 @@ class TestMainEntry(_TempDataRoot):
         settled = len(window.scripts)
         time.sleep(push.PUSH_INTERVAL_S * 1.6)
         self.assertEqual(len(window.scripts), settled, "main() 返回后推送线程仍在推")
+
+    def test_main_serves_js_as_javascript_even_if_the_registry_says_text_plain(self) -> None:
+        """BC-18：星图是 ES 模块，类型不对浏览器直接拒绝执行。模拟注册表被别的软件改过的 Windows 电脑。"""
+        mimetypes.add_type("text/plain", ".js")
+        self.addCleanup(mimetypes.add_type, "text/javascript", ".js")
+        self._run_main()
+        self.assertEqual(mimetypes.guess_type("starmap.js")[0], "text/javascript")
 
     def test_pick_path_uses_module_level_dialog_constants(self) -> None:
         """对话框类型常量在 `webview` 模块上，不在窗口对象上。"""

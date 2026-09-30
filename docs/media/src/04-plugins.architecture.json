@@ -1,0 +1,246 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "插件怎么装配：小核心 + 可换的零件",
+    "locale": "zh-CN",
+    "animation": "trace",
+    "quality_profile": "standard",
+    "viewBox": [
+      890,
+      570
+    ],
+    "legend": {
+      "mode": "hidden"
+    }
+  },
+  "components": [
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "窗口和 AI 接口",
+      "sublabel": "GUI 界面 · MCP 工具",
+      "pos": [
+        480,
+        30
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "runtime",
+      "type": "backend",
+      "label": "插件运行时",
+      "sublabel": "发现 · 校验 · 启停 · 显卡裁判",
+      "pos": [
+        270,
+        170
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "flow",
+      "type": "backend",
+      "label": "数据流管理器",
+      "sublabel": "规定顺序 · 唯一存储入口",
+      "pos": [
+        480,
+        170
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "sub",
+      "type": "security",
+      "label": "独立进程的重活",
+      "sublabel": "看图检索 · 本机 OCR",
+      "pos": [
+        20,
+        170
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "read",
+      "type": "cloud",
+      "label": "读文件零件",
+      "sublabel": "Markdown · Word · PDF · OCR",
+      "pos": [
+        270,
+        340
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "store",
+      "type": "cloud",
+      "label": "加工与存储零件",
+      "sublabel": "切块 · 向量化 · 关键词 · 向量库",
+      "pos": [
+        480,
+        340
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "more",
+      "type": "cloud",
+      "label": "搜索与增强零件",
+      "sublabel": "合并 · 重排 · 建议 · 摘要 · 去重",
+      "pos": [
+        690,
+        340
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "swap",
+      "type": "external",
+      "label": "换一个零件",
+      "sublabel": "换模型 / 存储：改设置立即生效",
+      "pos": [
+        480,
+        480
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "plan",
+      "type": "external",
+      "label": "零件之间互相隔离",
+      "sublabel": "规划中：现在靠约定避免冲突",
+      "pos": [
+        690,
+        480
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "tag": "规划中"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "核心（只有这两样）",
+      "wraps": [
+        "runtime",
+        "flow"
+      ],
+      "pad": 24
+    }
+  ],
+  "connections": [
+    {
+      "id": "c1",
+      "from": "ui",
+      "to": "flow",
+      "label": "只调公共接口",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        565,
+        120
+      ]
+    },
+    {
+      "id": "c2",
+      "from": "runtime",
+      "to": "read",
+      "label": "装配启停",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        355,
+        300
+      ]
+    },
+    {
+      "id": "c3",
+      "from": "flow",
+      "to": "store",
+      "label": "按顺序调用",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        565,
+        300
+      ]
+    },
+    {
+      "id": "c4",
+      "from": "flow",
+      "to": "more",
+      "label": "按顺序调用",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "top"
+    },
+    {
+      "id": "c5",
+      "from": "runtime",
+      "to": "sub",
+      "label": "拉起",
+      "variant": "security",
+      "fromSide": "left",
+      "toSide": "right",
+      "labelAt": [
+        218,
+        202
+      ]
+    },
+    {
+      "id": "c6",
+      "from": "store",
+      "to": "swap",
+      "label": "可替换",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        565,
+        445
+      ]
+    },
+    {
+      "id": "c7",
+      "from": "more",
+      "to": "plan",
+      "label": "规划中",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        775,
+        445
+      ]
+    }
+  ]
+}

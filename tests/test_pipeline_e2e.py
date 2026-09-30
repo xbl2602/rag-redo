@@ -9,12 +9,15 @@ chunker/library-manager/bm25/chroma/rrf）全部走真实代码，不打折扣�
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
+import re
 import shutil
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -384,7 +387,7 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
 
         class _RecordingVisual:
             def index_library(self, library_id, root, pdf_paths, *, generation,
-                              changed_paths, previous_generation, before_serve=None):
+                              changed_paths, previous_generation, before_serve=None, progress=None):
                 visual_calls.append((list(pdf_paths), list(changed_paths)))
 
         for allowlist in ((".md", ".txt", ".pdf"), (".md", ".txt")):
@@ -515,7 +518,7 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
 
         class _V:
             def index_library(self, library_id, root, pdf_paths, *, generation,
-                              changed_paths, previous_generation, before_serve=None):
+                              changed_paths, previous_generation, before_serve=None, progress=None):
                 hooks.append(before_serve)
 
         embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
@@ -533,12 +536,84 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
             embedder_release.assert_called_once_with()
             reranker_release.assert_called_once_with()
 
+    def test_the_visual_handoff_also_asks_the_local_ocr_service_to_give_up_the_gpu(self):
+        """2026-09-29 真机事故第二段：文字模型下车了，占显存的 MinerU 子进程还坐着。
+
+        8GB 卡上本机 MinerU 最低要 4.5GB、WEMM 要 5.5GB，物理上不可能共存；旧项目
+        `index.py:703-742 _vram_maybe_evict_wemm` 在加载任何 CUDA 模型前都会按
+        「先 MinerU 后 WEMM」的顺序请求对方卸载（fail-open，失败不阻塞加载）。
+        rag-redo 此前只卸自己进程里的模型，**从不问子进程服务让路**——WEMM 服务端
+        `_wait_for_vram(5.5GB)` 一直等不到（`data-real/visual_wemm/wemm_server.log`
+        反复打「空闲显存 5.4GB < 需求 5.5GB」），本轮页级索引全废。
+
+        让路回调必须覆盖到子进程服务；`release_gpu` 内部是 `/evict` 软驱逐
+        （子进程只卸模型、本体继续存活），与资源仲裁器 `on_preempt` 同一套路子。
+        """
+        # 让 MinerU 处于"启用但没拉起子进程"：on_enable 只在 is_active() 时真起进程，
+        # 这里把扫描件后端置空即可，本用例要验的是"核心有没有喊它让路"。
+        self.runtime.settings.set("pdf_scan_backend", "none")
+        self.runtime.load("official-ocr-mineru-local")
+        self.runtime.enable("official-ocr-mineru-local")
+
+        hooks: list = []
+
+        class _V:
+            def index_library(self, library_id, root, pdf_paths, *, generation,
+                              changed_paths, previous_generation, before_serve=None, progress=None):
+                hooks.append(before_serve)
+
+        mineru = self.runtime.plugins["official-ocr-mineru-local"].instance
+        with patch.object(mineru, "release_gpu") as mineru_release:
+            self._run_with_fake_visual(_V())
+            self.assertEqual(len(hooks), 1)
+            hooks[0]()
+        mineru_release.assert_called_once_with()
+
+    def test_the_visual_handoff_never_asks_the_visual_service_to_evict_itself(self):
+        """让路回调由视觉插件自己调用，让它去喊自己让路等于自我驱逐。
+
+        WEMM 是 `before_serve` 的调用方；`official-visual-wemm` 必须在让路名单之外，
+        否则它会在自己正要占显卡之前先把自己的模型卸掉。
+        """
+        self.assertIn("official-visual-wemm", Pipeline._VISUAL_HANDOFF_SKIP)
+        self.assertNotIn("official-visual-wemm", Pipeline._VISUAL_HANDOFF_TARGETS)
+        self.assertIn("official-ocr-mineru-local", Pipeline._VISUAL_HANDOFF_TARGETS)
+        self.assertIn("official-embedder-bge-m3", Pipeline._VISUAL_HANDOFF_TARGETS)
+        self.assertIn("official-reranker", Pipeline._VISUAL_HANDOFF_TARGETS)
+
+    def test_the_text_index_is_still_published_when_the_visual_index_cannot_run(self):
+        """①A 的核心承诺：页级视觉索引失败**不许连坐**文字索引。
+
+        2026-09-29 真机事故的代价就在这里：`core/pipeline.py` 的 manifest 写入与
+        generation commit 都排在视觉阶段**之后**，视觉阶段一旦挂住/被中断，
+        整轮（包括已经算好向量、切好块的文字索引）一份都不落盘——
+        `data-real/index_progress/Y2S1-*.json` 停在 `files_done=78/78, phase=visual`，
+        库的"最后索引时间"还是上一轮的。
+
+        真实 WEMM 插件在服务不可用时是"把剩余文件记成失败终态后正常返回"，不抛异常；
+        本用例钉住编排层必须容忍这一点：视觉没建成，文字照样发布、照样能搜到。
+        """
+        class _DeadVisual:
+            def index_library(self, library_id, root, pdf_paths, *, generation,
+                              changed_paths, previous_generation, before_serve=None, progress=None):
+                if before_serve is not None:
+                    before_serve()
+                return None  # 页级索引全废，但插件不抛——对齐熔断后的真实行为
+
+        self._run_with_fake_visual(_DeadVisual())
+        self.assertIsNotNone(
+            self.pipeline._generations.active("test-lib"),
+            "视觉索引失败把整轮文字索引一起丢了（generation 未发布）",
+        )
+        results = self.pipeline.search("test-lib", "插件 架构", top_k=5)
+        self.assertGreater(len(results), 0, "文字索引发布了却搜不到内容")
+
     def test_one_text_model_failing_to_release_does_not_stop_the_other_or_raise(self):
         hooks: list = []
 
         class _V:
             def index_library(self, library_id, root, pdf_paths, *, generation,
-                              changed_paths, previous_generation, before_serve=None):
+                              changed_paths, previous_generation, before_serve=None, progress=None):
                 hooks.append(before_serve)
 
         embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
@@ -550,6 +625,59 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         ):
             hooks[0]()
         reranker_release.assert_called_once_with()
+
+    def test_page_progress_from_the_visual_index_reaches_the_progress_message(self):
+        """2026-09-29 真机：渲染 7645 页的半小时里进度一直停在“78/78 文件”，看起来像冻住。
+        视觉插件报的“第几页/共几页”要经编排层写进进度记录的 `message`（桥接层把它透给
+        前端的 heartbeat_note），当前在编哪份 PDF 写进 `current_path`。"""
+
+        class _PagingVisual:
+            def index_library(self, library_id, root, pdf_paths, *, generation,
+                              changed_paths, previous_generation, before_serve=None, progress=None):
+                progress(3, 10, "visual.pdf")
+
+        real_plugin = self.pipeline._plugin
+        real_providers_of = self.runtime.registry.providers_of
+        events: list = []
+        with (
+            patch.object(self.runtime.registry, "providers_of",
+                         side_effect=lambda point: ["fake-visual"] if point == "visual_index" else real_providers_of(point)),
+            patch.object(self.pipeline, "_plugin",
+                         side_effect=lambda pid: _PagingVisual() if pid == "fake-visual" else real_plugin(pid)),
+        ):
+            self.pipeline.index_library("test-lib", progress_callback=events.append)
+        paging = [e for e in events if e.phase == "visual" and e.message == "页级视觉索引 3/10 页"]
+        self.assertEqual(len(paging), 1, [(e.phase, e.message) for e in events])
+        self.assertEqual(paging[0].current_path, "visual.pdf")
+
+    def test_library_rows_reports_real_chunk_count_after_an_unchanged_incremental_run(self):
+        """增量跑第二轮（内容没变）之后，库列表的块数不能归零。
+
+        2026-09-29 真机：4 个库的块数在界面上全部显示 0，但向量数据完好（Y2S1 4955 块、
+        Obsidian Vault 2184 块）而且能正常搜到。根因：`library_rows` 按 **active
+        generation** 算集合名去 `count()`，而数据其实在 manifest 的 `vector_segments`
+        指的那一段——增量轮把上一轮的段沿用下来（`vector_carry`），新 generation 自己那段
+        是空的，两个名字对不上，`count()` 就按"集合不存在"返回 0。检索与一致性自愈走的是
+        `_manifest_segments(...)` 逐段求和，所以它们是对的，只有展示这一处是错的。
+
+        这条同时钉住 AGENTS.md §4.5：块数只有一个权威算法（`index_integrity
+        ::count_store_chunks` + `_manifest_segments`），展示不许自己另算一遍。
+        """
+        self.pipeline.index_library("test-lib")
+        first = next(r for r in self.pipeline.library_rows() if r["library_id"] == "test-lib")
+        self.assertGreater(first["blocks"], 0, "第一轮就没建出块，后面的断言没意义")
+
+        self.pipeline.index_library("test-lib")  # 第二轮：内容没变，段被沿用
+        second = next(r for r in self.pipeline.library_rows() if r["library_id"] == "test-lib")
+        self.assertEqual(
+            second["blocks"],
+            first["blocks"],
+            "内容没变的增量轮之后块数变了（多半是按新 generation 算名字、查到空集合了）",
+        )
+        self.assertGreater(
+            second["blocks"], 0,
+            "库列表显示块数为 0，但向量数据还在、也还能搜到——展示层的集合名算错了",
+        )
 
     def test_index_then_search_finds_relevant_doc(self):
         report = self.pipeline.index_library("test-lib")
@@ -649,6 +777,40 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         self.assertIn("推进原理", hit.text)
         self.assertNotIn("图片.png", hit.text, "嵌入语法已从索引文本删除")
 
+    def test_html_table_is_flattened_and_kept_whole_with_its_context_in_index_text(self):
+        """BC-07（2026-09-30，操作者批准）：MinerU 的表格是 HTML，切块器只认竖线表格。索引文本必须
+        先把 HTML 表格摊平成竖线表格——进了向量库的块里不能有表格标签，整张表要在同一块里，
+        并带着它的直接上文（引出句）和下文（注）。走真实的流水线（清洗链 → 真实切块插件）。"""
+        table = (
+            "<table><tr><td rowspan=1 colspan=2>TABLE A-3</td></tr>"
+            "<tr><td rowspan=1 colspan=1>Water</td><td rowspan=1 colspan=1>4.18</td></tr>"
+            "<tr><td rowspan=1 colspan=1>Iron</td><td rowspan=1 colspan=1>0.45</td></tr></table>"
+        )
+        filler = "".join(f"这是填充第{i}句，内容随便写一点。" for i in range(60))  # 让这一节超过切块上限
+        (self.vault / "table-notes.md").write_text(
+            f"# 热物性\n\n{filler}\n\n表 3 给出常见物质的比热：\n\n{table}\n\n注：单位为 kJ/kg。\n\n{filler}\n",
+            encoding="utf-8",
+        )
+        report = self.pipeline.index_library("test-lib")
+        self.assertGreaterEqual(report.succeeded, 3, report.files)
+        generation = self.pipeline._generations.active("test-lib")
+        manifest = self.pipeline._manifests.read("test-lib", generation)
+        record = manifest["files"]["table-notes.md"]
+        vector_records = self.pipeline._vector_records(
+            "test-lib", list(record["chunk_ids"]),
+            self.pipeline._manifest_segments(manifest, "vector_segments", generation),
+        )
+        documents = [item["document"] for item in vector_records.values()]
+        self.assertTrue(documents)
+        for document in documents:
+            self.assertNotIn("<td", document, "进了向量库的文本里不能有表格标签")
+            self.assertNotIn("rowspan", document)
+        holders = [d for d in documents if "| Water | 4.18 |" in d]
+        self.assertEqual(len(holders), 1, "整张表只应出现在一块里")
+        self.assertIn("| Iron | 0.45 |", holders[0], "整张表必须在同一块里")
+        self.assertIn("表 3 给出常见物质的比热", holders[0], "表格必须带着直接上文")
+        self.assertIn("注：单位为 kJ/kg", holders[0], "表格必须带着直接下文")
+
     def test_graph_reads_active_manifest_and_relations_without_loading_embedder(self):
         (self.vault / "plugin-notes.md").write_text(
             "# 插件架构笔记\n\n插件系统连接到 [[cooking]]。",
@@ -665,6 +827,60 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
             ("test-lib|cooking.md", "test-lib|plugin-notes.md", "link"),
             {(edge.source, edge.target, edge.kind) for edge in response.edges},
         )
+
+    def test_overview_map_reads_stored_vectors_without_loading_embedder(self):
+        """BC-18：总览星图只读已经存好的向量，绝不为画图加载嵌入模型（显存敏感）。"""
+        self.pipeline.index_library("test-lib")
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        with patch.object(embedder, "embed_texts", wraps=embedder.embed_texts) as embed_texts:
+            response = self.pipeline.overview_map("all")
+        embed_texts.assert_not_called()
+        self.assertIsNone(response.error)
+        self.assertEqual([lib.library_id for lib in response.libraries], ["test-lib"])
+        files = response.libraries[0].files
+        graph_ids = {node.node_id for node in self.pipeline.graph("all").nodes}
+        self.assertEqual({f.path for f in files}, {"plugin-notes.md", "cooking.md"})
+        self.assertTrue({f.node_id for f in files} <= graph_ids, "文件 id 必须和图谱读模型一致，点开详情才对得上")
+        self.assertTrue(all(f.group >= 0 and f.state == "indexed" for f in files))
+        self.assertEqual(response.libraries[0].points, sum(1 + f.chunks + f.pages for f in files))
+        self.assertTrue(response.groups)
+
+    def test_overview_map_is_cached_until_the_index_changes(self):
+        self.pipeline.index_library("test-lib")
+        store = self.runtime.plugins["official-vector-store-chroma"].instance
+        with patch.object(store, "file_vectors", wraps=store.file_vectors) as file_vectors:
+            first = self.pipeline.overview_map("all")
+            second = self.pipeline.overview_map("all")
+            self.assertIs(first, second)
+            self.assertEqual(file_vectors.call_count, 1, "内容没变时第二次打开总览不应再读向量库")
+            (self.vault / "third.md").write_text("# 第三篇\n\n插件和食谱都提一下。", encoding="utf-8")
+            self.pipeline.index_library("test-lib")
+            third = self.pipeline.overview_map("all")
+        self.assertEqual(file_vectors.call_count, 2)
+        self.assertIn("third.md", {f.path for f in third.libraries[0].files})
+
+    def test_overview_map_before_indexing_follows_graph_and_has_no_groups(self):
+        """没索引过的库：文件集合跟图谱读模型一致（BC-09 只把未索引 PDF 列为待处理），不报错、不分组。"""
+        response = self.pipeline.overview_map("all")
+        self.assertIsNone(response.error)
+        self.assertEqual([lib.library_id for lib in response.libraries], ["test-lib"])
+        graph_paths = {node.path for node in self.pipeline.graph("all").nodes}
+        self.assertEqual({f.path for f in response.libraries[0].files}, graph_paths)
+        self.assertTrue(all(f.group == -1 for f in response.libraries[0].files))
+        self.assertEqual(response.groups, ())
+
+    def test_overview_map_vector_read_failure_keeps_files_reports_error_and_is_not_cached(self):
+        self.pipeline.index_library("test-lib")
+        store = self.runtime.plugins["official-vector-store-chroma"].instance
+        with patch.object(store, "file_vectors", side_effect=RuntimeError("磁盘/路径细节不该透出")):
+            broken = self.pipeline.overview_map("all")
+        self.assertEqual({f.path for f in broken.libraries[0].files}, {"plugin-notes.md", "cooking.md"})
+        self.assertTrue(all(f.group == -1 for f in broken.libraries[0].files))
+        self.assertIn("RuntimeError", broken.error or "")
+        self.assertNotIn("磁盘/路径细节", broken.error or "")
+        healed = self.pipeline.overview_map("all")
+        self.assertIsNone(healed.error, "读失败的结果不能被缓存住，恢复后下一次就该正常")
+        self.assertTrue(all(f.group >= 0 for f in healed.libraries[0].files))
 
     def test_graph_semantic_edges_are_separate_and_use_existing_embedder(self):
         (self.vault / "third.md").write_text("# 第三篇\n\n独立内容。", encoding="utf-8")
@@ -1415,6 +1631,224 @@ class TestEndToEndSearchPipeline(unittest.TestCase):
         self.assertTrue(any(r.path == "占位报告.docx" for r in results))
 
 
+class TestConversionCacheVisibility(unittest.TestCase):
+    """BC-19：转换缓存看得见——需要转换的文件（PDF、Word）转文字了没有、谁转的、存在哪、
+    多大；PDF 的页库建了没有。全部只读，不加载任何模型。
+
+    复用端到端测试的整套真实插件运行时（`setUp`/`_build_runtime` 直接借用），但单独成类：
+    继承 `TestEndToEndSearchPipeline` 会把上百个端到端用例再跑一遍。"""
+
+    setUp = TestEndToEndSearchPipeline.setUp
+    _build_runtime = TestEndToEndSearchPipeline._build_runtime
+
+    def _add_pdf(self, rel: str, text: str | None) -> None:
+        import pymupdf
+
+        target = self.vault / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        doc = pymupdf.open()
+        page = doc.new_page()
+        if text is None:  # 没有文字层的“扫描件”：只画一块图形
+            page.draw_rect(pymupdf.Rect(60, 60, 300, 300), color=(0, 0, 0), fill=(0.2, 0.2, 0.2))
+        else:
+            page.insert_text((72, 72), text, fontsize=14)
+        doc.save(str(target))
+        doc.close()
+
+    def _add_converted_files(self) -> None:
+        self._add_pdf("papers/a.pdf", "pdf body text about plugin architecture and recipes")
+        document = Document()
+        document.add_paragraph("Word 正文：插件架构和家常菜")
+        document.save(str(self.vault / "b.docx"))
+
+    @contextlib.contextmanager
+    def _with_visual(self, fake):
+        real_plugin = self.pipeline._plugin
+        real_providers_of = self.runtime.registry.providers_of
+
+        def _fake_providers(point, _real=real_providers_of):
+            return ["fake-visual"] if point == "visual_index" else _real(point)
+
+        def _fake_plugin(plugin_id, _real=real_plugin):
+            return fake if plugin_id == "fake-visual" else _real(plugin_id)
+
+        with (
+            patch.object(self.runtime.registry, "providers_of", side_effect=_fake_providers),
+            patch.object(self.pipeline, "_plugin", side_effect=_fake_plugin),
+        ):
+            yield
+
+    def test_converted_files_show_who_converted_them_where_they_live_and_how_big(self):
+        self._add_converted_files()
+        self.pipeline.index_library("test-lib")
+        embedder = self.runtime.plugins["official-embedder-bge-m3"].instance
+        with patch.object(embedder, "embed_texts", wraps=embedder.embed_texts) as embed_texts:
+            reports = self.pipeline.conversion_caches("all")
+        embed_texts.assert_not_called()
+        self.assertEqual([report.library_id for report in reports], ["test-lib"])
+        report = reports[0]
+        self.assertIsNone(report.error)
+        self.assertEqual(report.name, "测试库")
+        # 纯文字的 .md 不需要转换，不进清单
+        self.assertEqual([item.path for item in report.files], ["b.docx", "papers/a.pdf"])
+        self.assertEqual((report.text_done, report.text_total), (2, 2))
+        routes = {item.path: (item.text_route, item.text_route_name) for item in report.files}
+        for path, plugin_id in (("b.docx", "official-extractor-docx"), ("papers/a.pdf", "official-extractor-pdf-text")):
+            self.assertEqual(routes[path], (plugin_id, self.runtime.plugins[plugin_id].manifest.name))
+        for item in report.files:
+            self.assertEqual(item.text_state, "done")
+            cached = Path(item.text_file)
+            self.assertTrue(cached.is_file())
+            self.assertTrue(cached.is_relative_to(Path(report.text_dir)))
+            self.assertEqual(item.text_bytes, cached.stat().st_size)
+            # 清单说“存在这”，读正文读的就是这一份
+            self.assertEqual(
+                cached.read_text(encoding="utf-8"), self.pipeline.read_document("test-lib", item.path).text
+            )
+        pages = {item.path: item.pages_state for item in report.files}
+        self.assertEqual(pages, {"b.docx": "n/a", "papers/a.pdf": "off"})  # 这套运行时没有页库插件
+        self.assertFalse(report.pages_enabled)
+        # 每轮索引发布后缓存文件夹里自动有一份人能看懂的目录，链接都能打开
+        catalog = Path(report.catalog_file)
+        self.assertTrue(catalog.is_file())
+        text = catalog.read_text(encoding="utf-8")
+        self.assertIn("papers/a.pdf", text)
+        self.assertIn("b.docx", text)
+        links = re.findall(r"\[打开\]\(<([^>]+)>\)", text)
+        self.assertEqual(len(links), 2)
+        for link in links:
+            self.assertTrue((catalog.parent / urllib.parse.unquote(link)).is_file(), link)
+
+    def test_each_round_counts_reused_new_and_missing_conversions(self):
+        self._add_converted_files()
+        first = self.pipeline.index_library("test-lib").conversion
+        self.assertEqual((first.text_reused, first.text_new, first.text_missing), (0, 2, 0))
+        self.assertFalse(first.pages_enabled)
+        second = self.pipeline.index_library("test-lib").conversion
+        self.assertEqual((second.text_reused, second.text_new, second.text_missing), (2, 0, 0))
+        self._add_pdf("scan.pdf", None)
+        third = self.pipeline.index_library("test-lib").conversion
+        self.assertEqual((third.text_reused, third.text_new, third.text_missing), (2, 0, 1))
+        scan = {item.path: item for item in self.pipeline.conversion_caches("test-lib")[0].files}["scan.pdf"]
+        self.assertEqual((scan.text_state, scan.text_reason), ("pending", "scanned"))
+
+    def test_an_agent_scoped_round_keeps_frozen_formats_in_the_count_and_the_catalog(self):
+        """Agent 触发的一轮只处理授权格式，没授权的 PDF/Word 被“冻结”保留旧索引：
+        这一轮的账和缓存目录都不能因此把它们漏掉；收尾也不再把整个库重新扫一遍。"""
+        self._add_converted_files()
+        self.pipeline.index_library("test-lib")
+        with patch.object(self.lib_mgr, "resolve_included_files", wraps=self.lib_mgr.resolve_included_files) as enumerate_files:
+            scoped = self.pipeline.index_library("test-lib", format_allowlist=(".md", ".txt")).conversion
+        self.assertEqual(enumerate_files.call_count, 1, "收尾复用这一轮的裁决，不重扫整个库")
+        self.assertEqual((scoped.text_reused, scoped.text_new, scoped.text_missing), (2, 0, 0))
+        catalog = Path(self.pipeline.conversion_caches("test-lib")[0].catalog_file).read_text(encoding="utf-8")
+        self.assertIn("b.docx", catalog)
+        self.assertIn("papers/a.pdf", catalog)
+
+    def test_a_cache_file_that_vanished_is_reported_as_missing(self):
+        self._add_converted_files()
+        self.pipeline.index_library("test-lib")
+        item = {entry.path: entry for entry in self.pipeline.conversion_caches("test-lib")[0].files}["b.docx"]
+        Path(item.text_file).unlink()
+        again = {entry.path: entry for entry in self.pipeline.conversion_caches("test-lib")[0].files}["b.docx"]
+        self.assertEqual((again.text_state, again.text_reason, again.text_file), ("missing", "cache-missing", None))
+        catalog = self.pipeline.write_conversion_catalog("test-lib")
+        self.assertIn("正文文件不见了", catalog.read_text(encoding="utf-8"))
+
+    def test_a_library_that_cannot_be_read_does_not_break_the_others(self):
+        (self.tmp / "other-vault").mkdir()
+        self.lib_mgr.store.add_library("gone-lib", "读不出来的库", str(self.tmp / "other-vault"))
+        real = self.pipeline._conversion_report
+
+        def _report(library_id):
+            if library_id == "gone-lib":
+                raise OSError("boom")
+            return real(library_id)
+
+        with patch.object(self.pipeline, "_conversion_report", side_effect=_report):
+            reports = {report.library_id: report for report in self.pipeline.conversion_caches("all")}
+        self.assertEqual(reports["gone-lib"].error, "读取转换缓存失败：OSError")
+        self.assertEqual(reports["gone-lib"].files, ())
+        self.assertIsNone(reports["test-lib"].error)
+
+    def test_page_library_state_comes_from_the_visual_provider_without_starting_it(self):
+        from core.contracts import VisualPageState
+
+        self._add_converted_files()
+        test = self
+
+        class _FakeVisual:
+            built_in = None
+
+            def is_active(self):
+                return True
+
+            def cache_info(self):
+                return {"dir": str(test.tmp / "visual"), "bytes_per_page": 100, "vram_gb": 6.3, "idle_unload_seconds": 300}
+
+            def index_library(self, library_id, root, pdf_paths, **kwargs):
+                self.built_in = self.built_in or kwargs["generation"]
+
+            def graph_page_states(self, library_id, generation):
+                return (
+                    VisualPageState(
+                        library_id=library_id, path="papers/a.pdf", provider_id="fake-visual", status="indexed",
+                        failure_reason=None, pages=(1,), page_count=1, built_in=self.built_in,
+                    ),
+                )
+
+        fake = _FakeVisual()
+        with self._with_visual(fake):
+            first = self.pipeline.index_library("test-lib").conversion
+            report = self.pipeline.conversion_caches("test-lib")[0]
+            second = self.pipeline.index_library("test-lib").conversion
+        self.assertTrue(report.pages_enabled)
+        self.assertEqual(report.pages_dir, str(self.tmp / "visual"))
+        self.assertEqual((report.page_vram_gb, report.page_idle_unload_seconds), (6.3, 300))
+        pdf = {item.path: item for item in report.files}["papers/a.pdf"]
+        self.assertEqual((pdf.pages_state, pdf.pages, pdf.page_count), ("done", (1,), 1))
+        self.assertEqual((report.pdf_total, report.pages_done, report.page_bytes_estimate), (1, 1, 100))
+        self.assertEqual((first.pages_reused, first.pages_new, first.pages_missing), (0, 1, 0))
+        self.assertEqual((second.pages_reused, second.pages_new, second.pages_missing), (1, 0, 0))
+
+    def test_page_preview_only_draws_pdfs_inside_the_library(self):
+        self._add_converted_files()
+        rendered = []
+
+        class _Renderer:
+            def render_page_png(self, path, page, max_side=720):
+                rendered.append((Path(path), page, max_side))
+                return b"png-bytes"
+
+        with self.assertRaisesRegex(ValueError, "页库插件没有启用"):
+            self.pipeline.page_preview("test-lib", "papers/a.pdf", 1)
+        with self._with_visual(_Renderer()):
+            self.assertEqual(self.pipeline.page_preview("test-lib", "papers/a.pdf", 2, max_side=300), b"png-bytes")
+            self.assertEqual(rendered, [((self.vault / "papers" / "a.pdf").resolve(), 2, 300)])
+            with self.assertRaises(ValueError):
+                self.pipeline.page_preview("test-lib", "cooking.md", 1)
+            with self.assertRaises(ValueError):
+                self.pipeline.page_preview("test-lib", "../outside.pdf", 1)
+            with self.assertRaises(KeyError):
+                self.pipeline.page_preview("没有这个库", "papers/a.pdf", 1)
+
+    def test_navigate_can_be_limited_to_one_pdf(self):
+        calls = []
+
+        class _Navigator:
+            def navigate(self, library_id, query, top_k=5, **kwargs):
+                calls.append((library_id, query, top_k, kwargs))
+                return []
+
+        with self._with_visual(_Navigator()):
+            self.pipeline.navigate("test-lib", "查询", top_k=3, path="papers/a.pdf")
+            self.pipeline.navigate("test-lib", "查询", top_k=3)
+        self.assertEqual(
+            calls,
+            [("test-lib", "查询", 3, {"path": "papers/a.pdf"}), ("test-lib", "查询", 3, {})],
+        )
+
+
 class TestReleaseGpuMemory(TestEndToEndSearchPipeline):
     """手动"释放显存"按钮的编排层测试（core/pipeline.py::release_gpu_memory，
     2026-09-29 新能力，BC-16；旧项目 guiweb 没有对应能力）。复用
@@ -1897,14 +2331,9 @@ class TestOcrChainTryFallback(unittest.TestCase):
         self.assertIn("fake-ocr", results[0].text)
 
 
-class TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches(unittest.TestCase):
-    """2026-09-29 真机：点“增量重建”后四个库的全部文件（连 md 笔记）都被重新切块、重新算
-    向量——Obsidian Vault 225 个文件全部重做。原因是“任何一种格式的提取器签名变了”被当成
-    “所有文件的正文都作废”，而会让它变的不只是升级：①升级 PDF 提取器（修扫描件水印）；
-    ②本机 MinerU 某一轮没在时限内启动（索引子进程会把它卸载，PDF 提取器名单少一个），
-    下一轮又好了；③设置里换扫描件后端或补 MinerU Key。旧项目同类变化只让受影响格式的
-    提取缓存失效（obsidian-rag/extractors.py 缓存键 `<md5>.<route>.v<EXTRACT_VERSION>`
-    只管 PDF/DOCX），笔记从不因此重做（BC-12）。"""
+class _MixedLibraryCase(unittest.TestCase):
+    """两篇 md 笔记 + 一份有文字层的 PDF + 一份扫描件（走本机 OCR 的假结果）的小库。
+    子类决定要不要先建一轮索引。"""
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -1954,8 +2383,6 @@ class TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches(unittest.TestCase):
         lib_mgr = self.runtime.plugins["official-library-manager"].instance
         lib_mgr.store.add_library("mixed-lib", "混合库", str(self.vault))
         lib_mgr.store.set_policy("mixed-lib", enabled_extensions=[".md", ".pdf"])
-        first = self.pipeline.index_library("mixed-lib")
-        self.assertEqual(first.succeeded, 4, first.files)
 
     def _restore_env(self) -> None:
         if self._fake_ocr_env_backup is None:
@@ -1964,6 +2391,37 @@ class TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches(unittest.TestCase):
             os.environ["RAG_REDO_FAKE_OCR"] = self._fake_ocr_env_backup
         if self._api_key_backup is not None:
             os.environ["MINERU_API_KEY"] = self._api_key_backup
+
+    def _write_blank_scan(self, name: str) -> None:
+        import pymupdf
+
+        doc = pymupdf.open()
+        doc.new_page()
+        doc.save(str(self.vault / name))
+        doc.close()
+
+    def _plugin_instance(self, plugin_id: str):
+        return self.runtime.plugins[plugin_id].instance
+
+    def _active_manifest(self) -> dict:
+        manifest = self.pipeline._manifest("mixed-lib", self.pipeline._generations.active("mixed-lib"))
+        self.assertIsNotNone(manifest)
+        return manifest
+
+
+class TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches(_MixedLibraryCase):
+    """2026-09-29 真机：点“增量重建”后四个库的全部文件（连 md 笔记）都被重新切块、重新算
+    向量——Obsidian Vault 225 个文件全部重做。原因是“任何一种格式的提取器签名变了”被当成
+    “所有文件的正文都作废”，而会让它变的不只是升级：①升级 PDF 提取器（修扫描件水印）；
+    ②本机 MinerU 某一轮没在时限内启动（索引子进程会把它卸载，PDF 提取器名单少一个），
+    下一轮又好了；③设置里换扫描件后端或补 MinerU Key。旧项目同类变化只让受影响格式的
+    提取缓存失效（obsidian-rag/extractors.py 缓存键 `<md5>.<route>.v<EXTRACT_VERSION>`
+    只管 PDF/DOCX），笔记从不因此重做（BC-12）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        first = self.pipeline.index_library("mixed-lib")
+        self.assertEqual(first.succeeded, 4, first.files)
 
     def _reindex(self):
         """再跑一轮增量，返回（报告，md 提取器被调用次数，被送去算向量的文件集合）。"""
@@ -1976,11 +2434,6 @@ class TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches(unittest.TestCase):
             report = self.pipeline.index_library("mixed-lib")
         embedded = {chunk.path for call in embed.call_args_list for chunk in call.args[0]}
         return report, md_extract.call_count, embedded
-
-    def _active_manifest(self) -> dict:
-        manifest = self.pipeline._manifest("mixed-lib", self.pipeline._generations.active("mixed-lib"))
-        self.assertIsNotNone(manifest)
-        return manifest
 
     def _rewrite_pdf_signature(self, manifest: dict, values: dict[str, str]) -> None:
         for entry in manifest["signatures"]["extractor:pdf"]:
@@ -2048,6 +2501,100 @@ class TestIncrementalOnlyRedoesWhatAnExtractorChangeTouches(unittest.TestCase):
         self.assertEqual(self.pipeline.stale_libraries("mixed-lib"), [])
         report, md_extracts, embedded = self._reindex()
         self.assertEqual((md_extracts, embedded, report.unchanged), (0, set(), 4))
+
+
+class TestStoppedRunKeepsConvertedFilesAndScansAreBatched(_MixedLibraryCase):
+    """2026-09-29 操作者确认的两件事：①一轮被停止/出错时，已经转好的 PDF 不白丢——此前按轮次存
+    的提取缓存随这一轮一起丢弃，停在 Y2S1 第 24 个文件时 20 份已解析好的扫描件（约 4 分钟
+    MinerU 工作）下次得重来；②几份扫描件合成一批交给本机 MinerU（实测快 1.7～2 倍，显存只多
+    0.1～0.3GB），合批出错就退回一份一份识别。"""
+
+    SCANS = ("scanned.pdf", "scanned-2.pdf", "scanned-3.pdf")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_blank_scan("scanned-2.pdf")
+        self._write_blank_scan("scanned-3.pdf")
+        self.local = self._plugin_instance("official-ocr-mineru-local")
+        self.pdf_text = self._plugin_instance("official-extractor-pdf-text")
+
+    def _stash_files(self) -> list[Path]:
+        return sorted((self.tmp / "data" / "extracted" / "mixed-lib" / "_stash").glob("*.txt"))
+
+    def _fail_after_converting(self) -> None:
+        """转换全部做完、卡在向量化时出错——这一轮不发布；再像索引子进程收尾那样丢掉这一轮。"""
+        embedder = self._plugin_instance("official-embedder-bge-m3")
+        with patch.object(embedder, "embed_chunks", side_effect=RuntimeError("停在向量化")):
+            with self.assertRaisesRegex(RuntimeError, "停在向量化"):
+                self.pipeline.index_library("mixed-lib", generation_id="stopped")
+        self.pipeline.discard_index_generation("mixed-lib", "stopped")
+        self.assertIsNone(self.pipeline._generations.active("mixed-lib"))
+
+    def test_scans_waiting_for_local_ocr_go_in_one_batch(self):
+        with (
+            patch.object(self.local, "extract_many", wraps=self.local.extract_many) as many,
+            patch.object(self.local, "extract", wraps=self.local.extract) as single,
+        ):
+            report = self.pipeline.index_library("mixed-lib")
+        self.assertEqual(report.succeeded, 6, report.files)
+        self.assertEqual(many.call_count, 1)
+        self.assertEqual(sorted(many.call_args.args[1]), sorted(self.SCANS))  # 有文字层的那份不进 OCR
+        self.assertEqual(single.call_count, 0)
+        files = self._active_manifest()["files"]
+        for name in self.SCANS:
+            self.assertEqual(files[name]["extractor_id"], "official-ocr-mineru-local")
+        self.assertEqual(files["text-layer.pdf"]["extractor_id"], "official-extractor-pdf-text")
+
+    def test_a_batch_that_blows_up_falls_back_to_one_file_at_a_time(self):
+        with (
+            patch.object(self.local, "extract_many", side_effect=RuntimeError("合批炸了")),
+            patch.object(self.local, "extract", wraps=self.local.extract) as single,
+        ):
+            report = self.pipeline.index_library("mixed-lib")
+        self.assertEqual(report.succeeded, 6, report.files)
+        self.assertEqual(single.call_count, 3)
+
+    def test_a_run_stopped_after_converting_keeps_the_converted_pdfs(self):
+        self._fail_after_converting()
+        self.assertEqual(len(self._stash_files()), 4)  # 3 份扫描件 + 1 份文字层 PDF；md 不进暂存
+        with (
+            patch.object(self.local, "extract", side_effect=AssertionError("不该再送 MinerU")),
+            patch.object(self.local, "extract_many", side_effect=AssertionError("不该再送 MinerU")),
+            patch.object(self.pdf_text, "extract", side_effect=AssertionError("不该再转一遍")),
+        ):
+            report = self.pipeline.index_library("mixed-lib")
+        self.assertEqual(report.succeeded, 6, report.files)
+        self.assertEqual(self._active_manifest()["files"]["scanned-2.pdf"]["extractor_id"], "official-ocr-mineru-local")
+        self.assertTrue(any("fake-ocr" in r.text for r in self.pipeline.search("mixed-lib", "fake-ocr scanned", top_k=10)))
+        self.assertEqual(self._stash_files(), [], "发布成功后，已经用上的暂存要清掉")
+
+    def test_stashed_scans_are_used_even_when_mineru_is_down_next_round(self):
+        self._fail_after_converting()
+        self.runtime.disable("official-ocr-mineru-local")
+        self.runtime.unload("official-ocr-mineru-local")
+        report = self.pipeline.index_library("mixed-lib")
+        self.assertEqual(report.succeeded, 6, report.files)
+        self.assertEqual(report.deferred, 0)
+
+    def test_fresh_extract_ignores_the_stash(self):
+        self._fail_after_converting()
+        with patch.object(self.pdf_text, "extract", wraps=self.pdf_text.extract) as text_extract:
+            report = self.pipeline.index_library("mixed-lib", fresh_extract=True)
+        self.assertEqual(report.succeeded, 6, report.files)
+        self.assertGreaterEqual(text_extract.call_count, 4)
+
+    def test_a_changed_pdf_does_not_reuse_the_stash_of_its_old_content(self):
+        self._fail_after_converting()
+        import pymupdf
+
+        doc = pymupdf.open()
+        doc.new_page().insert_text((72, 72), "rewritten text layer about kitchen recipes")
+        doc.save(str(self.vault / "text-layer.pdf"))
+        doc.close()
+        with patch.object(self.pdf_text, "extract", wraps=self.pdf_text.extract) as text_extract:
+            report = self.pipeline.index_library("mixed-lib")
+        self.assertEqual(report.succeeded, 6, report.files)
+        self.assertIn("text-layer.pdf", [call.args[1] for call in text_extract.call_args_list])
 
 
 class _FakeLlmHttpClient:

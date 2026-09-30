@@ -29,10 +29,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import time
 import urllib.parse
 from pathlib import Path
 
 from .atomic import atomic_write_text
+
+#: “转换暂存”放在每个库缓存目录下的这个子目录里（下划线开头，不会与 uuid 形式的 generation 撞名）。
+STASH_DIR = "_stash"
+#: 暂存条目超过这么久没被用上就当孤儿清掉（文件后来改了、删了或被排除出索引范围）。
+STASH_MAX_AGE_SECONDS = 30 * 24 * 3600
+_CONTENT_HASH_RE = re.compile(r"[0-9a-f]{16,128}")
 
 
 def _hash_for(rel_path: str) -> str:
@@ -114,11 +123,7 @@ class ExtractCache:
         generation: str | None = None,
         route: str | None = None,
     ) -> str | None:
-        path = (
-            self._route_text_path(library_id, rel_path, route, generation)
-            if route
-            else self._text_path(library_id, rel_path, generation)
-        )
+        path = self.locate_path(library_id, rel_path, route, generation)
         if not path.is_file():
             return None
         try:
@@ -138,6 +143,23 @@ class ExtractCache:
             if text is not None:
                 return text
         return None
+
+    def locate_path(
+        self,
+        library_id: str,
+        rel_path: str,
+        route: str | None = None,
+        generation: str | None = None,
+    ) -> Path:
+        """这份正文缓存**应该**在的文件位置（不检查存不存在）。与 `read()` 同一套命名规则——
+        “转换缓存”清单（BC-19）靠它告诉用户“存在哪、多大”，不另起一套猜文件名的逻辑。"""
+        if route:
+            return self._route_text_path(library_id, rel_path, route, generation)
+        return self._text_path(library_id, rel_path, generation)
+
+    def library_dir(self, library_id: str) -> Path:
+        """这个库的转文字缓存文件夹（各轮 generation 的子文件夹、转换暂存都在它下面）。"""
+        return self._dir_for(library_id)
 
     def iter_entries(
         self,
@@ -208,6 +230,75 @@ class ExtractCache:
         library_dir = self._dir_for(library_id, generation)
         if library_dir.is_dir():
             shutil.rmtree(library_dir)
+
+    # ---- 转换暂存（2026-09-29 操作者确认）-------------------------------------
+    # 上面的缓存按“轮次”（generation）存：一轮索引被停止、出错或进程被杀，这一轮没发布，
+    # 它的目录随之丢弃——里面已经转好的 PDF/DOCX 正文也一起没了，下一轮得重新送 MinerU。
+    # 2026-09-29 真机：停在 Y2S1 的第 24 个文件时，20 份已解析好的扫描件（约 4 分钟 MinerU
+    # 工作）就这样丢了。暂存区按“文件内容指纹 + 产出它的转换器与版本”存，转好一份立刻落盘，
+    # 不跟轮次走：内容没变、转换器没升级，下一轮直接拿来用；成功发布后已经用上的条目清掉。
+
+    def _stash_path(self, library_id: str, content_hash: str, route: str) -> Path:
+        if not _CONTENT_HASH_RE.fullmatch(content_hash or ""):
+            raise ValueError("content_hash 必须是十六进制内容指纹")
+        return self._root / library_id / STASH_DIR / f"{content_hash}.{self._route_suffix(route)}.txt"
+
+    def write_stash(self, library_id: str, content_hash: str, route: str, text: str) -> None:
+        target = self._stash_path(library_id, content_hash, route)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(target, text)
+
+    def read_stash(
+        self,
+        library_id: str,
+        content_hash: str,
+        routes: tuple[str, ...] | list[str],
+    ) -> tuple[str, str] | None:
+        """按 `routes` 的先后找这份内容的暂存正文，返回（正文，产出它的路由）。路由里带
+        转换器版本，所以转换器升级后旧暂存自然查不到。"""
+        if not _CONTENT_HASH_RE.fullmatch(content_hash or ""):
+            return None
+        for route in routes:
+            path = self._stash_path(library_id, content_hash, route)
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            try:
+                os.utime(path)  # 还在被需要：刷新“最近用到”的时间，别被当孤儿过期清掉
+            except OSError:
+                pass
+            return text, route
+        return None
+
+    def prune_stash(
+        self,
+        library_id: str,
+        *,
+        settled_hashes: set[str],
+        max_age_seconds: float = STASH_MAX_AGE_SECONDS,
+        now: float | None = None,
+    ) -> int:
+        """清掉已经没用的暂存条目：内容已在刚发布的索引里落定（入库或终态）的，以及太久
+        没被用上的孤儿。其余（这一轮延后的、被 Agent 授权范围排除没处理到的）留着。
+        返回删掉的条目数；单个文件删不掉就跳过。"""
+        directory = self._root / library_id / STASH_DIR
+        if not directory.is_dir():
+            return 0
+        cutoff = (time.time() if now is None else now) - max_age_seconds
+        removed = 0
+        for path in directory.glob("*.txt"):
+            content_hash = path.name.split(".", 1)[0]
+            try:
+                stale = content_hash in settled_hashes or path.stat().st_mtime < cutoff
+                if stale:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                continue
+        return removed
 
     def list_relative_paths(self, library_id: str, generation: str | None = None) -> list[str]:
         """列出这个库当前缓存里有正文的全部相对路径——`find_duplicates`

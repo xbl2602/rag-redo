@@ -102,6 +102,78 @@ class TestExtractCache(unittest.TestCase):
         self.assertEqual(self.cache.list_relative_paths("never-existed"), [])
 
 
+class TestConversionStash(unittest.TestCase):
+    """转换暂存：按“内容指纹 + 转换器与版本”存，跟轮次（generation）无关——一轮被停掉、这一轮
+    的缓存段被丢弃，已经转好的正文还在（2026-09-29 操作者确认）。"""
+
+    H1 = "a" * 64
+    H2 = "b" * 64
+    LOCAL = "official-ocr-mineru-local:0.2.0"
+    TEXT = "official-extractor-pdf-text:0.3.0"
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.cache = ExtractCache(self.tmp / "extracted")
+
+    def test_round_trip_reports_which_converter_produced_it(self):
+        self.cache.write_stash("lib1", self.H1, self.LOCAL, "识别出的正文")
+        self.assertEqual(self.cache.read_stash("lib1", self.H1, [self.TEXT, self.LOCAL]), ("识别出的正文", self.LOCAL))
+
+    def test_a_different_converter_version_does_not_match(self):
+        self.cache.write_stash("lib1", self.H1, "official-extractor-pdf-text:0.2.0", "只有水印")
+        self.assertIsNone(self.cache.read_stash("lib1", self.H1, [self.TEXT]))
+
+    def test_a_different_content_does_not_match(self):
+        self.cache.write_stash("lib1", self.H1, self.LOCAL, "旧内容的识别结果")
+        self.assertIsNone(self.cache.read_stash("lib1", self.H2, [self.LOCAL]))
+
+    def test_discarding_a_generation_keeps_the_stash(self):
+        self.cache.write("lib1", "scan.pdf", "本轮缓存", generation="g-cancelled", route=self.LOCAL)
+        self.cache.write_stash("lib1", self.H1, self.LOCAL, "识别出的正文")
+        self.cache.clear_library("lib1", "g-cancelled")
+        self.assertEqual(self.cache.read_stash("lib1", self.H1, [self.LOCAL]), ("识别出的正文", self.LOCAL))
+
+    def test_removing_the_library_removes_its_stash(self):
+        self.cache.write_stash("lib1", self.H1, self.LOCAL, "识别出的正文")
+        self.cache.clear_library("lib1")
+        self.assertIsNone(self.cache.read_stash("lib1", self.H1, [self.LOCAL]))
+
+    def test_prune_drops_settled_and_expired_entries_and_keeps_the_rest(self):
+        import os
+        import time
+
+        self.cache.write_stash("lib1", self.H1, self.LOCAL, "已入库")
+        self.cache.write_stash("lib1", self.H2, self.LOCAL, "还没轮到")
+        self.cache.write_stash("lib1", "c" * 64, self.LOCAL, "放了很久")
+        old = time.time() - 40 * 24 * 3600
+        os.utime(self.cache._stash_path("lib1", "c" * 64, self.LOCAL), (old, old))
+        removed = self.cache.prune_stash("lib1", settled_hashes={self.H1})
+        self.assertEqual(removed, 2)
+        self.assertIsNone(self.cache.read_stash("lib1", self.H1, [self.LOCAL]))
+        self.assertIsNotNone(self.cache.read_stash("lib1", self.H2, [self.LOCAL]))
+
+    def test_reading_refreshes_the_last_used_time(self):
+        import os
+        import time
+
+        self.cache.write_stash("lib1", self.H1, self.LOCAL, "还被需要")
+        path = self.cache._stash_path("lib1", self.H1, self.LOCAL)
+        old = time.time() - 40 * 24 * 3600
+        os.utime(path, (old, old))
+        self.assertIsNotNone(self.cache.read_stash("lib1", self.H1, [self.LOCAL]))
+        self.assertEqual(self.cache.prune_stash("lib1", settled_hashes=set()), 0)
+
+    def test_a_non_hex_content_hash_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.cache.write_stash("lib1", "../../escape", self.LOCAL, "x")
+        self.assertIsNone(self.cache.read_stash("lib1", "../../escape", [self.LOCAL]))
+
+    def test_stash_does_not_show_up_as_a_library_entry(self):
+        self.cache.write_stash("lib1", self.H1, self.LOCAL, "识别出的正文")
+        self.assertEqual(self.cache.list_relative_paths("lib1"), [])
+
+
 class TestIndexManifestStore(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())

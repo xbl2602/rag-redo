@@ -427,8 +427,11 @@ class SubprocessServiceHandle:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read())
-        except urllib.error.URLError as exc:
-            raise SubprocessServiceError(f"调用子进程 {method} 失败: {exc}") from exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            # 读响应超时抛的是 TimeoutError（OSError 子类），不是 URLError；子进程回了半截或
+            # 不是 JSON 抛 ValueError。都折叠成本类异常，调用方（提取器）才能按“这一份失败”处理，
+            # 不会把整轮索引拖垮（§5：提取器失败不能抛成宿主异常）。
+            raise SubprocessServiceError(f"调用子进程 {method} 失败: {type(exc).__name__}: {exc}") from exc
 
     def stop(self, grace_period: float = 3.0) -> None:
         """不留游离进程（架构红线6）：先礼后兵——给子进程机会自己清理，

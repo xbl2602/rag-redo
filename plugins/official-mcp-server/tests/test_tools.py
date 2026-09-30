@@ -453,6 +453,46 @@ class TestMcpTools(TestMcpToolsAsyncBase):
             document.add_paragraph(text)
             document.save(str(directory / name))
 
+    async def test_wemm_status_reports_conversion_caches_only_for_authorized_formats(self):
+        """BC-19：Agent 也能查“转文字/页库缓存建没建、缺哪些、下一步怎么办”；
+        BC-02：没授权给 Agent 的格式，名字和数量都不能出现。"""
+        vault = self.tmp / "vault"
+        self._write_docx_pair(vault, "secret", "保密内容，Agent 不该知道它存在。" * 4)
+        docx_vault = self.tmp / "docx-vault"
+        self._write_docx_pair(docx_vault, "approved", "已批准的内容，用户允许 Agent 读取。" * 4)
+        self.lib_mgr.store.add_library("docx-lib", "有授权的库", str(docx_vault))
+        self.lib_mgr.store.set_agent_formats("docx-lib", [".docx"])
+        await self._reindex_and_wait("test-lib")
+        await self._reindex_and_wait("docx-lib")
+        # 前提自检：没授权的库里 docx 确实转好了（否则下面“不出现”是空话）
+        unfiltered = self.pipeline.conversion_caches("test-lib")[0]
+        self.assertTrue(any("secret" in item.path for item in unfiltered.files))
+
+        result = await self.server.call_tool("wemm_status", {})
+        self.assertFalse(result.is_error)
+        payload = result.structured_content
+        self.assertTrue(payload["ok"], payload)
+        caches = payload["conversion_caches"]
+        self.assertEqual((caches["test-lib"]["text_done"], caches["test-lib"]["text_total"]), (0, 0))
+        self.assertEqual((caches["docx-lib"]["text_done"], caches["docx-lib"]["text_total"]), (2, 2))
+        self.assertNotIn("missing", caches["docx-lib"], "不指定库时只给汇总")
+        self.assertNotIn("secret", str(payload))
+
+        # 授权库里一份缓存文件被删：指定库时列出它、写明原因和下一步
+        approved = {item.path: item for item in self.pipeline.conversion_caches("docx-lib")[0].files}
+        Path(approved["approved.docx"].text_file).unlink()
+        one = (await self.server.call_tool("wemm_status", {"library_id": "docx-lib"})).structured_content
+        self.assertEqual(list(one["conversion_caches"]), ["docx-lib"])
+        missing = one["conversion_caches"]["docx-lib"]["missing"]
+        self.assertEqual([row["path"] for row in missing], ["approved.docx"])
+        self.assertEqual(missing[0]["text_reason"], "正文文件不见了")
+        self.assertTrue(missing[0]["text_next_step"])
+        secret = (await self.server.call_tool("wemm_status", {"library_id": "test-lib"})).structured_content
+        self.assertEqual(secret["conversion_caches"]["test-lib"]["missing"], [])
+        self.assertNotIn("secret", str(secret))
+        bad = (await self.server.call_tool("wemm_status", {"library_id": "no-such-lib"})).structured_content
+        self.assertFalse(bad["ok"])
+
     async def test_find_duplicates_never_leaks_unauthorized_formats_across_libraries(self):
         """BC-02：Agent 默认只能处理 md/txt，pdf/docx 需要用户逐库批准。此前多库调用
         （含默认 `libraries=""`）不做任何格式过滤——某个库**没批准**的 docx 文件名和

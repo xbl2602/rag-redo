@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import sys
 import tempfile
@@ -15,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from core.singleton import pid_alive
 from core.registry import ExtensionConflictError
 from core.runtime import PluginRuntime, PluginState
 
@@ -378,24 +378,14 @@ class TestPluginRuntimeLifecycle(unittest.TestCase):
 
 
 def _process_is_gone(pid: int) -> bool:
-    """跨平台的"这个 pid 是不是真的没了"检查。POSIX 上 os.kill(pid, 0)
-    不发信号只探测进程是否存在，进程不在时抛 ProcessLookupError；Windows
-    没有这个信号语义，os.kill 在那边会直接抛 OSError（WinError 87），不能
-    用同一段代码判断，得走 Win32 OpenProcess API 才是真的问操作系统。"""
-    if os.name == "nt":
-        import ctypes
+    """"这个 pid 是不是真的没了"：直接问 `core/singleton.py::pid_alive`（看进程是不是已经
+    结束），测试里不另写一份判断（AGENTS.md §4.5、§7）。
 
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return True
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    return False
+    以前这里各自写成“OpenProcess 打得开就算还活着”，在 Windows 上判不准：进程被杀掉之后，
+    只要别处还有人握着它的句柄，这个进程对象就还在、照样打得开，要过零点几秒才真正消失。
+    2026-10-01 在整套回归里抓到过：`stop()` 之后立刻查，退出码已经是 1（被 taskkill 杀掉），
+    却仍被判“还活着”，1 秒后再查就没了——“停止子进程”那条测试时好时坏就是这个原因。"""
+    return not pid_alive(pid)
 
 
 class TestSubprocessServicePluginLifecycle(unittest.TestCase):

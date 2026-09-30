@@ -1,0 +1,311 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "一次搜索：从提问到拿到结果",
+    "locale": "zh-CN",
+    "animation": "trace",
+    "quality_profile": "standard",
+    "viewBox": [
+      810,
+      810
+    ],
+    "legend": {
+      "mode": "hidden"
+    }
+  },
+  "components": [
+    {
+      "id": "ask",
+      "type": "external",
+      "label": "你 / AI 助手提问",
+      "sublabel": "一句话，按意思搜",
+      "pos": [
+        220,
+        30
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "fresh",
+      "type": "backend",
+      "label": "先看笔记变了没",
+      "sublabel": "变了就自动更新（AI 助手搜索时）",
+      "pos": [
+        220,
+        144
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "vec",
+      "type": "backend",
+      "label": "按意思找",
+      "sublabel": "向量 · 大范围候选",
+      "pos": [
+        90,
+        258
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "kw",
+      "type": "backend",
+      "label": "按字词找",
+      "sublabel": "关键词 · 中文分词",
+      "pos": [
+        350,
+        258
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "fuse",
+      "type": "backend",
+      "label": "合并两路排名",
+      "sublabel": "RRF 融合",
+      "pos": [
+        220,
+        372
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "rerank",
+      "type": "backend",
+      "label": "精挑重排",
+      "sublabel": "更准的打分模型",
+      "pos": [
+        220,
+        486
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "deliver",
+      "type": "backend",
+      "label": "整理结果",
+      "sublabel": "同节合并 · 同文件封顶 · 补足条数",
+      "pos": [
+        220,
+        600
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "answer",
+      "type": "frontend",
+      "label": "返回结果",
+      "sublabel": "+ 至多 2 条搜索建议",
+      "pos": [
+        220,
+        714
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "sync",
+      "type": "cloud",
+      "label": "后台增量更新",
+      "sublabel": "更新期间旧索引照常可用",
+      "pos": [
+        610,
+        144
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "hyde",
+      "type": "cloud",
+      "label": "假设答案再查一遍",
+      "sublabel": "分数太低时 · 默认关闭",
+      "pos": [
+        610,
+        486
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "visual",
+      "type": "cloud",
+      "label": "看图找 PDF 页面",
+      "sublabel": "独立的第二套系统",
+      "pos": [
+        610,
+        258
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "vres",
+      "type": "database",
+      "label": "页面图 + 页码",
+      "sublabel": "不与文字分数混排",
+      "pos": [
+        610,
+        372
+      ],
+      "size": [
+        170,
+        64
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "第二套系统：看图找页面（独立）",
+      "wraps": [
+        "visual",
+        "vres"
+      ],
+      "pad": 18
+    }
+  ],
+  "connections": [
+    {
+      "id": "c1",
+      "from": "ask",
+      "to": "fresh",
+      "label": "提问",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        305,
+        119
+      ]
+    },
+    {
+      "id": "c2",
+      "from": "fresh",
+      "to": "vec",
+      "label": "意思",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "c3",
+      "from": "fresh",
+      "to": "kw",
+      "label": "字词",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "c4",
+      "from": "vec",
+      "to": "fuse",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "left"
+    },
+    {
+      "id": "c5",
+      "from": "kw",
+      "to": "fuse",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "right"
+    },
+    {
+      "id": "c6",
+      "from": "fuse",
+      "to": "rerank",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "c7",
+      "from": "rerank",
+      "to": "deliver",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "c8",
+      "from": "deliver",
+      "to": "answer",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "c9",
+      "from": "fresh",
+      "to": "sync",
+      "label": "有变化",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "c10",
+      "from": "rerank",
+      "to": "hyde",
+      "label": "分数低",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "c11",
+      "from": "hyde",
+      "to": "deliver",
+      "label": "更高才换",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "right"
+    },
+    {
+      "id": "c12",
+      "from": "visual",
+      "to": "vres",
+      "label": "页面",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        695,
+        347
+      ]
+    }
+  ]
+}

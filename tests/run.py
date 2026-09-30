@@ -52,6 +52,8 @@ CORE_SUITES = [
     "test_noise_cleaning",
     "test_note_relations",
     "test_graph",
+    "test_overview_map",
+    "test_conversion_cache",
     "test_singleton",
     "test_paths",
     "test_runtime",

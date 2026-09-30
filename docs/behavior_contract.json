@@ -1,7 +1,11 @@
 {
   "format_version": 1,
   "policy": "strict-behavior-compatibility",
-  "status_values": ["blocked", "partial", "pass"],
+  "status_values": [
+    "blocked",
+    "partial",
+    "pass"
+  ],
   "contracts": [
     {
       "id": "BC-01",
@@ -116,7 +120,8 @@
         "obsidian-rag/index.py:2204-2206",
         "obsidian-rag/index.py:97-101",
         "obsidian-rag/index.py:2056-2300",
-        "obsidian-rag/gui/store.py:317-326"
+        "obsidian-rag/gui/store.py:317-326",
+        "obsidian-rag/wemm_indexer.py:257-278"
       ],
       "redo_refs": [
         "rag-redo/plugins/official-extractor-text/official_extractor_text/extract.py::extract",
@@ -126,7 +131,8 @@
         "rag-redo/core/pipeline.py::Pipeline.index_library deferred 分支",
         "rag-redo/core/index_progress.py::IndexProgress",
         "rag-redo/core/pipeline.py:_PendingFile",
-        "rag-redo/core/index_progress.py:IndexWorkerManager.status"
+        "rag-redo/core/index_progress.py:IndexWorkerManager.status",
+        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py:index_library"
       ],
       "test_refs": [
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_empty_and_tbd_terminal_states_are_stable_until_content_changes",
@@ -141,9 +147,11 @@
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_embedding_progress_counts_chunks_and_never_precedes_extraction_progress",
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_failure_while_embedding_publishes_nothing_and_keeps_the_old_index",
         "rag-redo/tests/test_index_progress.py::TestIndexWorkerManager.test_embedding_phase_percent_counts_chunks_and_gives_no_file_based_eta",
-        "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestProgressSnapshot.test_embedding_phase_progress_counts_chunks_like_the_legacy_bar"
+        "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestProgressSnapshot.test_embedding_phase_progress_counts_chunks_like_the_legacy_bar",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_the_text_index_is_still_published_when_the_visual_index_cannot_run",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualIndexStopsWhenTheServiceIsUnreachable"
       ],
-      "acceptance": "unreadable、empty、tbd、scanned、extract-failed 等终态可区分；稳定失败不重复消耗资源；能力签名变化和内容变化可重试；deferred 不得伪装成终态且不落 manifest 记录——保留旧条目与旧块继续服务（检索不受影响），文件与旧记录的差异驱动下一轮自动重试，恢复后重试成功。【经操作者确认的偏离（2026-09-29）】文本提取器读文件时先剥掉开头的 UTF-8 BOM、再把 \\r\\n 与 \\r 统一成 \\n；旧项目 index.py:100 是裸 utf-8 解码、不做这两步（BOM 会以看不见的字符混进正文，Windows 换行会把 \\r 带进块文本，同一篇笔记在 Windows/Linux 间还会被当成内容变了）。用户可见的后果：含 CRLF 或 BOM 的旧笔记，块文本会变，迁移后首轮索引会重建一次，之后与旧项目一样稳定。除这两步外，解码降级（非 UTF-8 用替换字符入库、不落失败终态）、空文件落 empty 终态与旧项目逐条一致。【缺陷修复，恢复旧行为（2026-09-29）】索引轮次的顺序必须是旧项目 index.py:2056-2300 的三段：①逐个文件提取→清洗→切块，并把待嵌的块攒起来（提取失败/deferred/空文件/tbd 等终态在这一段就地落定）；②全部转换完后对所有待嵌块连续做向量（分片只为进度心跳，片内按文本长度排序减少填充，嵌入器内部批大小与显存自动收紧不变）；③统一写入向量库/词法库并生成清单记录，最后才原子发布 generation。此前是“一个文件：提取→切块→向量→写库”再下一个，真机上显卡每做完一个小文件就闲下来等 CPU（GPU 功耗在 0 和高值间来回跳），MinerU/WEMM 与向量模型在每个文件之间来回抢显存。进度口径随之对齐旧 gui/store.py::progress_ratio：向量化阶段进度条与 percent 按块数、其余阶段按文件数，按文件外推的剩余时间在向量化/写入阶段不给。任何一段异常整轮不发布，旧索引不动（有测试）。",
+      "acceptance": "unreadable、empty、tbd、scanned、extract-failed 等终态可区分；稳定失败不重复消耗资源；能力签名变化和内容变化可重试；deferred 不得伪装成终态且不落 manifest 记录——保留旧条目与旧块继续服务（检索不受影响），文件与旧记录的差异驱动下一轮自动重试，恢复后重试成功。【经操作者确认的偏离（2026-09-29）】文本提取器读文件时先剥掉开头的 UTF-8 BOM、再把 \\r\\n 与 \\r 统一成 \\n；旧项目 index.py:100 是裸 utf-8 解码、不做这两步（BOM 会以看不见的字符混进正文，Windows 换行会把 \\r 带进块文本，同一篇笔记在 Windows/Linux 间还会被当成内容变了）。用户可见的后果：含 CRLF 或 BOM 的旧笔记，块文本会变，迁移后首轮索引会重建一次，之后与旧项目一样稳定。除这两步外，解码降级（非 UTF-8 用替换字符入库、不落失败终态）、空文件落 empty 终态与旧项目逐条一致。【缺陷修复，恢复旧行为（2026-09-29）】索引轮次的顺序必须是旧项目 index.py:2056-2300 的三段：①逐个文件提取→清洗→切块，并把待嵌的块攒起来（提取失败/deferred/空文件/tbd 等终态在这一段就地落定）；②全部转换完后对所有待嵌块连续做向量（分片只为进度心跳，片内按文本长度排序减少填充，嵌入器内部批大小与显存自动收紧不变）；③统一写入向量库/词法库并生成清单记录，最后才原子发布 generation。此前是“一个文件：提取→切块→向量→写库”再下一个，真机上显卡每做完一个小文件就闲下来等 CPU（GPU 功耗在 0 和高值间来回跳），MinerU/WEMM 与向量模型在每个文件之间来回抢显存。进度口径随之对齐旧 gui/store.py::progress_ratio：向量化阶段进度条与 percent 按块数、其余阶段按文件数，按文件外推的剩余时间在向量化/写入阶段不给。任何一段异常整轮不发布，旧索引不动（有测试）。【缺陷修复，恢复旧行为（2026-09-29 晚，BC-11 配套）】页级视觉索引的失败必须同时满足两条，缺一条就会把整轮文字索引赔进去：①**快速失败**——子进程服务不可达（连接被拒/超时/已死）时，本轮页级索引立刻收手，不许逐页重试。旧项目 wemm_indexer.py:257-278（问题46「单轮单次」）的语义是「服务本轮不可用就记终态、不再拉起」；rag-redo 曾对每页失败只 `continue` 换下一页，78 份 PDF × 每份几十页＝几千次注定失败的调用，索引进程假活（心跳线程独立照刷、视觉阶段有 300 秒停滞宽限，界面显示一切正常），用户以为卡死而中断。②**不连坐**——视觉没建成不许阻止文字索引发布。core/pipeline.py 的 manifest 写入与 generation commit 排在视觉阶段之后，视觉阶段一旦挂住或被中断，已经算好向量、切好块的文字索引一份都不落盘。真机证据：data-real/index_progress/Y2S1-*.json 停在 files_done=78/78、phase=visual，库的「最后索引时间」仍是上一轮的。视觉失败的文件记可重试终态（status=failed，下一轮自动重试），已编出页的文件保留 indexed/partial（宁可 partial 也不丢已付出的编码），文字索引照常发布、照常能搜到。熔断只针对服务级故障；服务健康、只是某一页编码不出来仍然逐页继续——把单页失败也当服务挂了会让一次手抖毁掉整轮。",
       "blocker": ""
     },
     {
@@ -203,6 +211,8 @@
       ],
       "redo_refs": [
         "rag-redo/plugins/official-chunker/official_chunker/chunk.py:84-161",
+        "rag-redo/core/html_table.py",
+        "rag-redo/core/text_cleaning.py::flatten_html_tables",
         "rag-redo/core/pipeline.py:603-723",
         "rag-redo/core/pipeline.py:1085-1185",
         "rag-redo/plugins/official-mcp-server/official_mcp_server/tools.py:35-90"
@@ -210,9 +220,14 @@
       "test_refs": [
         "rag-redo/plugins/official-chunker/tests/test_chunk.py::TestChunkDocument.test_sibling_chunks_share_exact_parent_section",
         "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_small_to_big_backfills_and_folds_parent_section",
-        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_small_to_big_list_mode_keeps_small_chunks"
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_small_to_big_list_mode_keeps_small_chunks",
+        "rag-redo/plugins/official-chunker/tests/test_chunk.py::TestDisplayFormulaIsNeverCut",
+        "rag-redo/plugins/official-chunker/tests/test_chunk.py::TestFormulaGetsItsContext",
+        "rag-redo/plugins/official-chunker/tests/test_chunk.py::TestSmallParagraphsArePacked",
+        "rag-redo/tests/test_noise_cleaning.py::TestFlattenHtmlTables",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_html_table_is_flattened_and_kept_whole_with_its_context_in_index_text"
       ],
-      "acceptance": "小块检索保持不变；正文模式回填父节、同节只交付一次、同文件封顶后能补足 top_k；list 模式不展开正文。",
+      "acceptance": "小块检索保持不变；正文模式回填父节、同节只交付一次、同文件封顶后能补足 top_k；list 模式不展开正文。【经操作者批准的调整（2026-09-30）】切块形状调整，起因是对本机真实提取缓存（348 份、23,423 块）的体检：短于 30 字的块占 21%，单独一个公式的块占 14%，被从中间切断的 HTML 表格块 96 个，另有 32 块只含半个公式；根因是章节一长每个自然段各自成块、MinerU 的 HTML 表格切块器不认、公式块里的空行和超长公式会被切开。调整共四件：①索引文本清洗新增“HTML 表格摊平成竖线表格”（去掉标签与 rowspan/colspan 噪声，rowspan 的文字在被占的每一行重复，colspan 补空格子；围栏代码块里的 HTML 与写成说明文字的 `<td>` 不动；提取缓存与 read_document 交付的原文不动），此后切块器只需认竖线表格；②`$$…$$` 公式块与表格一样宁大勿断（块内空行不是段落边界，块内 # 不是标题，超长也不按句子切；找不到配对的结尾 $$ 时当普通段落，不吞后文）；③公式块不再单独成块，并入紧挨它的上文（上文超长时只借最后几句），公式后面的“式中…/where…”说明或不超过 40 字的短行一并带上，连续公式拼成推导链、最多拼到切块上限的 2 倍（做法参考 RAGFlow 把前后文字窗口并进表格块、Docling 把标题与图注拼进嵌入文本；不用大模型）；④同一节里的碎小段落合并到接近上限（600 字）再成块，有一侧不足 60 字时允许略超上限（至多 1.25 倍），表格与公式块不与无关段落合并，合并不跨节。【明确不改】表格整张不切是操作者确认的设计（避免丢上下文）；已知代价是很大的表格在重排阶段只有开头参与打分（重排模型最大长度 512）。升级影响：TEXT_PIPELINE_VERSION 3→4、CHUNKER_VERSION 0.3.0→0.4.0，所有库下一次增量重建时按 BC-12 的版本失效机制整库重新切块、重新向量化，用户数据不丢、无需迁移。真实数据前后对比（同样 348 份）：总块数 23,423→9,892；短于 30 字 5,019→231（剩下的约一半是“标题下整节只有一行”，无法再合并）；单独一个公式的块 3,244→192；表格被切断 44→0；公式被切断 16→0；含 HTML 标签的块 368→0；纯文字的超长块（>2000 字）0 个，>2000 字的 297 块都是整张的大表（285）或超长公式（12）；1,889 份文档逐份核对，新切块器不丢内容、不重复内容。对普通笔记（1,541 份 Markdown/文本）：总块数 17,001→15,294，短于 30 字 872→265，块长中位数 247→290。没有验证的：切块调整对真实检索质量的影响（孤立公式块是否真的把结果挤偏只是推测），需要在真实库上前后对比。",
       "blocker": ""
     },
     {
@@ -263,7 +278,7 @@
         "rag-redo/plugins/official-gui-shell/tests/test_api.py::TestApi.test_open_source_resolves_only_inside_library",
         "rag-redo/tests/test_pipeline_e2e.py::TestExportImportLibrary.test_import_preserves_terminal_failure_diagnostics"
       ],
-      "acceptance": "Graph 必须提供文件/页节点、双链/归属边、终态和可选语义边；GUI 只能消费只读模型，不能直接读存储；源文件打开必须限制在对应库目录内。",
+      "acceptance": "Graph 必须提供文件/页节点、双链/归属边、终态和可选语义边；GUI 只能消费只读模型，不能直接读存储；源文件打开必须限制在对应库目录内。（2026-09-30 起 GUI 图谱页改画总览星图（BC-18），界面不再渲染这些边；读模型、桥接方法 graph()/semantic_edges() 与其测试保持不变。）",
       "blocker": ""
     },
     {
@@ -303,7 +318,9 @@
         "obsidian-rag/mineru_server.py:520",
         "obsidian-rag/index.py:1784-1806",
         "obsidian-rag/wemm_indexer.py:253-278",
-        "obsidian-rag/wemm_indexer.py:311-321"
+        "obsidian-rag/wemm_indexer.py:311-321",
+        "obsidian-rag/index.py:703-742",
+        "obsidian-rag/gpu_arbiter.py:441-455"
       ],
       "redo_refs": [
         "rag-redo/core/resource_arbiter.py:46-375",
@@ -311,11 +328,13 @@
         "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py:97-180",
         "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/server.py:_vram_snapshot",
         "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/server.py:make_server",
-        "rag-redo/core/pipeline.py:_release_text_models_for_visual",
+        "rag-redo/core/pipeline.py:_make_room_for_visual_index",
         "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py:index_library",
         "rag-redo/core/subprocess_service.py:SubprocessServiceHandle._child_env",
         "rag-redo/plugins/official-visual-wemm/official_visual_wemm/server.py:_parent_watch_daemon",
         "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/server.py:_parent_watch_daemon",
+        "rag-redo/core/pipeline.py:Pipeline._VISUAL_HANDOFF_TARGETS",
+        "rag-redo/core/gpu_arbiter.py:request_evict",
         "rag-redo/plugins/official-embedder-bge-m3/official_embedder_bge_m3/embed.py:_RealEncoder._park",
         "rag-redo/plugins/official-embedder-bge-m3/official_embedder_bge_m3/embed.py:_RealEncoder._unpark",
         "rag-redo/plugins/official-reranker/official_reranker/rerank.py:_RealReranker._park",
@@ -334,13 +353,18 @@
         "rag-redo/tests/test_subprocess_service.py::TestChildKnowsItsParent",
         "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestServerExitsWhenItsHostIsGone.test_orphaned_server_really_exits_after_its_host_is_killed",
         "rag-redo/plugins/official-ocr-mineru-local/tests/test_plugin.py::TestServerExitsWhenItsHostIsGone.test_orphaned_server_really_exits_after_its_host_is_killed",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_the_visual_handoff_also_asks_the_local_ocr_service_to_give_up_the_gpu",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_the_visual_handoff_never_asks_the_visual_service_to_evict_itself",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVramGateIsReportedTruthfully",
+        "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestProgressSnapshot.test_a_broken_vram_probe_never_empties_the_whole_snapshot",
         "rag-redo/plugins/official-embedder-bge-m3/tests/test_embed.py::TestPreemptedModelWaitsInRam",
         "rag-redo/plugins/official-embedder-bge-m3/tests/test_embed.py::TestGpuLeaseCrossProcess.test_preempted_model_waits_in_ram_and_comes_back_without_reloading",
         "rag-redo/plugins/official-reranker/tests/test_rerank.py::TestRerankerPreemptedModelWaitsInRam",
         "rag-redo/tests/test_model_loading.py::TestLoadPretrained.test_loading_never_asks_the_hub_to_convert_weights",
-        "rag-redo/tests/test_model_loading.py::TestLoadPretrained.test_transformers_still_honours_the_conversion_switch"
+        "rag-redo/tests/test_model_loading.py::TestLoadPretrained.test_transformers_still_honours_the_conversion_switch",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_page_progress_from_the_visual_index_reaches_the_progress_message"
       ],
-      "acceptance": "GUI、MCP、worker 同时运行时不能双驻留；优先级抢占必须作用于真实 holder；锁状态未知不能宣称资源空闲。【缺陷修复，恢复旧行为（2026-09-29）】本机 MinerU 服务必须能在解析进行中应答 /health，且 /health 不在请求线程里做显存探测：旧项目 mineru_server.py 用 ThreadingHTTPServer 且 /health 不做重活；rag-redo 曾用单线程 HTTPServer 并在 /health 里现场 import torch，真机 CPU 被打满时超出宿主 10 秒启动预算，插件“启用失败”、扫描件被整轮延后。现改为多线程服务 + 后台刷新显存快照。【缺陷修复，恢复旧行为（2026-09-29）】文字索引与页级视觉索引必须按旧项目的交接顺序错峰：①视觉插件“真有页要渲染”时才调用核心传入的 before_serve，核心据此让 bge 与 reranker 释放显卡名额（旧项目 _release_for_wemm）；无页可渲染时既不让路也不拉起看图服务（零拉起零开销）；②页级索引失败/部分成功的记录每轮重试，不再因“PDF 没变”永远跳过（旧项目 wemm_indexer 终态条目不走快速路径）。真机现象：4 个库日志全是“WEMM子进程未运行，页级索引本轮跳过”，70 个 PDF 页库全记失败，图谱里没有任何 WEMM 页节点。已成功且没变的 PDF 仍零渲染零编码。【进程死亡兜底（2026-09-29，内部生命周期加固，非用户可见功能）】宿主进程（GUI/MCP/索引 worker）异常没了（崩溃、被“结束任务”、被强杀）来不及走 stop() 时，subprocess_service 子进程（WEMM 看图服务、本机 MinerU 服务）必须自己退出并释放显存，不能等半小时后的空闲自退出：宿主通过环境变量 RAG_REDO_PARENT_PID 告诉子进程自己的 pid，子进程每 2 秒确认宿主还在，不在就自退出（MinerU 服务连同它的内服务 mineru-api 一起按进程树结束）。旧项目服务只有空闲自退出，没有这条兜底。依据：2026-09-29 实测抓到一个宿主没了 29 分钟还活着的 WEMM 服务孤儿；真实 MinerU（模型已装进显存 3693MiB）宿主被硬杀后进程树 12.4 秒内全部消失、显存回到基线。宿主没有该环境变量（手动启动服务）时不启用监视。【操作者确认（2026-09-30）：被抢显卡时文字模型挪到内存】文字检索侧两个模型（bge-m3、重排器）被别的进程要显卡（GUI、MCP、后台索引进程共用同一个名额持有者，跨进程互相让路；WEMM/MinerU 优先级低抢不动它们）时，on_preempt 不再整个卸载，而是把模型挪到内存：显存全部让出、名额照样归还，对抢方与卸载无区别；下次用时经与首次加载相同的设备判定（冷却期 / 名额 / 物理显存）搬回显卡。真机实测两个模型挪出 0.4 秒、搬回 0.43 秒；此前让路后再搜要重新加载 10~40 秒（典型场景：界面里搜过 → 点重建 → 索引完再搜）。只有被抢这一条挪内存（操作者选定）：空闲满 300 秒（暂存在内存里的也算）、手动「释放显存」（BC-16）、慢批降级、插件停用仍整个卸载。挪不动（异常）退回整个卸载；搬回显卡失败按 CUDA 失败进冷却期、在 CPU 上继续用，不触发重排器的加载失败闩锁。代价：暂存期间多占约 2.2GB 内存。【缺陷修复（2026-09-30），AGENTS.md §1.3 本地优先】bge-m3 本地快照只有 pytorch_model.bin，transformers 每次冷加载都另起线程问 huggingface.co 要 safetensors 转换（真机 cProfile：4 个请求、约 2 秒），local_files_only=True 拦不住；core/model_loading.load_pretrained 现在加载前把 DISABLE_SAFETENSORS_CONVERSION 设为 1（用户自己设了值则尊重）。",
+      "acceptance": "GUI、MCP、worker 同时运行时不能双驻留；优先级抢占必须作用于真实 holder；锁状态未知不能宣称资源空闲。【缺陷修复，恢复旧行为（2026-09-29）】本机 MinerU 服务必须能在解析进行中应答 /health，且 /health 不在请求线程里做显存探测：旧项目 mineru_server.py 用 ThreadingHTTPServer 且 /health 不做重活；rag-redo 曾用单线程 HTTPServer 并在 /health 里现场 import torch，真机 CPU 被打满时超出宿主 10 秒启动预算，插件“启用失败”、扫描件被整轮延后。现改为多线程服务 + 后台刷新显存快照。【缺陷修复，恢复旧行为（2026-09-29）】文字索引与页级视觉索引必须按旧项目的交接顺序错峰：①视觉插件“真有页要渲染”时才调用核心传入的 before_serve，核心据此让 bge 与 reranker 释放显卡名额（旧项目 _release_for_wemm）；无页可渲染时既不让路也不拉起看图服务（零拉起零开销）；②页级索引失败/部分成功的记录每轮重试，不再因“PDF 没变”永远跳过（旧项目 wemm_indexer 终态条目不走快速路径）。真机现象：4 个库日志全是“WEMM子进程未运行，页级索引本轮跳过”，70 个 PDF 页库全记失败，图谱里没有任何 WEMM 页节点。已成功且没变的 PDF 仍零渲染零编码。【进程死亡兜底（2026-09-29，内部生命周期加固，非用户可见功能）】宿主进程（GUI/MCP/索引 worker）异常没了（崩溃、被“结束任务”、被强杀）来不及走 stop() 时，subprocess_service 子进程（WEMM 看图服务、本机 MinerU 服务）必须自己退出并释放显存，不能等半小时后的空闲自退出：宿主通过环境变量 RAG_REDO_PARENT_PID 告诉子进程自己的 pid，子进程每 2 秒确认宿主还在，不在就自退出（MinerU 服务连同它的内服务 mineru-api 一起按进程树结束）。旧项目服务只有空闲自退出，没有这条兜底。依据：2026-09-29 实测抓到一个宿主没了 29 分钟还活着的 WEMM 服务孤儿；真实 MinerU（模型已装进显存 3693MiB）宿主被硬杀后进程树 12.4 秒内全部消失、显存回到基线。宿主没有该环境变量（手动启动服务）时不启用监视。补充事实（2026-09-29 实测，纠正一个一度写错的判断）：判断显存余量**必须用 torch 的 `mem_get_info`，不能用 nvidia-smi**。本机（WDDM 笔记本，RTX 5060 Laptop 8151 MiB）两者相差约 5.2 GiB（torch 报空闲 6.878 GiB、nvidia-smi 报 1.681 GiB）——nvidia-smi 把大量系统内存计入显存占用，读数严重偏低。据此一度得出「这台机器装不下 WEMM」的错误结论并写进了 ROADMAP 与本条，均已更正。旧项目 2026-09-09 确实加载成功过（`data/wemm_server.log`：「model loaded in 8.7s -> cuda; gpu_mem=5.07GB」，`data/wemm_meta_LECTURE NOTE.json` 有 17 份 PDF 真编完页）。【缺陷修复 + 用户可见能力（2026-09-29 晚，操作者确认）】页级视觉导航的显存门槛必须**在本机实测标定**、不足时**带数字快速失败**、并允许**用户强制加载**。①门槛原为 5.5（照搬旧项目同名常量，从未在本机验证），实测（`tools/probe_wemm_vram.py`，用 server.py `_real_embed` 同一调用形态：真实需求是 **6.231 GiB**——加载吃 5.842（其中 torch `memory_allocated` 只有 5.070，**旧项目报的 `gpu_mem=5.07GB` 漏掉了 CUDA 上下文与 cuBLAS/cuDNN 句柄的 0.77 GiB**）+ 编一页再吃 0.404。门槛 5.5 比真实需求**低** 0.73 GiB，照它放行会让模型起来后差一截，触发 OOM 或 WDDM 共享内存抖动（整机变卡，正是本条反复警告的失败模式）——所以是太保守的反面、是漏算。现定 6.3。该值不可再压：试过 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，占用 6.231→6.230（那 0.678 GiB 是上下文与句柄而非碎片）；`WEMM_DIM` 512→256 也不省（省的是向量存储不是权重）。②等待上限从 900s 降到 60s：让路是**主动**发生的（`/evict` 软驱逐、bge/reranker 空闲自动卸载，都是秒级），60s 还等不到基本就是「这块卡此刻装不下」；原来 900s 期间界面只见「空闲显存 5.2GB < 需求 5.5GB」反复刷屏、宿主超时熔断后服务端还在干等。③显存不足时服务端回结构化错误 `{ok:false, reason:vram, required_gb, free_gb}`，插件把两个数字记进 `status()[\"vram\"]`，GUI 快照把「需要 X GB、当前 Y GB、文字索引不受影响、可以去设置里开强制加载」写进 `progress.heartbeat_note`（前端本来就会渲染这个字段，**因此不需要改逐字节冻结的前端**）。**不静默失效**是这条的要点。④新增设置项 `wemm_force_load`（布尔，默认关，设置页由后端 `groups` 动态渲染）：开着时服务端只**跳过那道门槛去试**、**不吞异常**——真 OOM 仍明确报错并把本轮页级索引记为可重试终态，绝不伪装成功、也绝不静默截断向量污染已建好的页库。**BC-15 的冻结值未改**：真模态弹窗需要改前端资产（sha256 会变），按 §3.3 须操作者另行确认，本轮只做「数字可见 + 设置可开关」。【操作者确认（2026-09-30）：被抢显卡时文字模型挪到内存】文字检索侧两个模型（bge-m3、重排器）被别的进程要显卡（GUI、MCP、后台索引进程共用同一个名额持有者，跨进程互相让路；WEMM/MinerU 优先级低抢不动它们）时，on_preempt 不再整个卸载，而是把模型挪到内存：显存全部让出、名额照样归还，对抢方与卸载无区别；下次用时经与首次加载相同的设备判定（冷却期 / 名额 / 物理显存）搬回显卡。真机实测两个模型挪出 0.4 秒、搬回 0.43 秒；此前让路后再搜要重新加载 10~40 秒（典型场景：界面里搜过 → 点重建 → 索引完再搜）。只有被抢这一条挪内存（操作者选定）：空闲满 300 秒（暂存在内存里的也算）、手动「释放显存」（BC-16）、慢批降级、插件停用仍整个卸载。挪不动（异常）退回整个卸载；搬回显卡失败按 CUDA 失败进冷却期、在 CPU 上继续用，不触发重排器的加载失败闩锁。代价：暂存期间多占约 2.2GB 内存。【缺陷修复（2026-09-30），AGENTS.md §1.3 本地优先】bge-m3 本地快照只有 pytorch_model.bin，transformers 每次冷加载都另起线程问 huggingface.co 要 safetensors 转换（真机 cProfile：4 个请求、约 2 秒），local_files_only=True 拦不住；core/model_loading.load_pretrained 现在加载前把 DISABLE_SAFETENSORS_CONVERSION 设为 1（用户自己设了值则尊重）。",
       "blocker": ""
     },
     {
@@ -460,6 +484,10 @@
         "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestPreviewLifecycle",
         "rag-redo/plugins/official-gui-shell/tests/test_boot.py::TestRuntimeBoot",
         "rag-redo/plugins/official-gui-shell/tests/test_boot.py::TestMainEntry",
+        "rag-redo/plugins/official-gui-shell/tests/test_md_render.py::TestHtmlTable",
+        "rag-redo/plugins/official-gui-shell/tests/test_md_render.py::TestFormula",
+        "rag-redo/plugins/official-gui-shell/tests/test_md_render.py::TestPipeTable",
+        "rag-redo/plugins/official-gui-shell/tests/test_md_render.py::TestUnchangedBehaviour",
         "rag-redo/plugins/official-gui-shell/tests/test_boot.py::TestPushLoop",
         "rag-redo/plugins/official-gui-shell/tests/test_contracts_parity.py::TestStartIndexBatch",
         "rag-redo/tests/test_index_progress.py::TestIndexWorkerManager.test_batch_runs_libraries_one_after_another_never_together",
@@ -472,7 +500,7 @@
         "rag-redo/tests/test_index_progress.py::TestIndexWorkerManager.test_batch_loads_plugins_and_models_only_once",
         "rag-redo/tests/test_index_progress.py::TestIndexWorkerManager.test_after_a_worker_crash_the_rest_of_the_batch_runs_in_a_new_process"
       ],
-      "acceptance": "GUI 是操作方式而非独立产品，必须与 MCP/CLI 共用同一业务核心，自身零业务判断。量化门槛：(1) 资产一致性——assets/{index.html,app.css,app.js,mock.js} 与 obsidian-rag/guiweb/ui/ 逐字节相同，sha256 冻结为 fixture 且测试断言 4/4；(2) 契约覆盖——contracts.md 定义的 37 个方法，新桥接层 37/37 同名存在且返回 JSON 键集合与契约一致，缺口必须为 0；(3) 推送通道——snapshot/log/alert/notice/preview 五类推送与 bind_window 必须存在，snapshot 周期 1 秒，连续失败 5 次才退出；(4) 视图覆盖——contracts.md 视图映射表 7 个视图（检索/库/索引/诊断/设置/图谱/全局）逐项可达；(5) 零业务逻辑——前端与桥接层不得出现 RRF/BM25/cosine/rerank 计算，排序过滤置信度一律来自 core，入口不得各自实现。【经操作者确认的偏离（2026-09-29）】共 4 处，用户可见的差别如下：①窗口标题叫 \"Obsidian RAG 2.0\"（旧项目叫 \"Obsidian RAG\"；夹具 `title` 保留旧值、`redo_title` 记新值，测试按新值断言）；②设置页只列 rag-redo 真实读取的键（当前 9 组，旧项目 13 组）——少掉的组对应的功能新版本来就没有，画出来只会是改了没用的假开关；③切块粒度（chunk_char_limit/short_doc_char_limit）与 collection 不能按库单独覆盖，只有全局统一值（旧项目可以按库覆盖；rag-redo 目前没有该能力，`UNSUPPORTED_CONFIG_KEYS` 显式拒绝，这是已知的能力缺口而非行为对齐；排除规则 exclude_dirs/files/patterns 仍可按库覆盖）；④索引进度条的 pct 取 0~100（旧桥送的是 0~1 小数，旧前端却按 0~100 使用，导致旧进度条几乎不动——这是旧项目自身的 bug，新版按前端实际读法送 0~100，进度条正常走）。【缺陷修复，恢复旧行为（2026-09-29，操作者确认）】一次点击重建多个库必须依次串行：旧项目一次点击只起一个索引进程，在 `index.py` 的 `__main__` 里按库逐个循环，某个库失败记日志后继续下一库，停止 = 整轮取消（`bridge.py:640-648`）；rag-redo 此前对每个库各起一个 worker、同时开跑，4 个库就是 4 份模型同时压满显卡和 CPU（真机上 4 个 worker 也全部中途崩溃，崩溃原因见后面的编码一条；两件事是否互为因果没有证实）。现改为核心层 `Pipeline.start_index_libraries` → `IndexWorkerManager.start_batch`：第一个库立刻起 worker，其余在管理器内存队列里显示为“排队中”，前一个 worker 退出后才起下一个；某库失败/起不来不影响后面的库；停止在跑的那个 = 整批取消，停止排队中的库 = 只把它从队列拿掉；GUI 入口只把整批交给核心，不自己排顺序。MCP 的单库 `reindex_knowledge` 与命令行 `index --library` 各自只处理一个库，不排队，同库互斥仍靠每库文件锁，本次未改。同时修复：索引 worker 的标准输出/错误此前沿用系统区域编码（Windows 下 cp1252），任何往标准输出写中文都会抛 `UnicodeEncodeError` 把整轮索引带崩；真机 4 个 worker 都死于 `UnicodeEncodeError: 'charmap' codec can't encode characters`，但具体是哪一行输出触发的没有定位到（单进程复现不出来），现把两个标准流统一成 UTF-8（写不进的字符替换、不抛错），从根上消除这一类；worker 崩溃时日志里留下“哪个库、什么错”一行和完整堆栈（旧项目失败原因在日志面板，诊断页的失败明细表只列文件级失败，两者一致，未新增界面）。【缺陷修复，恢复旧行为（2026-09-29，操作者确认）】设置页“PDF 与云端 OCR”组补回 mineru_api_key（保密字段）与 mineru_model_version（vlm/pipeline）两项：此前“设置页只列 rag-redo 真实读取的键”的判断漏了它们——云端识别一直在用 MinerU Key，只是只能靠环境变量，只用界面的人没有地方填。云端插件与能力签名改为“设置页优先、环境变量 MINERU_API_KEY / MINERU_MODEL_VERSION 兜底”，此前靠环境变量的用法不变；补上 Key 会改变能力签名，存量 scanned 终态下一轮自动重试。旧项目设置页里其余 MinerU 相关键（并发数/每分钟提交上限/超时/本地服务地址/页数上限/pdf_text_backend）rag-redo 没有对应实现，仍不列出。【可观测性补充（2026-09-29，操作者确认）】关窗时往 GUI 日志追加“窗口已关闭：回收了 N 个子进程，运行时收口用时 X 秒”，退出时若仍有子进程未回收则再追加一行 ERROR 级“仍有 N 个子进程未回收：进程名(pid)…”。这不是旧项目有的行为，只是日志一行、不新增界面，用来在操作者遇到“关 GUI 后显存/进程没释放”而现场无法复现时留下证据（没装 psutil 时只报用时）。【操作者确认（2026-09-30）：一次重建多个库在同一个 worker 进程里依次跑】此前每个库各起一个 worker 进程，每个都要重新载入深度学习库（真机约 8 秒）、重新加载模型（3~30 秒）；旧项目 index.py `__main__` 是一个索引进程按库循环。现在 start_batch 起一个带管道的 worker，做完一个库回报后由发起方派下一个，插件与模型只加载一次；队列仍由发起方掌握（排队中显示、停止排队的库只从队列拿掉、停止正在跑的库整批取消，均不变）。某个库索引抛异常或进程崩溃：该进程不再接活，后面的库换新进程（出过错的进程状态不可信）。每个库的终态在索引结束时就写，不再排在插件收尾之后（此前收尾卡住界面会一直显示“运行中”）。单库启动、MCP、CLI 仍是一个库一个进程。",
+      "acceptance": "GUI 是操作方式而非独立产品，必须与 MCP/CLI 共用同一业务核心，自身零业务判断。量化门槛：(1) 资产一致性——assets/{index.html,app.css,app.js,mock.js} 与 obsidian-rag/guiweb/ui/ 逐字节相同，sha256 冻结为 fixture 且测试断言 4/4；(2) 契约覆盖——contracts.md 定义的 37 个方法，新桥接层 37/37 同名存在且返回 JSON 键集合与契约一致，缺口必须为 0；(3) 推送通道——snapshot/log/alert/notice/preview 五类推送与 bind_window 必须存在，snapshot 周期 1 秒，连续失败 5 次才退出；(4) 视图覆盖——contracts.md 视图映射表 7 个视图（检索/库/索引/诊断/设置/图谱/全局）逐项可达；(5) 零业务逻辑——前端与桥接层不得出现 RRF/BM25/cosine/rerank 计算，排序过滤置信度一律来自 core，入口不得各自实现。【经操作者确认的偏离（2026-09-29）】共 4 处，用户可见的差别如下：①窗口标题叫 \"Obsidian RAG 2.0\"（旧项目叫 \"Obsidian RAG\"；夹具 `title` 保留旧值、`redo_title` 记新值，测试按新值断言）；②设置页只列 rag-redo 真实读取的键（当前 9 组，旧项目 13 组）——少掉的组对应的功能新版本来就没有，画出来只会是改了没用的假开关；③切块粒度（chunk_char_limit/short_doc_char_limit）与 collection 不能按库单独覆盖，只有全局统一值（旧项目可以按库覆盖；rag-redo 目前没有该能力，`UNSUPPORTED_CONFIG_KEYS` 显式拒绝，这是已知的能力缺口而非行为对齐；排除规则 exclude_dirs/files/patterns 仍可按库覆盖）；④索引进度条的 pct 取 0~100（旧桥送的是 0~1 小数，旧前端却按 0~100 使用，导致旧进度条几乎不动——这是旧项目自身的 bug，新版按前端实际读法送 0~100，进度条正常走）。【缺陷修复，恢复旧行为（2026-09-29，操作者确认）】一次点击重建多个库必须依次串行：旧项目一次点击只起一个索引进程，在 `index.py` 的 `__main__` 里按库逐个循环，某个库失败记日志后继续下一库，停止 = 整轮取消（`bridge.py:640-648`）；rag-redo 此前对每个库各起一个 worker、同时开跑，4 个库就是 4 份模型同时压满显卡和 CPU（真机上 4 个 worker 也全部中途崩溃，崩溃原因见后面的编码一条；两件事是否互为因果没有证实）。现改为核心层 `Pipeline.start_index_libraries` → `IndexWorkerManager.start_batch`：第一个库立刻起 worker，其余在管理器内存队列里显示为“排队中”，前一个 worker 退出后才起下一个；某库失败/起不来不影响后面的库；停止在跑的那个 = 整批取消，停止排队中的库 = 只把它从队列拿掉；GUI 入口只把整批交给核心，不自己排顺序。MCP 的单库 `reindex_knowledge` 与命令行 `index --library` 各自只处理一个库，不排队，同库互斥仍靠每库文件锁，本次未改。同时修复：索引 worker 的标准输出/错误此前沿用系统区域编码（Windows 下 cp1252），任何往标准输出写中文都会抛 `UnicodeEncodeError` 把整轮索引带崩；真机 4 个 worker 都死于 `UnicodeEncodeError: 'charmap' codec can't encode characters`，但具体是哪一行输出触发的没有定位到（单进程复现不出来），现把两个标准流统一成 UTF-8（写不进的字符替换、不抛错），从根上消除这一类；worker 崩溃时日志里留下“哪个库、什么错”一行和完整堆栈（旧项目失败原因在日志面板，诊断页的失败明细表只列文件级失败，两者一致，未新增界面）。【缺陷修复，恢复旧行为（2026-09-29，操作者确认）】设置页“PDF 与云端 OCR”组补回 mineru_api_key（保密字段）与 mineru_model_version（vlm/pipeline）两项：此前“设置页只列 rag-redo 真实读取的键”的判断漏了它们——云端识别一直在用 MinerU Key，只是只能靠环境变量，只用界面的人没有地方填。云端插件与能力签名改为“设置页优先、环境变量 MINERU_API_KEY / MINERU_MODEL_VERSION 兜底”，此前靠环境变量的用法不变；补上 Key 会改变能力签名，存量 scanned 终态下一轮自动重试。旧项目设置页里其余 MinerU 相关键（并发数/每分钟提交上限/超时/本地服务地址/页数上限/pdf_text_backend）rag-redo 没有对应实现，仍不列出。【可观测性补充（2026-09-29，操作者确认）】关窗时往 GUI 日志追加“窗口已关闭：回收了 N 个子进程，运行时收口用时 X 秒”，退出时若仍有子进程未回收则再追加一行 ERROR 级“仍有 N 个子进程未回收：进程名(pid)…”。这不是旧项目有的行为，只是日志一行、不新增界面，用来在操作者遇到“关 GUI 后显存/进程没释放”而现场无法复现时留下证据（没装 psutil 时只报用时）。【经操作者确认的偏离（2026-09-30，见 BC-18）】图谱页换成总览星图：旧图谱的节点卡片、双链/语义相似/归属线、库边界、着色模式、图层面板和“从问题节点荡开”的图谱内检索一并移除；图谱页搜索框保留，提交后跳到检索页显示结果；点文件看详情、打开源文件保留。视图数仍是 7 个，37 个契约方法（含 graph/semantic_edges）原样保留；index.html/app.js/app.css/mock.js 的字节与哈希按此更新，星图模块与本地 three.js 另行固定（夹具 starmap_assets）。【经操作者批准的扩展（2026-09-30）】GUI 的 Markdown 渲染器（`md_render.py`，检索命中、正文查看、提取试验台三处共用）新增三项，起因是对本机 196 份 MinerU 识别结果的体检：其中的表格是 HTML、公式是 LaTeX，旧渲染器（旧项目只认竖线表格）把 HTML 表格显示成一串带尖括号的源码、把公式里的星号当斜体标记吃掉。①HTML 表格显示成真表格：解析后只按“行列 + 固定标签 + 限幅到 100 的整数 colspan/rowspan”重新拼装，原始标签与属性一个都不透传（XSS-safe 不变），单元格内只保留上下标、换行和图片占位；被切断的半截表格块也能显示；写成说明文字的 `<td>` 不会被当成表格。②`$$…$$` 公式块显示为等宽原文块（class `md-math`），行内 `$…$` 不再被斜体/粗体规则改坏（沿用 Pandoc 判定，金额“$5 涨到 $10”不当公式；找不到配对 `$$` 时当普通段落，不吞后文）。**不做数学排版**：排版要往前端加公式库，须另行批准并修订本条。③竖线表格的单元格支持粗体等行内格式、`<br>` 换行、`\\|` 转义竖线。图片不动：仍显示占位符，因为本机 MinerU 设置为不导出图片（`return_images=false`），图片文件从未存在，这是操作者确认先不动的决定。没做：多级列表缩进、五/六级标题。不改任何前端资产（沿用现有 `.md-body` 样式），资产哈希不变。测试：`tests/test_md_render.py`，另用真实提取缓存整篇加逐块渲染做过一遍（15,984 次渲染：表格源码零残留、输出无白名单之外的标签）。【经操作者确认的偏离（2026-09-30，见 BC-19）】诊断页最上面加“转换缓存”清单，原“WEMM 页库明细”表并入其中（契约方法 wemm_status 原样保留，前端不再调用）；库卡片加“转文字/页库”一行；文件详情加“转换缓存”一节。新接口 conversion_caches/conversion_cache_file/open_cache_folder/reveal_cache_file/page_preview/page_try_search 是契约之外的精确 API，不占 37 个契约名额；index.html/app.js/app.css/mock.js 的字节与哈希按此更新。【操作者确认（2026-09-30）：一次重建多个库在同一个 worker 进程里依次跑】此前每个库各起一个 worker 进程，每个都要重新载入深度学习库（真机约 8 秒）、重新加载模型（3~30 秒）；旧项目 index.py `__main__` 是一个索引进程按库循环。现在 start_batch 起一个带管道的 worker，做完一个库回报后由发起方派下一个，插件与模型只加载一次；队列仍由发起方掌握（排队中显示、停止排队的库只从队列拿掉、停止正在跑的库整批取消，均不变）。某个库索引抛异常或进程崩溃：该进程不再接活，后面的库换新进程（出过错的进程状态不可信）。每个库的终态在索引结束时就写，不再排在插件收尾之后（此前收尾卡住界面会一直显示“运行中”）。单库启动、MCP、CLI 仍是一个库一个进程。",
       "blocker": "阶段A（资产原样搬运）已完成并通过 4/4 sha256 校验；阶段B/C（37 个契约方法桥接、勾选树/进度/推送/试验台/设置等 16 项 core 侧能力）已实现，并由 test_contracts_parity.py 对夹具 37/37 逐个真实调用断言返回键集合，test_boot.py 走真实运行时与真实 gui_main.main() 断言启动路径。**仍待**：①真实 pywebview 窗口内的人工验证（7 个视图逐项可达、推送通道在真实窗口里生效）与操作者确认（2026-09-28 已有的自动化证据，不代替这一步：真实进程冒烟——`gui_main.py` 在临时数据目录下 6~8 秒内出现标题「Obsidian RAG」的窗口，标准错误输出为空，正常关窗后整棵进程树（含 WEMM 看图服务）无残留；前端对真实 Api 与真实推送循环的浏览器联调——图谱/库/勾选范围写入回读/检索含建议与双链/设置保存回读/索引/试验台/诊断含去重均渲染并可操作，无 JS 报错、无失败请求；联调用的是假嵌入，未覆盖「点击开始索引」拉起真实 BGE-M3 worker 的路径）；②与旧项目的有意差异（窗口标题、设置页只列真实读取的键、切块粒度/collection 不能按库覆盖、进度条 pct 取 0~100）已于 2026-09-29 经操作者确认，登记在 acceptance 的【经操作者确认的偏离】里，不再是待办。原 official-gui-shell/tests/test_assets.py 的 7 条断言针对被取代的自制界面设计，已由本契约的资产一致性与零业务逻辑断言取代。**2026-09-29 追记**：新增 BC-16（手动释放 GPU 显存按钮）后，index.html/app.js/mock.js 的 bytes/sha256 已按操作者确认的新增内容更新（`legacy_guiweb_contract.json` 的 `_comment_bc16` 有完整记录），是本契约验收标准 (1) 资产一致性条款唯一一处已登记的例外，不是未声明的漂移；app.css 未改动。"
     },
     {
@@ -545,6 +573,136 @@
       ],
       "acceptance": "所有模型（嵌入 bge-m3、重排 bge-reranker、看图 WEMM、本机 OCR MinerU）统一从一个『模型目录』找/下载：设置项 models_dir 留空 = 项目内（发行目录下）的 models/ 文件夹（默认，已加入 .gitignore，不入库）；用户可在设置页『模型』组的『模型存放路径』改成任意文件夹（支持 ~ 与环境变量；相对路径按发行目录解析而不是当前工作目录；指到 HF_HOME 这种『模型其实在 hub 子文件夹里』的路径会自动落到 hub），从而复用电脑上已有的模型、不必重新下载。生效时机：嵌入/重排模型每次加载时现读设置（改路径后下一次重新加载就用新路径，不用重启）；看图/本机 OCR 是子进程，启动时定死，改路径后要等它们下次（重新）启动才生效。文件夹不存在不是错误（首次下载时 HuggingFace 自己建）。这是纯路径能力：不改模型版本、不改索引数据，因此不会让已有索引失效。",
       "blocker": "legacy_refs 均已核实旧项目**没有**这个能力：index.py 只按模型名交给 HuggingFace 默认缓存加载（离线优先）；wemm_server.py 把 ~/.cache/huggingface/hub 写死为查找位置；仅 MinerU 子进程由 gpu_arbiter.py 设置 HF_HOME（旧项目默认指向 E:\\models\\hf），主模型与 WEMM 都没有可配置路径。2026-09-29 由操作者提出需求（『默认放项目内文件夹，用户可自定义模型路径』），并指示把本机现有模型位置（C:\\Users\\xbl26\\.cache\\huggingface\\hub）作为其自定义路径配置——是纯新设计，不是行为兼容缺口。已知局限：①MinerU 本机 OCR 只做了『环境变量 HF_HUB_CACHE 传到子进程』的自动化测试，没有用真实 MinerU 模型验证它确实遵循该变量；②仍待操作者在真实使用中确认各模型都从配置的路径加载（同 BC-15/BC-16 的一贯要求，自动化测试不代替这一步）。"
+    },
+    {
+      "id": "BC-18",
+      "title": "图谱页换成总览星图（新能力，无旧项目对应）",
+      "status": "partial",
+      "legacy_refs": [
+        "obsidian-rag/guiweb/graph_data.py:1-246",
+        "obsidian-rag/guiweb/semantic.py:1-63",
+        "obsidian-rag/guiweb/ui/app.js:1-3026"
+      ],
+      "redo_refs": [
+        "rag-redo/core/contracts.py::FileVectorSet",
+        "rag-redo/core/contracts.py::OverviewMapResponse",
+        "rag-redo/core/overview_map.py::build_overview",
+        "rag-redo/core/pipeline.py::Pipeline.overview_map",
+        "rag-redo/plugins/official-vector-store-chroma/official_vector_store_chroma/store.py::ChromaVectorStore.file_vectors",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/api.py::Api.overview_map",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/assets/starmap/starmap.js",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/assets/vendor/three/three.module.min.js",
+        "rag-redo/demos/orbital-overview.html",
+        "rag-redo/gui_main.py:_serve"
+      ],
+      "test_refs": [
+        "rag-redo/tests/test_overview_map.py::TestSeriation",
+        "rag-redo/tests/test_overview_map.py::TestGapsAndLooseness",
+        "rag-redo/tests/test_overview_map.py::TestGroups",
+        "rag-redo/tests/test_overview_map.py::TestBuildOverview",
+        "rag-redo/tests/test_overview_map.py::TestChunkGroupsFromManifest",
+        "rag-redo/plugins/official-vector-store-chroma/tests/test_store.py::TestChromaVectorStore.test_file_vectors_average_each_files_chunks_and_normalize",
+        "rag-redo/plugins/official-vector-store-chroma/tests/test_store.py::TestChromaVectorStore.test_file_vectors_skip_missing_chunks_and_files_without_any_vector",
+        "rag-redo/plugins/official-vector-store-chroma/tests/test_store.py::TestChromaVectorStore.test_file_vectors_read_in_small_batches_give_the_same_answer",
+        "rag-redo/plugins/official-vector-store-chroma/tests/test_store.py::TestChromaVectorStore.test_file_vectors_on_missing_collection_is_empty_and_creates_nothing",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_overview_map_reads_stored_vectors_without_loading_embedder",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_overview_map_is_cached_until_the_index_changes",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_overview_map_before_indexing_follows_graph_and_has_no_groups",
+        "rag-redo/tests/test_pipeline_e2e.py::TestEndToEndSearchPipeline.test_overview_map_vector_read_failure_keeps_files_reports_error_and_is_not_cached",
+        "rag-redo/plugins/official-gui-shell/tests/test_api.py::TestApi.test_overview_map_returns_column_arrays_keyed_by_display_name",
+        "rag-redo/plugins/official-gui-shell/tests/test_api.py::TestApi.test_overview_map_folds_pipeline_exception_and_unknown_scope",
+        "rag-redo/plugins/official-gui-shell/tests/test_assets.py::TestStarMapReplacesGraphView",
+        "rag-redo/plugins/official-gui-shell/tests/test_assets.py::TestLegacyAssetParity",
+        "rag-redo/plugins/official-gui-shell/tests/test_boot.py::TestMainEntry.test_main_serves_js_as_javascript_even_if_the_registry_says_text_plain",
+        "rag-redo/plugins/official-gui-shell/tests/test_assets.py::TestStarMapReplacesGraphView.test_starmap_splats_conserve_energy_so_zoom_keeps_its_colour",
+        "rag-redo/plugins/official-gui-shell/tests/test_assets.py::TestStarMapReplacesGraphView.test_starmap_view_prefs_are_remembered",
+        "rag-redo/plugins/official-gui-shell/tests/test_assets.py::TestStarMapReplacesGraphView.test_starmap_prefs_are_validated_before_adoption",
+        "rag-redo/plugins/official-gui-shell/tests/test_assets.py::TestStarMapReplacesGraphView.test_starmap_prefs_do_not_go_through_the_settings_store"
+      ],
+      "acceptance": "旧项目无此能力：legacy_refs 核对过，旧图谱（graph_data.py）只有文件/页节点和双链/归属边，语义边（semantic.py）是按文件名临时加载嵌入模型算的，没有“按内容排开整个库”的视图。【操作者决定（2026-09-30）】GUI 图谱页换成“轨道星图”：每个库是一根绕中心转的连续发光光管，文件沿管子按内容相近排开（相近的挨着），内容越集中的那一段点越密、光管只是略微鼓起（由密度驱动、和管子顺滑衔接，不是一团团独立的球）；颜色按内容分组，同类内容跨库同色，相邻颜色沿管子交融；中心保留空心线框星；背景不能空（程序生成的星空和尘埃，不加载图片）。点数 = 文件数 + 块数 + 已建页库的页数。轨道半径按点数自动定：密度 = 点数 ÷ 光管体积，落在 [目标密度 ÷ 容许范围, 目标密度 × 容许范围] 内；相邻两根光管的管面间距不小于“轨道最小间距”，最内一根管面离中心不小于“最内轨道离中心”；排不下时把管子加粗/变细来把密度拉回区间。调节滑条一律对数刻度、拖动时画面同步变化（不出现“正在生成/刷新”），默认值：鼓起程度 0.15、聚合强度 5.2、颜色交融 5.0、体积光 0.35、点大小 1、转速 1、光带粗细 1、背景亮度 1、目标密度 2750、密度容许范围 2.00、轨道最小间距 1.00、最内轨道离中心 1.00。旧图谱的双链线、语义相似线、归属线、库边界、着色模式先拿掉（读模型 graph()/semantic_edges() 和它们的测试保留不动，BC-09 不变）；点文件看详情、打开源文件保留；图谱页的搜索框保留，提交后跳到检索页显示结果，“从查询处扩散”的动画留到检索重构时再做。【数据】排序和分组在核心算（core/overview_map.py，前端零判断）：只读向量库里已经存好的块向量、按文件求平均并归一化（vector_store.file_vectors，只读、不建集合），CPU 计算，绝不为画图加载嵌入模型；随机数固定种子，同样的数据每次同样的图；结果按“各库当前 generation + 向量库版本 + 图谱节点状态 + 算法版本”缓存，只留最近一份结果、不缓存文件向量本身；某个库读向量失败时它的文件照样列出（不分组），error 写明库和异常类型（不透传原文），这次结果不缓存。【显存（软件显存敏感，每 MB 都算）】three.js r160 放在本地（npm three@0.160.0 原样文件，MIT，约 0.7 MB，离线可用，不走网络；字节与哈希固定在 GUI 夹具 starmap_assets）；只有图谱页看得见时才创建 WebGL，切到别的页面立刻释放全部显卡资源并交还 WebGL 上下文，窗口被最小化或遮住时先停帧、满 20 秒也交还，回来时重建；请求低功耗显卡，不开抗锯齿/深度/模板缓冲，像素比封顶 1（高分屏上画面略软，换来画面缓冲只有 1/4）；每个点只占 4 字节（文件序号、类别、库序号打包成一个整数），点在管子里的随机落点按点的编号在显卡里现算，颜色/大小/亮度每个文件一份放在小纹理里；星空、尘埃、中心光晕全部在着色器里现算，库名是网页文字，不上传任何贴图；点数超过 40 万时块和页按比例抽样显示（文件大点全留，轨道与粗细仍按真实点数算）；帧率封顶：拖动/缩放/调滑条时 60，静止观看 30；状态行实时显示估算显存与帧率，离开页面时显示“未占用显卡”。实测（演示数据，约 5 万点、4 个库、预览窗口约 800×700）：换数据 53 ms，拖滑条每帧约 16 ms，估算显存约 7 MB，其中画面缓冲占绝大部分——窗口越大画面缓冲越大（1920×1080 全屏约 14 MB）。【交互】悬停显示文件路径、所属库、第几块/第几页与状态；点击打开文件详情（状态、内容分组与代表文件、光管上前后相邻的文件、阅读正文、打开源文件），选中时公转停下，关掉详情再转起来；点相邻文件镜头飞过去；缩放按钮与重置取景保留；换了库（范围变化、增删库）自动重新取景；索引跑完、库增删、块数变化时自动重读总览（索引进行中不重读）。【启动】桌面窗口启动前把 .js 固定登记为 text/javascript：星图是 ES 模块，类型不对浏览器直接拒绝执行，而 Windows 上 Python 会用注册表覆盖自带的类型表，有的电脑被别的软件把 .js 登记成 text/plain。\n\n【2026-09-30 增补：加法泼溅的能量守恒】星图用 CustomBlending/AddEquation 做加法混合，而一个点（以及一片体积光方片）的屏幕覆盖面积正比于 gl_PointSize²、点大小又正比于 1/相机距离——放大时面积按缩放平方涨，同一像素上累加的亮度跟着涨，冲破 1.0 后三个通道各自被裁到 1.0，必然呈白色，色相信息就此丢失。真机症状：缩放约 20 倍时整片纯白，缩回默认取景又灰白看不出色相（分组、颜色与光点一一对应都是对的，所以不是数据问题）。因此点层与体积光层都按自身屏幕面积做反比归一化，夹在 [0.02, 1.0]：上界 1.0 表示比 8 像素参考点还小就不补偿（远处维持原样），只在下界防止极端放大把画面压黑。归一化等比缩放三个通道，不改变色相。验收：放大到任意倍数都不再出现纯白，默认取景下观感与改前一致（AREA_REF 取 8 像素使默认缩放下系数约为 1）。\n\n【2026-09-30 增补：视图偏好跨会话记忆】此前 12 个滑块、图层 mask、轨道参考线与相机机位完全没有持久化（DEFAULTS 被 Object.freeze，每次打开回到默认值），真机反馈“设置是一次性的”。现存 localStorage（键 ragredo.starmap.ui.v1，带版本号以便将来识别旧记录并丢弃），读取时逐项按滑块声明范围夹紧并校验有限性——被手改坏的记录不得把半径或密度算成 0/NaN 导致整张图空掉；写入按 400ms 防抖（拖滑块是连续事件，逐帧写盘会卡手），相机经 OrbitControls 的 change 事件覆盖拖拽/缩放/聚焦三条改动机位的途径，“恢复默认”同样立即落盘。刻意不走 SettingsStore：save_settings 只接受 settings_schema.py 登记过的键（contract_bridge.py 对未登记键静默跳过），而 §8.5 要求登记键必须有真实读取点、禁止假开关；相机角度没有任何插件会读，登记它会同时踩到假开关禁令与设置页条目污染。故此项不进入设置页、不跨进程。验收：调好滑块/图层/机位后关闭重开窗口，状态完全恢复；恢复默认后重开仍为默认。",
+      "blocker": "实现与自动化测试已完成（核心计算、向量库只读汇总、流水线缓存、桥接、前端星图与显存管理、加法泼溅能量守恒、视图偏好跨会话记忆）；浏览器演示模式下已人工看过画面、悬停、点击详情、离开页面释放、搜索框跳检索页、亮色主题。仍待操作者在真实窗口、真实库上确认观感、流畅度与显存占用，**特别是 2026-09-30 增补的两项都只过了自动化测试**——能量守恒的实际观感（默认取景是否真的不变、20 倍缩放下颜色是否稳）与偏好记忆（关窗重开是否恢复）都必须真机看过才能算数（自动化测试不代替这一步，同 BC-15/BC-16/BC-17）。"
+    },
+    {
+      "id": "BC-19",
+      "title": "转换缓存看得见：PDF/Word 转文字缓存与 WEMM 页库一眼可查（新能力，无旧项目对应）",
+      "status": "partial",
+      "legacy_refs": [
+        "obsidian-rag/extractors.py:141-290",
+        "obsidian-rag/guiweb/bridge.py:946-959",
+        "obsidian-rag/server.py:965-1000"
+      ],
+      "redo_refs": [
+        "rag-redo/core/conversion_cache.py::build_library_report",
+        "rag-redo/core/conversion_cache.py::render_catalog",
+        "rag-redo/core/conversion_cache.py::round_summary",
+        "rag-redo/core/contracts.py::ConversionCacheFile",
+        "rag-redo/core/contracts.py::ConversionCacheLibrary",
+        "rag-redo/core/contracts.py::ConversionRoundSummary",
+        "rag-redo/core/extract_cache.py::ExtractCache.locate_path",
+        "rag-redo/core/pipeline.py::Pipeline.conversion_caches",
+        "rag-redo/core/pipeline.py::Pipeline.write_conversion_catalog",
+        "rag-redo/core/pipeline.py::Pipeline.page_preview",
+        "rag-redo/core/pipeline.py::Pipeline.navigate",
+        "rag-redo/core/index_progress.py::_worker_main 每轮转换缓存一行",
+        "rag-redo/core/cli.py::_print_conversion_caches",
+        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py::VisualWemmPlugin.render_page_png",
+        "rag-redo/plugins/official-visual-wemm/official_visual_wemm/plugin.py::VisualWemmPlugin.cache_info",
+        "rag-redo/plugins/official-mcp-server/official_mcp_server/tools.py::wemm_status",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/api.py::Api.conversion_caches",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/assets/app.js"
+      ],
+      "test_refs": [
+        "rag-redo/tests/test_conversion_cache.py::TestWhichFilesAreListed",
+        "rag-redo/tests/test_conversion_cache.py::TestTextState",
+        "rag-redo/tests/test_conversion_cache.py::TestPagesState",
+        "rag-redo/tests/test_conversion_cache.py::TestRoundSummary",
+        "rag-redo/tests/test_conversion_cache.py::TestCatalog",
+        "rag-redo/tests/test_pipeline_e2e.py::TestConversionCacheVisibility",
+        "rag-redo/tests/test_index_progress.py::TestIndexWorkerManager.test_a_finished_round_writes_one_conversion_cache_line_into_the_log",
+        "rag-redo/tests/test_cli.py::TestBusinessCli.test_caches_command_lists_what_is_missing_without_starting_the_page_service",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_page_states_carry_the_total_page_count_and_the_round_that_built_them",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_navigate_can_be_limited_to_one_pdf",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_render_page_png_draws_one_page_on_the_cpu_without_the_service",
+        "rag-redo/plugins/official-visual-wemm/tests/test_plugin.py::TestVisualWemmPlugin.test_cache_info_says_where_the_page_library_lives_and_what_it_costs",
+        "rag-redo/plugins/official-mcp-server/tests/test_tools.py::TestMcpTools.test_wemm_status_reports_conversion_caches_only_for_authorized_formats",
+        "rag-redo/plugins/official-gui-shell/tests/test_api.py::TestApi.test_conversion_caches_summarise_libraries_and_list_one_library_file_by_file",
+        "rag-redo/plugins/official-gui-shell/tests/test_api.py::TestApi.test_reveal_cache_file_only_selects_the_file_the_list_reported",
+        "rag-redo/plugins/official-gui-shell/tests/test_api.py::TestApi.test_page_preview_and_try_search_fold_every_failure_into_a_message",
+        "rag-redo/plugins/official-gui-shell/tests/test_assets.py::TestConversionCachesAreVisible"
+      ],
+      "acceptance": "旧项目无此能力：legacy_refs 核对过，旧项目提取缓存存成 data/extract_cache/<指纹>.<通道>.v<版本>.md，文件名看不出原文件，没有逐文件的缓存清单；旧 wemm_status（MCP 工具与 guiweb 页库表）只报各库页数与失败列表。【操作者决定（2026-09-30）】让用户和开发者一眼确认“PDF/Word 转成文字了没有、WEMM 页库建了没有、内容对不对、存在哪、多大”：统计范围 = 所有不是纯文字的格式（现在是 PDF、Word；md/txt 不算），页库只算 PDF。①库卡片加一行“转文字 已转/应转 · 页库 已建/PDF 数 · 大小”，有缺的整行标黄、写“缺 N”，点一下跳到诊断页清单并筛好这个库缺的文件；页库没开时灰字“页库 未开启”。②诊断页最上面一张“转换缓存”清单（可选库、可“只看缺的”、可“打开缓存文件夹”），每行：转文字（谁转的、大小；或缺的原因）、页库（几页/共几页；或缺的原因）；原“WEMM 页库明细”表并入这张清单，页库服务状态与“探测服务”保留。③文件详情（清单展开或星图点文件，同一份）：转文字写谁转的、字数、大小、日期、缓存文件路径，“窗口里阅读”“在资源管理器中显示”；页库写已建第几页、缺第几页，可输入页码看这一页的小图，可“试搜”一句话看这份 PDF 里哪几页被找出来。④缓存文件夹里放一份“缓存目录.md”（Markdown 表格，每轮索引完成后自动刷新，点“打开缓存文件夹”时也先刷新）：每行一个原文件 ↔ 缓存文件（相对链接），写明谁转的、大小、日期、页库几页。⑤开发者：每轮索引结束 index_worker.log 写一行“转换缓存：转文字 复用/新转/缺；页库 复用/新建/缺”（沿用正文缓存或转换暂存的算复用，只有真的跑了提取器才算新转）；命令行 caches [--library] [--all-files] 列出每库数量、位置、大小与缺哪些（只读，页库插件只加载不启用，不拉起看图服务、不占显卡）；MCP wemm_status 另附 conversion_caches 一行账，给 library_id 时列出缺的文件、原因与下一步，按每库 Agent 授权格式过滤（BC-02，未授权格式的名字和数量都不出现）。缺的原因与下一步怎么办的文案只在 core/conversion_cache.py 写一份，界面、目录文件、命令行、MCP 都用它；“缺”的判定也只有一处（needs_attention：正文没转好，或页库开着却没建全；页库没开不算缺）。【不变的】缓存的存法、文件名、检索与索引结果都不改；只读展示不触发任何转换、不加载任何模型。页库记录新增两项可选字段（page_count 总页数、built_in 哪一轮编的页），旧记录没有这两项时不猜缺页、按“沿用”计。【显存（每 MB 都算）】页面小图用 CPU 现画一张 PNG（最长边默认 720 像素），不存盘、不缓存、不碰显卡，收起就丢；只有“试搜”要用页库模型（约 6.3 GB，数字取自页库插件），规则与检索页看图搜索相同：闲 5 分钟自动卸载，也可点“释放显存”；按钮旁写明占多少、多久释放。页库在硬盘上的大小只能估（页向量存在数据库里）：每页约 WEMM_DIM×4×2+512 字节。",
+      "blocker": "实现与自动化测试已完成（核心清单、每轮日志、目录文件、命令行、MCP、GUI 桥接与前端）；浏览器演示模式下已看过库卡片、诊断页清单、展开详情、页面小图、试搜、星图文件详情、亮色主题。仍待操作者在真实窗口、真实库上确认显眼程度与数字是否对得上（自动化测试不代替这一步，同 BC-15/BC-16/BC-17/BC-18）。"
+    },
+    {
+      "id": "BC-20",
+      "title": "扫描件合批识别与转换暂存：本机 OCR 几份一批、一轮停下已转好的不白丢",
+      "status": "partial",
+      "legacy_refs": [
+        "obsidian-rag/extractors.py:174-176",
+        "obsidian-rag/mineru_server.py:81",
+        "obsidian-rag/mineru_server.py:455-470"
+      ],
+      "redo_refs": [
+        "rag-redo/core/pipeline.py::Pipeline._run_extract_chain",
+        "rag-redo/core/pipeline.py::Pipeline._batch_extractor_active",
+        "rag-redo/core/pipeline.py::Pipeline._stash_routes",
+        "rag-redo/core/pipeline.py::Pipeline.index_library 合批预取（_prefetch_pdf_batch）与暂存（_extract_with_stash、_stash_result）",
+        "rag-redo/core/extract_cache.py::ExtractCache.write_stash",
+        "rag-redo/core/extract_cache.py::ExtractCache.read_stash",
+        "rag-redo/core/extract_cache.py::ExtractCache.prune_stash",
+        "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/plugin.py::MineruLocalOcrPlugin.extract_many",
+        "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/server.py::_real_ocr_many",
+        "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/server.py::_plan_batches",
+        "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/server.py::_batch_allowed"
+      ],
+      "test_refs": [
+        "rag-redo/tests/test_extract_cache.py::TestConversionStash",
+        "rag-redo/tests/test_pipeline_e2e.py::TestStoppedRunKeepsConvertedFilesAndScansAreBatched",
+        "rag-redo/plugins/official-ocr-mineru-local/tests/test_plugin.py::TestServerBatchesScansWithinVramLimits",
+        "rag-redo/plugins/official-ocr-mineru-local/tests/test_plugin.py::TestPluginExtractMany"
+      ],
+      "acceptance": "旧项目证据：legacy_refs 核对过。①旧项目提取缓存按文件内容存（extractors.py:174-176，`<内容指纹>.<通道>.v<版本>.md`），转完一份就落盘，一轮被停下也不丢；rag-redo 的提取缓存按轮次存，停下时这一轮已转好的随未发布的轮次一起丢弃（2026-09-29 真机：停在 Y2S1 第 24 个文件时，20 份已解析好的扫描件、约 4 分钟 MinerU 工作下次得重来）。②旧项目本机 MinerU 服务一次只解一份（mineru_server.py:81 串行锁），没有合批——合批是新设计。【操作者决定（2026-09-29 确认尝试“但务必做好显存管理”；2026-10-01 确认登记并提交）】一、转换暂存（停下不白干）：PDF、Word 等需要转换的格式（md/txt 不进），新转出正文就按“内容指纹 + 转换器:版本”在该库缓存目录下的 `_stash/` 存一份；下一轮同样内容、同版本转换器的，直接沿用、不再送转换器（本机 MinerU 那一轮没起来也能用上）。“重新解析”（fresh_extract）不查暂存；文件内容变了不沿用旧内容的暂存。一轮发布后，已入库内容的暂存清掉，延后的、没轮到的留着；30 天没被用上的当孤儿清掉；移除库时一并删除；丢弃一轮不删暂存。暂存写不进去只记日志，不影响本轮结果。二、扫描件合批：本机 MinerU 在用时，主循环第一次要真正提取某个 PDF，就往后看最多 32 份同样要提取的 PDF，有文字层的照常逐份转，走到本机 OCR 的攒起来（每批最多 8 份）用 `extract_many` 一次交给它；服务端再按每批不超过 8 份、64 页细分，仍然一次只跑一个请求，模型装载前照旧等空闲显存 ≥ 4.5GB，模型装好后空闲显存不足 1GB 就这一批改为一份一份解，合批出过显存不足则本进程余下时间都一份一份解；合批接口出错或条数不对，这几份按单份的规矩重走提取链，不拖垮整轮。提取链的顺序与规则只有 `_run_extract_chain` 一处实现。进度条在合批时一次跳几份，提示“正在合批识别 N 份扫描件”。【不变的】提取结果、失败终态与重试规则、检索与索引结果都不变；只改“什么时候转、一次转几份、停下后转好的留不留”。",
+      "blocker": "实现与自动化测试已完成（暂存 9 条、流水线端到端 6 条、本机 OCR 服务端合批与显存把关 11 条、插件 extract_many 2 条），但测试全部走假识别（RAG_REDO_FAKE_OCR），从没在真机真模型上端到端跑过：合批的实际提速（09-29 调研实测 1.7～2 倍、显存多 0.1～0.3GB）与“停下后下一轮沿用暂存”都待操作者在真机上确认。合批请求的超时是各份单独超时之和再加 60 秒（8 份大扫描件时可达一小时以上），是防卡死的兜底，不是性能承诺。"
     }
   ]
 }

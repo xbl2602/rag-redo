@@ -79,6 +79,16 @@ class ChromaVectorStorePlugin:
         assert self.store is not None
         return self.store.get_all(library_id, generation)
 
+    def file_vectors(
+        self,
+        library_id: str,
+        chunk_groups: dict[str, list[str]],
+        generation: str | None = None,
+    ):
+        """按文件汇总的内容向量（BC-18），返回 `core.contracts.FileVectorSet`。"""
+        assert self.store is not None
+        return self.store.file_vectors(library_id, chunk_groups, generation)
+
     def query(
         self,
         library_id: str,

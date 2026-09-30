@@ -114,6 +114,50 @@ class TestChromaVectorStore(unittest.TestCase):
         records = self.store.get_all("lib1")
         self.assertEqual(set(records), {"c1"})
 
+    def test_file_vectors_average_each_files_chunks_and_normalize(self):
+        """BC-18：总览星图要"每个文件一个内容向量"——等于它全部块向量的平均再归一化。
+        只读已经存好的向量，不经过嵌入模型，所以打开总览页不占显存。"""
+        self.store.upsert(
+            "lib1",
+            ["a1", "a2", "b1"],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0]],
+        )
+        fv = self.store.file_vectors("lib1", {"a.md": ["a1", "a2"], "b.md": ["b1"]})
+        self.assertEqual(fv.paths, ("a.md", "b.md"))
+        self.assertEqual(fv.dim, 3)
+        self.assertEqual(fv.vectors.shape, (2, 3))
+        self.assertEqual(str(fv.vectors.dtype), "float32")
+        half = 0.5 ** 0.5
+        for got, want in zip(fv.vectors[0].tolist(), [half, half, 0.0]):
+            self.assertAlmostEqual(got, want, places=5)
+        for got, want in zip(fv.vectors[1].tolist(), [0.0, 0.0, 1.0]):
+            self.assertAlmostEqual(got, want, places=5)
+
+    def test_file_vectors_skip_missing_chunks_and_files_without_any_vector(self):
+        self.store.upsert("lib1", ["a1"], [[1.0, 0.0, 0.0]])
+        fv = self.store.file_vectors(
+            "lib1", {"a.md": ["a1", "gone"], "b.md": ["also-gone"], "c.md": []}
+        )
+        self.assertEqual(fv.paths, ("a.md",))
+        self.assertEqual(fv.vectors.shape, (1, 3))
+
+    def test_file_vectors_read_in_small_batches_give_the_same_answer(self):
+        ids = [f"c{i}" for i in range(7)]
+        vecs = [[float(i + 1), 1.0, 0.0] for i in range(7)]
+        self.store.upsert("lib1", ids, vecs)
+        groups = {"x.md": ids[:3], "y.md": ids[3:]}
+        whole = self.store.file_vectors("lib1", groups)
+        small = self.store.file_vectors("lib1", groups, batch=2)
+        self.assertEqual(whole.paths, small.paths)
+        self.assertEqual(whole.vectors.tolist(), small.vectors.tolist())
+
+    def test_file_vectors_on_missing_collection_is_empty_and_creates_nothing(self):
+        before = set(self.store.list_collection_names())
+        fv = self.store.file_vectors("nobody", {"a.md": ["a1"]})
+        self.assertEqual(fv.paths, ())
+        self.assertEqual(fv.vectors.shape[0], 0)
+        self.assertEqual(set(self.store.list_collection_names()), before)
+
     def test_sample_empty_collection_returns_empty_list(self):
         self.assertEqual(self.store.sample("lib1"), [])
 

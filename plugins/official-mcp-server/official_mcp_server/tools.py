@@ -10,6 +10,7 @@ import base64
 import time
 from typing import Any
 
+from core.conversion_cache import needs_attention, pages_summary, reason_text
 from core.pipeline import DEFAULT_CONFIDENCE_WARN_THRESHOLD, Pipeline, confidence_tier
 
 #: 视觉检索插件"现在不能查"的原因码集合（official-visual-wemm 的
@@ -277,7 +278,7 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
             return {"ok": False, "error": str(exc)}
 
     @server.tool()
-    def wemm_status() -> dict[str, Any]:
+    def wemm_status(library_id: str = "") -> dict[str, Any]:
         """WEMM 页级视觉导航状态诊断（对齐 obsidian-rag 的 `wemm_status`
         工具）：子进程是否存活、各库已建的页级索引规模（几个PDF、几页
         向量）——用这个一眼确认"WEMM 到底能不能用"，不用靠猜。只读，
@@ -286,12 +287,56 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
         `official-visual-wemm` 插件未启用时 `providers` 为空字典，不是
         错误——同 `navigate_knowledge` 未装该插件时"空结果不是失败"的
         语义一致。
+
+        另附 `conversion_caches`（BC-19）：每个库“需要转换的文件”（PDF、Word 等非纯文字
+        格式）的转文字缓存和页库一行账——几份转好、几份缺、缓存文件夹在哪、多大、页库几页。
+        给了 `library_id` 时再列出这个库**缺的**文件：路径、原因、下一步怎么办。只统计和
+        列出这个库授权给 Agent 的格式；缺的原因里写的“下一步”要转告用户去做，不要自己
+        反复重试索引。
+
+        Args:
+            library_id: 只看这个库并列出它缺的文件；留空 = 全部库只给汇总
         """
         try:
             status = pipeline.visual_status()
+            reports = pipeline.conversion_caches(library_id or "all")
         except Exception as exc:  # noqa: BLE001 - 见 search_knowledge docstring
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "providers": status}
+        caches: dict[str, Any] = {}
+        for report in reports:
+            if report.error:
+                caches[report.library_id] = {"error": report.error}
+                continue
+            # BC-02：未授权格式的文件，名字和数量都不出现在给 Agent 的返回值里
+            allowed = set(lib_mgr.agent_allowed_extensions(report.library_id))
+            visible = [item for item in report.files if "." + item.extension in allowed]
+            pdfs = [item for item in visible if item.pages_state != "n/a"]
+            entry: dict[str, Any] = {
+                "text_done": sum(1 for item in visible if item.text_state == "done"),
+                "text_total": len(visible),
+                "text_dir": report.text_dir,
+                "catalog_file": report.catalog_file,
+                "pages_enabled": report.pages_enabled,
+                "pdf_total": len(pdfs),
+                "pages_done": sum(1 for item in pdfs if item.pages_state == "done"),
+            }
+            if library_id:
+                entry["missing"] = [
+                    {
+                        "path": item.path,
+                        "text_state": item.text_state,
+                        "text_reason": reason_text(item.text_reason)[0] or None,
+                        "text_next_step": reason_text(item.text_reason)[1] or None,
+                        "pages_state": item.pages_state,
+                        "pages": pages_summary(item) if item.pages_state not in {"n/a", "off"} else None,
+                        "pages_reason": reason_text(item.pages_reason)[0] or None,
+                        "pages_next_step": reason_text(item.pages_reason)[1] or None,
+                    }
+                    for item in visible
+                    if needs_attention(item)
+                ]
+            caches[report.library_id] = entry
+        return {"ok": True, "providers": status, "conversion_caches": caches}
 
     @server.tool()
     def read_document(library_id: str, path: str) -> dict[str, Any]:

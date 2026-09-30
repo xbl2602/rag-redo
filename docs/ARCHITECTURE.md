@@ -55,15 +55,15 @@ RAG REDO 是 obsidian-rag 项目的完全重构，不复用旧项目的代码或
 
 | 扩展点 | 类型 | 对应旧项目能力 |
 |---|---|---|
-| `extractor:<ext>` | 多值 | md/txt 原生、pdf 文字层(pymupdf4llm)、docx(python-docx)、MinerU 云端 OCR、MinerU 本机 OCR |
+| `extractor:<ext>` | 多值 | md/txt 原生、pdf 文字层(pymupdf4llm)、docx(python-docx)、MinerU 云端 OCR、MinerU 本机 OCR（可选 `extract_many` 一次收几份，编排层据此给扫描件合批，接口与失败语义见 `core/contracts.py`） |
 | `chunker` | 单例 | 现有切块策略 |
 | `embedder` | 单例 | BGE-M3 |
-| `vector_store` | 单例 | Chroma |
+| `vector_store` | 单例 | Chroma；可选的只读方法 `file_vectors()` 按文件平均已存的块向量（返回 `core.contracts.FileVectorSet`），供总览星图排序分组（BC-18）——没实现它的向量库，总览里的文件照样列出、只是不分组 |
 | `lexical_index` | 单例 | BM25 + jieba |
 | `fusion` | 单例 | RRF |
 | `reranker` | 单例 | 现有 cross-encoder 重排器 |
 | `dedup` | 多值 | MinHash+LSH 近似去重 |
-| `visual_index` | 多值 | WEMM 页级视觉检索 |
+| `visual_index` | 多值 | WEMM 页级视觉检索；可选的只读方法：`graph_page_states()`（逐 PDF 页级状态，可带 `page_count` 总页数与 `built_in` 哪一轮编的页）、`is_active()`（开没开）、`cache_info()`（存放位置、每页估算字节、显存需求、闲置卸载时间）、`render_page_png()`（CPU 现画一页小图）；`navigate(..., path=)` 可只在一份 PDF 里找——这些都给“转换缓存”清单用（BC-19），没实现的提供者清单里只是少这几项 |
 | `library_manager` | 单例（默认自带） | 多库/路径级勾选(`decide_included`) |
 | `llm_provider` | 多值 | HyDE、库摘要生成用的 LLM 调用 |
 | `gui_panel` | 多值 | 库管理、检索结果、设置页、全库关系图…… |
@@ -71,6 +71,10 @@ RAG REDO 是 obsidian-rag 项目的完全重构，不复用旧项目的代码或
 | `archive_codec` | 单例 | 换电脑搬家的导出/导入归档格式编解码（`official-import-export`）；实现落地时改成单例——归档格式在任一时刻只应该有一种在用，不是像 `extractor:*`/`dedup` 那样多个实现各管一段、都参与聚合。真正跨 library_manager/lexical_index/vector_store 三个插件收集/写回数据的编排在 `core/pipeline.py` 的 `export_library`/`import_library`，和 `index_library`/`search` 同一种模式，这个扩展点本身只管"字典 <-> zip 字节"这一步编解码 |
 
 不是插件、而是核心提供的**服务**（区别见第 2.2 节）：Agent 写权限门禁、资源仲裁。
+
+**转换缓存清单**（BC-19）同样是编排层的只读组合：`Pipeline.conversion_caches()` = 库管理器的权威文件枚举 + 索引清单记录 + 正文缓存文件的实际位置（与读正文同一套查找）+ `visual_index` 的逐 PDF 页级状态 → `core/conversion_cache.py`（纯组装：状态、原因代码、“下一步”文案、“算不算缺”的判定只此一份）。界面、命令行 `caches`、MCP `wemm_status`、每轮索引日志和缓存文件夹里的 `缓存目录.md` 都吃这一份结果；不触发转换、不加载模型。
+
+**总览星图读模型**（BC-18）不是扩展点，是编排层的只读组合：`Pipeline.overview_map()` = `graph()` 的文件节点 + 索引清单里的块 id + `vector_store.file_vectors()` → `core/overview_map.py`（纯计算：一维排序、相邻差距、跨库分组，固定种子）。它只读已存向量，**不加载嵌入模型、不碰显卡**；GUI 前端只负责把这些数画出来（`assets/starmap/starmap.js`），显卡资源只在图谱页看得见时占用。
 
 **单例扩展点必须支持不重启切换**：`embedder`/`vector_store`/`lexical_index`/`fusion`/`reranker`/`llm_provider` 这几个单例点，只要多个候选实现已经装好并启用，"当前用哪个"只是一条配置，改配置立即生效，不需要重启核心、不需要重装插件——这是"插件化"要真正兑现"能自由换模型"这句承诺的关键，不能因为实现省事就退化成"选了就焊死，换要重装"。`llm_provider` 进一步可以支持"有序回退链"（优先用一个，不可用自动试下一个），参考模板项目已验证过这个模式能显著减少"每个 provider 各写一套可用性探测逻辑"的重复劳动。索引数据要能感知"embedder 换了/版本变了"从而判定过期重算，机制见 [LESSONS.md](LESSONS.md) 第3条。
 

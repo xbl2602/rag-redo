@@ -1,14 +1,32 @@
 # official-visual-wemm 子进程独立环境的依赖——不装进核心 .venv（架构
 # 红线7），由 env_bootstrap.py 在这个插件自己的 .venv 里装。
 #
-# 版本不锁死具体号——这几个包在这台真实 Windows 机器上用 pip 官方源装过
-# 一遍、真实跑通了 tencent/WeMM-Embedding-2B 的推理并验证过跨模态语义
-# 判别力（见 docs/ROADMAP.md Phase 2 状态段落），但当时是临时装进核心
-# venv 验证用的，没有特意固定版本号；等这个 env_bootstrap.py 真的跑过
-# 一次干净安装、确认这份不锁版本的列表长期可重复之后，再考虑要不要锁定
-# 具体版本（过早锁定一个只验证过一次的版本号，遇到上游发新版反而更容易
-# 悄悄装出一个从没测过的组合）。
-torch
+# **这里不要列 torch**（2026-09-29 修复的真机严重缺陷）：裸 `torch` 从 PyPI
+# 解析出来是 CPU-only 轮子，本机实测装成了 `torch 2.14.0+cpu`，
+# `cuda.is_available() = False`——WEMM 服务物理上不可能把模型装进显卡，页级
+# 编码只能跑 CPU。更糟的是 `server.py::_vram_free_gb` 的 torch 分支随之失效、
+# 回退到 nvidia-smi，而 WDDM 笔记本上 nvidia-smi 的 memory.free 低报约 5.2 GiB
+# （torch 6.878 GiB vs nvidia-smi 1.681 GiB），页级索引就一直卡在
+# 「空闲显存 5.4GB < 需求 5.5GB」的假门槛上。
+#
+# torch 改由 env_bootstrap.py 用 `--index-url https://download.pytorch.org/whl/cu128`
+# 单独先装（见该脚本的 TORCH_INDEX_URL / TORCH_SPEC 与模块 docstring），装完当场
+# 验证 CUDA 可用，装成 CPU 版直接失败。
+#
+# **torchvision 必须列，但它不是 torch 降级的元凶**（2026-09-29 真机实测澄清）：
+# qwen-vl-utils 0.0.14 的 PyPI 元数据里 `requires_dist` 是 av/packaging/pillow/
+# requests，既不含 torchvision 也不含 torch，但它的 `vision_process.py:16` 在
+# **运行时 `import torchvision`**——不装就会 `ModuleNotFoundError`。所以要列。
+#
+# 真正让 CUDA 轮子被换掉的是"不钉版本"：torchvision 最新版（0.29.0）钉的是
+# `torch==2.14.0`，而 cu128 源上只有 2.9.0/2.9.1/2.10.0/2.11.0，pip 只能回
+# PyPI 拿 CPU 轮子（venv 体积 5GB → 0.9GB）。现在由 env_bootstrap.py 生成的
+# 约束文件把 torch 钉死在 `2.11.0+cu128`，pip 就会自动挑与它匹配的
+# torchvision 0.26.0，并从 cu128 源取到带 CUDA 的那份。**不要再把 torchvision
+# 从这里删掉。**
+torchvision
 transformers
 qwen_vl_utils
-torchvision
+# server.py 渲染 PDF 页面（`pymupdf.open` → `page.get_pixmap(dpi=...)`）要用。
+# 2026-09-29 真机发现漏列：页级编码走到渲染那一步才报 ModuleNotFoundError。
+pymupdf

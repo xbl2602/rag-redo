@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "architecture",
+  "input": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\04-plugins.architecture.json",
+  "output": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\04-plugins.html",
+  "specification": {
+    "sha256": "5952a9b8c46deadcd2801db540962e85babf35f9bfbf9d482689c054b5a37f13",
+    "bytes": 4669
+  },
+  "artifact": {
+    "sha256": "702ec6fcf4caff0ba32083d0e0791a4451ea3368b6dcf3448f0b6ff28366ee2e",
+    "bytes": 807013
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "standard",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

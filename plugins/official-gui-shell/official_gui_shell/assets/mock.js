@@ -773,8 +773,209 @@
     // 新能力（BC-16），旧项目没有对应按钮，演示模式简单模拟"卸载成功"。
     release_gpu_memory: function () {
       return Promise.resolve({ released: ['official-embedder-bge-m3', 'official-reranker'], skipped: [], errors: {} });
+    },
+
+    // 新能力（BC-18）：总览星图数据。真实数据由核心按内容排序分组；这里按"主题一段一段"合成，
+    // 段内相邻文件差距小、段与段之间差距大，形状上和真实数据同一类。
+    overview_map: function (libraries) {
+      return delay(300).then(function () { return mockOverview(libraries); });
+    },
+
+    // 新能力（BC-19）：转换缓存清单。演示数据由上面的 PDF 节点推出来，再补两份 Word；
+    // 原因的人话在真实环境里由核心给（core/conversion_cache.py），这里抄几条够演示用。
+    conversion_caches: function (lib) {
+      return delay(150).then(function () {
+        var names = lib ? [lib] : LIBS.map(function (l) { return l.name; });
+        var libs = names.map(function (name) { return mockConvSummary(name, mockConvRows(name)); });
+        return { libs: libs, rows: lib ? mockConvRows(lib) : [], error: null };
+      });
+    },
+    conversion_cache_file: function (lib, rel) {
+      return delay(120).then(function () {
+        var row = mockConvRows(lib).filter(function (r) { return r.rel === rel; })[0];
+        if (!row && /\.pdf$/i.test(rel)) row = mockConvPdf(lib, rel);  // 星图演示数据里的 PDF：现编一行
+        if (!row) return { ok: false, error: '「' + rel + '」不是这个库里需要转换的文件' };
+        var out = JSON.parse(JSON.stringify(row));
+        out.text.chars = row.text.state === 'done' ? Math.round(row.text.bytes / 2.6) : null;
+        out.ok = true; out.lib = lib; out.pages_enabled = SET_VALUES.wemm_backend !== 'off';
+        out.pages_dir = 'D:\\RAG\\data\\visual_wemm'; out.vram_gb = 6.3; out.idle_unload_s = 300; out.error = null;
+        return out;
+      });
+    },
+    open_cache_folder: function (lib) {
+      var dir = 'D:\\RAG\\data\\extracted\\' + lib;
+      return Promise.resolve({ ok: true, opened: false, path: dir, catalog: dir + '\\缓存目录.md' });
+    },
+    reveal_cache_file: function (lib, rel) {
+      var row = mockConvRows(lib).filter(function (r) { return r.rel === rel; })[0];
+      if (!row || !row.text.file) return Promise.resolve({ ok: false, error: '这份文件还没有转好的正文' });
+      return Promise.resolve({ ok: true, opened: false, path: row.text.file });
+    },
+    page_preview: function (lib, rel, page) {
+      return delay(260).then(function () {
+        return { ok: true, page: +page, data_url: mockPageImage(rel, +page) };
+      });
+    },
+    page_try_search: function (lib, rel, query, topK) {
+      if (!String(query || '').trim()) return Promise.resolve({ ok: false, hits: [], error: '先输入一句要找的内容' });
+      if (SET_VALUES.wemm_backend === 'off') {
+        return Promise.resolve({ ok: false, hits: [], error: '（WEMM 视觉导航未开启：在设置里打开后重试）' });
+      }
+      var row = mockConvRows(lib).filter(function (r) { return r.rel === rel; })[0];
+      var total = row ? row.pages.count : 0, seed = 0, i;
+      for (i = 0; i < query.length; i++) seed = (seed * 31 + query.charCodeAt(i)) >>> 0;
+      var hits = [];
+      for (i = 0; i < Math.min(total, topK || 5); i++) hits.push({ page: 1 + (seed + i * 7) % total, rank: i + 1 });
+      return delay(1400).then(function () { return { ok: true, hits: hits, error: null }; });
     }
   };
+
+  /* ---------- 转换缓存假数据（BC-19） ---------- */
+  var CC_REASONS = {
+    'not-indexed': ['还没索引到', '新加的文件或索引还没跑完：等下一轮自动同步，或在库页点「增量更新」。'],
+    scanned: ['扫描件，等文字识别', '这份没有文字层：在设置里开启 MinerU（本机或云端）后，下一轮会自动转；已经开着就等下一轮。'],
+    'extract-failed': ['转换失败', '多半是当时的环境问题（缺 Key、额度用完、网络断了、本机解析出错），修好后下一轮自动重试。'],
+    'pages-off': ['页库没开', '在设置里打开「页级视觉导航（WEMM）」，下一轮索引会自动为 PDF 建页库。'],
+    'pages-not-built': ['页库还没建', '等下一轮索引自动建；页库开着却一直不建，去诊断页看页库服务的状态。'],
+    'pages-partial': ['有页面没编上', '缺的页下一轮会自动重试；一直缺，去诊断页看页库服务的日志。']
+  };
+  function ccRanges(pages) {
+    var out = [], i = 0;
+    while (i < pages.length) {
+      var a = pages[i], b = a;
+      while (i + 1 < pages.length && pages[i + 1] === b + 1) { i++; b = pages[i]; }
+      out.push(a === b ? String(a) : a + '–' + b);
+      i++;
+    }
+    return out.join('、');
+  }
+  function mockConvRows(lib) {
+    var pagesOn = SET_VALUES.wemm_backend !== 'off';
+    var rows = G.nodes.filter(function (n) { return n.type === 'pdf' && n.lib === lib; }).map(function (n) {
+      var m = n.pipeline.mineru, rel = G.baseName(n.rel);
+      var textReason = m === 'done' ? null : m === 'queued' ? 'scanned' : m === 'failed' ? 'extract-failed' : 'not-indexed';
+      var total = n.pages ? n.pages + (rel.indexOf('视觉') >= 0 ? 2 : 0) : (m === 'done' ? 12 : null);
+      var have = [], k;
+      for (k = 1; k <= (n.pages || 0); k++) have.push(k);
+      var missing = [];
+      if (total) for (k = 1; k <= total; k++) if (have.indexOf(k) < 0) missing.push(k);
+      var ps = !pagesOn ? 'off' : n.pipeline.wemm === 'done' ? (missing.length ? 'partial' : 'done') : 'none';
+      var pr = ps === 'off' ? 'pages-off' : ps === 'partial' ? 'pages-partial' : ps === 'none' ? 'pages-not-built' : null;
+      var bytes = m === 'done' ? 30000 + (n.pages || 10) * 2600 : 0;
+      return {
+        rel: rel, ext: 'pdf', attention: m !== 'done' || ps === 'none' || ps === 'partial',
+        text: {
+          state: m === 'done' ? 'done' : m === 'failed' ? 'failed' : 'pending', reason: textReason,
+          label: textReason ? CC_REASONS[textReason][0] : '', next: textReason ? CC_REASONS[textReason][1] : '',
+          route: m === 'done' ? 'official-ocr-mineru-local' : null, route_name: m === 'done' ? 'MinerU 本地解析' : null,
+          route_version: m === 'done' ? '1.2.0' : null, bytes: bytes, updated: m === 'done' ? n.updated : null,
+          file: m === 'done' ? 'D:\\RAG\\data\\extracted\\' + lib + '\\g-2026-09-30\\' + (n._k || 'x') + '9f3a1c.official-ocr-mineru-local%3A1.2.0.txt' : null
+        },
+        pages: {
+          state: ps, reason: pr, label: pr ? CC_REASONS[pr][0] : '', next: pr ? CC_REASONS[pr][1] : '',
+          detail: ps === 'partial' ? '部分页面编码失败' : null, count: have.length, total: total,
+          have: ccRanges(have), missing: ccRanges(missing), first: have.length ? 1 : null
+        }
+      };
+    });
+    if (lib === '技术笔记') {
+      rows.push({
+        rel: '部署手册.docx', ext: 'docx', attention: false,
+        text: { state: 'done', reason: null, label: '', next: '', route: 'official-extractor-docx', route_name: 'DOCX 提取器',
+          route_version: '1.0.0', bytes: 18432, updated: 1787000000, file: 'D:\\RAG\\data\\extracted\\技术笔记\\g-2026-09-30\\5be0.official-extractor-docx%3A1.0.0.txt' },
+        pages: { state: 'n/a', reason: null, label: '', next: '', detail: null, count: 0, total: null, have: '', missing: '', first: null }
+      });
+    }
+    return rows.sort(function (a, b) { return a.rel < b.rel ? -1 : 1; });
+  }
+  function mockConvPdf(lib, rel) {
+    var n = 8 + rel.length % 17;
+    return {
+      rel: rel, ext: 'pdf', attention: false,
+      text: { state: 'done', reason: null, label: '', next: '', route: 'official-extractor-pdf-text', route_name: 'PDF 文字层提取',
+        route_version: '1.0.0', bytes: 20000 + n * 2100, updated: 1787000000,
+        file: 'D:\\RAG\\data\\extracted\\' + lib + '\\g-2026-09-30\\' + (rel.length * 7919).toString(16) + '.official-extractor-pdf-text%3A1.0.0.txt' },
+      pages: { state: SET_VALUES.wemm_backend !== 'off' ? 'done' : 'off', reason: SET_VALUES.wemm_backend !== 'off' ? null : 'pages-off',
+        label: SET_VALUES.wemm_backend !== 'off' ? '' : CC_REASONS['pages-off'][0], next: SET_VALUES.wemm_backend !== 'off' ? '' : CC_REASONS['pages-off'][1],
+        detail: null, count: n, total: n, have: '1–' + n, missing: '', first: 1 }
+    };
+  }
+  function mockConvSummary(lib, rows) {
+    var s = { lib: lib, text_done: 0, text_total: rows.length, text_bytes: 0, text_attention: 0,
+      pages_enabled: SET_VALUES.wemm_backend !== 'off', pdf_total: 0, pages_done: 0, page_vectors: 0, page_bytes: 0,
+      pages_attention: 0, text_dir: 'D:\\RAG\\data\\extracted\\' + lib, catalog: 'D:\\RAG\\data\\extracted\\' + lib + '\\缓存目录.md',
+      pages_dir: 'D:\\RAG\\data\\visual_wemm', vram_gb: 6.3, idle_unload_s: 300, error: null };
+    rows.forEach(function (r) {
+      if (r.text.state === 'done') { s.text_done++; s.text_bytes += r.text.bytes; } else s.text_attention++;
+      if (r.pages.state === 'n/a') return;
+      s.pdf_total++;
+      if (r.pages.state === 'done') s.pages_done++;
+      if (r.pages.state === 'none' || r.pages.state === 'partial' || r.pages.state === 'failed') s.pages_attention++;
+      if (r.pages.state === 'done' || r.pages.state === 'partial') s.page_vectors += r.pages.count;
+    });
+    s.page_bytes = s.page_vectors * 4608;
+    return s;
+  }
+  /* 演示用的“页面小图”：画一张像讲义页的 SVG（真实环境是把 PDF 这一页现画成 PNG） */
+  function mockPageImage(rel, page) {
+    var lines = '', y = 118, i;
+    for (i = 0; i < 11; i++) {
+      var w = 300 - ((page * 37 + i * 53) % 120);
+      lines += '<rect x="48" y="' + y + '" width="' + w + '" height="7" rx="3" fill="#c9ced6"/>';
+      y += 20;
+    }
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="420" height="560" viewBox="0 0 420 560">'
+      + '<rect width="420" height="560" fill="#ffffff"/>'
+      + '<text x="48" y="70" font-family="sans-serif" font-size="20" font-weight="700" fill="#1f2933">'
+      + String(rel).replace(/[<&>]/g, '').replace(/\.pdf$/i, '') + '</text>'
+      + '<rect x="48" y="84" width="120" height="4" fill="#34d399"/>' + lines
+      + '<rect x="48" y="360" width="324" height="130" rx="6" fill="#eef1f4" stroke="#d5dae0"/>'
+      + '<text x="210" y="530" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#7a828c">— ' + page + ' —</text></svg>';
+    return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  }
+
+  /* ---------- 总览星图假数据（BC-18） ---------- */
+  var OV_TOPICS = ['插件架构', '混合检索', '向量模型', '文档提取', '知识管理', '索引流程', 'GUI 交互', 'MCP 协议',
+    'GPU 调度', '测试规范', '课程讲义', '论文笔记', '项目管理', '学习方法'];
+  function mockOverview(libraries) {
+    var want = libraries ? String(libraries).split(',').filter(Boolean) : [];
+    var seed = 0x5eed;
+    function rnd() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
+    var libs = [], sizes = {}, samples = {}, files = 0, points = 0;
+    LIBS.forEach(function (l, li) {
+      if (want.length && want.indexOf(l.name) < 0) return;
+      var cols = { lib: l.name, points: 0, rel: [], type: [], chunks: [], pages: [], state: [], group: [],
+        gap: [], loose: [], updated: [], fail: [] };
+      var n = l.files, cpf = l.chunks / l.files, i = 0;
+      while (i < n) {
+        var g = Math.min(OV_TOPICS.length - 1, Math.floor(Math.pow(rnd(), 1.6) * OV_TOPICS.length));
+        var run = Math.min(n - i, 6 + Math.floor(rnd() * rnd() * 90));
+        for (var k = 0; k < run; k++, i++) {
+          var pdf = rnd() < (li === 1 ? 0.7 : 0.06);
+          var s = rnd(), state = s < 0.03 ? 'failed' : (s < 0.05 ? 'ocr' : 'indexed');
+          var ch = state === 'indexed' ? Math.max(1, Math.round(cpf * (0.25 + rnd() * rnd() * 3.2))) : 0;
+          var pg = pdf && state === 'indexed' ? 6 + Math.floor(rnd() * rnd() * 40) : 0;
+          var rel = OV_TOPICS[g] + '/' + OV_TOPICS[g] + '-' + String(i + 1).padStart(4, '0') + (pdf ? '.pdf' : '.md');
+          cols.rel.push(rel); cols.type.push(pdf ? 'pdf' : 'md'); cols.chunks.push(ch); cols.pages.push(pg);
+          cols.state.push(state); cols.group.push(state === 'indexed' ? g : -1);
+          cols.gap.push(k === 0 ? 0.55 + rnd() * 0.35 : 0.04 + rnd() * rnd() * 0.3);
+          cols.loose.push(0.45 + rnd() * 0.5); cols.updated.push(1787000000 + Math.floor(rnd() * 1400000));
+          cols.fail.push(state === 'failed' ? 'extract-failed' : (state === 'ocr' ? 'scanned' : null));
+          cols.points += 1 + ch + pg;
+          if (state === 'indexed') {
+            sizes[g] = (sizes[g] || 0) + 1;
+            (samples[g] = samples[g] || []).length < 3 && samples[g].push({ lib: l.name, rel: rel });
+          }
+        }
+      }
+      files += n; points += cols.points;
+      libs.push(cols);
+    });
+    var groups = Object.keys(sizes).map(function (g) { return { group: +g, size: sizes[g], samples: samples[g] }; });
+    groups.sort(function (a, b) { return b.size - a.size; });
+    return { libs: libs, groups: groups, stats: { libs: libs.length, files: files, points: points },
+      layout_version: 'mock', error: null };
+  }
 
   /* ---------- 未实现方法守卫：缺方法抛错 + 控制台警告 ---------- */
   var KNOWN = Object.keys(impl);

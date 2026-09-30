@@ -19,9 +19,6 @@ var API = new Proxy({}, {
     };
   }
 });
-var RM = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-var SVGNS = 'http://www.w3.org/2000/svg';
-var OFF = 6000;
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -118,6 +115,7 @@ function debounce(fn, ms) {
 
 /* ============ 全局状态 ============ */
 var S = {
+  view: 'graph',       // 默认视图（index.html 里 view-graph 默认打开）
   libs: [],            // snapshot.libs
   scope: [],           // 选中的库名（空 = 全部）
   snap: null,
@@ -128,7 +126,6 @@ var S = {
 };
 var PHASE_NAME = { idle: '空闲', scanning: '扫描', converting: '转换', embedding: '嵌入', writing: '写库', done: '完成', wemm: '页库同步' };
 var HB_NAME = { idle: '空闲', running: '心跳正常', stalled: '心跳停滞', dead: '疑似卡死', done: '已完成' };
-var LIB_COLORS = ['#34D399', '#7DB8FF', '#FBBF24', '#F472B6', '#A78BFA', '#FB923C', '#22D3EE', '#A3E635'];
 var REASON_LABEL = {
   scanned: '扫描件待 OCR', unreadable: '无法解析', empty: '空文件',
   'extract-failed': '提取失败', tbd: '待处理'
@@ -194,9 +191,8 @@ function askConfirm(title, desc, warnTxt, okLabel) {
 function closeTop() {
   if (escStack.length) { hideOverlay(escStack[escStack.length - 1]); return true; }
   if ($('logDrawer').classList.contains('open')) { toggleLog(false); return true; }
-  if (G.insOpen) { closeGIns(); return true; }
+  if ($('gIns').classList.contains('open')) { closeGIns(); return true; }
   if ($('gPhysics').classList.contains('open')) { togglePhysics(false); return true; }
-  if (G.qNode || G.searching) { clearGSearch(); toast('已回到全库全景'); return true; }
   return false;
 }
 document.addEventListener('keydown', function (e) {
@@ -235,9 +231,9 @@ function go(v) {
     b.classList.toggle('on', b.getAttribute('data-nav') === v);
   });
   if (v === 'library') loadLibs();
-  if (v === 'diag') { loadFailures(); loadWemmStatus(); }
+  if (v === 'diag') { buildCcLibOptions(); loadFailures(); loadConv(); }
   if (v === 'settings' && !SET.loaded) loadSettings();
-  if (v !== 'graph') closeGIns();
+  if (v === 'graph') smEnter(); else smLeave();
 }
 Array.prototype.forEach.call(document.querySelectorAll('[data-nav]'), function (b) {
   b.addEventListener('click', function () { go(b.getAttribute('data-nav')); });
@@ -277,7 +273,8 @@ $('scopeOk').addEventListener('click', function () {
   else S.scope = sel;
   updateScopeUI();
   hideOverlay($('mScope'));
-  G.applyScope();
+  SMAP.stale = true;
+  if (S.view === 'graph') smLoad();
 });
 
 /* ============ 快照驱动（动态岛 / KPI / 心跳 / 门锁） ============ */
@@ -386,11 +383,11 @@ function onSnapshot(snap) {
   if (nameKey !== S.libNamesKey) {
     S.libNamesKey = nameKey;
     buildFailLibOptions();
-    buildWemmLibOptions();
+    buildCcLibOptions();
   }
   // 库视图打开时轻量刷新（弹层打开期间不打断）
   if (libLoaded && S.view === 'library' && !escStack.length) loadLibs();
-  if (G.ready) updateGStatus();
+  smOnSnapshot(snap);
 }
 
 /* ============ 检索 ============ */
@@ -656,6 +653,8 @@ function loadLibs() {
     LIBS_LIST = list;
     libLoaded = true;
     renderLibs();
+    // 转换缓存那一行另取（桥接层缓存 15 秒、索引一结束就作废），取到再补画
+    ccLoadSums().then(function () { if (S.view === 'library') renderLibs(); });
   }).catch(function () { toast('库列表加载失败', 'err'); });
 }
 function renderLibs() {
@@ -680,6 +679,7 @@ function renderLibs() {
       + '<div class="lib-stats"><div class="lib-stat"><b>' + fmtInt(l.blocks) + '</b><span>向量块</span></div>'
       + '<div class="lib-stat"><b class="mono" style="font-size:12px">' + esc(fmtTs(l.last_indexed)) + '</b><span>最近索引</span></div></div></div>'
       + '<div class="fmt-row">' + fmts + issues + '</div>'
+      + ccCardLine(l.name)
       + '<div class="lib-summary">' + summaryHtml + '</div>'
       + '<div class="lib-ops">'
       + '<button class="btn btn-sm" data-act="cfg">配置</button>'
@@ -702,6 +702,7 @@ $('libGrid').addEventListener('click', function (e) {
   } else if (act === 'cfg') { openCfg(lib); }
   else if (act === 'sel') { openSel(lib); }
   else if (act === 'sum') { openSum(lib); }
+  else if (act === 'cc') { ccJump(lib.name); }
   else if (act === 'rm') { openRm(lib); }
 });
 
@@ -1358,14 +1359,6 @@ function buildFailLibOptions() {
   }).join('');
   sel.value = cur || '';
 }
-function buildWemmLibOptions() {
-  var sel = $('wemmLibSel');
-  var cur = sel.value;
-  sel.innerHTML = S.libs.map(function (l) {
-    return '<option value="' + esc(l.name) + '">' + esc(l.name) + '</option>';
-  }).join('');
-  sel.value = cur || (S.libs[0] ? S.libs[0].name : '');
-}
 $('failLib').addEventListener('change', loadFailures);
 var S_fail = { rows: [] };   // 供详情行展开用
 function failBadge(reason) {
@@ -1484,45 +1477,228 @@ $('wemmProbeBtn').addEventListener('click', function () {
       : '<span class="badge" style="background:var(--err-dim);color:var(--err)">服务未运行</span> <span style="font-size:11.5px;color:var(--ph)">' + esc(r.detail) + ' · 可在设置中开启页级视觉索引</span>';
   }).catch(function () { btn.disabled = false; $('wemmProbeOut').textContent = '探测请求失败'; });
 });
-$('wemmLibSel').addEventListener('change', loadWemmStatus);
-var S_wemm = { rows: [] };
-function loadWemmStatus() {
-  var lib = $('wemmLibSel').value;
-  if (!lib) return;
-  API.wemm_status(lib).then(function (d) {
-    S_wemm.rows = d.rows || [];
-    $('wemmBody').innerHTML = S_wemm.rows.map(function (r, i) {
-      return '<tr class="wrow" data-i="' + i + '"><td class="p" title="' + esc(r.rel) + '">' + esc(r.rel) + '</td>'
-        + '<td class="mono">' + (r.pages != null ? r.pages + ' 页' : '--') + '</td>'
-        + '<td>' + (r.failed
-          ? '<span class="badge" style="background:var(--err-dim);color:var(--err)">' + esc(r.reason || '失败') + '</span>'
-          : '<span class="badge badge-hi">页库就绪</span>') + ' <span class="mono fd-hint">详情▾</span></td></tr>'
-        + '<tr class="wd" data-i="' + i + '" style="display:none"><td colspan="3">'
-        + (r.failed
-          ? '<div class="fd-sec">为什么没建成</div>'
-            + '<div class="fd-line fd-why">' + esc((REASON_WHY[r.reason] || '') + '（看图服务未就绪/渲染超时等都会导致单页失败，下轮会自动重试。）') + '</div>'
-            + '<div class="fd-sec">怎么处理</div>'
-            + '<div class="fd-line fd-fix">' + esc(REASON_FIX[r.reason] || '开启或重启 WEMM 看图服务后重建页库即可。') + '</div>'
-          : '<div class="fd-line">已为这份 PDF 生成 ' + r.pages + ' 页向量 · ' + esc(r.lib) + '</div>')
-        + '<button class="btn btn-sm btn-ghost" data-wopen="1">打开源文件</button></td></tr>';
-    }).join('') || '<tr><td colspan="3" class="g" style="text-align:center;color:var(--ph)">该库暂无页向量数据' + (d.exists ? '' : '（页库不存在）') + '</td></tr>';
-  }).catch(function () {});
+/* ============ 转换缓存（BC-19）：PDF/Word 转成文字了没有、页库建了没有、存在哪、多大 ============
+   数据、缺的原因和“下一步怎么办”全部由核心给（core/conversion_cache.py），这里只负责摆出来。
+   页面小图用 CPU 现画一张、看完就丢；只有“试搜”会用到页库模型（占显卡），按钮旁写明。 */
+var CC = { sums: {}, rows: [], lib: '' };
+function ccBytes(n) {
+  n = +n || 0;
+  if (n < 1024) return n + ' B';
+  var u = ['KB', 'MB', 'GB'], v = n / 1024, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (v < 10 ? v.toFixed(1) : Math.round(v)) + ' ' + u[i];
 }
-$('wemmBody').addEventListener('click', function (e) {
-  var btn = e.target.closest('[data-wopen]');
-  if (btn) {
-    var row = btn.closest('tr').previousElementSibling;
-    var r = S_wemm.rows[+(row && row.getAttribute('data-i'))];
-    if (r) API.open_source(r.lib, r.rel, '').then(function (res) {
-      toast(res.ok ? '已打开源文件' : ('打开失败：' + (res.error || '未知')), res.ok ? 'ok' : 'err');
-    });
-    return;
+function ccLoadSums() {
+  return API.conversion_caches('').then(function (d) {
+    var m = {};
+    (d.libs || []).forEach(function (s) { m[s.lib] = s; });
+    CC.sums = m;
+    return m;
+  }).catch(function () { return CC.sums; });
+}
+/* 库卡片上那一行：转文字 38/40 · 页库 36/40；缺的变黄，点一下去诊断页看缺哪些 */
+function ccCardLine(name) {
+  var s = CC.sums[name];
+  if (!s) return '';
+  if (s.error) return '<div class="cc-line"><span class="cc-warn">转换缓存读不出来：' + esc(s.error) + '</span></div>';
+  if (!s.text_total) return '<div class="cc-line"><span class="cc-na">转文字 —（这个库没有需要转换的 PDF/Word）</span></div>';
+  var t = '<span class="cc-part' + (s.text_attention ? ' cc-warn' : '') + '">转文字 <b>' + fmtInt(s.text_done) + '/' + fmtInt(s.text_total) + '</b>'
+    + (s.text_attention ? ' · 缺 ' + fmtInt(s.text_attention) : '') + '</span>';
+  var p = !s.pdf_total ? ''
+    : s.pages_enabled
+      ? '<span class="cc-part' + (s.pages_attention ? ' cc-warn' : '') + '">页库 <b>' + fmtInt(s.pages_done) + '/' + fmtInt(s.pdf_total) + '</b>'
+        + (s.pages_attention ? ' · 缺 ' + fmtInt(s.pages_attention) : '') + '</span>'
+      : '<span class="cc-part cc-na">页库 未开启</span>';
+  var size = '<span class="cc-size">' + ccBytes(s.text_bytes) + (s.pages_enabled && s.page_vectors ? ' · 页库约 ' + ccBytes(s.page_bytes) : '') + '</span>';
+  var alert = s.text_attention || (s.pages_enabled && s.pages_attention);
+  return '<button class="cc-line' + (alert ? ' cc-alert' : '') + '" data-act="cc" title="去诊断页看每个文件的转换缓存">'
+    + t + p + size + '<span class="cc-go">' + (alert ? '看缺哪些 →' : '明细 →') + '</span></button>';
+}
+function buildCcLibOptions() {
+  var sel = $('ccLib');
+  var cur = sel.value;
+  sel.innerHTML = S.libs.map(function (l) {
+    return '<option value="' + esc(l.name) + '">' + esc(l.name) + '</option>';
+  }).join('');
+  sel.value = cur || (S.libs[0] ? S.libs[0].name : '');
+}
+function ccJump(name) {
+  go('diag');
+  buildCcLibOptions();
+  $('ccLib').value = name;
+  $('ccOnly').checked = true;
+  loadConv();
+  var sec = $('ccSec');
+  if (sec && sec.scrollIntoView) sec.scrollIntoView({ block: 'start' });
+}
+function ccTextCell(r) {
+  var t = r.text;
+  if (t.state === 'done') {
+    return '<span class="badge badge-hi">已转好</span> <span class="cc-sub">' + esc(t.route_name || t.route || '') + ' · ' + ccBytes(t.bytes) + '</span>';
   }
-  var tr = e.target.closest('tr.wrow');
+  var cls = t.state === 'failed' || t.state === 'missing' ? 'cc-bad' : 'badge-lo';
+  return '<span class="badge ' + cls + '">' + esc(t.label || t.state) + '</span>';
+}
+function ccPagesCell(r) {
+  var p = r.pages;
+  if (p.state === 'n/a') return '<span class="cc-na">—</span>';
+  if (p.state === 'off') return '<span class="cc-na">页库没开</span>';
+  var n = fmtInt(p.count) + (p.total ? '/' + fmtInt(p.total) : '') + ' 页';
+  if (p.state === 'done') return '<span class="badge badge-hi">' + n + '</span>';
+  if (p.state === 'partial') return '<span class="badge badge-lo">' + n + ' · ' + esc(p.label) + '</span>';
+  return '<span class="badge ' + (p.state === 'failed' ? 'cc-bad' : 'badge-lo') + '">' + esc(p.label || p.state) + '</span>';
+}
+function loadConv() {
+  var lib = $('ccLib').value;
+  CC.lib = lib;
+  if (!lib) { $('ccBody').innerHTML = ''; $('ccSum').textContent = '还没有注册任何库'; return; }
+  $('ccSum').innerHTML = '<span class="mini-spin"></span>正在读取…';
+  API.conversion_caches(lib).then(function (d) {
+    if (lib !== CC.lib) return;
+    if (d.error) { $('ccSum').textContent = '读取失败：' + d.error; $('ccBody').innerHTML = ''; return; }
+    var s = (d.libs || [])[0] || {};
+    CC.sums[lib] = s;
+    CC.rows = d.rows || [];
+    var sum = '转文字 <b>' + fmtInt(s.text_done) + '/' + fmtInt(s.text_total) + '</b> 份已转好，共 ' + ccBytes(s.text_bytes);
+    sum += s.pages_enabled
+      ? ' · 页库 <b>' + fmtInt(s.pages_done) + '/' + fmtInt(s.pdf_total) + '</b> 份 PDF 已建，共 ' + fmtInt(s.page_vectors) + ' 页，约 ' + ccBytes(s.page_bytes)
+      : ' · 页库没开';
+    sum += '<div class="cc-path mono" title="转文字缓存文件夹">' + esc(s.text_dir || '') + '</div>';
+    if (s.pages_enabled && s.pages_dir) sum += '<div class="cc-path mono" title="页库数据文件夹">' + esc(s.pages_dir) + '</div>';
+    $('ccSum').innerHTML = sum;
+    renderConv();
+  }).catch(function () { $('ccSum').textContent = '读取失败'; });
+}
+function renderConv() {
+  var only = $('ccOnly').checked;
+  var html = '';
+  CC.rows.forEach(function (r, i) {
+    if (only && !r.attention) return;
+    html += '<tr class="cc-row" data-i="' + i + '"><td class="p" title="' + esc(r.rel) + '">' + esc(r.rel) + ' <span class="mono fd-hint">详情▾</span></td>'
+      + '<td>' + ccTextCell(r) + '</td><td>' + ccPagesCell(r) + '</td></tr>'
+      + '<tr class="cc-det" data-i="' + i + '" style="display:none"><td colspan="3"><div class="cc-d" data-lib="' + esc(CC.lib) + '" data-rel="' + esc(r.rel) + '"></div></td></tr>';
+  });
+  $('ccBody').innerHTML = html || '<tr><td colspan="3" class="g" style="text-align:center;color:var(--ph)">'
+    + (CC.rows.length ? '没有缺的，全部转好了' : '这个库里没有需要转换的 PDF/Word') + '</td></tr>';
+}
+/* 一份文件的详情：清单里展开、星图文件详情里都用这一份 */
+function ccDetailHtml(d) {
+  var t = d.text, p = d.pages, h = '<div class="cc-block"><h5>转文字</h5>';
+  if (t.state === 'done') {
+    h += '<div class="gi-kv"><span class="k">谁转的</span><span class="v">' + esc(t.route_name || t.route || '') + (t.route_version ? ' ' + esc(t.route_version) : '') + '</span></div>'
+      + '<div class="gi-kv"><span class="k">多少</span><span class="v">' + (t.chars != null ? fmtInt(t.chars) + ' 字 · ' : '') + ccBytes(t.bytes) + ' · ' + esc(fmtTs(t.updated)) + '</span></div>'
+      + '<div class="cc-path mono" title="缓存文件">' + esc(t.file || '') + '</div>'
+      + '<div class="cc-acts"><button class="btn btn-sm" data-cc="read">在窗口里阅读</button>'
+      + '<button class="btn btn-sm btn-ghost" data-cc="reveal">在资源管理器中显示</button></div>';
+  } else {
+    h += '<div class="fd-line fd-why">' + esc(t.label) + '</div>' + (t.next ? '<div class="fd-line fd-fix">下一步：' + esc(t.next) + '</div>' : '');
+  }
+  h += '</div>';
+  if (p.state === 'n/a') return h;
+  h += '<div class="cc-block"><h5>页库</h5>';
+  if (p.state === 'off') {
+    h += '<div class="fd-line fd-why">' + esc(p.label) + '</div><div class="fd-line fd-fix">下一步：' + esc(p.next) + '</div>';
+  } else {
+    h += '<div class="gi-kv"><span class="k">已建</span><span class="v">' + (p.count ? '第 ' + esc(p.have) + ' 页' : '一页都没有') + (p.total ? '（共 ' + fmtInt(p.total) + ' 页）' : '') + '</span></div>';
+    if (p.missing) h += '<div class="gi-kv"><span class="k">缺</span><span class="v cc-warn">第 ' + esc(p.missing) + ' 页</span></div>';
+    if (p.label) h += '<div class="fd-line fd-why">' + esc(p.label) + (p.detail ? '（' + esc(p.detail) + '）' : '') + '</div>'
+      + (p.next ? '<div class="fd-line fd-fix">下一步：' + esc(p.next) + '</div>' : '');
+    if (d.pages_enabled && p.count) {
+      h += '<div class="cc-acts"><input class="cc-q" type="text" placeholder="输入一句话，看这份 PDF 里哪几页被找出来">'
+        + '<button class="btn btn-sm" data-cc="try">试搜</button></div>'
+        + '<div class="cc-note">试搜要把页库模型装进显卡（约 ' + esc(d.vram_gb != null ? d.vram_gb : '?') + ' GB），'
+        + (d.idle_unload_s ? '闲 ' + Math.round(d.idle_unload_s / 60) + ' 分钟后自动释放' : '闲置后自动释放')
+        + '；也可以在设置里点「释放显存」。</div><div class="cc-hits"></div>';
+    }
+  }
+  h += '<div class="cc-acts"><span class="cc-sub">看第</span><input class="cc-pg" type="number" min="1"'
+    + (p.total ? ' max="' + p.total + '"' : '') + ' value="' + (p.first || 1) + '"><span class="cc-sub">页</span>'
+    + '<button class="btn btn-sm btn-ghost" data-cc="page">看这一页长什么样</button></div>'
+    + '<div class="cc-thumb"></div></div>';
+  return h;
+}
+function ccFill(box) {
+  box.innerHTML = '<div class="gi-none"><span class="mini-spin"></span>读取中…</div>';
+  return API.conversion_cache_file(box.getAttribute('data-lib'), box.getAttribute('data-rel')).then(function (d) {
+    if (!document.body.contains(box)) return d;
+    box.innerHTML = d.ok ? ccDetailHtml(d) : '<div class="gi-none">' + esc(d.error || '读取失败') + '</div>';
+    return d;
+  });
+}
+function ccShowPage(box, page) {
+  var out = box.querySelector('.cc-thumb');
+  if (!out) return;
+  out.innerHTML = '<div class="gi-none"><span class="mini-spin"></span>正在画第 ' + page + ' 页…</div>';
+  API.page_preview(box.getAttribute('data-lib'), box.getAttribute('data-rel'), page).then(function (r) {
+    if (!document.body.contains(out)) return;
+    out.innerHTML = r.ok
+      ? '<figure><img src="' + r.data_url + '" alt="第 ' + r.page + ' 页"><figcaption>第 ' + r.page + ' 页（现画的小图，关掉就丢，不占显卡）</figcaption></figure>'
+      : '<div class="gi-none">' + esc(r.error || '画不出来') + '</div>';
+  });
+}
+function ccAct(e) {
+  var btn = e.target.closest('[data-cc]');
+  if (!btn) return false;
+  var box = btn.closest('.cc-d');
+  if (!box) return false;
+  var lib = box.getAttribute('data-lib'), rel = box.getAttribute('data-rel'), act = btn.getAttribute('data-cc');
+  if (act === 'read') openDoc(lib, rel, '');
+  else if (act === 'reveal') {
+    API.reveal_cache_file(lib, rel).then(function (r) {
+      toast(r.ok ? (r.opened ? '已在资源管理器中选中缓存文件' : '缓存文件：' + r.path) : '打开失败：' + (r.error || '未知'), r.ok ? 'ok' : 'err');
+    });
+  } else if (act === 'page') {
+    ccShowPage(box, Math.max(1, parseInt((box.querySelector('.cc-pg') || {}).value, 10) || 1));
+  } else if (act === 'pg') {
+    var pg = +btn.getAttribute('data-pg');
+    var inp = box.querySelector('.cc-pg');
+    if (inp) inp.value = pg;
+    ccShowPage(box, pg);
+  } else if (act === 'try') {
+    var q = (box.querySelector('.cc-q') || {}).value || '';
+    var out = box.querySelector('.cc-hits');
+    if (!q.trim()) { toast('先输入一句要找的内容', 'warn'); return true; }
+    btn.disabled = true;
+    out.innerHTML = '<div class="gi-none"><span class="mini-spin"></span>正在试搜（第一次要等页库模型装进显卡）…</div>';
+    API.page_try_search(lib, rel, q, 5).then(function (r) {
+      btn.disabled = false;
+      if (!document.body.contains(out)) return;
+      if (!r.ok) { out.innerHTML = '<div class="fd-line fd-why">没能试搜：' + esc(r.error || '未知原因') + '</div>'; return; }
+      out.innerHTML = r.hits.length
+        ? '<div class="cc-sub">找出来的页（最像的在前，点一下看这一页）：</div><div class="cc-acts">' + r.hits.map(function (h) {
+            return '<button class="btn btn-sm btn-ghost" data-cc="pg" data-pg="' + h.page + '">第 ' + h.page + ' 页</button>';
+          }).join('') + '</div>'
+        : '<div class="gi-none">这份 PDF 的页库里没有找到相近的页</div>';
+    }).catch(function () { btn.disabled = false; out.innerHTML = '<div class="gi-none">试搜请求失败</div>'; });
+  }
+  return true;
+}
+$('ccLib').addEventListener('change', loadConv);
+$('ccOnly').addEventListener('change', renderConv);
+$('ccOpenDir').addEventListener('click', function () {
+  if (!CC.lib) return;
+  API.open_cache_folder(CC.lib).then(function (r) {
+    toast(r.ok ? (r.opened ? '已打开缓存文件夹（里面的「缓存目录.md」写明每个缓存文件对应哪份原文件）' : '缓存文件夹：' + r.path) : '打开失败：' + (r.error || '未知'), r.ok ? 'ok' : 'err');
+  });
+});
+$('ccBody').addEventListener('click', function (e) {
+  if (ccAct(e)) return;
+  if (e.target.closest('input')) return;
+  var tr = e.target.closest('tr.cc-row');
   if (!tr) return;
-  var idx = tr.getAttribute('data-i');
   var det = tr.nextElementSibling;
-  if (det && det.classList.contains('wd')) det.style.display = det.style.display === 'none' ? '' : 'none';
+  if (!det || !det.classList.contains('cc-det')) return;
+  var opening = det.style.display === 'none';
+  det.style.display = opening ? '' : 'none';
+  var box = det.querySelector('.cc-d');
+  if (opening) ccFill(box); else box.innerHTML = '';  // 收起就把小图一起丢掉
+});
+/* 试搜框里按回车 = 点“试搜”（清单展开处和星图文件详情里都有这个框） */
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Enter' && e.target.classList && e.target.classList.contains('cc-q')) {
+    var b = e.target.parentNode.querySelector('[data-cc="try"]');
+    if (b) b.click();
+  }
 });
 $('dupThresh').addEventListener('input', function () {
   $('dupThVal').textContent = parseFloat(this.value).toFixed(2);
@@ -1796,975 +1972,268 @@ window.addEventListener('log', function (e) {
   } catch (err) {}
 });
 
-/* ============ 图谱引擎（移植 demo7，数据来自 graph() 契约） ============ */
-var G = {
-  ready: false, nodes: [], byId: {}, links: [], owns: [], sem: [], semLoaded: false,
-  libs: [], anchors: {}, themes: [],
-  ly: { bilat: true, sem: false, own: true, page: false, cache: true, pdf: true, bounds: true, th: 0.62 },
-  colorMode: 'lib', topK: 5,
-  qNode: null, redges: [], searching: false, insOpen: false,
-  cam: { x: 0, y: 0, k: 1 }, nodeEls: {}
-};
-var gStage, gWorld, panning = false, dragging = null, dragMoved = 0, panStart = null, downPos = null;
-var sim = { alpha: 0, frame: 0, active: false };
-var fitOnSettle = false, needRender = true, gRipples = [], gCamTween = null;
-var gBilatEls = [], gOwnEls = [], gSemEls = [], gBoundEls = {}, gTagEls = {};
-var G_DIM = 16, G_SIGMA = 1.0;
+/* ============ 图谱页：总览星图（BC-18） ============
+   画图在 starmap/starmap.js（ES 模块，three.js 放在本地 vendor/）；这里只做对接：
+   拿数据（overview_map 只读已存好的向量，不加载任何模型）、图谱页看得见时占用显卡 / 离开即交还、
+   悬停提示、文件详情、搜索岛跳检索页、缩放按钮、状态行。顺序和分组全部来自核心，这里零内容判断。 */
+var SMAP = { data: null, info: null, stale: true, loading: false, sel: null, mounted: false, runKey: null };
+var SM_STATE = { indexed: ['已索引', 'ok'], pending: ['未索引', 'off'], ocr: ['排队识别', 'wait'], failed: ['失败', 'bad'] };
+var SM_KIND = { md: 'Markdown', txt: '文本', docx: 'Word', pdf: 'PDF' };
+var smLast = { fps: 0, vramMB: 0 };
 
-function gLibIdx(name) { return G.libs.indexOf(name); }
-function gLibColor(name) { return LIB_COLORS[gLibIdx(name) % LIB_COLORS.length]; }
 function baseName(rel) { return String(rel).split('\\').pop().split('/').pop(); }
-function gLabel(n) {
-  if (n.type === 'page') return 'p.' + n.page;
-  return baseName(n.rel).replace(/\.(md|txt|docx|pdf)$/i, '');
+function smApi() { return window.RagStarMap || null; }
+function smColor(g) {
+  var m = smApi();
+  if (!m) return 'var(--s4)';
+  return g >= 0 && g < m.palette.length ? m.palette[g] : m.ungrouped;
 }
-function gVisible(n) {
-  if (!n) return false;
-  if (S.scope.length && S.scope.indexOf(n.lib) < 0) return false;
-  if (n.type === 'page') return G.ly.page;
-  if (n.type === 'cache') return G.ly.cache;
-  if (n.type === 'pdf') return G.ly.pdf;
-  return true;
+function smEmpty(title, text) {
+  if (!title) { $('smEmpty').classList.remove('show'); return; }
+  $('smEmptyTitle').textContent = title;
+  $('smEmptyText').textContent = text || '';
+  $('smEmpty').classList.add('show');
 }
-function gOwnerOf(n) { return n._owner ? G.byId[n._owner] : null; }
-function gPdfOf(n) {
-  if (n.type === 'pdf') return n;
-  var cur = n;
-  for (var i = 0; i < 3; i++) {
-    var o = gOwnerOf(cur);
-    if (!o) return null;
-    if (o.type === 'pdf') return o;
-    cur = o;
-  }
+function smFile(li, i) {
+  var L = SMAP.data && SMAP.data.libs[li];
+  if (!L || i < 0 || i >= L.rel.length) return null;
+  return { li: li, i: i, lib: L.lib, rel: L.rel[i], type: L.type[i], chunks: L.chunks[i], pages: L.pages[i],
+    state: L.state[i], group: L.group[i], fail: L.fail[i], updated: L.updated[i] };
+}
+function smGroup(g) {
+  var gs = (SMAP.data && SMAP.data.groups) || [];
+  for (var k = 0; k < gs.length; k++) if (gs[k].group === g) return gs[k];
   return null;
 }
-function gPdfState(n) {
-  if (n.type === 'md') return null;
-  if (n.type === 'pdf') {
-    var m = n.pipeline.mineru, w = n.pipeline.wemm;
-    if (m === 'failed') return 'failed';
-    if (m === 'queued' || m === 'none') return 'none';
-    return w === 'done' ? 'ok' : 'partial';
+function smStem(rel) { return baseName(rel).replace(/\.(md|txt|docx|pdf)$/i, ''); }
+
+/* 星图是异步加载的 ES 模块，晚于本文件执行：就绪后再挂载 */
+function smWhenReady(fn) {
+  if (window.RagStarMap) { fn(window.RagStarMap); return; }
+  window.addEventListener('starmapready', function () { fn(window.RagStarMap); }, { once: true });
+  setTimeout(function () {
+    if (!window.RagStarMap) smEmpty('星图组件没有加载成功', '界面文件可能不完整，请重新安装或联系维护者。');
+  }, 10000);
+}
+function smMount(m) {
+  if (SMAP.mounted) return;
+  SMAP.mounted = true;
+  m.mount($('smStage'), $('smPanelBody'), { hover: smHover, select: smSelect, stats: smStats, error: smError });
+  if (SMAP.data) smApplyData();
+  if (S.view === 'graph') m.show();
+}
+function smLoad() {
+  if (SMAP.loading) return;
+  SMAP.loading = true;
+  if (!SMAP.data) smEmpty('正在读取总览…', '');
+  API.overview_map(scopeStr()).then(function (res) {
+    SMAP.loading = false;
+    SMAP.stale = false;
+    SMAP.data = res;
+    if (res.error) toast('总览：' + res.error, 'warn');
+    smApplyData();
+  }).catch(function () {
+    SMAP.loading = false;
+    smEmpty('总览数据读取失败', '请检查后端是否正常运行；切回本页时会自动重试。');
+  });
+}
+function smApplyData() {
+  var d = SMAP.data, m = smApi();
+  if (!d) return;
+  smRenderGroups();
+  if (!m || !SMAP.mounted) return;
+  closeGIns();
+  var r = m.setData(d);
+  SMAP.info = r;
+  if (r.tooMany) smEmpty('文件太多，画不下', '请用顶部的「库范围」缩小要看的库。');
+  else if (!r.libs) {
+    smEmpty(d.libs.length ? '还没有可画的内容' : '还没有资料库',
+      d.libs.length ? '所选的库里还没有索引好的文件，先到「索引」页建立索引。' : '先到「库」页添加资料文件夹并建立索引。');
+  } else smEmpty(null);
+  smStatus();
+}
+function smEnter() {
+  if (SMAP.stale || !SMAP.data) smLoad();
+  var m = smApi();
+  if (m && SMAP.mounted) m.show();
+  smStatus();
+}
+function smLeave() {
+  closeGIns();
+  $('gTip').classList.remove('show');
+  var m = smApi();
+  if (m && SMAP.mounted) m.hide();
+  smStatus();
+}
+/* 索引跑完、库增删、块数变化时把总览标记为过期（索引进行中不重读，跑完再读一次） */
+function smOnSnapshot(snap) {
+  var p = snap.progress || {};
+  var key = (p.running ? 'run' : 'idle') + '|' + snap.chunks + '|' + snap.files + '|' + (snap.libs || []).length;
+  if (!p.running && SMAP.runKey !== null && SMAP.runKey !== key) {
+    SMAP.stale = true;
+    if (S.view === 'graph') smLoad();
   }
-  var pdf = gPdfOf(n);
-  return pdf ? gPdfState(pdf) : null;
+  SMAP.runKey = key;
 }
-/* 确定性语义向量（仅用于布局力学与近邻展示） */
-function buildVectors() {
-  var centroids = {};
-  G.themes.forEach(function (t) {
-    var rnd = mulberry32(hashStr('theme:' + t));
-    var v = [];
-    for (var i = 0; i < G_DIM; i++) v.push(rnd() * 2 - 1);
-    centroids[t] = gNorm(v);
-  });
-  G.nodes.forEach(function (n) {
-    if (n.type === 'page') { n.vec = null; return; }
-    var rnd = mulberry32(hashStr(n.rel));
-    var u = [];
-    for (var i = 0; i < G_DIM; i++) u.push(rnd() * 2 - 1);
-    gNorm(u);
-    var ct = centroids[n.theme] || centroids.general || centroids[G.themes[0]];
-    var v = [];
-    for (var j = 0; j < G_DIM; j++) v.push(ct[j] + u[j] * G_SIGMA);
-    n.vec = gNorm(v);
-  });
-  G.nodes.forEach(function (n) { if (n.type === 'page' && n._owner && G.byId[n._owner]) n.vec = G.byId[n._owner].vec; });
-  // 语义引力对（布局用，与语义边图层无关）
-  G.grav = [];
-  var docs = G.nodes.filter(function (n) { return n.type !== 'page'; });
-  for (var i = 0; i < docs.length; i++) {
-    for (var j = i + 1; j < docs.length; j++) {
-      var s = gCos(docs[i], docs[j]);
-      if (s >= 0.62) G.grav.push({ a: docs[i].id, b: docs[j].id, s: s });
-    }
-  }
+
+/* 状态行：规模、显存估算、帧率 */
+function smStats(s) {
+  smLast = s;
+  if (s.zoom) $('gZoomLabel').textContent = Math.round(s.zoom * 100) + '%';
+  smStatus();
 }
-function gNorm(v) {
-  var s = 0, i;
-  for (i = 0; i < G_DIM; i++) s += v[i] * v[i];
-  s = Math.sqrt(s) || 1;
-  for (i = 0; i < G_DIM; i++) v[i] /= s;
-  return v;
+function smStatus() {
+  var d = SMAP.data, st = (d && d.stats) || null;
+  if (!st) { $('gStatus').textContent = ''; return; }
+  var parts = ['<b>' + fmtInt(st.libs) + '</b> 库', '<b>' + fmtInt(st.files) + '</b> 文件', '<b>' + fmtInt(st.points) + '</b> 点'];
+  if (SMAP.info && SMAP.info.sampled) parts.push('抽样显示 ' + fmtInt(SMAP.info.points) + ' 点');
+  var m = smApi();
+  if (m && m.isLive()) parts.push('显存约 <b>' + smLast.vramMB.toFixed(1) + '</b> MB', Math.round(smLast.fps) + ' 帧/秒');
+  else parts.push('未占用显卡');
+  $('gStatus').innerHTML = parts.join(' · ');
 }
-function gCos(a, b) {
-  if (!a.vec || !b.vec) return 0;
-  var s = 0;
-  for (var i = 0; i < G_DIM; i++) s += a.vec[i] * b.vec[i];
-  return s;
-}
-function ensureGradients() {
-  var defs = $('gDefs');
-  G.libs.forEach(function (name, i) {
-    var c = gLibColor(name);
-    var rg = document.createElementNS(SVGNS, 'radialGradient');
-    rg.setAttribute('id', 'glowL' + i);
-    rg.innerHTML = '<stop offset="0%" stop-color="' + c + '" stop-opacity="0.09"/><stop offset="60%" stop-color="' + c + '" stop-opacity="0.05"/><stop offset="100%" stop-color="' + c + '" stop-opacity="0"/>';
-    defs.appendChild(rg);
-  });
-}
-function gInitFrom(payload) {
-  G.libs = payload.libs || [];
-  G.themes = [];
-  // 锚点按库数环形铺开（此前 8 个固定槽位，多库共用槽位直接叠罗汉）
-  G.libs.forEach(function (name, i) {
-    var a = (i / Math.max(1, G.libs.length)) * Math.PI * 2 - Math.PI / 2;
-    G.anchors[name] = { ax: Math.cos(a) * 620, ay: Math.sin(a) * 480 };
-  });
-  G.nodes = (payload.nodes || []).map(function (raw, i) {
-    var n = {
-      id: raw.id, lib: raw.lib, rel: raw.rel, type: raw.type, chunks: raw.chunks || 0,
-      updated: raw.updated, pipeline: raw.pipeline || { mineru: 'none', wemm: 'none' },
-      page: raw.page, pages: raw.pages, fail: raw.fail_reason, theme: raw.theme || 'general',
-      big: !!raw.big, t: ''
-    };
-    if (G.themes.indexOf(n.theme) < 0) G.themes.push(n.theme);
-    n.t = gLabel(n);
-    var an = G.anchors[n.lib] || { ax: 0, ay: 0 };
-    var ang = (i * 2.399) % (Math.PI * 2);
-    var r = n.type === 'page' ? 40 : (150 + (i % 9) * 65);
-    n.x = an.ax + Math.cos(ang) * r;
-    n.y = an.ay + Math.sin(ang) * r;
-    n.vx = 0; n.vy = 0;
-    G.byId[n.id] = n;
-    return n;
-  });
-  (payload.edges || []).forEach(function (e) {
-    if (!G.byId[e.a] || !G.byId[e.b]) return;
-    if (e.kind === 'link') G.links.push([e.a, e.b]);
-    else { G.owns.push({ a: e.a, b: e.b, rest: G.byId[e.a].type === 'page' ? 26 : 85 }); G.byId[e.a]._owner = e.b; }
-  });
-  buildVectors();
-  ensureGradients();
-  buildGraphDom();
-  G.ready = true;
-  // 超量节点自动进性能模式（去卡片阴影，见 CSS .g-stage.perf）
-  if (G.nodes.length > 500) gStage.classList.add('perf');
-  updateLabelDensity();
-  $('gpSum').textContent = fmtInt(payload.stats ? payload.stats.nodes : G.nodes.length) + ' 节点 · 实时生效';
-  renderLegend();
-  if (RM) { settleSync(320); fitView(100); render(); }
-  else { settleSync(180); fitView(100); startSim(0.3); }
-  updateSemCount(); updateGStatus(); updateLibCounts();
-  requestAnimationFrame(gLoop);
-}
-function buildGraphDom() {
-  var wrap = $('gNodes');
-  G.nodes.forEach(function (n) {
-    var el = document.createElement('div');
-    var st = gPdfState(n);
-    el.className = 'g-node t-' + n.type + (n.big ? ' big' : '');
-    el.dataset.id = n.id;
-    el.dataset.lib = n.lib;
-    if (st) el.dataset.state = st;
-    if (n.type === 'pdf') {
-      if (n.pipeline.mineru === 'failed') el.classList.add('st-failed');
-      else if (n.pipeline.mineru === 'queued' || n.pipeline.mineru === 'none') el.classList.add('st-nocache');
-    }
-    el.innerHTML = '<div class="g-card"><span class="g-mark"></span><span class="g-label">' + esc(n.t) + '</span></div>';
-    wrap.appendChild(el);
-    G.nodeEls[n.id] = el;
-  });
-  G.links.forEach(function (e) {
-    var p = document.createElementNS(SVGNS, 'path');
-    p.setAttribute('class', 'ge');
-    $('gBilatG').appendChild(p);
-    gBilatEls.push(p);
-  });
-  G.owns.forEach(function (e) {
-    var p = document.createElementNS(SVGNS, 'path');
-    p.setAttribute('class', 'go');
-    $('gOwnG').appendChild(p);
-    gOwnEls.push(p);
-  });
-  G.libs.forEach(function (name, i) {
-    var e = document.createElementNS(SVGNS, 'ellipse');
-    e.setAttribute('fill', 'url(#glowL' + i + ')');
-    e.setAttribute('stroke', gLibColor(name));
-    e.setAttribute('stroke-opacity', '0.25');
-    e.setAttribute('stroke-width', '1.2');
-    e.setAttribute('stroke-dasharray', '7 9');
-    $('gBoundsG').appendChild(e);
-    gBoundEls[name] = { el: e, rx: 340, ry: 270, cx: G.anchors[name].ax, cy: G.anchors[name].ay };
-    var tag = document.createElement('div');
-    tag.className = 'g-libtag';
-    tag.innerHTML = '<b>' + esc(name) + '</b><span></span>';
-    $('gTags').appendChild(tag);
-    gTagEls[name] = tag;
-  });
-  applyColorMode();
-}
-function renderLegend() {
-  $('gLegendLibs').innerHTML = G.libs.map(function (name) {
-    return '<span class="gl-lib"><i style="background:' + gLibColor(name) + '"></i><span>' + esc(name) + '</span></span>';
+function smError(msg) { smEmpty('星图无法显示', msg); }
+
+/* 图例：内容分组（颜色 + 最像这一组的代表文件） */
+function smRenderGroups() {
+  var gs = (SMAP.data && SMAP.data.groups) || [];
+  var h = gs.slice(0, 10).map(function (g) {
+    var s = g.samples[0];
+    var tip = g.samples.map(function (x) { return x.lib + ' / ' + x.rel; }).join('\n');
+    return '<span class="gl-lib" title="' + esc(tip) + '"><i style="background:' + smColor(g.group) + '"></i><span>'
+      + esc(s ? smStem(s.rel) : '第 ' + (g.group + 1) + ' 组') + ' 等 ' + fmtInt(g.size) + ' 个</span></span>';
   }).join('');
+  if (gs.length > 10) h += '<span class="gl-lib"><span>另有 ' + (gs.length - 10) + ' 组</span></span>';
+  $('smGroups').innerHTML = h || '<span class="gl-lib"><span>索引完成后，这里按内容分组着色</span></span>';
 }
-function applyColorMode() {
-  document.body.classList.toggle('g-mono', G.colorMode === 'mono');
-  $('gLegendLibs').style.display = G.colorMode === 'lib' ? '' : 'none';
-  $('gLegendState').style.display = G.colorMode === 'state' ? '' : 'none';
-  $('gLegendMono').style.display = G.colorMode === 'mono' ? '' : 'none';
-  Array.prototype.forEach.call($('gColorSeg').querySelectorAll('button'), function (b) {
-    b.classList.toggle('on', b.getAttribute('data-cm') === G.colorMode);
-  });
-  G.nodes.forEach(function (n) {
-    var el = G.nodeEls[n.id];
-    if (!el) return;
-    var mark = el.querySelector('.g-mark');
-    if (!mark) return;
-    if (G.colorMode === 'mono') { mark.style.background = ''; mark.style.borderColor = ''; return; }
-    var st = el.dataset.state;
-    var c = G.colorMode === 'lib' ? gLibColor(n.lib)
-      : (st === 'ok' ? '#34D399' : st === 'partial' ? '#7DB8FF'
-        : st === 'failed' ? '#F87171' : '');
-    if (c) { mark.style.background = c; mark.style.borderColor = 'transparent'; }
-    else { mark.style.background = ''; mark.style.borderColor = ''; }
-  });
+
+/* 悬停提示 */
+function smHover(ref, x, y) {
+  var tip = $('gTip');
+  var f = ref ? smFile(ref.li, ref.i) : null;
+  if (!f) { tip.classList.remove('show'); return; }
+  $('gTipPath').textContent = f.rel;
+  var what = ref.kind === 'chunk' ? '第 ' + ref.sub + ' 块'
+    : ref.kind === 'page' ? '第 ' + ref.sub + ' 页'
+    : (SM_KIND[f.type] || f.type) + ' · ' + fmtInt(f.chunks) + ' 块' + (f.pages ? ' · ' + fmtInt(f.pages) + ' 页' : '');
+  $('gTipMeta').textContent = f.lib + ' · ' + what + ' · ' + (SM_STATE[f.state] || ['--'])[0];
+  tip.style.left = x + 'px';
+  tip.style.top = y + 'px';
+  tip.classList.add('show');
 }
-/* 力导向 */
-function gA() { return G.nodes.filter(gVisible); }
-function startSim(alpha) { sim.alpha = alpha || 1; sim.frame = 0; sim.active = true; requestRender(); }
-function settleSync(iter) {
-  for (var i = 0; i < iter; i++) {
-    sim.alpha = Math.max(0.004, 1 - i / iter);
-    simStep();
+
+/* 文件详情 */
+function smSelect(ref) {
+  if (!ref) { closeGIns(); return; }
+  openGIns(ref.li, ref.i, false);
+}
+function openGIns(li, i, fly) {
+  var f = smFile(li, i);
+  if (!f) return;
+  SMAP.sel = { li: li, i: i };
+  var m = smApi();
+  if (m) m.select({ li: li, i: i }, fly);
+  var st = SM_STATE[f.state] || ['--', 'off'];
+  $('giMark').style.background = smColor(f.group);
+  $('giMark').style.borderColor = 'transparent';
+  $('giLib').textContent = f.lib;
+  $('giBadge').innerHTML = '<span class="gi-chip ' + st[1] + '">' + esc(st[0]) + '</span>';
+  $('giTitle').textContent = baseName(f.rel);
+  $('giPath').textContent = f.rel;
+  var meta = [SM_KIND[f.type] || f.type, fmtInt(f.chunks) + ' 块'];
+  if (f.pages) meta.push(fmtInt(f.pages) + ' 页');
+  if (f.updated) meta.push(fmtTs(f.updated));
+  $('giMeta').innerHTML = meta.map(function (x) { return '<span>' + esc(x) + '</span>'; }).join('');
+  var h = '';
+  if (f.state === 'failed' || f.state === 'ocr') {
+    h += '<div class="gi-sec"><h5>状态</h5><div class="gi-pipe"><span class="gi-chip ' + st[1] + '">'
+      + esc(f.fail ? (REASON_LABEL[f.fail] || f.fail) : st[0]) + '</span></div>'
+      + '<div class="gi-list"><button class="gi-item" data-godiag="1"><span class="nm">前往诊断查看失败明细</span><span class="arr">→</span></button></div></div>';
   }
-  sim.active = false;
-}
-function simStep() {
-  var A = sim.alpha, i, j, n, m, dx, dy, d2, d, fx, fy, a, b;
-  var act = gA();
-  for (i = 0; i < act.length; i++) {
-    n = act[i];
-    for (j = i + 1; j < act.length; j++) {
-      m = act[j];
-      if (n.orbit || m.orbit) continue;
-      dx = n.x - m.x; dy = n.y - m.y;
-      d2 = dx * dx + dy * dy;
-      if (d2 < 1) { dx = (i % 3 + 1) * 0.6; dy = (j % 3 + 1) * 0.6; d2 = dx * dx + dy * dy; }
-      if (d2 < 640000) {
-        d = Math.sqrt(d2);
-        fx = dx / d * (52000 / d2 * A);
-        fy = dy / d * (52000 / d2 * A);
-        n.vx += fx; n.vy += fy;
-        m.vx -= fx; m.vy -= fy;
-      }
+  // PDF/Word 的转换缓存放在最显眼的位置；纯文字文件桥接层会说“不需要转换”，这一节随即拿掉
+  h += '<div class="gi-sec" id="giCc"><h5>转换缓存</h5><div class="cc-d" data-lib="' + esc(f.lib) + '" data-rel="' + esc(f.rel) + '"></div></div>';
+  var g = f.group >= 0 ? smGroup(f.group) : null;
+  h += '<div class="gi-sec"><h5>内容分组</h5>';
+  if (g) {
+    h += '<div class="gi-kv"><span class="k"><i class="sm-sw" style="background:' + smColor(f.group) + '"></i>第 ' + (f.group + 1) + ' 组</span>'
+      + '<span class="v">共 ' + fmtInt(g.size) + ' 个文件，最有代表性的是：'
+      + g.samples.map(function (x) { return esc(smStem(x.rel)); }).join('、') + '</span></div>';
+  } else {
+    h += '<div class="gi-none">还没有内容向量（未索引或没有正文），暂不分组，排在光管末尾。</div>';
+  }
+  h += '</div>';
+  if (g) {
+    /* 沿光管前后的文件：顺序由核心按内容排好，挨着的就是内容相近的 */
+    var L = SMAP.data.libs[li], items = '';
+    for (var d = -3; d <= 3; d++) {
+      var j = i + d;
+      if (!d || j < 0 || j >= L.rel.length || L.group[j] < 0) continue;
+      items += '<button class="gi-item" data-smi="' + j + '"><span class="g-mark" style="background:' + smColor(L.group[j])
+        + ';border-color:transparent"></span><span class="nm">' + esc(baseName(L.rel[j])) + '</span><span class="arr">定位 →</span></button>';
     }
+    h += '<div class="gi-sec"><h5>光管上的邻居（内容相近）</h5>' + (items ? '<div class="gi-list">' + items + '</div>' : '<div class="gi-none">暂无</div>') + '</div>';
   }
-  for (i = 0; i < G.grav.length; i++) {
-    var gp = G.grav[i];
-    a = G.byId[gp.a]; b = G.byId[gp.b];
-    if (!gVisible(a) || !gVisible(b) || a.orbit || b.orbit) continue;
-    dx = b.x - a.x; dy = b.y - a.y;
-    d = Math.sqrt(dx * dx + dy * dy) || 1;
-    fx = dx / d * ((gp.s - 0.62) * 10 * A);
-    fy = dy / d * ((gp.s - 0.62) * 10 * A);
-    a.vx += fx; a.vy += fy;
-    b.vx -= fx; b.vy -= fy;
-  }
-  if (G.ly.bilat) {
-    for (i = 0; i < G.links.length; i++) {
-      a = G.byId[G.links[i][0]]; b = G.byId[G.links[i][1]];
-      if (!gVisible(a) || !gVisible(b) || a.orbit || b.orbit) continue;
-      dx = b.x - a.x; dy = b.y - a.y;
-      d = Math.sqrt(dx * dx + dy * dy) || 1;
-      fx = dx / d * ((d - 175) * 0.02 * A);
-      fy = dy / d * ((d - 175) * 0.02 * A);
-      a.vx += fx; a.vy += fy;
-      b.vx -= fx; b.vy -= fy;
-    }
-  }
-  for (i = 0; i < G.owns.length; i++) {
-    a = G.byId[G.owns[i].a]; b = G.byId[G.owns[i].b];
-    if (!gVisible(a) || !gVisible(b)) continue;
-    var rest = G.owns[i].rest, kk = a.type === 'page' ? 0.06 : 0.05;
-    dx = b.x - a.x; dy = b.y - a.y;
-    d = Math.sqrt(dx * dx + dy * dy) || 1;
-    fx = dx / d * ((d - rest) * kk * A);
-    fy = dy / d * ((d - rest) * kk * A);
-    a.vx += fx; a.vy += fy;
-    b.vx -= fx; b.vy -= fy;
-  }
-  for (i = 0; i < act.length; i++) {
-    n = act[i];
-    if (n.fixed) { n.vx = 0; n.vy = 0; continue; }
-    if (n.orbit) {
-      var ob = n.orbit;
-      var ox = (G.qNode ? G.qNode.x : 0) + Math.cos(ob.a) * ob.r;
-      var oy = (G.qNode ? G.qNode.y : 0) + Math.sin(ob.a) * ob.r;
-      n.vx = (ox - n.x) * 0.16;
-      n.vy = (oy - n.y) * 0.16;
-      n.x += n.vx; n.y += n.vy;
-      continue;
-    }
-    var an = G.anchors[n.lib] || { ax: 0, ay: 0 };
-    n.vx += (an.ax - n.x) * 0.0045 * A;
-    n.vy += (an.ay - n.y) * 0.0045 * A;
-    n.vx *= 0.86; n.vy *= 0.86;
-    var sp = Math.sqrt(n.vx * n.vx + n.vy * n.vy);
-    if (sp > 26) { n.vx = n.vx / sp * 26; n.vy = n.vy / sp * 26; }
-    n.x += n.vx; n.y += n.vy;
-  }
-  // 检索态：问题节点是辐射中心——非命中节点受径向排斥 drift 向外围，
-  // 命中节点走 orbit 轨道聚拢。只在模拟进行时生效，清除检索后自动回落。
-  if (G.qNode) {
-    var hs = G.searchHits || {};
-    for (i = 0; i < act.length; i++) {
-      n = act[i];
-      if (n.fixed || n.orbit || hs[n.id]) continue;
-      dx = n.x - G.qNode.x; dy = n.y - G.qNode.y;
-      d2 = dx * dx + dy * dy;
-      if (d2 < 360000 && d2 > 1) {
-        d = Math.sqrt(d2);
-        var push = (600 - d) / 600 * 3.4 * A;
-        n.vx += dx / d * push; n.vy += dy / d * push;
-      }
-    }
-  }
-  sim.alpha *= 0.982;
-  sim.frame++;
-  if (sim.alpha < 0.004 || sim.frame >= 360) sim.active = false;
+  h += '<div class="gi-sec"><h5>操作</h5><div class="gi-list"><button class="gi-item" data-read="1"><span class="nm">在窗口里阅读正文</span><span class="arr">→</span></button></div></div>';
+  $('giBody').innerHTML = h;
+  var ccBox = $('giBody').querySelector('.cc-d');
+  ccFill(ccBox).then(function (d) {
+    if (d && !d.ok && document.body.contains(ccBox)) { var sec = $('giCc'); if (sec) sec.remove(); }
+  }).catch(function () { var sec = $('giCc'); if (sec) sec.remove(); });
+  $('gIns').classList.add('open');
 }
-/* 相机 */
-function gStageRect() { return gStage.getBoundingClientRect(); }
-/* 标签密度：缩小时（k<1.05）或可见节点>350，只留 hub/命中/选中/悬停标签。
-   只做 class 翻转（状态变化时才碰 DOM），不逐节点操作。 */
-function updateLabelDensity() {
-  if (!gStage) return;
-  var min = (G.cam.k < 1.05) || (gA().length > 350);
-  if (gStage.classList.contains('labels-min') !== min) {
-    gStage.classList.toggle('labels-min', min);
+function closeGIns() {
+  $('gIns').classList.remove('open');
+  if (SMAP.sel) {
+    SMAP.sel = null;
+    var m = smApi();
+    if (m) m.select(null);
   }
 }
-function applyCam() {
-  gWorld.style.transform = 'translate(' + G.cam.x + 'px,' + G.cam.y + 'px) scale(' + G.cam.k + ')';
-  $('gZoomLabel').textContent = Math.round(G.cam.k * 100) + '%';
-  updateLabelDensity();
-}
-function clampK(k) { return Math.min(2.4, Math.max(0.3, k)); }
-function zoomAt(sx, sy, k2) {
-  k2 = clampK(k2);
-  var r = gStageRect();
-  var lx = sx - r.left, ly = sy - r.top;
-  G.cam.x = lx - (lx - G.cam.x) * k2 / G.cam.k;
-  G.cam.y = ly - (ly - G.cam.y) * k2 / G.cam.k;
-  G.cam.k = k2;
-  applyCam();
-  requestRender();
-}
-function fitView(margin) {
-  var act = gA();
-  if (!act.length) return;
-  var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
-  act.forEach(function (n) {
-    if (n.x < minX) minX = n.x;
-    if (n.x > maxX) maxX = n.x;
-    if (n.y < minY) minY = n.y;
-    if (n.y > maxY) maxY = n.y;
-  });
-  var bw = Math.max(1, maxX - minX), bh = Math.max(1, maxY - minY);
-  var r = gStageRect();
-  var k = Math.min((r.width - margin * 2) / bw, (r.height - margin * 2) / bh);
-  k = clampK(Math.min(k, 1.35));
-  G.cam.k = k;
-  G.cam.x = r.width / 2 - (minX + maxX) / 2 * k;
-  G.cam.y = r.height / 2 - (minY + maxY) / 2 * k;
-  applyCam();
-  requestRender();
-}
-/* 边路径与渲染 */
-function gEdgeD(a, b) {
-  var mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-  var dx = b.x - a.x, dy = b.y - a.y;
-  return 'M' + (a.x + OFF) + ',' + (a.y + OFF)
-    + ' Q' + (mx - dy * 0.08 + OFF) + ',' + (my + dx * 0.08 + OFF)
-    + ' ' + (b.x + OFF) + ',' + (b.y + OFF);
-}
-function renderBounds() {
-  G.libs.forEach(function (k) {
-    var B = gBoundEls[k];
-    if (!B) return;
-    var sx = 0, sy = 0, c = 0;
-    G.nodes.forEach(function (n) { if (n.lib === k && gVisible(n)) { sx += n.x; sy += n.y; c++; } });
-    var tx = c ? sx / c : G.anchors[k].ax;
-    var ty = c ? sy / c : G.anchors[k].ay;
-    B.cx += (tx - B.cx) * 0.02;
-    B.cy += (ty - B.cy) * 0.02;
-    if (G.ly.bounds) {
-      B.el.style.display = '';
-      B.el.setAttribute('cx', (B.cx + OFF).toFixed(1));
-      B.el.setAttribute('cy', (B.cy + OFF).toFixed(1));
-      B.el.setAttribute('rx', B.rx);
-      B.el.setAttribute('ry', B.ry);
-      gTagEls[k].style.display = '';
-      gTagEls[k].style.transform = 'translate(' + B.cx.toFixed(1) + 'px,' + (B.cy - B.ry - 16).toFixed(1) + 'px) translate(-50%,-100%)';
-    } else {
-      B.el.style.display = 'none';
-      gTagEls[k].style.display = 'none';
-    }
-  });
-}
-function updateLibCounts() {
-  G.libs.forEach(function (k) {
-    var c = 0;
-    G.nodes.forEach(function (n) { if (n.lib === k && gVisible(n)) c++; });
-    if (gTagEls[k]) gTagEls[k].querySelector('span').textContent = c + ' 节点';
-  });
-}
-function requestRender() { needRender = true; }
-function render() {
-  renderBounds();
-  G.nodes.forEach(function (n) {
-    var el = G.nodeEls[n.id];
-    if (el) el.style.transform = 'translate(' + n.x + 'px,' + n.y + 'px)';
-  });
-  if (G.qNode && G.nodeEls.qnode) {
-    G.nodeEls.qnode.style.transform = 'translate(' + G.qNode.x + 'px,' + G.qNode.y + 'px)';
-  }
-  var i, e, a, b, p;
-  for (i = 0; i < G.links.length; i++) {
-    e = G.links[i]; p = gBilatEls[i];
-    a = G.byId[e[0]]; b = G.byId[e[1]];
-    if (G.ly.bilat && gVisible(a) && gVisible(b)) {
-      p.style.display = '';
-      p.setAttribute('d', gEdgeD(a, b));
-    } else { p.style.display = 'none'; }
-  }
-  for (i = 0; i < G.owns.length; i++) {
-    e = G.owns[i]; p = gOwnEls[i];
-    a = G.byId[e.a]; b = G.byId[e.b];
-    if (G.ly.own && gVisible(a) && gVisible(b)) {
-      p.style.display = '';
-      p.setAttribute('d', gEdgeD(a, b));
-    } else { p.style.display = 'none'; }
-  }
-  for (i = 0; i < G.sem.length; i++) {
-    e = G.sem[i]; p = gSemEls[i];
-    a = G.byId[e.a]; b = G.byId[e.b];
-    if (G.ly.sem && e.sim >= G.ly.th && gVisible(a) && gVisible(b)) {
-      p.style.display = '';
-      p.setAttribute('d', gEdgeD(a, b));
-    } else { p.style.display = 'none'; }
-  }
-  for (i = 0; i < G.redges.length; i++) {
-    var rr = G.redges[i];
-    var bb = G.byId[rr.to];
-    if (bb && G.qNode) rr.el.setAttribute('d', gEdgeD(G.qNode, bb));
-  }
-}
-function gLoop() {
-  requestAnimationFrame(gLoop);
-  if (!G.ready) return;
-  var busy = false;
-  if (sim.active) { simStep(); busy = true; }
-  else if (fitOnSettle) { fitOnSettle = false; fitView(100); }
-  if (gCamTween) { gCamTween(); busy = true; }
-  var now = performance.now();
-  for (var i = gRipples.length - 1; i >= 0; i--) {
-    var rp = gRipples[i];
-    var t = (now - rp.t0) / 1500;
-    if (t >= 1) { rp.el.remove(); gRipples.splice(i, 1); continue; }
-    var e2 = 1 - Math.pow(1 - t, 3);
-    rp.el.setAttribute('r', 30 + e2 * 300);
-    rp.el.setAttribute('opacity', (0.5 * (1 - t)).toFixed(3));
-    busy = true;
-  }
-  if (panning || dragging) busy = true;
-  if (busy || needRender) { render(); needRender = false; }
-}
-/* 交互：拖拽 / 平移 / 缩放 */
-function bindStage() {
-  gStage.addEventListener('pointerdown', function (e) {
-    if (e.button === 2) return;
-    if (!G.ready) return;
-    var nodeEl = e.target.closest ? e.target.closest('.g-node') : null;
-    downPos = { x: e.clientX, y: e.clientY };
-    dragMoved = 0;
-    if (nodeEl) {
-      var id = nodeEl.dataset.id;
-      var n = id === 'qnode' ? G.qNode : G.byId[id];
-      if (n) {
-        dragging = { n: n, el: nodeEl, ox: n.x, oy: n.y, px: e.clientX, py: e.clientY, q: id === 'qnode' };
-        nodeEl.classList.add('dragging');
-        try { gStage.setPointerCapture(e.pointerId); } catch (err) {}
-        e.preventDefault();
-        return;
-      }
-    }
-    panning = true;
-    panStart = { x: e.clientX, y: e.clientY, cx: G.cam.x, cy: G.cam.y };
-    try { gStage.setPointerCapture(e.pointerId); } catch (err) {}
-    gStage.style.cursor = 'grabbing';
-  });
-  gStage.addEventListener('pointermove', function (e) {
-    if (dragging) {
-      dragMoved += Math.abs(e.movementX || 0) + Math.abs(e.movementY || 0);
-      var n = dragging.n;
-      n.x = dragging.ox + (e.clientX - dragging.px) / G.cam.k;
-      n.y = dragging.oy + (e.clientY - dragging.py) / G.cam.k;
-      requestRender();
-      return;
-    }
-    if (panning) {
-      G.cam.x = panStart.cx + (e.clientX - panStart.x);
-      G.cam.y = panStart.cy + (e.clientY - panStart.y);
-      applyCam();
-      requestRender();
-    }
-  });
-  gStage.addEventListener('pointerup', function (e) {
-    if (dragging) {
-      dragging.el.classList.remove('dragging');
-      if (dragMoved < 5) {
-        if (!dragging.q) openGIns(dragging.el.dataset.id);
-      } else if (!RM && !dragging.q) {
-        startSim(0.25);
-      }
-      dragging = null;
-    } else if (panning) {
-      panning = false;
-      gStage.style.cursor = '';
-      if (downPos) {
-        var moved = Math.abs(e.clientX - downPos.x) + Math.abs(e.clientY - downPos.y);
-        if (moved < 4) closeGIns();
-      }
-    }
-  });
-  gStage.addEventListener('pointercancel', function () {
-    if (dragging) { dragging.el.classList.remove('dragging'); dragging = null; }
-    panning = false;
-    gStage.style.cursor = '';
-  });
-  gStage.addEventListener('wheel', function (e) {
-    e.preventDefault();
-    zoomAt(e.clientX, e.clientY, G.cam.k * Math.exp(-e.deltaY * 0.0016));
-  }, { passive: false });
-  gStage.addEventListener('contextmenu', function (e) { e.preventDefault(); });
-  $('gzIn').addEventListener('click', function () {
-    var r = gStageRect();
-    zoomAt(r.left + r.width / 2, r.top + r.height / 2, G.cam.k * 1.25);
-  });
-  $('gzOut').addEventListener('click', function () {
-    var r = gStageRect();
-    zoomAt(r.left + r.width / 2, r.top + r.height / 2, G.cam.k / 1.25);
-  });
-  $('gzFit').addEventListener('click', function () {
-    if (!RM) {
-      gA().forEach(function (n) { n.vx = (Math.random() - 0.5) * 14; n.vy = (Math.random() - 0.5) * 14; });
-      fitOnSettle = true;
-      startSim(1);
-    } else {
-      fitView(100);
-    }
-    toast('已重置取景与力导向布局');
-  });
-}
-/* Tooltip */
-function bindTip() {
-  var tip = $('gTip'), pin = null;
-  function nodePath(n) {
-    if (n.type === 'page') {
-      var pdf = gPdfOf(n);
-      return (pdf ? pdf.rel : n.rel) + ' · 第 ' + n.page + ' 页';
-    }
-    return n.rel;
-  }
-  gStage.addEventListener('pointerover', function (e) {
-    var el = e.target.closest ? e.target.closest('.g-node') : null;
-    if (!el || el === pin) return;
-    pin = el;
-    var id = el.dataset.id;
-    if (id === 'qnode') {
-      $('gTipPath').textContent = '检索 · 问题节点';
-      $('gTipMeta').textContent = '语义检索的辐射中心';
-    } else {
-      var n = G.byId[id];
-      if (!n) return;
-      $('gTipPath').textContent = nodePath(n);
-      var st = gPdfState(n), stTxt = '';
-      if (st === 'partial') stTxt = ' · 有缓存 · 缺 WEMM';
-      else if (st === 'failed') stTxt = ' · ' + (n.fail || 'OCR 失败');
-      else if (st === 'none') stTxt = (n.type === 'pdf' && n.pipeline.mineru === 'queued') ? ' · OCR 排队中' : ' · 未识别 · 待 OCR';
-      $('gTipMeta').textContent = n.lib + ' · ' + n.type + stTxt + (n.updated ? ' · 更新于 ' + fmtDay(n.updated) : '');
-    }
-    tip.classList.add('show');
-  });
-  gStage.addEventListener('pointermove', function (e) {
-    if (!pin) return;
-    tip.style.left = e.clientX + 'px';
-    tip.style.top = e.clientY + 'px';
-  });
-  gStage.addEventListener('pointerout', function (e) {
-    var el = e.target.closest ? e.target.closest('.g-node') : null;
-    if (el && el === pin && (!e.relatedTarget || !e.relatedTarget.closest || !e.relatedTarget.closest('.g-node'))) {
-      pin = null;
-      tip.classList.remove('show');
-    }
-  });
-}
-/* 图谱检索：真契约 API.search → 问题节点 + 涟漪 + 轨道 */
-var gTimers = [], G_SEQ = 0;
-function clearGLit() {
-  G.nodes.forEach(function (n) { var el = G.nodeEls[n.id]; if (el) el.classList.remove('lit'); });
-  // 置信度角标跟随命中态一起清（残留会污染下一轮检索的显示）
-  Array.prototype.forEach.call(document.querySelectorAll('#gNodes .g-conf'), function (c) { c.remove(); });
-  applyGDim();
-}
-function applyGDim() {
-  var qset = G.searchHits || null;
-  G.nodes.forEach(function (n) {
-    var el = G.nodeEls[n.id];
-    if (!el) return;
-    var dim = false;
-    if (qset && !qset[n.id] && n.id !== G.insOpenId) dim = true;
-    el.classList.toggle('dim', dim);
-  });
-  var keep = {};
-  if (qset) Object.keys(qset).forEach(function (k) { keep[k] = 1; });
-  if (G.qNode) keep.qnode = 1;
-  if (G.insOpenId) keep[G.insOpenId] = 1;
-  function edgeDim(a, b) { return qset ? !(keep[a] && keep[b]) : false; }
-  var i, e;
-  for (i = 0; i < G.links.length; i++) {
-    e = G.links[i];
-    gBilatEls[i].classList.toggle('dim', edgeDim(e[0], e[1]));
-  }
-  for (i = 0; i < G.sem.length; i++) {
-    e = G.sem[i];
-    gSemEls[i].classList.toggle('dim', edgeDim(e.a, e.b));
-  }
-  for (i = 0; i < G.owns.length; i++) {
-    e = G.owns[i];
-    gOwnEls[i].classList.toggle('dim', edgeDim(e.a, e.b));
-  }
-}
-function clearGSearch() {
-  gTimers.forEach(clearTimeout); gTimers = [];
-  G_SEQ++;
-  setGoBusy(false);
-  G.searching = false;
-  if (G.qNode) { if (G.nodeEls.qnode) G.nodeEls.qnode.remove(); G.nodeEls.qnode = null; G.qNode = null; }
-  G.redges.forEach(function (r) { r.el.remove(); });
-  G.redges = [];
-  $('gOrbitG').innerHTML = '';
-  $('gRippleG').innerHTML = '';
-  gRipples = [];
-  G.searchHits = null;
-  G.searching = false;
-  G.nodes.forEach(function (n) { n.orbit = null; });
-  clearGLit();
-  if (!RM) startSim(0.5);
-  requestRender();
-}
-function setGoBusy(on) {
-  var b = $('gGo');
-  if (!b) return;
-  b.disabled = on;
-  b.textContent = on ? '检索中…' : '检索';
-  b.classList.toggle('busy', on);
-}
-function runGSearch(q) {
-  if (G.searching) { toast('检索进行中，请稍候…', 'warn'); return; }
-  G.searching = true;
-  setGoBusy(true);
-  gTimers.forEach(clearTimeout); gTimers = [];
-  G_SEQ++;
-  G.nodes.forEach(function (n) { n.orbit = null; });
-  if (G.qNode) { if (G.nodeEls.qnode) G.nodeEls.qnode.remove(); G.nodeEls.qnode = null; G.qNode = null; }
-  G.redges.forEach(function (r) { r.el.remove(); });
-  G.redges = [];
-  $('gOrbitG').innerHTML = '';
-  $('gRippleG').innerHTML = '';
-  gRipples = [];
-  G.searchHits = null;
-  clearGLit();
-  var seq = G_SEQ;
-  // 图谱按文件节点点亮：topK 个块常归属 2~3 个文件（"只能出来两条"的根因）。
-  // 多取候选（topK×4，至少 20）再按文件分组，展示上限 G_MAXHITS 个文件。
-  var G_MAXHITS = 12;
-  var fetchK = Math.max(G.topK * 4, 20);
-  API.search(q, fetchK, scopeStr(), true).then(function (res) {
-    if (seq !== G_SEQ) return;
-    G.searching = false;
-    setGoBusy(false);
-    if (res.error) { setGoBusy(false); toast('检索失败：' + res.error, 'err'); return; }
-    var seen = {};
-    var files = [];
-    (res.results || []).forEach(function (r) {
-      if (r.notice) return;
-      var id = r.lib + '|' + r.rel;
-      var n = G.byId[id];
-      if (!n || !gVisible(n)) return;
-      if (!seen[id]) {
-        seen[id] = { id: id, conf: r.confidence || 0, snip: r.body || '', blocks: 0 };
-        files.push(seen[id]);
-      }
-      var f = seen[id];
-      f.blocks++;
-      if ((r.confidence || 0) > f.conf) { f.conf = r.confidence; f.snip = r.body || ''; }
-    });
-    files.sort(function (a, b) { return b.conf - a.conf; });
-    var hits = files.slice(0, G_MAXHITS);
-    G.lastSnips = {};
-    files.forEach(function (f) { G.lastSnips[f.id] = f.snip; });
-    if (!hits.length) { setGoBusy(false); toast('没有匹配到可见节点，换个问法或调整库范围', 'warn'); return; }
-    var r0 = gStageRect();
-    var c = s2w(r0.left + r0.width / 2 - 170, r0.top + r0.height * 0.36);
-    G.qNode = { id: 'qnode', x: c.x, y: c.y, fixed: true };
-    var el = document.createElement('div');
-    el.className = 'g-node qnode';
-    el.dataset.id = 'qnode';
-    el.innerHTML = '<div class="g-card"><span class="g-mark"></span><span class="g-label">' + esc(q.trim()) + '</span><span class="q-x" role="button" aria-label="清除检索" title="回到全库全景">×</span></div>';
-    $('gNodes').appendChild(el);
-    G.nodeEls.qnode = el;
-    var qx = el.querySelector('.q-x');
-    if (qx) qx.addEventListener('click', function (ev) { ev.stopPropagation(); clearGSearch(); });
-    // 三环封顶（此前半径 90+i*60 无界，命中一多就飞出屏幕）；半径按当前缩放折算，
-    // 保证屏幕观感一致（缩小时 world 半径放大，放大时缩小）。
-    var zk = 1 / Math.max(0.35, G.cam.k);
-    var RINGS = [130 * zk, 220 * zk, 310 * zk];
-    var ringN = Math.min(3, hits.length);
-    for (var ri = 0; ri < ringN; ri++) {
-      var oc = document.createElementNS(SVGNS, 'circle');
-      oc.setAttribute('class', 'g-orbit-ring');
-      oc.setAttribute('cx', (G.qNode.x + OFF).toFixed(1));
-      oc.setAttribute('cy', (G.qNode.y + OFF).toFixed(1));
-      oc.setAttribute('r', RINGS[ri].toFixed(1));
-      oc.setAttribute('opacity', (0.20 - ri * 0.05).toFixed(3));
-      $('gOrbitG').appendChild(oc);
-    }
-    var orbitDefs = [];
-    (function () {
-      var per = {};
-      hits.forEach(function (h, i) {
-        var rk = RINGS[i % RINGS.length];
-        (per[rk] = per[rk] || []).push(i);
-      });
-      Object.keys(per).forEach(function (rk) {
-        var arr = per[rk];
-        arr.forEach(function (idx, j) {
-          orbitDefs[idx] = { r: +rk, a: -Math.PI / 2 + (j * 2 * Math.PI) / arr.length };
-        });
-      });
-    })();
-    requestRender();
-    G.searchHits = {};
-    hits.forEach(function (h) { G.searchHits[h.id] = 1; });
-    function applyResults() {
-      if (seq !== G_SEQ || !G.qNode) return;
-      hits.forEach(function (h, i) {
-        var d2 = RM ? 0 : i * 90;
-        gTimers.push(setTimeout(function () {
-          if (seq !== G_SEQ) return;
-          var n = G.byId[h.id];
-          if (!n) return;
-          var nel = G.nodeEls[h.id];
-          nel.classList.add('lit');
-          var conf = nel.querySelector('.g-conf');
-          if (!conf) {
-            conf = document.createElement('div');
-            conf.className = 'g-conf';
-            nel.appendChild(conf);
-          }
-          conf.textContent = h.conf.toFixed(2);
-          var p = document.createElementNS(SVGNS, 'path');
-          p.setAttribute('class', 'gr');
-          p.setAttribute('stroke-width', (1.2 + h.conf * 2.4).toFixed(2));
-          p.setAttribute('stroke-dasharray', '6 7');
-          $('gRedgeG').appendChild(p);
-          G.redges.push({ to: h.id, el: p });
-          gTimers.push(setTimeout(function () { p.classList.add('on'); }, 30));
-          var od = orbitDefs[i];
-          if (od) {
-            n.orbit = od;
-            if (RM) {
-              n.x = (G.qNode ? G.qNode.x : 0) + Math.cos(od.a) * od.r;
-              n.y = (G.qNode ? G.qNode.y : 0) + Math.sin(od.a) * od.r;
-            } else if (!sim.active) {
-              startSim(0.6);
-            }
-          }
-        }, d2));
-      });
-      applyGDim();
-    }
-    if (RM) { applyResults(); }
-    else {
-      [0, 380, 760].forEach(function (d3, i) {
-        gTimers.push(setTimeout(function () {
-          if (seq !== G_SEQ || !G.qNode) return;
-          var cir = document.createElementNS(SVGNS, 'circle');
-          cir.setAttribute('class', 'gr-c');
-          cir.setAttribute('cx', G.qNode.x + OFF);
-          cir.setAttribute('cy', G.qNode.y + OFF);
-          cir.setAttribute('r', 30);
-          cir.setAttribute('stroke-width', i === 2 ? 1.2 : 1.8);
-          cir.setAttribute('opacity', '0.5');
-          $('gRippleG').appendChild(cir);
-          gRipples.push({ el: cir, t0: performance.now() });
-        }, d3));
-      });
-      gTimers.push(setTimeout(applyResults, 950));
-    }
-    toast('已命中 ' + files.length + ' 个相关文件'
-      + (files.length > hits.length ? '（轨道展示前 ' + hits.length + ' 个）' : ''));
-  }).catch(function (err) {
-    if (seq !== G_SEQ) return;
-    G.searching = false;
-    setGoBusy(false);
-    toast('检索失败：' + (err && err.message ? err.message : err), 'err');
-  });
-}
-function s2w(sx, sy) {
-  var r = gStageRect();
-  return { x: (sx - r.left - G.cam.x) / G.cam.k, y: (sy - r.top - G.cam.y) / G.cam.k };
-}
-$('gGo').addEventListener('click', function () {
-  var q = $('gq').value.trim();
-  if (!q) { toast('先输入一个问题', 'warn'); return; }
-  runGSearch(q);
+$('giClose').addEventListener('click', closeGIns);
+$('giOpen').addEventListener('click', function () {
+  var f = SMAP.sel && smFile(SMAP.sel.li, SMAP.sel.i);
+  if (!f) return;
+  API.open_source(f.lib, f.rel, '').then(function (res) {
+    var bad = res && res.ok === false;
+    toast(bad ? '打开失败：' + (res.error || '未知') : '已调用系统打开源文件', bad ? 'err' : 'ok');
+  }).catch(function () { toast('打开失败', 'err'); });
 });
-$('gq').addEventListener('keydown', function (e) {
-  if (e.key === 'Enter') {
-    var q = $('gq').value.trim();
-    if (q) runGSearch(q);
-  }
-});
-$('gTopk').addEventListener('change', function () {
-  G.topK = parseInt(this.value, 10) || 5;
-});
-['WEMM 页级视觉导航是怎么实现的？', 'MinerU 扫描件是怎么处理的？', 'Agent 门禁是怎么设计的？'].forEach(function (h) {
-  var b = document.createElement('button');
-  b.className = 'g-chip';
-  b.type = 'button';
-  b.textContent = h;
-  b.addEventListener('click', function () {
-    $('gq').value = h;
-    runGSearch(h);
-  });
-  $('gHints').appendChild(b);
-});
-/* 图层开关 */
-function updateSemCount() {
-  if (!G.semLoaded) {
-    $('semCount').textContent = '开启后需加载嵌入模型（约 30-60 秒）';
+$('giBody').addEventListener('click', function (e) {
+  if (ccAct(e)) return;
+  var t = e.target.closest('[data-smi],[data-godiag],[data-read]');
+  if (!t || !SMAP.sel) return;
+  if (t.hasAttribute('data-godiag')) { closeGIns(); go('diag'); return; }
+  if (t.hasAttribute('data-read')) {
+    var f = smFile(SMAP.sel.li, SMAP.sel.i);
+    if (f) openDoc(f.lib, f.rel, '');
     return;
   }
-  var c = 0;
-  G.sem.forEach(function (e) {
-    if (e.sim >= G.ly.th && gVisible(G.byId[e.a]) && gVisible(G.byId[e.b])) c++;
-  });
-  $('semCount').textContent = '阈值 ' + G.ly.th.toFixed(2) + ' · 当前 ' + c + ' 条';
-}
-function updateGStatus() {
-  var ne = 0, i, e;
-  for (i = 0; i < G.links.length; i++) {
-    e = G.links[i];
-    if (G.ly.bilat && gVisible(G.byId[e[0]]) && gVisible(G.byId[e[1]])) ne++;
-  }
-  for (i = 0; i < G.sem.length; i++) {
-    e = G.sem[i];
-    if (G.ly.sem && e.sim >= G.ly.th && gVisible(G.byId[e.a]) && gVisible(G.byId[e.b])) ne++;
-  }
-  for (i = 0; i < G.owns.length; i++) {
-    e = G.owns[i];
-    if (G.ly.own && gVisible(G.byId[e.a]) && gVisible(G.byId[e.b])) ne++;
-  }
-  var dev = S.snap && S.snap.device ? S.snap.device : {};
-  $('gStatus').innerHTML = '<b>' + gA().length + '</b> 节点 · <b>' + ne + '</b> 边 · <b>' + fmtInt(S.snap ? S.snap.chunks : 0) + '</b> 块 · '
-    + esc(dev.model || '') + (dev.cuda ? ' · CUDA' : '');
-}
-function gLayerChanged() {
-  G.nodes.forEach(function (n) {
-    var el = G.nodeEls[n.id];
-    if (el) el.style.display = gVisible(n) ? '' : 'none';
-  });
-  updateLabelDensity();
-  if (!RM) startSim(0.45); else { settleSync(120); fitView(100); }
-  updateSemCount(); updateGStatus(); updateLibCounts();
-  requestRender();
-}
-function bindLy(id, key) {
-  $(id).addEventListener('change', function () {
-    G.ly[key] = this.checked;
-    gLayerChanged();
-  });
-}
-bindLy('lyBilat', 'bilat');
-bindLy('lyOwn', 'own');
-bindLy('lyPage', 'page');
-bindLy('lyCache', 'cache');
-bindLy('lyPdf', 'pdf');
-$('lyBounds').addEventListener('change', function () {
-  G.ly.bounds = this.checked;
-  requestRender();
+  openGIns(SMAP.sel.li, +t.getAttribute('data-smi'), true);
 });
-/* 语义边：按需经 semantic_edges() 加载（先弹模型加载确认） */
-$('lySem').addEventListener('change', function () {
-  var cb = this;
-  if (!cb.checked) { G.ly.sem = false; updateSemCount(); updateGStatus(); requestRender(); return; }
-  if (G.semLoaded) { G.ly.sem = true; updateSemCount(); updateGStatus(); requestRender(); return; }
-  cb.checked = false;
-  askConfirm('加载语义相似边',
-    '语义边由当前嵌入模型对「标题+相对路径」实时编码计算（余弦相似 ≥ 阈值），首次需要加载嵌入模型。',
-    '预计耗时约 30-60 秒；纯读路径，不写任何文件、不产生索引副作用。', '加载并计算')
-    .then(function (yes) {
-      if (!yes) return;
-      cb.checked = true;
-      $('semCount').textContent = '正在加载嵌入模型并计算…';
-      API.semantic_edges(scopeStr(), G.ly.th).then(function (res) {
-        G.semLoaded = true;
-        G.ly.sem = true;
-        G.sem = (res.edges || []).map(function (e) { return { a: e.a, b: e.b, sim: e.sim }; });
-        var g = $('gSemG');
-        g.innerHTML = '';
-        gSemEls = [];
-        G.sem.forEach(function (e) {
-          var p = document.createElementNS(SVGNS, 'path');
-          p.setAttribute('class', 'gs');
-          p.setAttribute('stroke-opacity', (0.10 + Math.max(0, e.sim - 0.5) * 0.85).toFixed(3));
-          g.appendChild(p);
-          gSemEls.push(p);
-        });
-        updateSemCount(); updateGStatus();
-        requestRender();
-        toast('语义边已加载 · ' + G.sem.length + ' 条');
-      }).catch(function (err) {
-        cb.checked = false;
-        toast('语义边计算失败：' + (err && err.message ? err.message : err), 'err');
-      });
-    });
+
+/* 搜索岛：提交后跳到检索页显示结果（星图上的"从问题扩散"留到检索重构时再做） */
+function gSearch() {
+  var q = $('gq').value.trim();
+  if (!q) { toast('请输入要检索的内容', 'warn'); $('gq').focus(); return; }
+  $('qInput').value = q;
+  $('topkSel').value = $('gTopk').value;
+  go('search');
+  doSearch();
+}
+$('gGo').addEventListener('click', gSearch);
+$('gq').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter' && !e.isComposing) gSearch();
 });
-var semThReload = debounce(function () {
-  if (!G.semLoaded) return;
-  $('semCount').textContent = '按新阈值重算…';
-  API.semantic_edges(scopeStr(), G.ly.th).then(function (res) {
-    G.sem = (res.edges || []).map(function (e) { return { a: e.a, b: e.b, sim: e.sim }; });
-    var g = $('gSemG');
-    g.innerHTML = '';
-    gSemEls = [];
-    G.sem.forEach(function (e) {
-      var p = document.createElementNS(SVGNS, 'path');
-      p.setAttribute('class', 'gs');
-      p.setAttribute('stroke-opacity', (0.10 + Math.max(0, e.sim - 0.5) * 0.85).toFixed(3));
-      g.appendChild(p);
-      gSemEls.push(p);
-    });
-    updateSemCount(); updateGStatus();
-    requestRender();
-  });
-}, 700);
-$('semTh').addEventListener('input', function () {
-  G.ly.th = parseFloat(this.value);
-  $('semThVal').textContent = G.ly.th.toFixed(2);
-  if (G.semLoaded) { updateSemCount(); requestRender(); }
-});
-$('semTh').addEventListener('change', function () { semThReload(); });
-$('gColorSeg').addEventListener('click', function (e) {
-  var b = e.target.closest('button[data-cm]');
-  if (!b) return;
-  G.colorMode = b.getAttribute('data-cm');
-  applyColorMode();
+
+/* 缩放 dock、面板收起、说明弹层 */
+$('gzIn').addEventListener('click', function () { var m = smApi(); if (m) m.zoom(0.8); });
+$('gzOut').addEventListener('click', function () { var m = smApi(); if (m) m.zoom(1.25); });
+$('gzFit').addEventListener('click', function () { var m = smApi(); if (m) m.fit(); });
+$('smFold').addEventListener('click', function () {
+  var folded = $('smPanel').classList.toggle('folded');
+  this.textContent = folded ? '展开' : '收起';
+  this.setAttribute('aria-expanded', folded ? 'false' : 'true');
+  this.setAttribute('aria-label', folded ? '展开调节面板' : '收起调节面板');
 });
 function togglePhysics(open) {
   var ph = $('gPhysics');
@@ -2784,201 +2253,6 @@ document.addEventListener('click', function (e) {
     togglePhysics(false);
   }
 });
-/* Inspector */
-function giItem(id, label, simv) {
-  var n = G.byId[id];
-  if (!n) return '';
-  return '<button class="gi-item" data-focus="' + esc(id) + '">'
-    + '<span class="g-mark" style="background:' + gLibColor(n.lib) + ';border-color:transparent"></span>'
-    + '<span class="nm">' + esc(label || n.t) + '</span>'
-    + (simv != null ? '<span class="gi-sim">' + simv.toFixed(2) + '</span>' : '')
-    + '<span class="arr">定位 →</span></button>';
-}
-function giLinks(arr) {
-  if (!arr.length) return '<div class="gi-none">暂无</div>';
-  return '<div class="gi-list">' + arr.map(function (id) { return giItem(id); }).join('') + '</div>';
-}
-function giSemTop(id, k) {
-  var self = G.byId[id];
-  var arr = [];
-  G.nodes.forEach(function (m) {
-    if (m.id === id || m.type === 'page' || !gVisible(m)) return;
-    arr.push({ id: m.id, t: m.t, s: gCos(self, m) });
-  });
-  arr.sort(function (a, b) { return b.s - a.s; });
-  return '<div class="gi-list">' + arr.slice(0, k).map(function (x) { return giItem(x.id, x.t, x.s); }).join('') + '</div>';
-}
-function giSnippetHtml(id) {
-  var hit = G.lastSnips && G.lastSnips[id];
-  return hit ? '<div class="gi-sec"><h5>命中片段</h5><div class="gi-snip">' + hl(hit, lastQuery) + '</div></div>' : '';
-}
-function openGIns(id) {
-  var n = G.byId[id];
-  if (!n) return;
-  G.insOpenId = id;
-  G.insOpen = true;
-  G.nodes.forEach(function (x) { var el = G.nodeEls[x.id]; if (el) el.classList.remove('sel'); });
-  G.nodeEls[id].classList.add('sel');
-  applyGDim();
-  $('giMark').style.background = gLibColor(n.lib);
-  $('giMark').style.borderColor = 'transparent';
-  $('giLib').textContent = n.lib;
-  $('giBadge').innerHTML = '<span class="badge" style="background:var(--s3);color:var(--sec)">' + esc(n.type) + '</span>';
-  $('giTitle').textContent = n.t;
-  $('giPath').textContent = n.type === 'page' ? (gPdfOf(n) ? gPdfOf(n).rel : n.rel) + ' · 第 ' + n.page + ' 页' : n.rel;
-  var meta = [];
-  meta.push('更新 ' + (n.updated ? fmtDay(n.updated) : '--'));
-  var outIds = [], inIds = [];
-  if (n.type === 'md') {
-    G.links.forEach(function (e) {
-      if (e[0] === id) outIds.push(e[1]);
-      if (e[1] === id) inIds.push(e[0]);
-    });
-    meta.push((outIds.length + inIds.length) > 0 ? (outIds.length + inIds.length) + ' 条双链' : '无显式双链');
-  }
-  if (n.type === 'cache' && n.chunks) meta.push(n.chunks + ' 块');
-  $('giMeta').innerHTML = meta.map(function (m) { return '<span>' + esc(m) + '</span>'; }).join('');
-  var h = giSnippetHtml(id);
-  function pipeChips(nn) {
-    var pc = '<div class="gi-sec"><h5>管线</h5><div class="gi-pipe">';
-    var m = nn.pipeline.mineru, w = nn.pipeline.wemm;
-    if (nn.type === 'md') pc += '<span class="gi-chip ok">extract v4 · local</span>';
-    else if (m === 'done') pc += '<span class="gi-chip ok">mineru:vlm · ' + (nn.pages || '') + (nn.pages ? ' 页' : '') + '</span>';
-    else if (m === 'queued') pc += '<span class="gi-chip wait">MinerU 排队中 · 下轮自动重试</span>';
-    else if (m === 'failed') pc += '<span class="gi-chip bad">失败 · ' + esc(nn.fail || '提取失败') + '</span>';
-    else pc += '<span class="gi-chip off">未识别 · 待 OCR</span>';
-    if (nn.type !== 'md') {
-      if (w === 'done') pc += '<span class="gi-chip ok">wemm 页库 · DPI 144</span>';
-      else if (m === 'done') pc += '<span class="gi-chip off">页库未建立</span>';
-    }
-    pc += '</div></div>';
-    return pc;
-  }
-  if (n.type === 'md') {
-    h += pipeChips(n);
-    if (outIds.length) h += '<div class="gi-sec"><h5>出链</h5>' + giLinks(outIds) + '</div>';
-    if (inIds.length) h += '<div class="gi-sec"><h5>入链</h5>' + giLinks(inIds) + '</div>';
-    if (!outIds.length && !inIds.length) {
-      h += '<div class="gi-sec"><h5>语义近邻</h5><div class="gi-none">无显式链接。以下 Top3 来自语义向量：</div>' + giSemTop(id, 3) + '</div>';
-    }
-  } else if (n.type === 'pdf') {
-    h += pipeChips(n);
-    var cid = null;
-    G.owns.forEach(function (e) { if (e.b === id && G.byId[e.a].type === 'cache') cid = e.a; });
-    h += '<div class="gi-sec"><h5>关联缓存</h5>'
-      + (cid ? '<div class="gi-list">' + giItem(cid) + '</div>' : '<div class="gi-none">尚无缓存节点，等待识别完成。</div>') + '</div>';
-    if (n.pipeline.mineru === 'failed' || n.pipeline.wemm !== 'done') {
-      h += '<div class="gi-sec"><h5>处置</h5><div class="gi-list"><button class="gi-item" data-godiag="1"><span class="nm">前往诊断查看失败明细与页库状态</span><span class="arr">→</span></button></div></div>';
-    }
-  } else if (n.type === 'cache') {
-    h += pipeChips(n);
-    h += '<div class="gi-sec"><h5>来源 PDF</h5><div class="gi-list">' + (n._owner ? giItem(n._owner) : '<div class="gi-none">未知</div>') + '</div></div>';
-    var pc2 = 0;
-    G.nodes.forEach(function (m) { if (m.type === 'page' && m._owner === id) pc2++; });
-    h += '<div class="gi-sec"><h5>WEMM 页库</h5>'
-      + (pc2 > 0 ? '<div class="gi-list"><button class="gi-item" data-pages="' + esc(id) + '"><span class="nm">' + pc2 + ' 页 · 定位页节点群</span><span class="arr">跳转 →</span></button></div>'
-        : '<div class="gi-none">该文档未建页库。</div>') + '</div>';
-  } else {
-    var cache = gOwnerOf(n), pdf = gPdfOf(n);
-    h += '<div class="gi-sec"><h5>管线</h5><div class="gi-pipe"><span class="gi-chip ok">p.' + n.page + ' · 1024 维 · DPI 144</span></div></div>';
-    h += '<div class="gi-sec"><h5>所属文档</h5>'
-      + '<div class="gi-kv"><span class="k">MD 缓存</span><span class="v">' + esc(cache ? cache.t : '--') + '</span></div>'
-      + '<div class="gi-kv"><span class="k">PDF 原件</span><span class="v">' + esc(pdf ? pdf.t : '--') + '</span></div>'
-      + '<div class="gi-list">' + (cache ? giItem(cache.id, '定位所属缓存') : '') + '</div></div>';
-  }
-  $('giBody').innerHTML = h;
-  $('gIns').classList.add('open');
-}
-function closeGIns() {
-  $('gIns').classList.remove('open');
-  G.insOpen = false;
-  if (G.insOpenId && G.nodeEls[G.insOpenId]) G.nodeEls[G.insOpenId].classList.remove('sel');
-  G.insOpenId = null;
-  applyGDim();
-}
-$('giClose').addEventListener('click', closeGIns);
-$('giOpen').addEventListener('click', function () {
-  var n = G.byId[G.insOpenId];
-  if (!n) return;
-  var target = n.type === 'page' ? (gPdfOf(n) || n) : n;
-  API.open_source(target.lib, target.rel, '').then(function () { toast('已调用系统打开源文件'); });
-});
-$('giBody').addEventListener('click', function (e) {
-  var t = e.target.closest('[data-focus],[data-pages],[data-godiag]');
-  if (!t) return;
-  if (t.hasAttribute('data-godiag')) { closeGIns(); go('diag'); return; }
-  if (t.hasAttribute('data-pages')) { focusPages(t.getAttribute('data-pages')); return; }
-  var id = t.getAttribute('data-focus');
-  var n = G.byId[id];
-  if (n && !gVisible(n)) {
-    var key = n.type === 'page' ? 'page' : (n.type === 'cache' ? 'cache' : 'pdf');
-    G.ly[key] = true;
-    var cb = $(key === 'page' ? 'lyPage' : key === 'cache' ? 'lyCache' : 'lyPdf');
-    if (cb) cb.checked = true;
-    gLayerChanged();
-    toast('已重新开启对应图层');
-  }
-  focusNode(id);
-  openGIns(id);
-});
-function gTweenTo(wx, wy, k) {
-  var r = gStageRect();
-  var ox = $('gIns').classList.contains('open') ? 190 : 0;
-  var tx = (r.width - ox * 2) / 2 - wx * k;
-  var ty = r.height * 0.5 - wy * k;
-  if (RM) {
-    G.cam.x = tx; G.cam.y = ty; G.cam.k = clampK(k);
-    applyCam();
-    requestRender();
-    return;
-  }
-  var from = { x: G.cam.x, y: G.cam.y, k: G.cam.k };
-  var t0 = performance.now();
-  gCamTween = function () {
-    var t = Math.min(1, (performance.now() - t0) / 550);
-    var e = 1 - Math.pow(1 - t, 3);
-    G.cam.x = from.x + (tx - from.x) * e;
-    G.cam.y = from.y + (ty - from.y) * e;
-    G.cam.k = from.k + (clampK(k) - from.k) * e;
-    applyCam();
-    requestRender();
-    if (t >= 1) gCamTween = null;
-  };
-}
-function gFlash(id) {
-  var el = G.nodeEls[id];
-  if (!el) return;
-  el.classList.remove('flash');
-  void el.offsetWidth;
-  el.classList.add('flash');
-  setTimeout(function () { el.classList.remove('flash'); }, RM ? 200 : 1150);
-}
-function focusNode(id) {
-  var n = G.byId[id];
-  if (!n) return;
-  gTweenTo(n.x, n.y, Math.max(G.cam.k, 0.9));
-  gFlash(id);
-}
-function focusPages(cacheId) {
-  var pages = G.nodes.filter(function (n) { return n.type === 'page' && n._owner === cacheId; });
-  if (!pages.length) { toast('该文档未建页库', 'warn'); return; }
-  if (!G.ly.page) {
-    G.ly.page = true;
-    $('lyPage').checked = true;
-    gLayerChanged();
-    toast('已开启页节点图层');
-  }
-  var cx = 0, cy = 0;
-  pages.forEach(function (p) { cx += p.x; cy += p.y; });
-  gTweenTo(cx / pages.length, cy / pages.length, Math.max(G.cam.k, 1.0));
-  pages.forEach(function (p) { gFlash(p.id); });
-}
-/* 库范围作用于图谱 */
-G.applyScope = function () {
-  if (!G.ready) return;
-  gLayerChanged();
-  applyGDim();
-};
 
 /* ============ 推送监听 ============ */
 window.addEventListener('snapshot', function (e) {
@@ -3000,20 +2274,14 @@ function boot() {
     if (localStorage.getItem('rag-theme') === 'light') applyTheme(true);
   } catch (e) {}
   if (window.__RAG_MOCK && window.__RAG_MOCK.active) $('mockBadge').style.display = 'block';
-  gStage = $('gStage');
-  gWorld = $('gWorld');
-  bindStage();
-  bindTip();
   updateScopeUI();
   var booted = false;
   function start() {
     if (booted) return;
     booted = true;
     API.get_snapshot().then(onSnapshot).catch(function () { toast('快照获取失败，请检查后端', 'err'); });
-    API.graph().then(gInitFrom).catch(function () {
-      $('gpSum').textContent = '图谱加载失败';
-      toast('图谱数据加载失败', 'err');
-    });
+    smWhenReady(smMount);
+    if (S.view === 'graph') smLoad();
     pollLog();
   }
   if (window.pywebview && window.pywebview.api) start();

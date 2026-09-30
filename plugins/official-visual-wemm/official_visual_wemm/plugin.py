@@ -67,6 +67,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import queue
+import tempfile
+import threading
+import time
 from pathlib import Path
 
 import chromadb
@@ -82,6 +87,22 @@ GPU_RESOURCE_ID = "gpu:0"
 GPU_PRIORITY = 10  # 和 official-ocr-mineru-local 同一层级，互相抢占（preempt_equal）
 WEMM_RENDER_DPI = 60  # 页图渲染 DPI，行为对齐旧项目 wemm_indexer.py 的默认值
 WEMM_DIM = 512  # 输出向量维度，行为对齐旧项目 config.py 的默认值
+#: 加载页级视觉模型所需的最小空闲显存（GiB），**只用于向用户显示**。
+#: 真正的门槛在 server.py（`WEMM_MIN_VRAM_GB`）——子进程是独立解释器、装在插件
+#: 自己的 .venv 里，import 不到这个模块，所以只能各写一份，用
+#: `tests/test_plugin.py::TestVramGateIsReportedTruthfully` 钉住两边一致。
+#: 6.3 = 2026-09-29 本机实测 6.231 GiB（加载 5.842 + 编一页 0.404）向上取整到 0.1。
+#: 旧值 5.5 是照搬旧项目的，从来没在本机验证过，比真实需求低 0.73 GiB。
+WEMM_MIN_VRAM_GB = 6.3
+#: 看图模型闲置多久自动卸载（秒），**只用于向用户显示**（“试搜会占显卡，闲 N 分钟自动释放”，
+#: BC-19）。真正的计时在 server.py（`WEMM_UNLOAD_AFTER_SECONDS`），理由同上各写一份，
+#: 由 `tests/test_plugin.py::TestCacheVisibility` 钉住两边一致。
+WEMM_UNLOAD_AFTER_SECONDS = 300
+#: 每页在页库数据库里大约占多少字节：向量本身（float32，存一份原值、一份检索索引）加上
+#: 路径/页码等元数据。页向量存在数据库文件里，按库精确量不出来，“转换缓存”清单只能这样估。
+_BYTES_PER_PAGE_ESTIMATE = WEMM_DIM * 4 * 2 + 512
+#: 页面小图（“看页库这一页长什么样”）的最长边上限（像素）：足够认出版面，内存里一张不到 1 MB。
+_PREVIEW_MAX_SIDE = 1600
 VISUAL_INDEX_VERSION = "1"
 # LEGACY obsidian-rag/config.py:122 的 wemm_backend 默认值；on/local=开，
 # off=关（obsidian-rag/wemm_retriever.py:37 的同一套判定）。
@@ -127,6 +148,114 @@ def _collection_name(library_id: str, generation: str | None = None) -> str:
     return f"visual_{library_id}"
 
 
+def _looks_like_no_path_support(result: dict) -> bool:
+    """判断"服务端不认本地路径"这种**可退让**故障。
+
+    这条通道是长驻子进程：宿主代码升级了，跑着的服务端可能还是旧的。老服务端收到
+    只有 `path` 没有 `content` 的请求会回 400 + 「content 非空」。那是**接口版本不
+    对**，不是模型/显存/网络出了故障——所以可以安全地退回旧的 base64 走法。
+
+    反过来说，别的失败（显存不足、编码失败、服务不可达）**一律不退让**：那些是真实
+    故障，退回去只会把同一个错误再撞一遍、白白多花一次 180 秒超时。
+    """
+    if result.get("ok"):
+        return False
+    if result.get("reason") in {"vram"}:
+        return False
+    error = str(result.get("error") or "")
+    return "content 非空" in error or "path 非法" in error
+
+
+class _PageRenderer:
+    """后台线程把 PDF 逐页渲染成临时 PNG，用有界队列交给主线程送 GPU。
+
+    #3 提速（2026-09-29）：原来的循环把「CPU 渲染」和「GPU 编码」完全串行——渲染时
+    显卡全闲，编码时 CPU 全闲。真机上 7645 页跑了 30 分钟、显卡利用率只有 30~55%、
+    功耗 53W，说明有大段是在等 CPU 而不是算。
+
+    改成流水线后总耗时接近 `max(渲染, 编码)` 而不是 `渲染 + 编码`。
+
+    队列深度只给 2，这是**有意的**：再深只是多占几个临时文件（隐私要求"用完即删"，
+    见下），对吞吐没帮助——瓶颈是两条流水线的**较慢那一条**，不是排队深度。
+
+    两条纪律：
+    - 退出时必须把**所有**自己造过的临时文件删掉，不管消费到哪一步了。不做记账、
+      靠 `os.unlink` 对已删文件抛 FileNotFoundError 来兜底：隐私承诺（页图只在临时
+      目录过一道、绝不落进持久化目录）不能因为异常路径破个洞。
+    - 必须在 `document.close()` **之前** join 完线程。pymupdf 的 Document 不是线程
+      安全的，渲染线程还在 `load_page()` 时主线程去 close 会踩出难查的崩溃。
+    """
+
+    def __init__(self, document, dpi: int, queue_size: int = 2) -> None:
+        self._document = document
+        self._dpi = dpi
+        self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self._stop = threading.Event()
+        self._created: list[str] = []
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_PageRenderer":
+        self._thread = threading.Thread(
+            target=self._work, name="wemm-page-render", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=30.0)
+        for path in self._created:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass  # 已经消费掉删掉了就是我们要的结果
+        self._created.clear()
+        return False
+
+    def _work(self) -> None:
+        """渲染线程。**绝不抛异常**：这里抛出去没人接，队列会永远空着，
+        主线程就会把"渲染失败"误判成"这份 PDF 渲染完了"。"""
+        try:
+            total = int(self._document.page_count)
+        except Exception:  # noqa: BLE001
+            return
+        for page_index in range(total):
+            if self._stop.is_set():
+                return
+            tmp_path = None
+            try:
+                page = self._document.load_page(page_index)
+                png_bytes = page.get_pixmap(dpi=self._dpi).tobytes("png")
+                fd, tmp_path = tempfile.mkstemp(prefix="wemm_page_", suffix=".png")
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(png_bytes)
+                self._created.append(tmp_path)
+            except Exception:  # noqa: BLE001 - 渲不出这一页就跳过，不影响别的页
+                continue
+            # 队列满时等主线程消化。轮询 + stop 检查：卡在满队列上时也能立刻响应退出。
+            while not self._stop.is_set():
+                try:
+                    self._queue.put((page_index, tmp_path), timeout=0.5)
+                    break
+                except queue.Full:
+                    continue
+
+    def __iter__(self):
+        """逐页产出 `(page_index, tmp_path)`，到渲染线程收工且队列排空为止。"""
+        while True:
+            try:
+                yield self._queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._thread is not None and self._thread.is_alive():
+                    continue
+                # 线程没了，再排一次空队列确认真的排空了（避免最后一页正卡在 put 上）
+                try:
+                    yield self._queue.get_nowait()
+                except queue.Empty:
+                    return
+
+
 class VisualWemmPlugin:
     def __init__(self) -> None:
         self._handle: SubprocessServiceHandle | None = None
@@ -139,10 +268,16 @@ class VisualWemmPlugin:
         self._runtime_env_bootstrap: str | None = None
         self._generations: IndexGenerationStore | None = None
         self._state_root: Path | None = None
+        self._storage_root: Path | None = None
         self._resource_arbiter = None
         self._plugin_id = ""
         self._settings = None
         self._log_path: Path | None = None
+        #: 最近一次因为显存不足被挡下的记录（`{required_gb, free_gb, forced}`），
+        #: 供 `status()` 与 GUI 快照如实显示"需要多少 / 现在多少"（2026-09-29 新增）。
+        #: None = 没被挡过。刚起来时是 None，不代表"够用"——够不够由服务端的
+        #: 门槛判断，这里只记录**被挡下**这件事，免得每次快照都去探测拉模型。
+        self._vram_blocked: dict | None = None
 
     def on_load(self, ctx):
         storage_root = ctx.storage.directory("visual_wemm", legacy="visual_wemm")
@@ -153,6 +288,7 @@ class VisualWemmPlugin:
             ctx.storage.directory("index_generations", legacy="index_generations")
         )
         self._state_root = storage_root / "state"
+        self._storage_root = storage_root
         self._logger = ctx.logger
         self._settings = ctx.settings
         # 子进程输出（模型加载失败/端口冲突/socketserver 的 traceback）落到
@@ -187,6 +323,25 @@ class VisualWemmPlugin:
         )
         if acquired:
             self._start_handle()
+
+    def force_load_enabled(self) -> bool:
+        """用户是否开启了「强制加载页级视觉导航」（设置项 `wemm_force_load`）。
+
+        2026-09-29 新增。WEMM 2B 在本机实测要占 6.23 GiB（见 server.py
+        `WEMM_MIN_VRAM_GB` 的注释），8GB 卡在 Windows + 桌面应用占掉约 2GB 的
+        情况下只剩 6.878 GiB，**余量不到 0.7 GiB**。用户关掉几个占显存的程序可能
+        就够，也可能怎么都不够——所以给一个显式开关让他自己判断，而不是替他决定。
+
+        开着时只是**跳过那道门槛去试**，不吞异常：真 OOM 照样明确报错，不会伪装成
+        成功，也不会静默截断向量（那会污染已建好的页库）。
+
+        每次现读 `ctx.settings` 不缓存（同 `backend()` 的理由：长驻进程里用户中途
+        改设置必须立刻生效）。没设置过就是 False——默认仍走"显存不够就不加载"的
+        安全路径。
+        """
+        if self._settings is None:
+            return False
+        return bool(self._settings.get("wemm_force_load", False))
 
     def backend(self) -> str:
         """当前 WEMM 后端设置值（LEGACY obsidian-rag/config.py 的同名设置项
@@ -398,6 +553,7 @@ class VisualWemmPlugin:
         changed_paths: list[str] | None = None,
         previous_generation: str | None = None,
         before_serve=None,
+        progress=None,
     ) -> None:
         """`before_serve`：真要占显卡渲染页面之前调用一次的"让路"回调（对齐旧项目
         obsidian-rag/index.py:1784-1806 `_release_for_wemm` 经 wemm_indexer.py:266-272
@@ -444,6 +600,52 @@ class VisualWemmPlugin:
             or files.get(path, {}).get("signature") != signature
         )
         indexed_pages = 0
+        # 用户是否开了「强制加载页级视觉导航」。整轮只读一次：设置在长驻进程里
+        # 中途改了不该让同一轮的前后不一致。
+        force_load = self.force_load_enabled()
+
+        # ── 页级进度上报（2026-09-29 新增，核心 contracts.py::VisualProgress）──
+        # 视觉索引的进度口径是文字索引的 files_done/files_total，那两个数在进入
+        # 视觉阶段前就已经是最终值（真机 Y2S1：78/78、100%），于是渲染 7645 页的
+        # 这 30 分钟里界面一个数都不变、看起来完全像冻住。旧项目有页级进度回调
+        # （wemm_indexer.py 问题47），移植时漏了，这里补回来。
+        #
+        # 两个必须自己算的量：
+        # ① pages_total —— 全部 PDF 的总页数。只能在渲染前数一遍：pymupdf 的
+        #    `page_count` 不打开文件就拿不到，而逐页编码已经开着文档了。
+        # ② 节流 —— 页循环每页都走完，逐页写进度文件会让磁盘 IO 变成瓶颈
+        #    （实测吞吐 12~15 页/秒，即每秒 12~15 次写盘）。按时间节流到 ~2 秒一次，
+        #    顺带保证一定在收尾时补报一次终值。
+        pages_total = 0
+        if progress is not None:
+            try:
+                import pymupdf as _pm
+
+                for _p in pdf_paths:
+                    try:
+                        with _pm.open(str(root / _p)) as _doc:
+                            pages_total += int(_doc.page_count)
+                    except Exception:  # noqa: BLE001 - 数不出页数只是进度不准，不该中断
+                        continue
+            except Exception:  # noqa: BLE001 - 同上
+                pages_total = 0
+
+        pages_done = 0
+        last_report = [0.0]
+
+        def _report(current_path: str = "", force: bool = False) -> None:
+            """上报页级进度。任何异常都吞掉——进度上报失败绝不能拖垮页级索引。"""
+            if progress is None:
+                return
+            now = time.monotonic()
+            if not force and now - last_report[0] < 2.0:
+                return
+            last_report[0] = now
+            try:
+                progress(pages_done, pages_total, current_path)
+            except Exception:  # noqa: BLE001 - 见上：进度是锦上添花，不是主流程
+                pass
+
         if requested:
             # 真要渲染页面了：先让文字向量/重排模型让出显卡，再去抢名额拉服务
             if before_serve is not None:
@@ -464,7 +666,74 @@ class VisualWemmPlugin:
         if alive:
             import pymupdf
 
+            # 2026-09-29 真机事故（data-real/index_worker.log + visual_wemm/wemm_server.log）：
+            # 子进程被成功拉起、`alive` 为 True，但服务端 `_wait_for_vram(5.5GB)` 等不到
+            # 显存（8GB 卡上 Windows 与桌面应用本身就吃掉约 2.6GB，把全部模型卸干净后空闲
+            # 也只有约 5.1GB），随后连接被拒。此时页级 embed 每页都抛
+            # SubprocessServiceError，而旧代码只 `continue` 换下一页 —— 78 份 PDF × 每份
+            # 几十页 = 几千次注定失败的调用，索引进程假活半小时；用户以为卡死而中断，整轮
+            # generation 从未发布（manifest 写入与 commit 都在视觉阶段之后，
+            # core/pipeline.py::_emit("visual") 之后），已算好的文字索引全部丢失。
+            #
+            # 恢复旧项目 wemm_indexer.py:257-278（问题46「单轮单次」）的语义：**服务不可达
+            # 不是"这一页不行"，而是"本轮服务不可用"**——第一次撞上就终止本轮页级索引，
+            # 剩余文件记可重试失败终态，由文字索引照常发布、下轮自动重试。
+            # 只熔断"服务级"故障（SubprocessServiceError）；服务健康、只是这一页编码不出来
+            # （`ok=False`）仍然逐页继续——把单页失败也当服务挂了会让一次手抖毁掉整轮。
+            service_down: str | None = None
+
+            # ── #4 传本地临时文件路径，而不是 base64 像素（2026-09-29 提速）──
+            # 宿主和服务在同一台机器。旧走法把 PNG 做 base64 塞进 JSON（体积 +33%），
+            # 服务端再解 base64、把**同样内容**的 PNG 写进一个临时文件——因为模型的
+            # 图像接口只收文件路径/URL，不收原始字节。于是每页都在磁盘上白往返一趟，
+            # 中间还被 json.dumps 转义、json.loads 解析各走一遍。
+            #
+            # 改后：宿主自己落临时文件，JSON 里只发几十字节的路径。隐私性质一字未改
+            # （还是本机临时文件、用完即删、绝不出网，见 server.py 同名注释）。
+            #
+            # `path_mode` 会自我纠正：这是个**长驻子进程**，宿主升级后它可能还跑着旧代码，
+            # 老服务端不认识 `path`、回一句"content 非空"。撞上就整轮永久退回 base64，
+            # 不影响正确性，只是慢一点——宁可慢，不许因为提速改动而整轮失败。
+            path_mode = [True]
+
+            def _embed_page(tmp_path: str):
+                """送一页去编码，返回服务端结果；自动在两种走法之间退让。"""
+                if path_mode[0]:
+                    result = self._handle.call(
+                        "embed",
+                        {
+                            "kind": "image",
+                            "path": tmp_path,
+                            "dim": WEMM_DIM,
+                            "force": force_load,
+                        },
+                        timeout=180.0,
+                    )
+                    if result.get("ok") or not _looks_like_no_path_support(result):
+                        return result
+                    path_mode[0] = False
+                    self._logger.warning(
+                        "WEMM子进程是旧版本（不认本地路径），本页起退回 base64 走法："
+                        "会慢一些但结果一致。重启 WEMM 服务可恢复更快的走法。"
+                    )
+                # 退回旧走法才需要像素字节：从刚落盘的临时文件读回来。只在老服务端
+                # 这条慢路径上多一次读盘，快路径上不发生。
+                with open(tmp_path, "rb") as fh:
+                    png_bytes = fh.read()
+                return self._handle.call(
+                    "embed",
+                    {
+                        "kind": "image",
+                        "content": base64.b64encode(png_bytes).decode("ascii"),
+                        "dim": WEMM_DIM,
+                        "force": force_load,
+                    },
+                    timeout=180.0,
+                )
+
             for path in pdf_paths:
+                if service_down is not None:
+                    break
                 old = files.get(path, {})
                 full_path = root / path
                 if path not in requested and old.get("signature") == signature:
@@ -507,32 +776,66 @@ class VisualWemmPlugin:
                 embeddings: list[list[float]] = []
                 metadatas: list[dict] = []
                 try:
-                    for page_index in range(document.page_count):
-                        try:
-                            page = document.load_page(page_index)
-                            png_bytes = page.get_pixmap(dpi=WEMM_RENDER_DPI).tobytes("png")
-                            encoded = base64.b64encode(png_bytes).decode("ascii")
-                            result = self._handle.call(
-                                "embed", {"kind": "image", "content": encoded, "dim": WEMM_DIM}, timeout=120.0
+                    # #3：渲染交给后台线程，与主线程的 GPU 编码重叠。渲染器必须在
+                    # document.close() 之前退出（`with` 在这里、close 在外层 finally），
+                    # 否则渲染线程可能正在 load_page 时文档被关掉。
+                    with _PageRenderer(document, WEMM_RENDER_DPI) as renderer:
+                        for page_index, tmp_path in renderer:
+                            try:
+                                result = _embed_page(tmp_path)
+                            except SubprocessServiceError as exc:
+                                # 服务级故障（连接被拒/超时/子进程已死），不是这一页的问题。
+                                # 本轮就此收手（见上方 2026-09-29 注释），否则整库页数乘以失败
+                                # 次数空转，索引假活而用户看不到任何提示。
+                                service_down = f"{type(exc).__name__}: {exc}"
+                                self._logger.error(
+                                    "WEMM子进程不可达（%s），本轮页级索引到此终止：%s", path, service_down
+                                )
+                                break
+                            finally:
+                                # #4：这一页用完立刻删。渲染器退出时还会兜底扫一遍，
+                                # 所以这里删失败（已删/被清理）不算问题。
+                                try:
+                                    os.unlink(tmp_path)
+                                except OSError:
+                                    pass
+                            if not result.get("ok"):
+                            # 显存不足是**用户能自己解决/决定**的一类失败（关掉占显存的
+                            # 程序，或在设置里开强制加载），必须把两个数字如实记下来交给
+                            # GUI 显式告知，而不是只留一句 error 让人猜。
+                                if result.get("reason") == "vram":
+                                    self._vram_blocked = {
+                                        "required_gb": result.get("required_gb"),
+                                        "free_gb": result.get("free_gb"),
+                                        "forced": bool(force_load),
+                                    }
+                                    self._logger.error(
+                                        "WEMM显存不足：需要 %s GB，当前 %s GB（%s）。"
+                                        "本轮页级索引记为待重试，文字索引照常发布。",
+                                        result.get("required_gb"),
+                                        result.get("free_gb"),
+                                        "已开强制加载仍失败" if force_load else "可关闭占显存的程序后重试，"
+                                        "或在设置里开启「强制加载页级视觉导航」",
+                                    )
+                                else:
+                                    self._logger.warning(
+                                        "WEMM编码失败，跳过 %s 第%d页：%s", path, page_index, result.get("error")
+                                    )
+                                continue
+                            ids.append(f"{path}::{page_index}")
+                            embeddings.append(result["embedding"])
+                            metadatas.append(
+                                {
+                                    "path": path,
+                                    "page": page_index,
+                                    "abs_path": str(full_path),
+                                    "library_id": library_id,
+                                }
                             )
-                        except SubprocessServiceError as exc:
-                            self._logger.warning("WEMM调用失败，跳过 %s 第%d页：%s", path, page_index, exc)
-                            continue
-                        if not result.get("ok"):
-                            self._logger.warning(
-                                "WEMM编码失败，跳过 %s 第%d页：%s", path, page_index, result.get("error")
-                            )
-                            continue
-                        ids.append(f"{path}::{page_index}")
-                        embeddings.append(result["embedding"])
-                        metadatas.append(
-                            {
-                                "path": path,
-                                "page": page_index,
-                                "abs_path": str(full_path),
-                                "library_id": library_id,
-                            }
-                        )
+                            pages_done += 1
+                            _report(path)
+                    # 注意这段在 `with _PageRenderer(...)` **之外**：渲染线程必须已经
+                    # 退出（__exit__ 里 join 过）才碰 document.close() 和页库写入。
                     if ids and collection is not None:
                         collection.upsert(ids=ids, embeddings=embeddings, metadatas=metadatas)
                         indexed_pages += len(ids)
@@ -544,10 +847,32 @@ class VisualWemmPlugin:
                         "status": "indexed" if len(ids) == document.page_count else "partial" if ids else "failed",
                         "failure_reason": None if len(ids) == document.page_count else "部分页面编码失败",
                         "page_ids": ids,
+                        # 总页数：“转换缓存”清单据此写“28/36 页”、列出缺哪几页（BC-19）
+                        "page_count": int(document.page_count),
+                        # 哪一轮真的编的这些页（压缩会改 segment，但不改这一项）：每轮日志据此
+                        # 分清页库“复用”和“新建”（BC-19）
+                        "built_in": generation_key,
                         "segment": generation_key,
                     }
                 finally:
                     document.close()
+            # 收尾强制补报一次终值：节流到 ~2 秒一次意味着最后一次可能刚好被丢掉，
+            # 界面上就会停在「3186/7645」然后直接跳到结束——那正是最难解释的形态。
+            _report(force=True)
+            if service_down is not None:
+                # 本轮提前收手：没轮到、以及本轮明确失败的文件都留下失败终态，下一轮才会
+                # 自动重试（`requested` 的重建条件含 `status != "indexed"`，见本函数上方注释）。
+                # 已经编出页的文件保留 indexed/partial——宁可 partial 也不丢已付出的编码。
+                for path in sorted(requested):
+                    record = files.get(path)
+                    if record is None or record.get("status") not in {"indexed", "partial"}:
+                        files[path] = {
+                            "signature": signature,
+                            "status": "failed",
+                            "failure_reason": f"WEMM子进程不可达，本轮未执行（下轮自动重试）：{service_down}",
+                            "page_ids": [],
+                            "segment": generation_key,
+                        }
         else:
             for path in requested:
                 files[path] = {
@@ -689,6 +1014,7 @@ class VisualWemmPlugin:
                 )
             )
             reason = record.get("failure_reason")
+            page_count = record.get("page_count")
             states.append(
                 VisualPageState(
                     library_id=library_id,
@@ -697,6 +1023,8 @@ class VisualWemmPlugin:
                     status=str(record.get("status") or "failed"),
                     failure_reason=str(reason) if reason else None,
                     pages=pages,
+                    page_count=int(page_count) if isinstance(page_count, int) and page_count > 0 else None,
+                    built_in=str(record["built_in"]) if record.get("built_in") else None,
                 )
             )
         return tuple(states)
@@ -796,7 +1124,75 @@ class VisualWemmPlugin:
                 if isinstance(service, dict) else None
             ),
             "libraries": libraries,
+            # 2026-09-29 新增：把"显存被挡下"这件事和两个数字如实报出去。
+            # GUI 快照据此在进度条上写清「需要 X GB，当前 Y GB」并提示可去设置里
+            # 开强制加载；诊断页也能直接看到，不用去翻 wemm_server.log。
+            # `vram_blocked` 为 None = 本轮没被挡（不等于"够用"，够不够服务端才知道）。
+            "vram": {
+                "required_gb": WEMM_MIN_VRAM_GB,
+                "blocked": self._vram_blocked,
+                "force_load": self.force_load_enabled(),
+            },
         }
+
+    @staticmethod
+    def _score_pages_directly(collection, page_ids: list[str], query: list[float], merged: dict) -> None:
+        """按 id 取出这些页的向量，用余弦相似度打分（与页库 `hnsw:space=cosine` 的
+        `1 - distance` 同一量纲），把更高的分数并进 `merged`。"""
+        try:
+            got = collection.get(ids=page_ids, include=["embeddings", "metadatas"])
+        except Exception:  # noqa: BLE001 - 这个 segment 里没有这些页：跳过即可
+            return
+        embeddings = got.get("embeddings")
+        if embeddings is None:  # 注意：Chroma 返回 numpy 数组，不能写 `or []`（§9）
+            embeddings = []
+        metadatas = got.get("metadatas")
+        if metadatas is None:
+            metadatas = []
+        query_norm = sum(float(value) * float(value) for value in query) ** 0.5 or 1.0
+        for page_id, vector, meta in zip(got.get("ids", []), embeddings, metadatas):
+            values = [float(value) for value in vector]
+            norm = sum(value * value for value in values) ** 0.5 or 1.0
+            score = sum(a * float(b) for a, b in zip(values, query)) / (norm * query_norm)
+            previous = merged.get(page_id)
+            if previous is None or score > previous[1]:
+                merged[page_id] = (meta or {}, score)
+
+    def cache_info(self) -> dict:
+        """页库存在哪、每页大约占多少、建页库/试搜要多少显存、闲多久自动卸载——给“转换缓存”
+        清单（BC-19）用。只读，不拉起服务、不加载模型。"""
+        return {
+            "dir": str(self._storage_root) if self._storage_root is not None else None,
+            "bytes_per_page": _BYTES_PER_PAGE_ESTIMATE,
+            "vram_gb": WEMM_MIN_VRAM_GB,
+            "idle_unload_seconds": WEMM_UNLOAD_AFTER_SECONDS,
+        }
+
+    def render_page_png(self, pdf_path: Path, page: int, max_side: int = 720) -> bytes:
+        """把 PDF 第 `page` 页（从 1 起）画成一张 PNG（最长边不超过 `max_side` 像素）。
+
+        给“看页库这一页长什么样”用（BC-19）：只用 CPU 画这一张，画完关文档，不存盘、不缓存、
+        不碰显卡，也不需要看图服务在跑。页码越界、文件打不开都抛 ValueError（原因只含类型）。"""
+        import pymupdf
+
+        side = max(64, min(int(max_side), _PREVIEW_MAX_SIDE))
+        try:
+            document = pymupdf.open(str(pdf_path))
+        except Exception as exc:  # noqa: BLE001 - 文件打不开：只报类型，不透传原文
+            raise ValueError(f"PDF 打不开（{type(exc).__name__}）") from exc
+        try:
+            total = int(document.page_count)
+            if not 1 <= int(page) <= total:
+                raise ValueError(f"没有第 {page} 页（这份 PDF 一共 {total} 页）")
+            pdf_page = document.load_page(int(page) - 1)
+            longest = max(pdf_page.rect.width, pdf_page.rect.height) or 1.0
+            zoom = side / float(longest)
+            return pdf_page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom)).tobytes("png")
+        finally:
+            try:
+                document.close()
+            except Exception:  # noqa: BLE001 - 收尾失败不能盖掉已经画好的图（§5）
+                pass
 
     def _health_snapshot(self) -> dict | None:
         """只读 GET 子进程 /health（模型/设备快照）；任何失败返回 None——
@@ -818,7 +1214,7 @@ class VisualWemmPlugin:
 
     # ---- 查询态 ----------------------------------------------------------
 
-    def navigate(self, library_id: str, query: str, top_k: int = 5) -> list[PageHit]:
+    def navigate(self, library_id: str, query: str, top_k: int = 5, path: str | None = None) -> list[PageHit]:
         """页级导航。返回**普通空列表**只意味着一件事："查了，但这一页确实
         没有匹配"。任何"这次没能查"的情况（WEMM 后端没开、GPU 租约被别人
         占着且服务没活着、服务拉不起来/请求没打通）都抛
@@ -837,8 +1233,10 @@ class VisualWemmPlugin:
             return []
         active_ids = {
             page_id
-            for record in files.values()
+            for file_path, record in files.items()
             if isinstance(record, dict) and record.get("status") in {"indexed", "partial"}
+            # `path` 给了就只在这一份 PDF 的页里找（“转换缓存”清单里的试搜，BC-19）
+            and (path is None or file_path == path)
             for page_id in record.get("page_ids", [])
         }
         segments = [str(value) for value in state.get("segments", []) if value]
@@ -862,6 +1260,11 @@ class VisualWemmPlugin:
                 segment_name = None if segment == "legacy" else segment
                 collection = self._client.get_collection(name=_collection_name(library_id, segment_name))
             except Exception:
+                continue
+            if path is not None:
+                # 只看一份 PDF：它最多几百页，直接按 id 取出这几页的向量现算相似度，不走带过滤
+                # 条件的近邻检索（那条路在匹配数很少时容易报错或凑不满结果）。
+                self._score_pages_directly(collection, sorted(active_ids), result["embedding"], merged)
                 continue
             count = collection.count()
             request = min(count, max(top_k * 4, 32))

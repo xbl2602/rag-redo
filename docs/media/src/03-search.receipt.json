@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "architecture",
+  "input": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\03-search.architecture.json",
+  "output": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\03-search.html",
+  "specification": {
+    "sha256": "f6966b8d75bf71fad7e9366acf735ac4d72fc458dbf2ec7a0719d742233ea68e",
+    "bytes": 5882
+  },
+  "artifact": {
+    "sha256": "b9723ef868a65c284dbf285bb4b26cc6f2819b19b81b3b5cad3727d91f144861",
+    "bytes": 811771
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "standard",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

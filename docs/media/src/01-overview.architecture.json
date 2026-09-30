@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "RAG NAVIGATION 整体全景",
+    "locale": "zh-CN",
+    "animation": "trace",
+    "quality_profile": "standard",
+    "legend": {
+      "mode": "hidden"
+    },
+    "viewBox": [
+      850,
+      470
+    ]
+  },
+  "components": [
+    {
+      "id": "notes",
+      "type": "external",
+      "label": "你的笔记库",
+      "sublabel": "Markdown / PDF / Word",
+      "pos": [
+        30,
+        40
+      ],
+      "size": [
+        140,
+        70
+      ]
+    },
+    {
+      "id": "indexer",
+      "type": "backend",
+      "label": "建索引",
+      "sublabel": "读取 · 切块 · 向量化",
+      "pos": [
+        240,
+        40
+      ],
+      "size": [
+        140,
+        70
+      ]
+    },
+    {
+      "id": "store",
+      "type": "database",
+      "label": "索引库",
+      "sublabel": "向量 + 关键词 + 页面图",
+      "pos": [
+        450,
+        40
+      ],
+      "size": [
+        140,
+        70
+      ]
+    },
+    {
+      "id": "users",
+      "type": "external",
+      "label": "你 / AI 助手",
+      "sublabel": "提问、点按钮",
+      "pos": [
+        680,
+        40
+      ],
+      "size": [
+        140,
+        70
+      ]
+    },
+    {
+      "id": "entries",
+      "type": "frontend",
+      "label": "三个入口",
+      "sublabel": "GUI / MCP / CLI",
+      "pos": [
+        680,
+        190
+      ],
+      "size": [
+        140,
+        70
+      ]
+    },
+    {
+      "id": "search",
+      "type": "backend",
+      "label": "搜索",
+      "sublabel": "多路查找 · 重排",
+      "pos": [
+        450,
+        190
+      ],
+      "size": [
+        140,
+        70
+      ]
+    },
+    {
+      "id": "plugins",
+      "type": "cloud",
+      "label": "可换的零件",
+      "sublabel": "21 个官方插件",
+      "pos": [
+        240,
+        340
+      ],
+      "size": [
+        140,
+        70
+      ]
+    },
+    {
+      "id": "gpu",
+      "type": "security",
+      "label": "显卡裁判",
+      "sublabel": "谁先用、谁让路",
+      "pos": [
+        450,
+        340
+      ],
+      "size": [
+        140,
+        70
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "核心：插件运行时 + 数据流管理器",
+      "wraps": [
+        "indexer",
+        "store",
+        "search"
+      ],
+      "pad": 24
+    }
+  ],
+  "connections": [
+    {
+      "id": "notes-to-indexer",
+      "from": "notes",
+      "to": "indexer",
+      "label": "扫描",
+      "variant": "emphasis"
+    },
+    {
+      "id": "indexer-to-store",
+      "from": "indexer",
+      "to": "store",
+      "label": "写入",
+      "variant": "emphasis"
+    },
+    {
+      "id": "users-to-entries",
+      "from": "users",
+      "to": "entries",
+      "label": "提问",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        750,
+        150
+      ]
+    },
+    {
+      "id": "entries-to-search",
+      "from": "entries",
+      "to": "search",
+      "label": "调用",
+      "fromSide": "left",
+      "toSide": "right",
+      "labelAt": [
+        647,
+        225
+      ]
+    },
+    {
+      "id": "search-to-store",
+      "from": "search",
+      "to": "store",
+      "label": "查询",
+      "variant": "emphasis",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [
+        520,
+        150
+      ]
+    },
+    {
+      "id": "plugins-to-indexer",
+      "from": "plugins",
+      "to": "indexer",
+      "label": "提供零件",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [
+        310,
+        312
+      ]
+    },
+    {
+      "id": "gpu-to-search",
+      "from": "gpu",
+      "to": "search",
+      "label": "显存排队",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [
+        520,
+        306
+      ]
+    }
+  ]
+}

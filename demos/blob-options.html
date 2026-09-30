@@ -1,0 +1,713 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>光团选型</title>
+<style>
+  :root{ --ink:#dfe9f5; --dim:#8ba0b8; --line:rgba(140,180,220,.18); --panel:rgba(8,14,24,.78); --acc:#4fc3ff; }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;color:var(--ink);
+    font:13px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;}
+  body{background:radial-gradient(1100px 780px at 50% 46%, rgba(28,66,116,.18), transparent 62%),#000;}
+  #c{position:fixed;inset:0;display:block}
+  .panel{position:fixed;background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:10px 12px;backdrop-filter:blur(8px);box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  #ctl{left:14px;top:14px;width:258px;max-height:calc(100vh - 28px);overflow:auto}
+  h4{margin:8px 0 5px;font-size:11px;letter-spacing:.12em;color:#7fd4ff;font-weight:600}
+  h4:first-child{margin-top:0}
+  button{display:block;width:100%;text-align:left;margin:3px 0;padding:6px 9px;border-radius:7px;
+    background:#0b1420;color:var(--dim);border:1px solid #1d3044;font:inherit;font-size:12px;cursor:pointer}
+  button b{color:var(--ink);margin-right:6px}
+  button.on{background:#10304a;border-color:var(--acc);color:var(--ink);box-shadow:0 0 12px rgba(79,195,255,.25)}
+  input[type=range]{width:100%;accent-color:var(--acc)}
+  .sep{height:1px;background:var(--line);margin:9px 0}
+  #cap{left:50%;bottom:16px;transform:translateX(-50%);font-size:15px;padding:7px 16px;white-space:nowrap}
+  #cap b{color:#7fd4ff;margin-right:8px}
+  #boot{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:rgba(0,0,0,.9);z-index:20;color:#8fd8ff;letter-spacing:.1em}
+  #boot.hide{display:none}
+  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+    background:rgba(0,0,0,.95);z-index:30;padding:40px;text-align:center;line-height:1.9;color:#ff9a9a}
+  .hint{color:#6b8099;font-size:11px;line-height:1.7}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ctl" class="panel">
+  <h4>光团放在哪一层</h4>
+  <button data-k="L" data-v="A"><b>A</b>一个主题一颗球，串在轨道上</button>
+  <button data-k="L" data-v="B"><b>B</b>一个库就是一颗大球，绕中心转</button>
+  <button data-k="L" data-v="C"><b>C</b>保留环带，主题处长出球</button>
+  <h4>球的质感</h4>
+  <button data-k="T" data-v="1"><b>1</b>光团：中心最亮，往外渐淡</button>
+  <button data-k="T" data-v="2"><b>2</b>实心球：像太阳，边缘清楚</button>
+  <h4>中间那颗</h4>
+  <button data-k="S" data-v="h"><b>空心</b>现在的线框球</button>
+  <button data-k="S" data-v="s"><b>实心</b>发光的实心球</button>
+  <div class="sep"></div>
+  <h4>球大小 <span id="v-ball"></span></h4>
+  <input id="s-ball" type="range" min="0.6" max="1.6" step="0.05" value="1">
+  <h4>亮度 <span id="v-bright"></span></h4>
+  <input id="s-bright" type="range" min="0.4" max="1.8" step="0.05" value="1">
+  <h4>公转速度 <span id="v-speed"></span></h4>
+  <input id="s-speed" type="range" min="0" max="3" step="0.05" value="1">
+  <div class="sep"></div>
+  <div class="hint">左键拖拽转视角 · 滚轮拉近 · 右键平移<br>
+    拉近看：球是由成千上万个光点（文件 / 块 / 页）堆出来的，外面再罩一层体积光。<br>
+    数据是合成的，只用来比样子。</div>
+</div>
+<div id="cap" class="panel"></div>
+<div id="boot">正在生成…</div>
+<div id="err"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+function fatal(msg){
+  const el = document.getElementById('err');
+  el.style.display = 'flex'; el.textContent = msg;
+  document.getElementById('boot').classList.add('hide');
+}
+addEventListener('error', e => fatal('运行出错：' + (e.error?.stack || e.message)));
+addEventListener('unhandledrejection', e => fatal('运行出错：' + (e.reason?.stack || e.reason)));
+
+/* ============================================================
+   0. 工具
+   ============================================================ */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+function mulberry32(a){
+  return function(){
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const gauss = rng => Math.sqrt(-2 * Math.log(1 - rng())) * Math.cos(TAU * rng());
+function hex2rgb(hex){
+  const h = hex.slice(1);
+  return [parseInt(h.slice(0,2),16)/255, parseInt(h.slice(2,4),16)/255, parseInt(h.slice(4,6),16)/255];
+}
+function dir3(rng){
+  const u = rng() * 2 - 1, th = rng() * TAU, s = Math.sqrt(Math.max(0, 1 - u * u));
+  return [s * Math.cos(th), s * Math.sin(th), u];
+}
+/* 球内均匀：投影后中间厚、边上薄，读起来是一颗边缘清楚的实心球 */
+function inBall(rng, R){
+  const d = dir3(rng), r = R * Math.cbrt(rng());
+  return [d[0] * r, d[1] * r, d[2] * r];
+}
+/* Plummer 分布（球状星团的经典密度剖面）：核心极密、往外平滑变稀。
+   截断在 rmax，保证不会有远点把球撑散。 */
+function plummer(rng, a, rmax){
+  let r = rmax;
+  for (let k = 0; k < 40; k++){
+    const u = Math.max(1e-6, rng());
+    const t = a / Math.sqrt(Math.pow(u, -2 / 3) - 1);
+    if (t <= rmax){ r = t; break; }
+  }
+  const d = dir3(rng);
+  return [d[0] * r, d[1] * r, d[2] * r];
+}
+/* 光团用：r = R·u^0.62，比体积均匀更往中心挤，但有硬边界——
+   Plummer 的长尾会让球边炸毛，看起来像蒲公英而不是一团实心的光。 */
+function denseBall(rng, R){
+  const d = dir3(rng), r = R * Math.pow(rng(), 0.62);
+  return [d[0] * r, d[1] * r, d[2] * r];
+}
+function clampLen(p, R){
+  const l = Math.hypot(p[0], p[1], p[2]);
+  if (l <= R) return p;
+  const s = R / l;
+  return [p[0] * s, p[1] * s, p[2] * s];
+}
+function shuffle(rng, a){
+  for (let i = a.length - 1; i > 0; i--){ const j = Math.floor(rng() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+
+const PALETTE = [
+  '#38e1ff','#4d8cff','#7a6bff','#b06bff','#e05cff','#ff5c9e','#ff6b6b','#ff9147',
+  '#ffb03a','#ffe066','#c6f24e','#5fe08a','#2fe0c0','#9ad0ff','#d4a0ff','#ffb3c7',
+];
+const PAL = PALETTE.map(hex2rgb);
+const TOPIC_NAMES = [
+  '插件架构','混合检索','向量模型','文档提取','知识管理','索引流程','GUI 交互','MCP 协议',
+  'GPU 调度','测试规范','课程讲义','论文笔记','项目管理','学习方法','数据存储','日志诊断',
+];
+const STATUS_DIM = [1.00, 0.50, 0.64, 0.32];
+const LIB_DEFS = [
+  { name:'Obsidian Vault', color:'#57d7ff', R: 8.4, tiltX:  7, tiltZ:  4, node:  0, files:6068, cpf:5.2,  pdf:0.05, topics:16 },
+  { name:'agents',         color:'#7cff9e', R:12.8, tiltX:-11, tiltZ:  7, node: 47, files: 420, cpf:5.7,  pdf:0.00, topics:10 },
+  { name:'skills',         color:'#ffc46b', R:17.2, tiltX: 16, tiltZ:-6, node:112, files: 340, cpf:5.6,  pdf:0.00, topics:11 },
+  { name:'Y2S1',           color:'#ff87c2', R:21.6, tiltX:-19, tiltZ:  9, node: 26, files:  78, cpf:11.5, pdf:0.95, topics: 9 },
+];
+const SIZE_CHUNK = 0.036, SIZE_PAGE = 0.030;
+const fileSize = n => 0.070 + 0.090 * Math.min(1, n / 45);
+
+/* ============================================================
+   1. 合成数据（只为比样子，和正式 demo 同一套量级）
+   ============================================================ */
+function makeLibrary(def, li, rng){
+  const n = def.files, T = def.topics;
+  const cw = []; let acc = 0;
+  for (let i = 0; i < T; i++){ acc += 1 / Math.pow(i + 1.4, 0.85); cw.push(acc); }
+  for (let i = 0; i < T; i++) cw[i] /= acc;
+  cw[T - 1] = 1;
+  const lib = {
+    def, li, name:def.name, color:def.color, R:def.R, nTopics:T, nFiles:n,
+    topic:new Uint8Array(n), status:new Uint8Array(n),
+    nChunksOf:new Int32Array(n), nPagesOf:new Int32Array(n),
+  };
+  lib.U = new THREE.Vector3(1, 0, 0);
+  lib.V = new THREE.Vector3(0, 0, 1);
+  const rot = new THREE.Matrix4().makeRotationFromEuler(
+    new THREE.Euler(THREE.MathUtils.degToRad(def.tiltX), 0, THREE.MathUtils.degToRad(def.tiltZ), 'XYZ'));
+  lib.U.applyMatrix4(rot); lib.V.applyMatrix4(rot);
+  const m2 = new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(def.node));
+  lib.U.applyMatrix4(m2); lib.V.applyMatrix4(m2);
+  lib.N = new THREE.Vector3().crossVectors(lib.U, lib.V).normalize();
+  lib.speed = 0.15 * Math.sqrt(8.2 / def.R);
+  for (let i = 0; i < n; i++){
+    const r = rng();
+    let t = 0; while (t < T - 1 && r > cw[t]) t++;
+    lib.topic[i] = t;
+    const s = rng();
+    lib.status[i] = s < 0.030 ? 3 : (s < 0.050 ? 2 : (s < 0.105 ? 1 : 0));
+    const pdf = rng() < def.pdf;
+    lib.nChunksOf[i] = Math.max(0, Math.round(def.cpf * (0.25 + rng() * rng() * 3.2)));
+    lib.nPagesOf[i] = (pdf && lib.status[i] !== 3) ? 6 + Math.floor(rng() * rng() * 46) : 0;
+    if (lib.status[i] === 3){ lib.nChunksOf[i] = 0; lib.nPagesOf[i] = 0; }
+    else if (lib.status[i] === 2) lib.nChunksOf[i] = 0;
+  }
+  return lib;
+}
+const ptsOf = (lib, f) => 1 + lib.nChunksOf[f] + lib.nPagesOf[f];
+
+/* ============================================================
+   2. 三种布局
+   put(lib, 锚点角, 锚点半径, 锚点高度, 局部偏移 x/y/z, 直径, rgb, 亮度, 是否随球自转)
+   局部偏移用"径向 / 切向 / 法向"三个方向，自转就是绕法向转。
+   ============================================================ */
+
+/* 往一颗球里装一批文件。光团：Plummer，核心极密；实心球：体积均匀，边缘清楚。 */
+function fillBall(lib, rng, put, files, anchor, r, tex, rgb, center = [0, 0, 0], bound = r){
+  const [ac, ar, ah] = anchor;
+  for (const f of files){
+    const off = tex === 1 ? denseBall(rng, r) : inBall(rng, r * 0.97);
+    const p = clampLen([center[0] + off[0], center[1] + off[1], center[2] + off[2]], bound);
+    const dim = STATUS_DIM[lib.status[f]];
+    put(lib, ac, ar, ah, p[0], p[1], p[2], fileSize(lib.nChunksOf[f]), rgb, 0.70 * dim, 1);
+    /* 块和页紧挨着它的文件，整体仍然服从同一个密度剖面 */
+    const cr = r * 0.09;
+    for (let k = 0; k < lib.nChunksOf[f]; k++){
+      const b = inBall(rng, cr);
+      const q = clampLen([p[0] + b[0], p[1] + b[1], p[2] + b[2]], bound);
+      put(lib, ac, ar, ah, q[0], q[1], q[2], SIZE_CHUNK, rgb, 0.55 * dim, 1);
+    }
+    for (let k = 0; k < lib.nPagesOf[f]; k++){
+      const b = inBall(rng, cr * 0.5);
+      const q = clampLen([p[0] + b[0], p[1] + b[1], p[2] + b[2]], bound);
+      put(lib, ac, ar, ah, q[0], q[1], q[2], SIZE_PAGE, rgb, 0.55 * dim, 1);
+    }
+  }
+}
+function groupByTopic(lib){
+  const g = Array.from({ length:lib.nTopics }, () => []);
+  for (let f = 0; f < lib.nFiles; f++) g[lib.topic[f]].push(f);
+  return g;
+}
+const sumPts = (lib, fs) => fs.reduce((s, f) => s + ptsOf(lib, f), 0);
+
+/* A：一个主题一颗球。零散文件（不太属于任何主题的）留在一条很淡的细线上。 */
+function layoutA(lib, rng, put, bodies, tex){
+  const groups = groupByTopic(lib), loose = [];
+  for (const g of groups) for (let i = g.length - 1; i >= 0; i--) if (rng() < 0.06){ loose.push(g[i]); g.splice(i, 1); }
+  const T = lib.nTopics, R = lib.R;
+  const rad = groups.map(g => clamp(0.085 * Math.cbrt(Math.max(1, sumPts(lib, g))), 0.42, 1.6) * ui.ball);
+  const used = rad.reduce((s, r) => s + 2 * r / R, 0);
+  const gap = Math.max(0, (TAU - used) / T);
+  let a = rng() * TAU;
+  for (const t of shuffle(rng, [...Array(T).keys()])){
+    const r = rad[t], ac = a + r / R, hc = (rng() * 2 - 1) * 0.2 * r;
+    a += 2 * r / R + gap;
+    bodies.push({ lib, ang:ac, rad:R, hgt:hc, radius:r, rgb:PAL[t], mode:tex, gain:1 });
+    fillBall(lib, rng, put, groups[t], [ac, R, hc], r, tex, PAL[t]);
+  }
+  for (const f of loose){
+    const ang = rng() * TAU, rgb = PAL[lib.topic[f]];
+    const lx = clamp(gauss(rng) * 0.07, -0.18, 0.18), lz = clamp(gauss(rng) * 0.05, -0.12, 0.12);
+    put(lib, ang, R, 0, lx, 0, lz, fileSize(lib.nChunksOf[f]) * 0.8, rgb, 0.45, 0);
+    for (let k = 0; k < lib.nChunksOf[f]; k++){
+      const b = inBall(rng, 0.05);
+      put(lib, ang, R, 0, lx + b[0], b[1], lz + b[2], SIZE_CHUNK, rgb, 0.30, 0);
+    }
+  }
+}
+
+/* B：一个库就是一颗大球。各主题在球里各占一块，颜色区分。 */
+function layoutB(lib, rng, put, bodies, tex){
+  const groups = groupByTopic(lib), R = lib.R;
+  const P = groups.map(g => sumPts(lib, g)), tot = P.reduce((s, x) => s + x, 0);
+  const r = clamp(0.072 * Math.cbrt(tot), 0.75, 2.9) * ui.ball;
+  const ac = rng() * TAU;
+  bodies.push({ lib, ang:ac, rad:R, hgt:0, radius:r, rgb:hex2rgb(lib.color), mode:tex, gain:0.8 });
+  for (let t = 0; t < lib.nTopics; t++){
+    const share = P[t] / tot;
+    const sr = r * clamp(0.75 * Math.cbrt(share), 0.20, 0.62);
+    const d = dir3(rng), dist = (r - sr) * Math.cbrt(rng()) * 0.85;
+    fillBall(lib, rng, put, groups[t], [ac, R, 0], sr, tex, PAL[t], [d[0] * dist, d[1] * dist, d[2] * dist], r);
+  }
+}
+
+/* C：保留一条连续环带，每个主题在自己那段弧的中间长出一颗球。 */
+function layoutC(lib, rng, put, bodies, tex){
+  const groups = groupByTopic(lib), R = lib.R, T = lib.nTopics, S = R / 14;
+  const P = groups.map(g => sumPts(lib, g)), tot = P.reduce((s, x) => s + x, 0);
+  const w = P.map(p => 0.35 / T + 0.65 * p / tot), ws = w.reduce((s, x) => s + x, 0);
+  let a = rng() * TAU;
+  for (const t of shuffle(rng, [...Array(T).keys()])){
+    const arc = TAU * w[t] / ws, a0 = a, ac = a + arc / 2;
+    a += arc;
+    const g = shuffle(rng, groups[t].slice());
+    const cut = Math.round(g.length * 0.55), inBallFiles = g.slice(0, cut), belt = g.slice(cut);
+    const r = Math.min(clamp(0.085 * Math.cbrt(Math.max(1, sumPts(lib, inBallFiles))), 0.35, 1.35) * ui.ball, arc * R * 0.42);
+    bodies.push({ lib, ang:ac, rad:R, hgt:0, radius:r, rgb:PAL[t], mode:tex, gain:1 });
+    fillBall(lib, rng, put, inBallFiles, [ac, R, 0], r, tex, PAL[t]);
+    for (const f of belt){
+      const ang = a0 + rng() * arc, rgb = PAL[t], dim = STATUS_DIM[lib.status[f]];
+      const lx = (rng() * 2 - 1) * 0.30 * S, lz = clamp(gauss(rng) * 0.20 * S, -0.5 * S, 0.5 * S);
+      put(lib, ang, R, 0, lx, 0, lz, fileSize(lib.nChunksOf[f]) * 0.85, rgb, 0.62 * dim, 0);
+      for (let k = 0; k < lib.nChunksOf[f]; k++){
+        const b = inBall(rng, 0.06 * S);
+        put(lib, ang, R, 0, lx + b[0], b[1], lz + b[2], SIZE_CHUNK, rgb, 0.45 * dim, 0);
+      }
+    }
+  }
+}
+
+/* ============================================================
+   3. 场景
+   ============================================================ */
+const canvas = document.getElementById('c');
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true, powerPreference:'high-performance' });
+} catch (e){ fatal('拿不到 WebGL 上下文：' + e); throw e; }
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 0);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(46, 1, 0.3, 1600);
+camera.position.set(0, 21, 36);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true; controls.dampingFactor = 0.07;
+controls.minDistance = 2.2; controls.maxDistance = 200;
+controls.rotateSpeed = 0.62; controls.zoomSpeed = 0.9;
+
+const ui = { L:'A', T:1, S:'h', ball:1.0, bright:1.0, speed:1.0 };
+const U = { uTime:{value:0}, uSizeK:{value:1}, uBright:{value:1} };
+/* 纯加色，而且不写画布的透明度：用 three 自带的 AdditiveBlending 会把透明度也叠满，
+   画布在球的方片范围内变成不透明黑，背景渐变被挖出一个个黑圆盘。 */
+const ADD = { blending:THREE.CustomBlending, blendEquation:THREE.AddEquation,
+  blendSrc:THREE.OneFactor, blendDst:THREE.OneFactor,
+  blendSrcAlpha:THREE.ZeroFactor, blendDstAlpha:THREE.OneFactor,
+  depthWrite:false, transparent:true };
+
+/* ---------- 光点 ---------- */
+const POINT_VS = `
+uniform float uTime, uSizeK, uBright;
+attribute vec3 aU, aV, aColor, aLocal;
+attribute vec4 aOrbit;     // x=锚点角 y=锚点半径 z=锚点高度 w=世界直径
+attribute float aSpin, aSelf;
+varying vec3 vColor;
+varying float vFade, vPx;
+void main(){
+  vec3 N = cross(aU, aV);
+  float a = aOrbit.x + uTime * aSpin;
+  vec3 er = aU * cos(a) + aV * sin(a);
+  vec3 et = -aU * sin(a) + aV * cos(a);
+  float s = uTime * 0.16 * aSelf, cs = cos(s), sn = sin(s);
+  vec3 L = vec3(aLocal.x * cs - aLocal.y * sn, aLocal.x * sn + aLocal.y * cs, aLocal.z);
+  vec3 p = er * (aOrbit.y + L.x) + et * L.y + N * (aOrbit.z + L.z);
+  vec4 mv = modelViewMatrix * vec4(p, 1.0);
+  gl_Position = projectionMatrix * mv;
+  vPx = aOrbit.w * uSizeK / max(0.001, -mv.z);
+  gl_PointSize = max(1.0, vPx);
+  /* 远处小于 1 像素的点按面积折算亮度，否则远看一片噪点 */
+  float sub = clamp(vPx, 0.25, 1.0);
+  vColor = aColor * uBright * sub;
+  vFade = clamp(1.3 - (-mv.z) / 210.0, 0.22, 1.0);
+}`;
+const POINT_FS = `
+varying vec3 vColor;
+varying float vFade, vPx;
+void main(){
+  vec2 q = gl_PointCoord - 0.5;
+  float d = length(q) * 2.0;
+  if (d > 1.0) discard;
+  float core = pow(max(0.0, 1.0 - d), 2.2);
+  float halo = smoothstep(1.0, 0.04, d) * 0.26;
+  float bar = max(0.0, 1.0 - min(abs(q.x), abs(q.y)) * 26.0) * max(0.0, 1.0 - d * 1.05);
+  float spike = bar * smoothstep(5.0, 17.0, vPx) * 0.55;
+  gl_FragColor = vec4(vColor * (core + halo + spike) * vFade, 1.0);
+}`;
+const pointMat = new THREE.ShaderMaterial({
+  uniforms:U, vertexShader:POINT_VS, fragmentShader:POINT_FS, ...ADD,
+});
+
+/* ---------- 球体本身（体积光）----------
+   一张永远正对镜头的方片，片元里按"视线穿过球的厚度"算亮度，
+   所以不管怎么转，看到的都是一颗有体积的实心球，而不是一圈点。 */
+const EXT = 2.6;
+const BODY_VS = `
+uniform float uTime;
+attribute vec4 iOrbit;     // 角 半径 高度 球半径
+attribute vec3 iU, iV, iColor;
+attribute float iSpin;
+attribute vec2 iMode;      // x: 1=光团 2=实心球   y: 强度
+varying vec2 vQ;
+varying vec3 vCol;
+varying vec2 vMode;
+const float EXT = ${EXT.toFixed(2)};
+void main(){
+  vec3 N = cross(iU, iV);
+  float a = iOrbit.x + uTime * iSpin;
+  vec3 c = iU * (iOrbit.y * cos(a)) + iV * (iOrbit.y * sin(a)) + N * iOrbit.z;
+  vec4 mv = modelViewMatrix * vec4(c, 1.0);
+  mv.xy += position.xy * 2.0 * iOrbit.w * EXT;
+  vQ = position.xy * 2.0 * EXT;
+  vCol = iColor; vMode = iMode;
+  gl_Position = projectionMatrix * mv;
+}`;
+const BODY_FS = `
+uniform float uBright;
+varying vec2 vQ;
+varying vec3 vCol;
+varying vec2 vMode;
+const float EXT = ${EXT.toFixed(2)};
+void main(){
+  float b = length(vQ);
+  if (b > EXT) discard;
+  vec3 col;
+  if (vMode.x < 1.5){
+    /* 光团：和点的 Plummer 分布同形的投影亮度，核心发白，外面一层柔光 */
+    float fill = pow(max(0.0, 1.0 - b * b), 1.25);          // 整颗球的体积
+    float core = pow(1.0 + b * b / 0.06, -1.5);               // 越往里越密
+    float halo = exp(-b * b / 1.5) * 0.14;                    // 外面一层柔光
+    col = vCol * (fill * 0.62 + halo) + mix(vCol, vec3(1.0), 0.65) * core * 0.75;
+  } else {
+    /* 实心球：像太阳的"边缘变暗"——中间最厚最亮，边上薄，轮廓清楚；外面一圈日冕 */
+    float edge = smoothstep(1.0, 0.965, b);
+    float mu = sqrt(max(0.0, 1.0 - b * b));
+    float surf = (0.22 + 0.78 * pow(mu, 0.55)) * edge;
+    float corona = (1.0 - edge) * exp(-(b - 1.0) * 3.4) * 0.30 + exp(-b * b / 2.2) * 0.05;
+    col = mix(vCol, vec3(1.0), 0.42 * mu) * surf * 0.95 + vCol * corona;
+  }
+  col *= smoothstep(EXT, EXT - 0.4, b);
+  gl_FragColor = vec4(col * vMode.y * uBright, 1.0);
+}`;
+const bodyMat = new THREE.ShaderMaterial({
+  uniforms:U, vertexShader:BODY_VS, fragmentShader:BODY_FS, ...ADD,
+});
+
+/* ---------- 中心：空心线框（原样） ---------- */
+const LINE_VS = `
+uniform float uTime, uSpin;
+attribute vec3 aNrm;
+varying float vFace, vPulse;
+void main(){
+  float c = cos(uTime * uSpin), s = sin(uTime * uSpin);
+  vec3 p = vec3(position.x, position.y * c - position.z * s, position.y * s + position.z * c);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+  vFace = 0.09 + 0.91 * smoothstep(-0.4, 0.8, normalize(normalMatrix * aNrm).z);
+  vPulse = 0.82 + 0.18 * sin(uTime * 0.9);
+}`;
+const LINE_FS = `
+uniform vec3 uColor;
+uniform float uOpacity;
+varying float vFace, vPulse;
+void main(){ gl_FragColor = vec4(uColor * vFace * vPulse * uOpacity, 1.0); }`;
+function makeWire(pos, nrm, color, opacity, spin){
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('aNrm', new THREE.Float32BufferAttribute(nrm, 3));
+  return new THREE.LineSegments(g, new THREE.ShaderMaterial({
+    uniforms:{ uTime:U.uTime, uSpin:{value:spin},
+      uColor:{value:new THREE.Vector3(...hex2rgb(color))}, uOpacity:{value:opacity} },
+    vertexShader:LINE_VS, fragmentShader:LINE_FS, ...ADD,
+  }));
+}
+function normalsFromPos(arr){
+  const out = new Float32Array(arr.length);
+  for (let i = 0; i < arr.length; i += 3){
+    const s = Math.hypot(arr[i], arr[i+1], arr[i+2]) || 1;
+    out[i] = arr[i]/s; out[i+1] = arr[i+1]/s; out[i+2] = arr[i+2]/s;
+  }
+  return out;
+}
+function latLong(radius, latSeg, lonSeg){
+  const pos = [], nrm = [];
+  const P = (deg, t) => { const a = deg*Math.PI/180, r = Math.cos(a)*radius;
+    return [r*Math.cos(t), Math.sin(a)*radius, r*Math.sin(t)]; };
+  for (let i = 0; i <= latSeg; i++){
+    const deg = -86 + 172*i/latSeg;
+    for (let j = 0; j < lonSeg; j++){
+      const a = P(deg, TAU*j/lonSeg), b = P(deg, TAU*(j+1)/lonSeg);
+      pos.push(...a, ...b); nrm.push(...a, ...b);
+    }
+  }
+  for (let j = 0; j < lonSeg; j++){
+    const t = TAU*j/lonSeg;
+    for (let i = 0; i < latSeg; i++){
+      const a = P(-86 + 172*i/latSeg, t), b = P(-86 + 172*(i+1)/latSeg, t);
+      pos.push(...a, ...b); nrm.push(...a, ...b);
+    }
+  }
+  return { pos, nrm };
+}
+const wireGroup = new THREE.Group();
+{
+  const ll = latLong(1.35, 16, 28);
+  wireGroup.add(makeWire(ll.pos, ll.nrm, '#cdefff', 0.95, 0.21));
+  for (const [radius, detail, color, opacity, spin] of [[1.62, 1, '#5fc8ff', 0.55, -0.14], [1.92, 0, '#8a72ff', 0.34, 0.10]]){
+    const g = new THREE.WireframeGeometry(new THREE.IcosahedronGeometry(radius, detail)).attributes.position.array;
+    wireGroup.add(makeWire(g, normalsFromPos(g), color, opacity, spin));
+  }
+  const eq = [];
+  for (let j = 0; j < 180; j++){
+    const t0 = TAU*j/180, t1 = TAU*(j+1)/180;
+    eq.push(Math.cos(t0)*2.2, 0, Math.sin(t0)*2.2, Math.cos(t1)*2.2, 0, Math.sin(t1)*2.2);
+  }
+  wireGroup.add(makeWire(eq, eq, '#4aa8ff', 0.6, 0));
+  scene.add(wireGroup);
+}
+const glow = (() => {
+  const s = document.createElement('canvas'); s.width = s.height = 256;
+  const c = s.getContext('2d');
+  const g = c.createRadialGradient(128, 128, 0, 128, 128, 128);
+  g.addColorStop(0, 'rgba(155,220,255,.6)');
+  g.addColorStop(0.22, 'rgba(90,170,255,.18)');
+  g.addColorStop(1, 'rgba(60,120,255,0)');
+  c.fillStyle = g; c.fillRect(0, 0, 256, 256);
+  const tex = new THREE.CanvasTexture(s);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map:tex, blending:THREE.AdditiveBlending,
+    depthWrite:false, depthTest:false, transparent:true }));
+  sp.scale.set(11, 11, 1);
+  scene.add(sp);
+  return sp;
+})();
+
+const ringGroup = new THREE.Group(), labelGroup = new THREE.Group();
+scene.add(ringGroup, labelGroup);
+function makeLabel(text, color){
+  const s = document.createElement('canvas'); s.width = 512; s.height = 128;
+  const c = s.getContext('2d');
+  c.font = '600 54px "Segoe UI","Microsoft YaHei",sans-serif';
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.shadowColor = color; c.shadowBlur = 24; c.fillStyle = color; c.fillText(text, 256, 64);
+  c.shadowBlur = 0; c.fillStyle = '#eaf6ff'; c.fillText(text, 256, 64);
+  const tex = new THREE.CanvasTexture(s);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map:tex, transparent:true, depthWrite:false, depthTest:false }));
+  sp.scale.set(5.4, 1.35, 1);
+  return sp;
+}
+
+/* ============================================================
+   4. 构建
+   ============================================================ */
+let points = null, bodyMesh = null;
+const CENTER_LIB = { U:new THREE.Vector3(1,0,0), V:new THREE.Vector3(0,0,1), N:new THREE.Vector3(0,-1,0), speed:0 };
+
+function buildAll(){
+  const rng = mulberry32(0x5eed);
+  if (points){ points.geometry.dispose(); scene.remove(points); points = null; }
+  if (bodyMesh){ bodyMesh.geometry.dispose(); scene.remove(bodyMesh); bodyMesh = null; }
+  for (const o of [...ringGroup.children]){ o.geometry.dispose(); o.material.dispose(); ringGroup.remove(o); }
+  for (const o of [...labelGroup.children]){ o.material.map?.dispose(); o.material.dispose(); labelGroup.remove(o); }
+  const libs = LIB_DEFS.map((def, li) => makeLibrary(def, li, rng));
+
+  const nBG = 2400, nCore = ui.S === 's' ? 2600 : 0;
+  let cap = nBG + nCore;
+  for (const lib of libs) for (let f = 0; f < lib.nFiles; f++) cap += ptsOf(lib, f);
+
+  const aU = new Float32Array(cap*3), aV = new Float32Array(cap*3), aLocal = new Float32Array(cap*3);
+  const aOrbit = new Float32Array(cap*4), aColor = new Float32Array(cap*3);
+  const aSpin = new Float32Array(cap), aSelf = new Float32Array(cap);
+  let w = 0;
+  const put = (lib, ang, rad, hgt, lx, ly, lz, size, rgb, dim, self) => {
+    const i = w*3, j = w*4;
+    aU[i] = lib.U.x; aU[i+1] = lib.U.y; aU[i+2] = lib.U.z;
+    aV[i] = lib.V.x; aV[i+1] = lib.V.y; aV[i+2] = lib.V.z;
+    aLocal[i] = lx; aLocal[i+1] = ly; aLocal[i+2] = lz;
+    aOrbit[j] = ang; aOrbit[j+1] = rad; aOrbit[j+2] = hgt; aOrbit[j+3] = size;
+    aColor[i] = rgb[0]*dim; aColor[i+1] = rgb[1]*dim; aColor[i+2] = rgb[2]*dim;
+    aSpin[w] = lib.speed; aSelf[w] = self;
+    w++;
+  };
+
+  const bodies = [];
+  const layout = { A:layoutA, B:layoutB, C:layoutC }[ui.L];
+  for (const lib of libs){
+    layout(lib, rng, put, bodies, ui.T);
+    const pts = [];
+    for (let j = 0; j <= 260; j++){
+      const t = TAU*j/260;
+      pts.push(new THREE.Vector3().addScaledVector(lib.U, lib.R*Math.cos(t)).addScaledVector(lib.V, lib.R*Math.sin(t)));
+    }
+    ringGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+      new THREE.LineBasicMaterial({ color:new THREE.Color(lib.color), transparent:true,
+        opacity: ui.L === 'C' ? 0.10 : 0.16, blending:THREE.AdditiveBlending, depthWrite:false })));
+    const lbl = makeLabel(lib.name, lib.color);
+    lbl.position.copy(new THREE.Vector3().addScaledVector(lib.U, lib.R + 2.4).addScaledVector(lib.N, 0.8));
+    labelGroup.add(lbl);
+  }
+
+  /* 中心：实心时换成一颗发光实心球，里面也塞满光点 */
+  const coreRGB = [0.78, 0.90, 1.0];
+  wireGroup.visible = ui.S === 'h';
+  if (ui.S === 's'){
+    bodies.push({ lib:CENTER_LIB, ang:0, rad:0, hgt:0, radius:1.55, rgb:coreRGB, mode:2, gain:1.25 });
+    for (let k = 0; k < nCore; k++){
+      const p = inBall(rng, 1.5);
+      put(CENTER_LIB, 0, 0, 0, p[0], p[1], p[2], 0.05, coreRGB, 0.35, 1);
+    }
+  }
+
+  /* 远景星空 */
+  for (let i = 0; i < nBG; i++){
+    const d = dir3(rng), r = 300 + rng()*280, b = 0.26 + rng()*0.46;
+    put(CENTER_LIB, 0, 0, 0, d[0]*r, d[1]*r, d[2]*r, 0.9 + rng()*1.8, [0.75, 0.86, 1.0], b, 0);
+  }
+
+  const g = new THREE.BufferGeometry();
+  const n = w;
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n*3), 3));
+  g.setAttribute('aU', new THREE.BufferAttribute(aU.subarray(0, n*3), 3));
+  g.setAttribute('aV', new THREE.BufferAttribute(aV.subarray(0, n*3), 3));
+  g.setAttribute('aLocal', new THREE.BufferAttribute(aLocal.subarray(0, n*3), 3));
+  g.setAttribute('aOrbit', new THREE.BufferAttribute(aOrbit.subarray(0, n*4), 4));
+  g.setAttribute('aColor', new THREE.BufferAttribute(aColor.subarray(0, n*3), 3));
+  g.setAttribute('aSpin', new THREE.BufferAttribute(aSpin.subarray(0, n), 1));
+  g.setAttribute('aSelf', new THREE.BufferAttribute(aSelf.subarray(0, n), 1));
+  points = new THREE.Points(g, pointMat);
+  points.frustumCulled = false;
+  scene.add(points);
+
+  const base = new THREE.PlaneGeometry(1, 1);
+  const bg = new THREE.InstancedBufferGeometry();
+  bg.index = base.index;
+  bg.setAttribute('position', base.attributes.position);
+  const m = bodies.length;
+  const iOrbit = new Float32Array(m*4), iU = new Float32Array(m*3), iV = new Float32Array(m*3);
+  const iColor = new Float32Array(m*3), iSpin = new Float32Array(m), iMode = new Float32Array(m*2);
+  bodies.forEach((b, k) => {
+    iOrbit.set([b.ang, b.rad, b.hgt, b.radius], k*4);
+    iU.set([b.lib.U.x, b.lib.U.y, b.lib.U.z], k*3);
+    iV.set([b.lib.V.x, b.lib.V.y, b.lib.V.z], k*3);
+    iColor.set(b.rgb, k*3);
+    iSpin[k] = b.lib.speed;
+    iMode.set([b.mode, b.gain], k*2);
+  });
+  bg.setAttribute('iOrbit', new THREE.InstancedBufferAttribute(iOrbit, 4));
+  bg.setAttribute('iU', new THREE.InstancedBufferAttribute(iU, 3));
+  bg.setAttribute('iV', new THREE.InstancedBufferAttribute(iV, 3));
+  bg.setAttribute('iColor', new THREE.InstancedBufferAttribute(iColor, 3));
+  bg.setAttribute('iSpin', new THREE.InstancedBufferAttribute(iSpin, 1));
+  bg.setAttribute('iMode', new THREE.InstancedBufferAttribute(iMode, 2));
+  bg.instanceCount = m;
+  bodyMesh = new THREE.Mesh(bg, bodyMat);
+  bodyMesh.frustumCulled = false;
+  scene.add(bodyMesh);
+  glow.visible = ui.S === 'h';
+  console.log(`[blob-options] ${ui.L}${ui.T}${ui.S}: ${n} 点, ${m} 颗球`);
+}
+
+/* ============================================================
+   5. 控件（状态写进网址 #A1h，方便直接分享某一种样子）
+   ============================================================ */
+const LNAME = { A:'一个主题一颗球', B:'一个库一颗大球', C:'环带 + 主题处长球' };
+const TNAME = { 1:'光团质感', 2:'实心球质感' };
+const SNAME = { h:'中心空心', s:'中心实心' };
+function readHash(src = location.hash){
+  const m = /^#?([ABC])([12])([hs])$/.exec(src);
+  if (m){ ui.L = m[1]; ui.T = +m[2]; ui.S = m[3]; }
+}
+function sync(){
+  for (const b of document.querySelectorAll('button[data-k]')){
+    const k = b.dataset.k, v = b.dataset.v;
+    b.classList.toggle('on', String(ui[k]) === v);
+  }
+  document.getElementById('cap').innerHTML =
+    `<b>${ui.L}${ui.T}</b>${LNAME[ui.L]} · ${TNAME[ui.T]} · ${SNAME[ui.S]}`;
+  const h = `#${ui.L}${ui.T}${ui.S}`;
+  try { if (location.hash !== h) history.replaceState(null, '', h); } catch { /* data: 预览里改不了网址，无所谓 */ }
+}
+function rebuild(){
+  sync();
+  const boot = document.getElementById('boot');
+  boot.classList.remove('hide');
+  setTimeout(() => { buildAll(); boot.classList.add('hide'); }, 30);
+}
+for (const b of document.querySelectorAll('button[data-k]')){
+  b.onclick = () => { const k = b.dataset.k; ui[k] = k === 'T' ? +b.dataset.v : b.dataset.v; rebuild(); };
+}
+const bindRange = (id, key, onInput, live) => {
+  const el = document.getElementById('s-' + id), lab = document.getElementById('v-' + id);
+  const show = () => lab.textContent = ui[key].toFixed(2) + '×';
+  el.addEventListener(live ? 'input' : 'change', () => { ui[key] = +el.value; show(); onInput(); });
+  if (!live) el.addEventListener('input', () => { ui[key] = +el.value; show(); });
+  show();
+};
+bindRange('ball', 'ball', rebuild, false);
+bindRange('bright', 'bright', () => { U.uBright.value = ui.bright; }, true);
+bindRange('speed', 'speed', () => {}, true);
+addEventListener('hashchange', () => { readHash(); rebuild(); });
+addEventListener('keydown', e => {
+  const k = e.key.toUpperCase();
+  if ('ABC'.includes(k) && k.length === 1){ ui.L = k; rebuild(); }
+  else if (k === '1' || k === '2'){ ui.T = +k; rebuild(); }
+  else if (k === 'H' || k === 'S'){ ui.S = k.toLowerCase(); rebuild(); }
+});
+
+/* ============================================================
+   6. 主循环
+   ============================================================ */
+let clock = 0, last = performance.now();
+function resize(){
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  U.uSizeK.value = h * renderer.getPixelRatio() / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2));
+}
+addEventListener('resize', resize);
+function tick(now){
+  requestAnimationFrame(tick);
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  clock += dt * ui.speed;
+  U.uTime.value = clock;
+  glow.material.opacity = 1;
+  controls.update();
+  renderer.render(scene, camera);
+}
+window.__set = h => { readHash(h); rebuild(); };
+window.__cam = (x, y, z, tx = 0, ty = 0, tz = 0) => { camera.position.set(x, y, z); controls.target.set(tx, ty, tz); controls.update(); };
+readHash();
+resize();
+rebuild();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

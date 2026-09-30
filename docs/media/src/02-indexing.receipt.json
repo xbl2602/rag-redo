@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "architecture",
+  "input": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\02-indexing.architecture.json",
+  "output": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\02-indexing.html",
+  "specification": {
+    "sha256": "c713be7354678f772172267c9a0d6d4dbd79707f7f3ef787ed1674f34e08eeae",
+    "bytes": 4577
+  },
+  "artifact": {
+    "sha256": "3923169b1dda7d37d20ac02c674832e31c755397b10ec9e379fc5f987f6303bd",
+    "bytes": 806287
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "standard",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

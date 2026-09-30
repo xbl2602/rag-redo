@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "三个入口，共用一个大脑",
+    "locale": "zh-CN",
+    "animation": "trace",
+    "quality_profile": "standard",
+    "viewBox": [
+      740,
+      680
+    ],
+    "legend": {
+      "mode": "hidden"
+    }
+  },
+  "components": [
+    {
+      "id": "mcp",
+      "type": "frontend",
+      "label": "MCP 工具",
+      "sublabel": "AI 助手来调用",
+      "pos": [
+        280,
+        30
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "gate",
+      "type": "security",
+      "label": "写权限门禁",
+      "sublabel": "提案号 + 确认码 · 一次性",
+      "pos": [
+        280,
+        150
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "gui",
+      "type": "frontend",
+      "label": "GUI 窗口",
+      "sublabel": "点按钮、看进度",
+      "pos": [
+        30,
+        290
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "core",
+      "type": "backend",
+      "label": "同一个业务核心",
+      "sublabel": "排序、过滤、报错只在这里",
+      "pos": [
+        280,
+        290
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "命令行",
+      "sublabel": "脚本、批处理",
+      "pos": [
+        530,
+        290
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "plugins",
+      "type": "cloud",
+      "label": "插件零件",
+      "sublabel": "读文件 · 切块 · 重排 等",
+      "pos": [
+        280,
+        430
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "store",
+      "type": "database",
+      "label": "索引库",
+      "sublabel": "数据只从唯一入口读写",
+      "pos": [
+        280,
+        570
+      ],
+      "size": [
+        170,
+        64
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "c1",
+      "from": "gui",
+      "to": "core",
+      "label": "点按钮",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "c2",
+      "from": "cli",
+      "to": "core",
+      "label": "命令",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "right"
+    },
+    {
+      "id": "c3",
+      "from": "mcp",
+      "to": "gate",
+      "label": "要改设置",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        365,
+        122
+      ]
+    },
+    {
+      "id": "c4",
+      "from": "gate",
+      "to": "core",
+      "label": "确认后放行",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        365,
+        252
+      ]
+    },
+    {
+      "id": "c5",
+      "from": "core",
+      "to": "plugins",
+      "label": "按顺序调用",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        365,
+        392
+      ]
+    },
+    {
+      "id": "c6",
+      "from": "plugins",
+      "to": "store",
+      "label": "唯一读写入口",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        365,
+        532
+      ]
+    }
+  ]
+}

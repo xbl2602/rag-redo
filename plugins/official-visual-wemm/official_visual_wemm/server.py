@@ -60,8 +60,32 @@ from pathlib import Path
 
 WEMM_MODEL_DEFAULT = "tencent/WeMM-Embedding-2B"
 WEMM_DIM_DEFAULT = 512
-WEMM_MIN_VRAM_GB = 5.5  # WeMM-2B bf16 + 激活余量，对齐旧项目 gpu_arbiter.py 同名常量
-WEMM_VRAM_WAIT_SECONDS = 900.0
+#: 加载前要求的最小空闲显存（GiB）。
+#:
+#: **2026-09-29 在本机实测重标定过，原来的 5.5 是照搬旧项目 `gpu_arbiter.py`
+#: 的同名常量，从来没有在这台机器上验证过。** 实测（`tools/probe_wemm_vram.py`，
+#: 用本文件 `_real_embed` 同一套调用形态，RTX 5060 Laptop / torch 2.11.0+cu128）：
+#:
+#:   加载前空闲 6.878 → 加载后 1.036   即加载吃掉 5.842
+#:   torch 报 `memory_allocated` 5.070、`memory_reserved` 5.164
+#:   再编一页额外吃 0.404（编码峰值 reserved 5.527）
+#:   ── 合计 6.231 GiB
+#:
+#: 旧项目日志里那个 `gpu_mem=5.07GB` 是 `memory_allocated`（纯权重），**漏掉了
+#: CUDA 上下文与 cuBLAS/cuDNN 句柄的 0.77 GiB**。门槛 5.5 比真实需求低 0.73 GiB，
+#: 照它放行会让模型起来后差一截，触发 OOM 或 WDDM 共享内存抖动（整机变卡，
+#: 正是本模块 docstring 里反复警告的那种后果）。
+#:
+#: 6.23 是**不可再压**的下限（不量化的话）：试过 `PYTORCH_CUDA_ALLOC_CONF=
+#: expandable_segments:True`，占用 6.231 → 6.230，那 0.678 GiB 不是碎片而是上下文
+#: 与句柄，换分配器无效。`WEMM_DIM` 512→256 也不省——省的是向量存储不是权重。
+WEMM_MIN_VRAM_GB = 6.3
+#: 等待其他 GPU 消费者让路的上限。原来 900s 长得离谱：期间界面只见「空闲显存
+#: 5.2GB < 需求 5.5GB」反复刷屏，宿主 120s 超时熔断后请求早已失败，服务端还在
+#: 干等。降到 60s：让路是**主动**发生的（`/evict` 软驱逐，或 bge/reranker 空闲
+#: 自动卸载，都是秒级），60s 还等不到基本就是"这块卡此刻就是装不下"，此时快速
+#: 失败并把所需/现有数字报回去，好过静默耗掉 15 分钟。
+WEMM_VRAM_WAIT_SECONDS = 60.0
 WEMM_UNLOAD_AFTER_SECONDS = 300  # 空闲卸载模型（保留子进程），0=不自动卸载
 WEMM_IDLE_EXIT_SECONDS = 1800  # 卸载后再空闲这么久，子进程自退出，0=常驻不退出
 
@@ -109,15 +133,21 @@ def _vram_free_gb(max_age: float = 5.0):
     return val
 
 
-def _wait_for_vram(min_free_gb: float, timeout_s: float = WEMM_VRAM_WAIT_SECONDS, poll_s: float = 10.0) -> bool:
+def _wait_for_vram(min_free_gb: float, timeout_s: float = WEMM_VRAM_WAIT_SECONDS, poll_s: float = 10.0) -> tuple[bool, float | None]:
+    """等空闲显存 ≥ min_free_gb。返回 `(够不够, 最后一次实测的空闲显存)`。
+
+    2026-09-29 改签名：以前只回 bool，显存不足时上层只能说"超时"，用户和 GUI
+    拿不到任何数字，只能在日志里翻。现在把最后一次探测到的空闲显存带回去，
+    报错信息里直接写明"需要 X GB、当前只有 Y GB"，GUI 才有东西可以显示。
+    """
     deadline = time.time() + timeout_s
     while True:
         free = _vram_free_gb(max_age=0.0)
         if free is None or free >= min_free_gb:
-            return True
+            return True, free
         if time.time() >= deadline:
-            return False
-        print(f"[wemm] 空闲显存 {free:.1f}GB < 需求 {min_free_gb:.1f}GB，等待其他模型让路...", file=sys.stderr)
+            return False, free
+        print(f"[wemm] 空闲显存 {free:.2f}GB < 需求 {min_free_gb:.2f}GB，等待其他模型让路...", file=sys.stderr)
         time.sleep(poll_s)
 
 
@@ -154,16 +184,63 @@ def _resolve_model_path(model_id: str) -> str:
     return model_id
 
 
-def _load_engine(model_id: str):
+class InsufficientVram(RuntimeError):
+    """显存不足，**并且带着具体数字**，供上层/GUI 如实转述给用户。
+
+    2026-09-29 新增。以前这里只 `raise RuntimeError("等待空闲显存 >= 5.5GB 超时")`，
+    用户在界面上看到的是「索引还在继续」，日志里是「空闲显存 5.2GB < 需求
+    5.5GB」，但**没有任何地方告诉他"你需要多少、现在有多少、差多少、怎么办"**，
+    只能自己翻日志猜。现在这两个数字是异常的一等公民。
+
+    `required_gb` 用的是本机实测标定后的 6.3（见 `WEMM_MIN_VRAM_GB` 的注释：
+    原来的 5.5 漏算了 CUDA 上下文与 cuBLAS 句柄，比真实需求低 0.73 GiB）。
+    """
+
+    def __init__(self, required_gb: float, free_gb: float | None) -> None:
+        self.required_gb = round(float(required_gb), 2)
+        self.free_gb = None if free_gb is None else round(float(free_gb), 2)
+        if self.free_gb is None:
+            detail = "当前空闲显存探测失败（装了 nvidia-smi 也没有），无法判断是否装得下"
+        else:
+            detail = f"需要 {self.required_gb} GB，当前只有 {self.free_gb} GB"
+        super().__init__(
+            f"显卡内存不足：{detail}。页级视觉导航（WEMM）本轮未运行，"
+            "文字索引不受影响。可关闭占显存的程序后重试，"
+            "或在设置里开启「强制加载页级视觉导航」再试（显存不足时可能失败）。"
+        )
+
+
+def _load_engine(model_id: str, *, force: bool = False):
     global _engine, _last_use
     with _ENGINE_LOCK:
         if _engine is not None and _engine["model_id"] == model_id:
             _last_use = time.time()
             return _engine
         # 显存互斥：其他 GPU 消费者在线时不硬抢——等它让路（空闲自动卸载 /
-        # evict 主动抢占），等不到就报错本条请求，绝不撑爆显存导致整机卡死。
-        if not _wait_for_vram(WEMM_MIN_VRAM_GB):
-            raise RuntimeError(f"等待空闲显存 >= {WEMM_MIN_VRAM_GB}GB 超时（其他模型占用中），本条请求未执行")
+        # evict 主动抢占），等不到就报出确切数字快速失败，绝不撑爆显存导致整机卡死。
+        #
+        # `force`（2026-09-29 新增，对应设置项 `wemm_force_load`）：用户在 GUI
+        # 明确选择"我知道风险，仍要试"时跳过这道门槛，直接尝试加载。风险是实的
+        # ——低于实测需求（6.23 GiB）时很可能 CUDA OOM，或者触发 WDDM 共享内存
+        # 溢出把整机拖卡（见本模块 docstring 反复警告的失败模式）。所以 force
+        # 只跳门槛、**不吞异常**：真 OOM 就让调用方看到明确的 OOM 报错，而不是
+        # 伪装成成功或静默截断。
+        if not force:
+            enough, free_now = _wait_for_vram(WEMM_MIN_VRAM_GB)
+            if not enough:
+                print(
+                    f"[wemm] 显存不足，跳过加载：需要 {WEMM_MIN_VRAM_GB}GB，"
+                    f"当前 {free_now if free_now is not None else '探测失败'}GB。"
+                    "本轮页级索引记为待重试，文字索引照常发布。",
+                    file=sys.stderr,
+                )
+                raise InsufficientVram(WEMM_MIN_VRAM_GB, free_now)
+        else:
+            print(
+                f"[wemm] 已开启强制加载：跳过 {WEMM_MIN_VRAM_GB}GB 显存门槛直接尝试"
+                "（显存不足会明确报错，不会伪装成功）",
+                file=sys.stderr,
+            )
         import torch
         from transformers import AutoModel, AutoProcessor
 
@@ -321,7 +398,7 @@ def build_messages(kind: str, content):
     raise ValueError(f"未知类型: {kind}")
 
 
-def _real_embed(kind: str, content, dim: int) -> list[float]:
+def _real_embed(kind: str, content, dim: int, *, force: bool = False) -> list[float]:
     try:
         import torch
         import torch.nn.functional as F
@@ -332,7 +409,7 @@ def _real_embed(kind: str, content, dim: int) -> list[float]:
         ) from exc
 
     model_id = os.environ.get("RAG_REDO_WEMM_MODEL", WEMM_MODEL_DEFAULT)
-    eng = _load_engine(model_id)
+    eng = _load_engine(model_id, force=force)
     if eng["supported"] and dim not in eng["supported"]:
         raise ValueError(f"不支持的维度 {dim}，支持 {eng['supported']}")
 
@@ -416,25 +493,76 @@ class Handler(http.server.BaseHTTPRequestHandler):
         kind = payload.get("kind")
         content = payload.get("content")
         dim = int(payload.get("dim") or WEMM_DIM_DEFAULT)
+        # `force` 对应设置项 wemm_force_load：用户明确选择"知道风险也要试"。
+        force = bool(payload.get("force"))
+        # ── 本地临时文件直传（2026-09-29 提速，见下）──
+        # 宿主与服务在同一台机器。旧的走法是宿主把 PNG 做 base64 塞进 JSON，服务端再
+        # 解 base64、把同样内容的 PNG 写到一个临时文件——因为模型的图像接口要的是
+        # **文件路径/URL 而不是原始字节**，所以像素在磁盘上白往返了一趟，中间还被
+        # `json.dumps` 转义 + `json.loads` 解析各走一遍（base64 还平白膨胀 33%）。
+        #
+        # 改法：宿主自己落临时文件，JSON 里只发路径字符串（几十字节）。隐私性质一字
+        # 未改——还是本机临时文件、用完即删、绝不出网（见 `_decode_image_to_tmpfile`
+        # 的注释）。
+        #
+        # 两种走法都留着：这是**长驻子进程**，宿主升级后它可能还是旧代码在跑（反之亦然），
+        # 老服务不认识 `path` 会回 400，宿主据此自动退回 base64（见 plugin.py）。
+        path = payload.get("path")
+        caller_owned = False
+        if kind == "image" and path:
+            path = str(path)
+            # 只认系统临时目录里的真实文件：这条 HTTP 通道本来只有宿主这一个调用方，
+            # 但它是个"把任意路径交给模型读文件"的接口，值得挡一道，避免哪天被
+            # 别的端口扫到就能读任意文件。
+            try:
+                resolved = os.path.realpath(path)
+                tmp_root = os.path.realpath(tempfile.gettempdir())
+                if not resolved.startswith(tmp_root + os.sep) or not os.path.isfile(resolved):
+                    raise ValueError("path 必须指向系统临时目录里已存在的文件")
+                content = resolved
+                caller_owned = True  # 文件归宿主所有，服务端不删
+            except (OSError, ValueError) as exc:
+                self._json(400, {"ok": False, "error": f"path 非法: {exc}"})
+                return
         if kind not in ("image", "text") or content is None:
-            self._json(400, {"ok": False, "error": "kind 必须是 image|text，content 必填"})
+            self._json(400, {"ok": False, "error": "kind 必须是 image|text，content 非空"})
             return
         _active_requests += 1
         try:
             _check_idle_unload()
-            if kind == "image":
+            # 直传路径时 content 已经是那份临时文件的路径，不是 base64——再解一次
+            # 会把路径字符串当图片数据，每一页都报“base64 解码失败”，页库一页也建不上。
+            if kind == "image" and not caller_owned:
                 content = self._decode_image_to_tmpfile(content)
             if os.environ.get("RAG_REDO_FAKE_WEMM"):
                 embedding = _fake_embed(kind, content, dim)
             else:
-                embedding = _real_embed(kind, content, dim)
+                embedding = _real_embed(kind, content, dim, force=force)
             _last_use = time.time()
             self._json(200, {"ok": True, "embedding": embedding, "dim": dim})
+        except InsufficientVram as exc:
+            # 显存不足单独回一个 reason 标记 + 两个数字：宿主侧要据此把
+            # 「需要多少 / 当前多少 / 差多少」原样转述给 GUI，塞进
+            # snapshot.progress.heartbeat_note 显示在进度条上。只回一句
+            # 错误文本的话，上层拿不到结构化数字，只能把整段文案塞进去。
+            self._json(
+                200,
+                {
+                    "ok": False,
+                    "reason": "vram",
+                    "required_gb": exc.required_gb,
+                    "free_gb": exc.free_gb,
+                    "error": str(exc),
+                },
+            )
         except Exception as exc:  # noqa: BLE001 - 子进程这一侧也不能让异常直接炸掉HTTP响应
             self._json(200, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
         finally:
             _active_requests -= 1
-            if kind == "image" and isinstance(content, str) and content.endswith(".png"):
+            # 只删**自己造**的临时文件。宿主直传路径时（caller_owned）文件归宿主，
+            # 服务端删了会跟宿主侧的清理打架；而且宿主可能还要把它留在队列里复用
+            # （见 plugin.py 的渲染线程）——那时候服务端先删就等于删掉了正在排队的页。
+            if kind == "image" and not caller_owned and isinstance(content, str) and content.endswith(".png"):
                 try:
                     os.unlink(content)
                 except OSError:

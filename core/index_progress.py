@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from .atomic import atomic_write_text, read_text_retry
+from .conversion_cache import format_round_summary
 from .runtime import PluginRuntime, PluginState
 from .singleton import FileByteLock, pid_alive
 
@@ -516,6 +517,14 @@ def _index_one_library(
                 name: int(getattr(report, name, 0))
                 for name in ("added", "changed", "removed", "unchanged", "retried")
             }
+            # 每轮一行“转换缓存”账（BC-19）：GUI 日志面板读的就是这份日志，开发者不开窗口
+            # 也能在这里看到这一轮转文字/页库各复用了多少、新做了多少、还缺多少。
+            conversion = getattr(report, "conversion", None)
+            if conversion is not None:
+                try:
+                    print(f"[{library_id}] {format_round_summary(conversion)}", flush=True)
+                except Exception:  # noqa: BLE001 - 日志写不进绝不影响已经完成的索引
+                    pass
         except Exception as exc:
             terminal_error = f"{type(exc).__name__}: {exc}"
             # 进度文件只留这一行摘要；完整堆栈和一行"哪个库失败了"写进 worker 日志

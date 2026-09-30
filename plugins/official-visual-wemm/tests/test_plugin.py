@@ -10,6 +10,7 @@ pymupdf渲染+Chroma读写这条链路本身通不通、检索排序对不对"�
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -24,28 +25,28 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import pymupdf  # noqa: E402
 
+from core.singleton import pid_alive  # noqa: E402
 from core.runtime import PluginRuntime, PluginState  # noqa: E402
+from core.subprocess_service import SubprocessServiceError  # noqa: E402
+
+# 插件包本身不在 sys.path 上（tests/run.py 按文件路径加载测试模块），沿用本文件
+# TestVisualWemmServerModelLookup 的同一惯例按路径加载，只为拿输出向量维度。
+_WEMM_PLUGIN_PATH = REPO_ROOT / "plugins" / "official-visual-wemm" / "official_visual_wemm" / "plugin.py"
+_spec = importlib.util.spec_from_file_location("wemm_plugin_under_test", _WEMM_PLUGIN_PATH)
+_wemm_plugin = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_wemm_plugin)
+WEMM_DIM = _wemm_plugin.WEMM_DIM
 
 
 def _process_is_gone(pid: int) -> bool:
-    """跨平台的"这个 pid 是不是真的没了"检查，理由同
-    tests/test_runtime.py 里同名函数——POSIX 的 os.kill(pid, 0) 信号-0
-    探测语义在 Windows 上不成立（直接抛 OSError 而不是
-    ProcessLookupError），得走 Win32 OpenProcess API。"""
-    if os.name == "nt":
-        import ctypes
+    """"这个 pid 是不是真的没了"：直接问 `core/singleton.py::pid_alive`（看进程是不是已经
+    结束），测试里不另写一份判断（AGENTS.md §4.5、§7）。
 
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return True
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    return False
+    以前这里各自写成“OpenProcess 打得开就算还活着”，在 Windows 上判不准：进程被杀掉之后，
+    只要别处还有人握着它的句柄，这个进程对象就还在、照样打得开，要过零点几秒才真正消失。
+    2026-10-01 在整套回归里抓到过：`stop()` 之后立刻查，退出码已经是 1（被 taskkill 杀掉），
+    却仍被判“还活着”，1 秒后再查就没了——“停止子进程”那条测试时好时坏就是这个原因。"""
+    return not pid_alive(pid)
 
 
 def _make_pdf(path: Path, page_texts: list[str]) -> None:
@@ -182,6 +183,62 @@ class TestVisualWemmPlugin(unittest.TestCase):
         self.assertEqual(states[0].status, "indexed")
         self.assertEqual(states[0].pages, (1, 2))
         self.assertFalse(self.rt.plugins["official-visual-wemm"].instance._handle)
+
+    # ---- 转换缓存看得见（BC-19）-----------------------------------------------
+
+    def test_page_states_carry_the_total_page_count_and_the_round_that_built_them(self):
+        """清单要写“28/36 页”、列出缺哪几页，还要分清页向量是这轮新建的还是沿用上一轮的。"""
+        self.instance.index_library("lib1", self.vault, ["doc.pdf"], generation="g1")
+        self.assertTrue(self.instance._generations.commit("lib1", "g1"))  # noqa: SLF001
+        first = self.instance.graph_page_states("lib1", "g1")
+        self.assertEqual((first[0].page_count, first[0].built_in), (2, "g1"))
+        self.instance.index_library(
+            "lib1", self.vault, ["doc.pdf"], generation="g2", changed_paths=[], previous_generation="g1",
+        )
+        again = self.instance.graph_page_states("lib1", "g2")
+        # 没重编：即使压缩把页向量搬进了新段，也还记着是 g1 编的
+        self.assertEqual((again[0].page_count, again[0].built_in), (2, "g1"))
+
+    def test_navigate_can_be_limited_to_one_pdf(self):
+        """“试搜”只在这一份 PDF 的页里找，别的 PDF 的页一律不出现。"""
+        _make_pdf(self.vault / "other.pdf", ["另一份第一页 gamma", "另一份第二页 delta", "另一份第三页"])
+        self.instance.index_library("lib1", self.vault, ["doc.pdf", "other.pdf"])
+        everything = self.instance.navigate("lib1", "查询", top_k=10)
+        self.assertEqual({hit.path for hit in everything}, {"doc.pdf", "other.pdf"})
+        only = self.instance.navigate("lib1", "查询", top_k=10, path="other.pdf")
+        self.assertEqual([hit.path for hit in only], ["other.pdf"] * 3)
+        self.assertEqual({hit.page_index for hit in only}, {0, 1, 2})
+        scores = [hit.score for hit in only]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        # 同一页单独查和全库查，分数是同一把尺子
+        full = {(hit.path, hit.page_index): hit.score for hit in everything}
+        for hit in only:
+            self.assertAlmostEqual(hit.score, full[(hit.path, hit.page_index)], places=3)
+        self.assertEqual(self.instance.navigate("lib1", "查询", top_k=10, path="不存在.pdf"), [])
+
+    def test_render_page_png_draws_one_page_on_the_cpu_without_the_service(self):
+        self.rt.disable("official-visual-wemm")
+        png = self.instance.render_page_png(self.vault / "doc.pdf", 2, max_side=200)
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        pixmap = pymupdf.Pixmap(png)
+        self.assertLessEqual(max(pixmap.width, pixmap.height), 200)
+        self.assertGreaterEqual(max(pixmap.width, pixmap.height), 190)
+        with self.assertRaises(ValueError):
+            self.instance.render_page_png(self.vault / "doc.pdf", 3)
+        with self.assertRaises(ValueError):
+            self.instance.render_page_png(self.vault / "doc.pdf", 0)
+        with self.assertRaises(ValueError):
+            self.instance.render_page_png(self.vault / "没有这个文件.pdf", 1)
+        self.assertFalse(self.instance._handle)  # noqa: SLF001 - 画小图不拉起看图服务
+
+    def test_cache_info_says_where_the_page_library_lives_and_what_it_costs(self):
+        info = self.instance.cache_info()
+        self.assertTrue(Path(info["dir"]).is_dir())
+        self.assertEqual(info["bytes_per_page"], WEMM_DIM * 4 * 2 + 512)
+        server = TestVramGateIsReportedTruthfully._load_server_module()
+        self.assertEqual(info["vram_gb"], server.WEMM_MIN_VRAM_GB)
+        # 插件对外说的“闲多久自动卸载”必须等于服务端真实计时，否则用户被告知错的时间
+        self.assertEqual(info["idle_unload_seconds"], server.WEMM_UNLOAD_AFTER_SECONDS)
 
     def test_status_before_any_indexing_has_no_libraries(self):
         status = self.instance.status()
@@ -790,6 +847,359 @@ class TestServerExitsWhenItsHostIsGone(unittest.TestCase):
         host.wait(timeout=10)
         gone, alive = psutil.wait_procs(tree, timeout=30)
         self.assertEqual([p.pid for p in alive], [], "宿主没了之后服务进程树必须自己退出")
+
+
+class TestVisualIndexStopsWhenTheServiceIsUnreachable(unittest.TestCase):
+    """服务进程起来了、但页级调用打不通时，本轮必须立刻收手（2026-09-29 真机事故复现）。
+
+    真机证据（`data-real/index_worker.log` + `data-real/visual_wemm/wemm_server.log`）：
+    WEMM 子进程被成功拉起，`_ensure_alive` 返回 True，但服务端 `_wait_for_vram(5.5GB)`
+    一直等不到显存（8GB 卡上 Windows 与桌面应用本身就吃掉约 2.6GB，把全部模型卸干净
+    后空闲也只有约 5.1GB < 5.5GB），随后子进程连接被拒。此时页级 `embed` 每页都抛
+    `SubprocessServiceError`，而旧代码只 `continue` 换下一页——78 份 PDF × 每份几十页
+    ＝ 几千次注定失败的调用，索引进程假活半小时；用户以为卡死而中断，整轮 generation
+    从未发布（`core/pipeline.py` 的 manifest 写入与 commit 都在视觉阶段之后），
+    已经算好的文字索引全部丢失。
+
+    恢复旧项目 `obsidian-rag/wemm_indexer.py:257-278`（问题46「单轮单次」）的语义：
+    **服务不可达不是"这一页不行"，而是"本轮服务不可用"**——立刻终止本轮页级索引，
+    把剩余文件记成可重试的失败终态，让文字索引照常发布，下轮自动重试。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._fake_backup = os.environ.get("RAG_REDO_FAKE_WEMM")
+        os.environ["RAG_REDO_FAKE_WEMM"] = "1"
+        self._skip_backup = os.environ.get("RAG_REDO_SKIP_ENV_BOOTSTRAP")
+        os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = "1"
+        self.addCleanup(self._restore_env)
+
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        # 三份各 2 页：逐页空转的话是 6 次 embed 调用，本轮就该在第 1 次后收手。
+        for name in ("a.pdf", "b.pdf", "c.pdf"):
+            _make_pdf(self.vault / name, [f"{name} 第一页", f"{name} 第二页"])
+
+        self.rt = PluginRuntime(
+            REPO_ROOT / "plugins",
+            state_file=self.tmp / "plugins_state.json",
+            data_dir=self.tmp / "data",
+        )
+        self.rt.scan()
+        self.rt.load("official-visual-wemm")
+        self.rt.enable("official-visual-wemm")
+        self.instance = self.rt.plugins["official-visual-wemm"].instance
+
+        def _cleanup_runtime() -> None:
+            if self.rt.plugins["official-visual-wemm"].state.value == "enabled":
+                self.rt.disable("official-visual-wemm")
+            if self.rt.plugins["official-visual-wemm"].state.value == "disabled":
+                self.rt.unload("official-visual-wemm")
+
+        self.addCleanup(_cleanup_runtime)
+
+    def _restore_env(self) -> None:
+        if self._fake_backup is None:
+            os.environ.pop("RAG_REDO_FAKE_WEMM", None)
+        else:
+            os.environ["RAG_REDO_FAKE_WEMM"] = self._fake_backup
+        if self._skip_backup is None:
+            os.environ.pop("RAG_REDO_SKIP_ENV_BOOTSTRAP", None)
+        else:
+            os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = self._skip_backup
+
+    def test_an_unreachable_service_stops_the_round_instead_of_failing_every_page(self) -> None:
+        """服务不可达时只该试一次，不是每页试一次。"""
+        with patch.object(
+            self.instance._handle,  # noqa: SLF001 - 复现子进程被拒的宿主视角
+            "call",
+            side_effect=SubprocessServiceError("connection refused"),
+        ) as call_mock:
+            self.instance.index_library(
+                "lib1", self.vault, ["a.pdf", "b.pdf", "c.pdf"], generation="g1"
+            )
+        self.assertEqual(
+            call_mock.call_count,
+            1,
+            f"服务不可达后仍发起了 {call_mock.call_count} 次页级调用（3 份 × 2 页 = 6），"
+            "会把整库页数乘以失败次数空转，正是 2026-09-29 假活半小时的成因",
+        )
+
+    def test_every_remaining_file_becomes_a_retryable_failed_entry(self) -> None:
+        """本轮没轮到的文件必须留下失败终态，下轮才会自动重试（不是静默消失）。"""
+        with patch.object(
+            self.instance._handle,  # noqa: SLF001
+            "call",
+            side_effect=SubprocessServiceError("connection refused"),
+        ):
+            self.instance.index_library(
+                "lib1", self.vault, ["a.pdf", "b.pdf", "c.pdf"], generation="g1"
+            )
+        state = self.instance._read_state("lib1", "g1")["files"]  # noqa: SLF001
+        self.assertEqual(set(state), {"a.pdf", "b.pdf", "c.pdf"})
+        for path, record in state.items():
+            self.assertEqual(record["status"], "failed", path)
+            self.assertIn("WEMM", str(record["failure_reason"]), path)
+            self.assertEqual(record["page_ids"], [], path)
+
+    def test_a_page_that_merely_fails_to_encode_still_moves_to_the_next_page(self) -> None:
+        """区分两件事：服务健康、只是这一页编码不出来 → 继续下一页，不熔断。
+
+        这是熔断的边界：把"单页失败"也当成"服务挂了"会让一次手抖毁掉整轮页级索引。
+        """
+        calls: list[int] = []
+
+        def _first_page_fails_only(method: str, payload: dict, timeout: float = 0.0) -> dict:
+            calls.append(1)
+            if len(calls) == 1:
+                return {"ok": False, "error": "这一页渲染炸了"}
+            return {"ok": True, "embedding": [0.0] * WEMM_DIM}
+
+        with patch.object(self.instance._handle, "call", side_effect=_first_page_fails_only):  # noqa: SLF001
+            self.instance.index_library("lib1", self.vault, ["a.pdf", "b.pdf"], generation="g1")
+
+        state = self.instance._read_state("lib1", "g1")["files"]  # noqa: SLF001
+        # a.pdf 首页失败但第二页成功 → partial；b.pdf 两页都成功 → indexed
+        self.assertEqual(state["a.pdf"]["status"], "partial")
+        self.assertEqual(state["b.pdf"]["status"], "indexed")
+        self.assertEqual(len(state["b.pdf"]["page_ids"]), 2)
+
+    def test_pages_indexed_before_the_outage_are_kept(self) -> None:
+        """已经编好的页不能因为后面服务挂了就一起判失败（宁可 partial 不要丢）。"""
+        state: list[int] = []
+
+        def _dies_on_the_third_call(method: str, payload: dict, timeout: float = 0.0) -> dict:
+            state.append(1)
+            if len(state) == 3:
+                raise SubprocessServiceError("connection refused")
+            return {"ok": True, "embedding": [0.0] * WEMM_DIM}
+
+        with patch.object(self.instance._handle, "call", side_effect=_dies_on_the_third_call):  # noqa: SLF001
+            self.instance.index_library("lib1", self.vault, ["a.pdf", "b.pdf"], generation="g1")
+
+        files = self.instance._read_state("lib1", "g1")["files"]  # noqa: SLF001
+        self.assertEqual(len(files["a.pdf"]["page_ids"]), 2, "a.pdf 两页都编好了，不该被抹掉")
+        self.assertEqual(files["a.pdf"]["status"], "indexed")
+        self.assertEqual(files["b.pdf"]["status"], "failed")
+
+
+class TestVramGateIsReportedTruthfully(unittest.TestCase):
+    """显存不足必须**带数字、可强制、且不静默**（2026-09-29 真机事故）。
+
+    真机经过：WEMM 子进程环境装成了 CPU-only torch → 显存探测回退 nvidia-smi
+    → WDDM 笔记本上 nvidia-smi 低报约 5.2 GiB → 页级索引一直卡在「空闲显存
+    5.4GB < 需求 5.5GB」静默等待 → 用户中断 → 整轮 generation 从未发布。
+    修好环境后实测出真实需求是 **6.231 GiB**（加载 5.842 + 编一页 0.404），
+    而门槛还写着 5.5 —— 比真实需求低 0.73 GiB，照它放行反而会 OOM。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._fake_backup = os.environ.get("RAG_REDO_FAKE_WEMM")
+        os.environ["RAG_REDO_FAKE_WEMM"] = "1"
+        self._skip_backup = os.environ.get("RAG_REDO_SKIP_ENV_BOOTSTRAP")
+        os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = "1"
+        self.addCleanup(self._restore_env)
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        _make_pdf(self.vault / "a.pdf", ["a 第一页", "a 第二页"])
+        _make_pdf(self.vault / "b.pdf", ["b 第一页", "b 第二页"])
+        self.rt = PluginRuntime(
+            REPO_ROOT / "plugins",
+            state_file=self.tmp / "plugins_state.json",
+            data_dir=self.tmp / "data",
+        )
+        self.rt.scan()
+        self.rt.load("official-visual-wemm")
+        self.rt.enable("official-visual-wemm")
+        self.instance = self.rt.plugins["official-visual-wemm"].instance
+
+        def _cleanup_runtime() -> None:
+            if self.rt.plugins["official-visual-wemm"].state.value == "enabled":
+                self.rt.disable("official-visual-wemm")
+            if self.rt.plugins["official-visual-wemm"].state.value == "disabled":
+                self.rt.unload("official-visual-wemm")
+
+        self.addCleanup(_cleanup_runtime)
+
+    def _restore_env(self) -> None:
+        if self._fake_backup is None:
+            os.environ.pop("RAG_REDO_FAKE_WEMM", None)
+        else:
+            os.environ["RAG_REDO_FAKE_WEMM"] = self._fake_backup
+        if self._skip_backup is None:
+            os.environ.pop("RAG_REDO_SKIP_ENV_BOOTSTRAP", None)
+        else:
+            os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = self._skip_backup
+
+    def test_the_gate_is_calibrated_above_the_measured_need(self):
+        """门槛必须高于实测需求 6.231 GiB——照 5.5 放行会 OOM，不是保守是漏算。
+
+        实测（tools/probe_wemm_vram.py，本机 RTX 5060 Laptop / torch 2.11.0+cu128）：
+        加载吃 5.842、编一页再吃 0.404，合计 6.231 GiB。旧值 5.5 漏算了
+        CUDA 上下文与 cuBLAS 句柄的 0.77 GiB。
+        """
+        plugin_mod = sys.modules[type(self.instance).__module__]
+        server = self._load_server_module()
+        self.assertGreaterEqual(
+            server.WEMM_MIN_VRAM_GB,
+            6.231,
+            "门槛低于实测需求 6.231 GiB，会让模型起来后差一截→OOM 或 WDDM 共享内存溢出",
+        )
+        # 插件与 server 各写一份常量（子进程独立解释器，import 不到插件模块），
+        # 但对外显示的数字必须一致，否则用户看到的"需要多少"和真实门槛会打架。
+        self.assertEqual(
+            plugin_mod.WEMM_MIN_VRAM_GB,
+            server.WEMM_MIN_VRAM_GB,
+            "插件显示用的门槛与 server 真实门槛不一致，用户会被告知错的数字",
+        )
+
+    def test_waiting_for_vram_does_not_outlive_the_host_request(self):
+        """等待上限必须远短于宿主的调用超时，否则又是一轮静默假活。
+
+        宿主 `/embed` 的调用超时是 180s（plugin.py），服务端只该等一小段：
+        让路是**主动**发生的（/evict 软驱逐、空闲自动卸载，都是秒级），
+        等 60s 还不动基本就是"这块卡此刻装不下"，此时快速失败并报数字，
+        好过静默耗掉 15 分钟（旧的 900s 就是这么让真机干等半小时的）。
+        """
+        server = self._load_server_module()
+        self.assertLessEqual(
+            server.WEMM_VRAM_WAIT_SECONDS,
+            180.0,
+            "服务端等待上限必须不超过宿主调用超时，否则宿主已放弃、服务还在空等",
+        )
+
+    def test_insufficient_vram_names_the_two_numbers(self):
+        """异常必须同时带着"需要多少"和"现在多少"，否则上层只能显示一句空话。"""
+        server = self._load_server_module()
+        exc = server.InsufficientVram(6.3, 5.2)
+        self.assertEqual(exc.required_gb, 6.3)
+        self.assertEqual(exc.free_gb, 5.2)
+        text = str(exc)
+        self.assertIn("6.3", text)
+        self.assertIn("5.2", text)
+        # 探测失败也是一种真实状态，不能假装有数字
+        self.assertIsNone(server.InsufficientVram(6.3, None).free_gb)
+
+    def test_status_reports_the_gate_and_the_last_block(self):
+        """GUI 要能读到"需要多少 / 上次被挡时有多少 / 是否开了强制"，用不着翻日志。"""
+        status = self.instance.status()
+        vram = status["vram"]
+        self.assertEqual(vram["required_gb"], 6.3)
+        self.assertIsNone(vram["blocked"], "刚起来时没被挡过")
+        self.assertFalse(vram["force_load"], "默认不强制加载")
+        # 没被挡过时不能凭空编数字
+        self.instance._vram_blocked = {"required_gb": 6.3, "free_gb": 5.2, "forced": False}
+        again = self.instance.status()["vram"]
+        self.assertEqual(again["blocked"]["free_gb"], 5.2)
+        self.assertFalse(again["blocked"]["forced"])
+
+    def test_force_load_is_off_by_default_and_reads_the_setting_live(self):
+        """默认关；开设置立刻生效（长驻进程里用户中途改设置必须立刻管用）。"""
+        self.assertFalse(self.instance.force_load_enabled())
+        self.rt.settings.set("wemm_force_load", True)
+        self.assertTrue(self.instance.force_load_enabled())
+        self.rt.settings.set("wemm_force_load", False)
+        self.assertFalse(self.instance.force_load_enabled())
+
+    def test_a_vram_block_is_remembered_with_its_numbers(self):
+        """服务端回 reason=vram 时，插件要把数字记下来给 GUI，不能只丢一句 error。"""
+        self.instance._handle.call(  # noqa: SLF001
+            "embed",
+            {"kind": "image", "content": "x", "dim": 512},
+            timeout=5.0,
+        )
+        # 让服务回显存不足
+        with patch.object(
+            self.instance._handle,  # noqa: SLF001
+            "call",
+            return_value={
+                "ok": False,
+                "reason": "vram",
+                "required_gb": 6.3,
+                "free_gb": 5.2,
+                "error": "显卡内存不足",
+            },
+        ):
+            self.instance.index_library("lib1", self.vault, ["a.pdf"], generation="g1")
+        self.assertIsNotNone(self.instance._vram_blocked, "显存被挡下却没有记录")
+        self.assertEqual(self.instance._vram_blocked["required_gb"], 6.3)
+        self.assertEqual(self.instance._vram_blocked["free_gb"], 5.2)
+        # 文字索引的页级条目仍要留下可重试终态，下一轮才会自动重试
+        state = self.instance._read_state("lib1", "g1")["files"]  # noqa: SLF001
+        self.assertEqual(state["a.pdf"]["status"], "failed")
+
+    def test_page_level_progress_is_reported_so_the_ui_is_not_frozen(self) -> None:
+        """页级进度必须上报（2026-09-29 真机：编 7645 页的 30 分钟界面一动不动）。
+
+        这一段的口径是文字索引的 `files_done/files_total`，那两个数在进视觉阶段前就
+        已经是 78/78、100%，所以界面上一个数都不会变——用户看到的就是"卡死"。
+        旧项目有页级进度回调（`wemm_indexer.py` 问题47），移植时漏了，这里补回来。
+
+        断言三件事：页总数数得对、编过的页会累加上报、上报回调炸了不许影响页级索引。
+        """
+        seen: list[tuple[int, int, str]] = []
+
+        def _progress(pages_done: int, pages_total: int, current_path: str = "") -> None:
+            seen.append((pages_done, pages_total, current_path))
+
+        self.instance.index_library(
+            "lib1", self.vault, ["a.pdf", "b.pdf"], generation="g1", progress=_progress
+        )
+        self.assertTrue(seen, "一次都没上报——界面会完全看不到这一段在推进")
+        # 两个 PDF 各 2 页 = 4 页总数
+        self.assertEqual(seen[-1][1], 4, f"页总数数错了：{seen[-1]}")
+        # 已编页数是累计值且不倒退，末值应等于成功编码的页数
+        done_values = [s[0] for s in seen]
+        self.assertEqual(done_values, sorted(done_values), f"累计值倒退了：{done_values}")
+        self.assertGreater(done_values[-1], 0, "跑完了却一页都没计入")
+        # 当前文件名要带上，用户才知道在编哪一份
+        self.assertTrue(any(s[2] for s in seen), "上报里没有当前文件名")
+
+    def test_a_broken_progress_callback_never_breaks_page_indexing(self) -> None:
+        """进度上报是锦上添花：回调抛异常只该丢掉这次上报，不该带崩页级索引。"""
+        def _boom(*a, **kw):
+            raise RuntimeError("进度回调坏了")
+
+        self.instance.index_library(
+            "lib1", self.vault, ["a.pdf"], generation="g1", progress=_boom
+        )
+        state = self.instance._read_state("lib1", "g1")["files"]  # noqa: SLF001
+        self.assertEqual(state["a.pdf"]["status"], "indexed")
+
+    def test_omitting_progress_still_works(self) -> None:
+        """不传 progress（老插件/老调用方）不许崩——它是可选参数。"""
+        self.instance.index_library("lib1", self.vault, ["a.pdf"], generation="g1")
+        state = self.instance._read_state("lib1", "g1")["files"]  # noqa: SLF001
+        self.assertEqual(state["a.pdf"]["status"], "indexed")
+
+    def test_progress_is_not_written_once_per_page(self) -> None:
+        """上报必须按时间节流：逐页写进度文件会让磁盘 IO 变成瓶颈。
+
+        实测吞吐 12~15 页/秒，即每秒 12~15 次写盘；不节流的话光写进度就比编码还忙。
+        """
+        seen: list[tuple[int, int, str]] = []
+        self.instance.index_library(
+            "lib1", self.vault, ["a.pdf"], generation="g1",
+            progress=lambda d, t, p="": seen.append((d, t, p)),
+        )
+        # a.pdf 只有 2 页，一次 _report(force=True) 就够；有 2 次以上说明没节流到位
+        self.assertLessEqual(len(seen), 2, f"2 页却上报了 {len(seen)} 次，没节流")
+
+    @staticmethod
+    def _load_server_module():
+        import importlib.util
+
+        path = (
+            REPO_ROOT / "plugins" / "official-visual-wemm"
+            / "official_visual_wemm" / "server.py"
+        )
+        spec = importlib.util.spec_from_file_location("wemm_server_vram_gate", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
 
 
 if __name__ == "__main__":

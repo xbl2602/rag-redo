@@ -22,8 +22,11 @@ from dataclasses import dataclass, field, replace as dataclasses_replace
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from .contracts import Chunk, DocumentContent, ExtractedDocument, GraphResponse, LibraryFreshness, LibrarySummary, PageHit, PreviewExtraction, QueryExpansion, SampledChunk, SearchAdviceInput, SearchResponse, SearchResult, SemanticGraphResponse, VisualPageState
+from .contracts import Chunk, ConversionCacheLibrary, ConversionRoundSummary, DocumentContent, ExtractedDocument, FileVectorSet, GraphResponse, LibraryFreshness, LibrarySummary, OverviewMapResponse, PageHit, PreviewExtraction, QueryExpansion, SampledChunk, SearchAdviceInput, SearchResponse, SearchResult, SemanticGraphResponse, VisualPageState
 from .graph import build_graph, select_semantic_edges
+from .overview_map import OVERVIEW_LAYOUT_VERSION, build_overview, chunk_groups_from_manifest
+from .conversion_cache import PLAIN_TEXT_EXTENSIONS, build_library_report, render_catalog, round_summary
+from .atomic import atomic_write_text
 from .extract_cache import ExtractCache
 from . import index_integrity
 from .index_failures import IndexFailuresStore
@@ -32,8 +35,8 @@ from .index_progress import IndexProgressEvent, IndexStartResult, IndexWorkerMan
 from .library_key import library_storage_key
 from .note_relations import NoteRelationsStore, extract_wikilink_targets
 from .text_cleaning import (TEXT_PIPELINE_VERSION, build_anchor_context, clean_wikilinks,
-                            extract_frontmatter, strip_boilerplate_lines, strip_dead_image_refs,
-                            strip_page_number_lines, strip_sidecar_noise)
+                            extract_frontmatter, flatten_html_tables, strip_boilerplate_lines,
+                            strip_dead_image_refs, strip_page_number_lines, strip_sidecar_noise)
 from .runtime import PluginRuntime, PluginState
 
 
@@ -67,6 +70,12 @@ SKIP_MISSING_ROOT = "library-root-missing"
 _EMBED_SLICE = 64
 #: 向量库写入的缓冲上限（块数）：攒够一批再 upsert，与压缩段用的 1000 一致。
 _WRITE_FLUSH_CHUNKS = 1000
+#: 不进转换暂存的格式：纯文本读原文件和读暂存一样快，存一份只是白占磁盘。
+_STASH_SKIP_EXTENSIONS = PLAIN_TEXT_EXTENSIONS
+#: 扫描件合批：一次最多攒几份交给本机 OCR（子进程再按页数上限细分，见 official-ocr-mineru-local）。
+_EXTRACT_BATCH_FILES = 8
+#: 攒一批时最多往后看几份要提取的 PDF（有文字层的在这一步就逐份转掉，别一口气把整库都转了）。
+_EXTRACT_LOOKAHEAD_FILES = 32
 
 
 @dataclass
@@ -279,6 +288,9 @@ class IndexReport:
     #: 计数会让调用方无法回答"这轮到底有没有文件被推迟"，也会让
     #: `deferred > 0` 触发"下轮一定重试"的错误预期。
     skip_reason: str | None = None
+    #: 本轮结束时的“转换缓存”一行账（转文字/页库各复用、新做、还缺多少，BC-19）；
+    #: 索引 worker 把它写进 index_worker.log。算不出来（或本轮整库跳过）时为 None。
+    conversion: ConversionRoundSummary | None = None
 
     @property
     def skipped(self) -> bool:
@@ -326,6 +338,8 @@ class Pipeline:
         self._note_relations = NoteRelationsStore(runtime.data_dir / "note_relations")
         self._index_failures = IndexFailuresStore(runtime.data_dir / "index_failures")
         self._graph_semantic_cache: tuple[tuple[object, ...], SemanticGraphResponse] | None = None
+        # 只留最近一次的总览结果（几百 KB）；不缓存文件向量本身——上万个文件的 1024 维向量要几十 MB 内存
+        self._overview_cache: tuple[tuple[object, ...], OverviewMapResponse] | None = None
 
     # ---- 插件解析 --------------------------------------------------------
 
@@ -361,34 +375,64 @@ class Pipeline:
         return self._plugin(plugin_id)
 
     def _extract(self, library_id: str, path: str, root: Path) -> ExtractedDocument:
+        result, _paused_at = self._run_extract_chain(library_id, path, root)
+        assert result is not None
+        return result
+
+    def _run_extract_chain(
+        self,
+        library_id: str,
+        path: str,
+        root: Path,
+        *,
+        start: int = 0,
+        pause_before_batch: bool = False,
+    ) -> tuple[ExtractedDocument | None, int | None]:
+        """按提取链从第 `start` 个提供者开始试，返回（结果，暂停位置）。
+
+        链式尝试：文字层提取器先试，折叠成 "scanned" 的交给后面的 OCR 提供者；第一个产出
+        正文的结果胜出，都没产出就返回最后一个结果。`pause_before_batch=True` 时，走到第一个
+        能合批（有 `extract_many`）且启用中的提供者就停下，返回（此前最后一个结果或 None，
+        它在链里的位置），由调用方合批后从“位置+1”接着走——链的顺序与规则只有这一处实现。"""
         ext = Path(path).suffix.lstrip(".").lower()
-        provider_ids = self.runtime.registry.providers_of(f"extractor:{ext}")
+        provider_ids = sorted(self.runtime.registry.providers_of(f"extractor:{ext}"))
         if not provider_ids:
-            return ExtractedDocument(
-                library_id=library_id,
-                path=path,
-                text=None,
-                failure_reason=f"没有插件能处理 .{ext} 格式",
-                extracted_by="core.pipeline",
-                extractor_version="-",
-                content_hash="",
+            return (
+                ExtractedDocument(
+                    library_id=library_id,
+                    path=path,
+                    text=None,
+                    failure_reason=f"没有插件能处理 .{ext} 格式",
+                    extracted_by="core.pipeline",
+                    extractor_version="-",
+                    content_hash="",
+                ),
+                None,
             )
         last_result: ExtractedDocument | None = None
-        # 链式尝试：目前每种格式通常只有一个 provider；Phase 2 起 OCR 插件
-        # 也会认领同一个 extractor:pdf 点（处理文字层提取器折叠成
-        # "scanned:"的文件），届时"文字层先试、失败了交给OCR"就是这条链
-        # 的自然延伸，不需要重新设计这一层。
-        for plugin_id in sorted(provider_ids):
+        for index in range(start, len(provider_ids)):
+            extractor = self._plugin(provider_ids[index])
+            active = getattr(extractor, "is_active", None)
+            if callable(active) and not active():
+                continue
+            if pause_before_batch and callable(getattr(extractor, "extract_many", None)):
+                return last_result, index
+            result = extractor.extract(library_id, path, root)
+            last_result = result
+            if result.text is not None:
+                return result, None
+        return last_result, None
+
+    def _batch_extractor_active(self, extension: str) -> bool:
+        """这种格式的提取链上有没有启用中的、能合批的提供者（目前只有本机 MinerU）。"""
+        for plugin_id in self.runtime.registry.providers_of(f"extractor:{extension}"):
             extractor = self._plugin(plugin_id)
             active = getattr(extractor, "is_active", None)
             if callable(active) and not active():
                 continue
-            result = extractor.extract(library_id, path, root)
-            last_result = result
-            if result.text is not None:
-                return result
-        assert last_result is not None
-        return last_result
+            if callable(getattr(extractor, "extract_many", None)):
+                return True
+        return False
 
     def preview_extract(self, path: str, *, backend: str = "") -> "PreviewExtraction":
         """提取试验台：对**任意**本地文件跑一次提取，不写提取缓存、不落
@@ -514,23 +558,37 @@ class Pipeline:
             routes.append(f"{plugin_id}:{version}")
         return tuple(routes)
 
+    def _extract_cache_candidates(self, library_id: str, path: str, segments: list[str]):
+        """按“读正文”的查找顺序列出这份文件可能的缓存位置：新 segment 优先，同一 segment 里按
+        提取器优先级；非 PDF 再兜底找不带提取器名的旧式文件。读正文和“转换缓存”清单（BC-19）
+        都走这一处，保证清单里说的“存在哪”就是读正文真正读的那一份。"""
+        extension = Path(path).suffix.lstrip(".").lower()
+        routes = self._extractor_cache_routes(extension)
+        for segment in reversed(segments):
+            for route in routes:
+                yield self._extract_cache.locate_path(library_id, path, route, generation=segment)
+            if not routes or extension != "pdf":
+                yield self._extract_cache.locate_path(library_id, path, generation=segment)
+
     def _read_extract_cache(
         self,
         library_id: str,
         path: str,
         segments: list[str],
     ) -> str | None:
-        extension = Path(path).suffix.lstrip(".").lower()
-        routes = self._extractor_cache_routes(extension)
-        for segment in reversed(segments):
-            if routes:
-                text = self._extract_cache.read_preferred(library_id, path, routes, generation=segment)
-                if text is None and extension != "pdf":
-                    text = self._extract_cache.read(library_id, path, generation=segment)
-            else:
-                text = self._extract_cache.read(library_id, path, generation=segment)
-            if text is not None:
-                return text
+        for candidate in self._extract_cache_candidates(library_id, path, segments):
+            if not candidate.is_file():
+                continue
+            try:
+                return candidate.read_text(encoding="utf-8")
+            except OSError:
+                continue
+        return None
+
+    def _locate_extract_cache(self, library_id: str, path: str, segments: list[str]) -> Path | None:
+        for candidate in self._extract_cache_candidates(library_id, path, segments):
+            if candidate.is_file():
+                return candidate
         return None
 
     def _extractor_capabilities(self) -> dict[str, list[list[str]]]:
@@ -565,6 +623,20 @@ class Pipeline:
                 if point.startswith("extractor:"):
                     versions.setdefault(point, []).append([plugin_id, str(manifest.version)])
         return versions
+
+    def _stash_routes(self, extension: str) -> list[str]:
+        """转换暂存可以认的路由：这种格式**装着的**全部提取器的“插件:版本”，顺序同
+        `_extractor_cache_routes`。按装着的而不是这一轮起来了的算——暂存的正文是那个版本的
+        代码产出的，本机 MinerU 这一轮没起来，并不妨碍用它上一轮已经转好的结果。"""
+        entries = self._extractor_code_versions().get(f"extractor:{extension}", [])
+        preferred = (
+            ("official-ocr-mineru-cloud", "official-ocr-mineru-local", "official-extractor-pdf-text")
+            if extension == "pdf"
+            else ()
+        )
+        order = {plugin_id: index for index, plugin_id in enumerate(preferred)}
+        ordered = sorted(entries, key=lambda entry: (order.get(entry[0], len(order)), entry[0]))
+        return [f"{plugin_id}:{version}" for plugin_id, version in ordered]
 
     def _pipeline_signatures(self) -> dict[str, list[list[str]]]:
         signatures: dict[str, list[list[str]]] = dict(self._extractor_code_versions())
@@ -1109,6 +1181,151 @@ class Pipeline:
                 for chunk_id in plan["old"].get("chunk_ids", []):
                     lexical.remove_chunk(library_id, chunk_id, generation=generation)
 
+        def _stash_usable(plan: dict) -> bool:
+            return bool(plan.get("content_hash")) and (
+                Path(str(plan["path"])).suffix.lower().lstrip(".") not in _STASH_SKIP_EXTENSIONS
+            )
+
+        #: 这一轮真的调用了提取器的文件（合批、单份都算；沿用正文缓存/转换暂存的不算）。
+        #: 每轮日志“转文字 复用/新转/缺”靠它区分复用和新转（BC-19）。
+        fresh_paths: set[str] = set()
+
+        def _stash_result(plan: dict, doc: ExtractedDocument) -> None:
+            # 三条提取路径（合批预取、合批落单、逐份）拿到新结果都经过这里，在这里记“新转”
+            fresh_paths.add(str(plan["path"]))
+            if not _stash_usable(plan) or doc.text is None:
+                return
+            try:
+                self._extract_cache.write_stash(
+                    library_id, str(plan["content_hash"]), f"{doc.extracted_by}:{doc.extractor_version}", doc.text
+                )
+            except (OSError, ValueError) as exc:
+                # 暂存只是“停下不白干”的保险，写不进去不影响本轮结果
+                logging.getLogger("rag_redo.core.pipeline").info("转换暂存写入失败（忽略）：%s: %s", plan["path"], exc)
+
+        def _stashed_doc(plan: dict) -> ExtractedDocument | None:
+            if fresh_extract or not _stash_usable(plan):
+                return None
+            path = str(plan["path"])
+            extension = Path(path).suffix.lower().lstrip(".")
+            hit = self._extract_cache.read_stash(library_id, str(plan["content_hash"]), self._stash_routes(extension))
+            if hit is None:
+                return None
+            text, route = hit
+            extracted_by, _sep, extractor_version = route.rpartition(":")
+            return ExtractedDocument(
+                library_id=library_id,
+                path=path,
+                text=text,
+                failure_reason=None,
+                extracted_by=extracted_by,
+                extractor_version=extractor_version,
+                content_hash=str(plan["content_hash"]),
+            )
+
+        # ---- 扫描件合批（2026-09-29 操作者确认“尝试，但务必做好显存管理”）----------------
+        # 本机 MinerU 一份一份解时，显卡只在每份里认版面、认字那几小段干活（平均占用 17%）；
+        # 几份合成一批实测快 1.7～2 倍、显存只多 0.1～0.3GB。做法：主循环第一次要真正提取某个
+        # PDF 时，往后看几份同样要提取的 PDF，一起过一遍提取链——有文字层的照常逐份转，走到
+        # 本机 OCR 的攒起来一次交给它（`extract_many`，分组上限与显存把关在它的子进程里）；
+        # 结果放进 `prefetched`，主循环走到那几份时直接取。进度条因此一次跳几份。
+        prefetched: dict[str, ExtractedDocument] = {}
+        batch_pdf = self._batch_extractor_active("pdf")
+        pdf_plans = [
+            plan for plan in plans if plan["included"] and Path(str(plan["path"])).suffix.lower() == ".pdf"
+        ]
+        pdf_position = {str(plan["path"]): index for index, plan in enumerate(pdf_plans)}
+
+        def _will_extract(plan: dict) -> bool:
+            """主循环走到这份文件时会不会真的调提取器——判断顺序照抄主循环。"""
+            if plan["fingerprint_error"] or (plan["action"] == "unchanged" and not plan["needs_chunks"]):
+                return False
+            cache_first = (not plan["needs_source"]) or (
+                plan["action"] in {"unchanged", "rebuilt"} and plan["content_hash"] == plan["old"].get("content_hash")
+            )
+            if cache_first and self._read_extract_cache(library_id, str(plan["path"]), cache_segments) is not None:
+                return False
+            return _stashed_doc(plan) is None
+
+        def _prefetch_pdf_batch(first: dict) -> None:
+            waiting: list[tuple[dict, int]] = []
+            looked = 0
+            for examined, plan in enumerate([first, *pdf_plans[pdf_position[str(first["path"])] + 1:]]):
+                if (
+                    len(waiting) >= _EXTRACT_BATCH_FILES
+                    or looked >= _EXTRACT_LOOKAHEAD_FILES
+                    or examined >= _EXTRACT_LOOKAHEAD_FILES * 8
+                ):
+                    break
+                path = str(plan["path"])
+                if plan is not first and (path in prefetched or not _will_extract(plan)):
+                    continue
+                looked += 1
+                _emit("extracting", current_path=path, stall_grace_s=300.0, message=f"正在提取：{path}")
+                doc, paused_at = self._run_extract_chain(library_id, path, root, pause_before_batch=True)
+                if paused_at is None:
+                    if doc is not None:
+                        _stash_result(plan, doc)
+                        prefetched[path] = doc
+                else:
+                    waiting.append((plan, paused_at))
+            provider_ids = sorted(self.runtime.registry.providers_of("extractor:pdf"))
+            by_provider: dict[int, list[dict]] = {}
+            for plan, paused_at in waiting:
+                by_provider.setdefault(paused_at, []).append(plan)
+            for paused_at, group in sorted(by_provider.items()):
+                paths = [str(plan["path"]) for plan in group]
+                docs: list[ExtractedDocument | None] = []
+                if len(paths) > 1:
+                    _emit(
+                        "extracting",
+                        current_path=paths[0],
+                        stall_grace_s=600.0,
+                        message=f"正在合批识别 {len(paths)} 份扫描件：{paths[0]} 等",
+                    )
+                    try:
+                        docs = list(self._plugin(provider_ids[paused_at]).extract_many(library_id, paths, root))
+                    except Exception as exc:  # noqa: BLE001 - 合批接口炸了：这几份按单份的规矩重走，不拖垮整轮
+                        logging.getLogger("rag_redo.core.pipeline").warning("合批识别出错，改为逐份识别：%s", exc)
+                        docs = []
+                if len(docs) != len(paths):
+                    # 只攒到一份（与此前完全一样逐份识别），或合批接口出错/条数不对
+                    docs = [None] * len(paths)
+                for plan, doc in zip(group, docs):
+                    path = str(plan["path"])
+                    if doc is None:
+                        _emit("extracting", current_path=path, stall_grace_s=300.0, message=f"正在提取：{path}")
+                        doc, _ = self._run_extract_chain(library_id, path, root, start=paused_at)
+                    elif doc.text is None:
+                        # 链的规矩：没出正文就交给后面的提供者；后面没人了，就以它的结果为准
+                        later, _ = self._run_extract_chain(library_id, path, root, start=paused_at + 1)
+                        if later is not None:
+                            doc = later
+                    if doc is not None:
+                        _stash_result(plan, doc)
+                        prefetched[path] = doc
+
+        def _extract_with_stash(path: str, plan: dict, message: str) -> ExtractedDocument:
+            """真正调提取器之前：①合批时已经替它提取好的，直接取；②再查转换暂存
+            （`ExtractCache.read_stash`）——同样内容、同版本转换器上一轮已经转好、只是那一轮
+            没发布（被停止/出错/进程被杀）的，直接拿来用，不再送 MinerU；③要提取的 PDF 且本机
+            OCR 在用，就顺带合批（见上）；④否则照旧逐份提取。新转好的 PDF/DOCX 立刻存一份暂存。
+            `fresh_extract` 是用户明确要求重新解析，不查暂存。纯文本格式不进暂存。"""
+            if path in prefetched:
+                return prefetched.pop(path)
+            stashed = _stashed_doc(plan)
+            if stashed is not None:
+                _emit("extracting", current_path=path, message=f"沿用上次已转好的结果：{path}")
+                return stashed
+            if batch_pdf and path in pdf_position:
+                _prefetch_pdf_batch(plan)
+                if path in prefetched:
+                    return prefetched.pop(path)
+            _emit("extracting", current_path=path, stall_grace_s=300.0, message=message)
+            doc = self._extract(library_id, path, root)
+            _stash_result(plan, doc)
+            return doc
+
         pending: list[_PendingFile] = []
         for plan in plans:
             path = str(plan["path"])
@@ -1184,8 +1401,7 @@ class Pipeline:
                             route=f"{doc.extracted_by}:{doc.extractor_version}",
                         )
                 if doc is None:
-                    _emit("extracting", current_path=path, stall_grace_s=300.0, message="正在提取：{path}")
-                    doc = self._extract(library_id, path, root)
+                    doc = _extract_with_stash(path, plan, f"正在提取：{path}")
                     if doc.text is not None:
                         self._extract_cache.write(
                             library_id,
@@ -1214,8 +1430,7 @@ class Pipeline:
                         content_hash=str(plan["content_hash"] or old.get("content_hash", "")),
                     )
                 if doc is None:
-                    _emit("extracting", current_path=path, stall_grace_s=300.0, message=f"正在重新提取：{path}")
-                    doc = self._extract(library_id, path, root)
+                    doc = _extract_with_stash(path, plan, f"正在重新提取：{path}")
                     if doc.text is not None:
                         self._extract_cache.write(
                             library_id,
@@ -1303,8 +1518,11 @@ class Pipeline:
             # 读不到自动跳过）] → 页码行 → 样板行。先剥图链（避免重复图片
             # 路径行被误判成样板）；sidecar 只精确删官方标注的页眉/页脚/页码，
             # 删不中的残差交给启发式兜底。纯文本变换，不影响终态判定。
+            # 死图链之后再把 HTML 表格摊平成竖线表格（BC-07，2026-09-30）：MinerU 的表格是 HTML，
+            # 切块器只认竖线表格；先剥图链，单元格里的 <img> 才不会带着标签进表格。
             index_text = strip_dead_image_refs(index_text)
-            _sidecar = self._read_sidecar(library_id, doc.content_hash or plan["content_hash"])
+            index_text = flatten_html_tables(index_text)
+            _sidecar =self._read_sidecar(library_id, doc.content_hash or plan["content_hash"])
             if _sidecar:
                 index_text = strip_sidecar_noise(index_text, _sidecar)
             index_text = strip_page_number_lines(index_text)
@@ -1637,6 +1855,32 @@ class Pipeline:
         _emit("visual", chunks_total=chunks_done, stall_grace_s=300.0, message="正在建立视觉索引")
         for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
             visual = self._plugin(plugin_id)
+
+            def _visual_progress(
+                pages_done: int,
+                pages_total: int,
+                current_path: str = "",
+                _chunk_total: int = chunks_done,
+            ) -> None:
+                """把页级进度写进进度记录的 `message`。
+
+                这一段是 2026-09-29 补的：视觉索引的口径是文字索引的
+                `files_done/files_total`，跑完就是 78/78、100%，于是渲染 7645 页的
+                这 30 分钟里界面一个数都不变、看起来完全像冻住。前端是逐字节冻结的
+                （BC-15，sha256 固定），改不了，所以走 `heartbeat_note` 这个既有字段
+                ——桥接层会把 `message` 透给它，前端本来就会渲染。
+
+                `stall_grace_s` 提到 60：批量编码期间两次上报之间可能静默一会儿，
+                别让停滞守卫误判。
+                """
+                _emit(
+                    "visual",
+                    chunks_total=_chunk_total,
+                    stall_grace_s=60.0,
+                    current_path=current_path,
+                    message=f"页级视觉索引 {pages_done}/{pages_total} 页",
+                )
+
             visual.index_library(
                 library_id,
                 root,
@@ -1644,7 +1888,8 @@ class Pipeline:
                 generation=generation,
                 changed_paths=changed_pdf_paths,
                 previous_generation=previous,
-                before_serve=self._release_text_models_for_visual,
+                before_serve=self._make_room_for_visual_index,
+                progress=_visual_progress,
             )
 
         links_by_path = {
@@ -1712,6 +1957,36 @@ class Pipeline:
             self.prune_unreferenced_data()
         except Exception as exc:  # noqa: BLE001 - 回收失败绝不影响索引结果（旧 2496-2499 同纪律）
             logging.getLogger("rag_redo.core.pipeline").info("全局回收失败（忽略）：%s", exc)
+        try:
+            # 已经入库的内容，正文已在本轮发布的缓存段里，暂存可以清掉；延后的、没轮到的
+            # 留着给下一轮（见 ExtractCache.prune_stash）。
+            self._extract_cache.prune_stash(
+                library_id,
+                settled_hashes={
+                    str(record.get("content_hash"))
+                    for record in manifest_files.values()
+                    if record.get("status") == "indexed" and record.get("content_hash")
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - 清暂存失败绝不影响已经发布的索引
+            logging.getLogger("rag_redo.core.pipeline").info("转换暂存清理失败（忽略）：%s", exc)
+        try:
+            # 索引已经发布：按发布后的真实状态记这一轮的“转换缓存”账，并刷新缓存文件夹里的
+            # 缓存目录.md（BC-19）。两件事都只是“让人看得见”，失败绝不影响已发布的索引。
+            # 用这一轮自己的裁决（不重扫整个库）。Agent 触发、带格式白名单的一轮里，没授权的
+            # 格式被“冻结”保留旧索引——按本函数自己的口径（included 或 frozen）照样算进来，
+            # 否则目录文件会因为这一轮是 Agent 跑的就把用户的 PDF 漏掉。
+            conversion = self._conversion_report(
+                library_id,
+                included_files=[
+                    (str(plan["path"]), bool(plan["included"]) or plan.get("action") == "frozen", str(plan["reason"]))
+                    for plan in plans
+                ],
+            )
+            report.conversion = round_summary(conversion, fresh_paths)
+            self._write_catalog(conversion)
+        except Exception as exc:  # noqa: BLE001 - 见上
+            logging.getLogger("rag_redo.core.pipeline").warning("转换缓存清单/目录生成失败（忽略）：%s", type(exc).__name__)
         return report
 
     def prune_unreferenced_data(self) -> tuple[int, int, int]:
@@ -1969,10 +2244,22 @@ class Pipeline:
         rows = []
         for cfg in lib_mgr.store.list_libraries():
             generation = self._generations.active(cfg.library_id)
-            try:
-                blocks = vector_store.count(cfg.library_id, generation=generation)
-            except Exception:
-                blocks = 0  # collection 未创建 = 从未索引（旧 list_summary 同语义）
+            # 块数必须按 **manifest 的 vector_segments 逐段求和**，不能拿 active generation
+            # 直接当集合名去数：增量轮把上一轮的段沿用下来（`vector_carry`，见本方法下文），
+            # 数据留在上一轮那段里，新 generation 自己那段是空的。2026-09-29 真机：4 个库的
+            # 块数在界面上全显示 0，而向量数据完好（Y2S1 4955 块）也照常能搜——检索与一致性
+            # 自愈走的就是 `_manifest_segments` 逐段求和（见 index_library 里的
+            # `index_integrity.count_store_chunks`），只有这里自己另算了一遍名字，对不上。
+            # 复用同一套算法与同一个 fail-open 口径（AGENTS.md §4.5/§7）。
+            manifest = self._manifests.read(cfg.library_id, generation) if generation else None
+            segments = self._manifest_segments(manifest, "vector_segments", generation)
+            counted = index_integrity.count_store_chunks(
+                lambda segment: vector_store.count(cfg.library_id, generation=segment),
+                segments,
+            )
+            # 数不出来（探测失败）时按 0 展示，与旧 list_summary 同语义；这只影响展示，
+            # 不会像自愈检查那样被当成"块丢了"而触发全量重建。
+            blocks = 0 if counted is None else counted
             last_indexed = None
             if generation:
                 manifest_path = self._manifests._path_for(cfg.library_id, generation)
@@ -2073,6 +2360,138 @@ class Pipeline:
                 continue
         return tuple(states)
 
+    # ---- 转换缓存清单（BC-19）----------------------------------------------
+    #
+    # 只读：读清单记录、正文缓存文件的位置和大小、页库插件的逐 PDF 状态。绝不触发转换、
+    # 不拉起页库服务、不加载任何模型。“需要转换、缺了什么原因、下一步怎么办”的判断全在
+    # core/conversion_cache.py，这里只负责把各处的数据取齐。
+
+    def _visual_cache_info(self) -> dict:
+        """页库（`visual_index` 提供者）开没开、存在哪、每页大约占多少、要多少显存。
+
+        提供者可选实现 `is_active()`（没实现 = 启用了就算开）和 `cache_info()`（没实现 =
+        不知道存放位置）；多个提供者时存放信息取第一个。"""
+        info: dict = {"enabled": False, "dir": None, "bytes_per_page": 0, "vram_gb": None, "idle_unload_seconds": None}
+        for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
+            try:
+                visual = self._plugin(plugin_id)
+                active = getattr(visual, "is_active", None)
+                enabled = bool(active()) if callable(active) else True
+                # 插件被用户停用了：设置里开着也建不了页库，按“没开”报。只加载未启用（命令行
+                # `caches` 的只读诊断）不算停用——那只是这次不拉起服务。
+                record = self.runtime.plugins.get(plugin_id)
+                if record is not None and record.state.value == "disabled":
+                    enabled = False
+                reader = getattr(visual, "cache_info", None)
+                data = reader() if callable(reader) else {}
+            except Exception:  # noqa: BLE001 - 单个提供者读不出来只算它没开，不让整份清单失败
+                continue
+            info["enabled"] = info["enabled"] or enabled
+            if info["dir"] is None and isinstance(data, dict):
+                info["dir"] = data.get("dir")
+                info["bytes_per_page"] = int(data.get("bytes_per_page") or 0)
+                info["vram_gb"] = data.get("vram_gb")
+                info["idle_unload_seconds"] = data.get("idle_unload_seconds")
+        return info
+
+    def _conversion_report(
+        self,
+        library_id: str,
+        included_files: list[tuple[str, bool, str]] | None = None,
+    ) -> ConversionCacheLibrary:
+        """`included_files` 缺省时现问库管理器（权威枚举）；索引收尾时传入这一轮已经算好的
+        裁决，不再把整个库重新扫一遍。"""
+        lib_mgr = self._singleton("library_manager")
+        cfg = lib_mgr.store.get(library_id)
+        if cfg is None:
+            raise KeyError(f"未知库: {library_id}")
+        generation = self._generations.active(library_id)
+        manifest = self._manifest(library_id, generation)
+        segments = self._manifest_segments(manifest, "extract_segments", generation)
+        visual = self._visual_cache_info()
+        route_names = {
+            plugin_id: plugin.manifest.name
+            for plugin_id, plugin in self.runtime.plugins.items()
+            if plugin.manifest is not None and plugin.manifest.name
+        }
+        return build_library_report(
+            library_id=library_id,
+            name=getattr(cfg, "name", "") or library_id,
+            included_files=(
+                lib_mgr.resolve_included_files(library_id) if included_files is None else included_files
+            ),
+            records=self._manifest_files(manifest),
+            locate_text=lambda path: self._locate_extract_cache(library_id, path, segments),
+            route_names=route_names,
+            page_states=self.visual_page_states(library_id),
+            pages_enabled=bool(visual["enabled"]),
+            generation=generation,
+            text_dir=self._extract_cache.library_dir(library_id),
+            pages_dir=visual["dir"],
+            bytes_per_page=visual["bytes_per_page"],
+            page_vram_gb=visual["vram_gb"],
+            page_idle_unload_seconds=visual["idle_unload_seconds"],
+        )
+
+    def conversion_caches(self, libraries: str = "all") -> tuple[ConversionCacheLibrary, ...]:
+        """各库的转换缓存清单：需要转换的文件（PDF、Word……）转文字了没有、谁转的、存在哪、
+        多大；PDF 的页库建了没有、几页、缺哪几页。某个库读不出来只在它自己那份里写 `error`，
+        其余库照常出结果。"""
+        lib_mgr = self._singleton("library_manager")
+        reports: list[ConversionCacheLibrary] = []
+        for entry in lib_mgr.resolve_libraries(libraries or "all"):
+            try:
+                reports.append(self._conversion_report(entry.library_id))
+            except Exception as exc:  # noqa: BLE001 - 一个库坏了不牵连别的库
+                reports.append(
+                    ConversionCacheLibrary(
+                        library_id=entry.library_id,
+                        name=getattr(entry, "name", "") or entry.library_id,
+                        files=(),
+                        text_dir=str(self._extract_cache.library_dir(entry.library_id)),
+                        catalog_file="",
+                        pages_enabled=False,
+                        error=f"读取转换缓存失败：{type(exc).__name__}",
+                    )
+                )
+        return tuple(reports)
+
+    def _write_catalog(self, report: ConversionCacheLibrary) -> Path:
+        cfg = self._singleton("library_manager").store.get(report.library_id)
+        target = Path(report.catalog_file)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(target, render_catalog(report, library_root=str(getattr(cfg, "root_path", ""))))
+        return target
+
+    def write_conversion_catalog(self, library_id: str) -> Path:
+        """现在就把这个库的 `缓存目录.md` 刷新一遍并返回它的位置（“打开缓存文件夹”按钮先调它，
+        保证用户看到的目录是最新的；每轮索引发布后也会自动刷新）。"""
+        return self._write_catalog(self._conversion_report(library_id))
+
+    def page_preview(self, library_id: str, path: str, page: int, *, max_side: int = 720) -> bytes:
+        """把某份 PDF 的第 `page` 页（从 1 起）画成一张 PNG 小图，给“看页库这一页长什么样”用。
+
+        只用 CPU 现画一张，不存盘、不进缓存、不占显卡；路径必须是这个库里纳入索引的 PDF。
+        页面渲染交给页库插件（它本来就负责把页面画成图），没有提供者时报错说明。"""
+        lib_mgr = self._singleton("library_manager")
+        cfg = lib_mgr.store.get(library_id)
+        if cfg is None:
+            raise KeyError(f"未知库: {library_id}")
+        if not str(path).lower().endswith(".pdf"):
+            raise ValueError("只有 PDF 才有页面小图")
+        included = {rel for rel, ok, _reason in lib_mgr.resolve_included_files(library_id) if ok}
+        if path not in included:
+            raise ValueError(f"「{path}」不在这个库的索引范围里")
+        root = Path(cfg.root_path).resolve()
+        target = (root / path).resolve()
+        if root != target and root not in target.parents:
+            raise ValueError("文件路径越出库目录")
+        for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
+            renderer = getattr(self._plugin(plugin_id), "render_page_png", None)
+            if callable(renderer):
+                return renderer(target, int(page), max_side=int(max_side))
+        raise ValueError("页库插件没有启用，画不了页面小图")
+
     def graph(self, libraries: str = "all") -> GraphResponse:
         lib_mgr = self._singleton("library_manager")
         entries = lib_mgr.resolve_libraries(libraries or "all")
@@ -2138,6 +2557,63 @@ class Pipeline:
             )
         self._graph_semantic_cache = (key, result)
         return result
+
+    def overview_map(self, libraries: str = "all") -> OverviewMapResponse:
+        """总览星图读模型（BC-18）：每个库的文件按内容排好顺序、分好颜色组。
+
+        只读向量库里已经存好的块向量（按文件求平均），**不加载嵌入模型、不碰显卡**——
+        这个软件对显存很敏感，打开一张图不能换来一个常驻的模型。结果按"各库当前
+        generation + 向量库版本 + 图谱节点状态"缓存：索引没变时反复进出图谱页不重算。
+        某个库读向量失败时，它的文件照样列出（不分组），`error` 说明原因，且这次结果不缓存。
+        """
+        response = self.graph(libraries)
+        store_plugin = self.runtime.registry.active_of("vector_store") or ""
+        generations = {library_id: self._generations.active(library_id) for library_id in response.library_ids}
+        key = (
+            OVERVIEW_LAYOUT_VERSION,
+            tuple(self._plugin_signature(store_plugin)),
+            tuple(generations.items()),
+            tuple(
+                (node.node_id, node.updated_ns, node.chunks, node.extraction_state,
+                 node.failure_reason, node.visual_state, node.page_count)
+                for node in response.nodes
+            ),
+        )
+        if self._overview_cache is not None and self._overview_cache[0] == key:
+            return self._overview_cache[1]
+        vector_sets: dict[str, FileVectorSet] = {}
+        failed: list[str] = []
+        for library_id, generation in generations.items():
+            manifest = self._manifest(library_id, generation)
+            paths = [
+                node.path for node in response.nodes
+                if node.library_id == library_id and node.node_type not in {"page", "pagegroup"}
+            ]
+            chunk_groups = chunk_groups_from_manifest(manifest, paths)
+            if not chunk_groups:
+                continue
+            try:
+                reader = getattr(self._singleton("vector_store"), "file_vectors", None)
+                if not callable(reader):
+                    raise NotImplementedError("当前向量库不支持按文件读取向量")
+                result = reader(library_id, chunk_groups, generation)
+                if not isinstance(result, FileVectorSet):
+                    raise TypeError("向量库返回的不是 FileVectorSet")
+                vector_sets[library_id] = result
+            except Exception as exc:  # noqa: BLE001 - 一个库读不出来不能让整张总览图打不开
+                failed.append(f"{library_id}（{type(exc).__name__}）")
+        try:
+            overview = build_overview(response, vector_sets)
+        except Exception as exc:  # noqa: BLE001 - 计算出错时给出可诊断的空图，而不是让界面报异常
+            return OverviewMapResponse(
+                libraries=(), groups=(), built_by="core.overview_map",
+                layout_version=OVERVIEW_LAYOUT_VERSION,
+                error=f"总览计算失败：{type(exc).__name__}",
+            )
+        if failed:
+            return dataclasses_replace(overview, error="读取内容向量失败：" + "、".join(failed))
+        self._overview_cache = (key, overview)
+        return overview
 
     def start_index_library(
         self,
@@ -2814,7 +3290,7 @@ class Pipeline:
 
     # ---- 页级视觉导航（独立于 search() 的"第二检索系统"）-------------------
 
-    def navigate(self, library_id: str, query: str, top_k: int = 5) -> list[PageHit]:
+    def navigate(self, library_id: str, query: str, top_k: int = 5, *, path: str | None = None) -> list[PageHit]:
         """页级视觉导航——调查过旧项目 obsidian-rag 的 navigate_knowledge/
         wemm_retriever.py 后确认：这不是 search() 的变体，是完全独立的
         检索面，从不与 BM25+向量+RRF 那条融合排序发生任何关系（不混向量
@@ -2830,7 +3306,11 @@ class Pipeline:
         hits: list[PageHit] = []
         for plugin_id in sorted(self.runtime.registry.providers_of("visual_index")):
             visual = self._plugin(plugin_id)
-            hits.extend(visual.navigate(library_id, query, top_k=top_k))
+            if path:
+                # 只在这一份 PDF 的页里找：“转换缓存”清单里的“试搜”用来判断这份页库好不好使（BC-19）
+                hits.extend(visual.navigate(library_id, query, top_k=top_k, path=path))
+            else:
+                hits.extend(visual.navigate(library_id, query, top_k=top_k))
         return hits
 
     def visual_status(self) -> dict:
@@ -2860,16 +3340,40 @@ class Pipeline:
         "official-ocr-mineru-local",
     )
 
-    def _release_text_models_for_visual(self) -> None:
-        """页级视觉索引真要占显卡之前的"让路"：把文字向量模型与重排模型从显卡上卸下来。
+    #: 页级视觉索引"让路"时要卸的插件：文字向量模型 + 重排模型 + **本机 OCR 子进程**。
+    #:
+    #: 2026-09-29 真机事故第二段（`data-real/visual_wemm/wemm_server.log` 反复打
+    #: 「空闲显存 5.4GB < 需求 5.5GB」）：此前只卸前两个，坐着的 MinerU 子进程没人管。
+    #: 8GB 卡上本机 MinerU 最低要 4.5GB、WEMM 要 5.5GB，物理上不可能共存；旧项目
+    #: `obsidian-rag/index.py:703-742 _vram_maybe_evict_wemm` 在加载任何 CUDA 模型前
+    #: 都会按「先 MinerU 后 WEMM」的顺序请求对方卸载（fail-open，失败不阻塞加载），
+    #: rag-redo 把这一步整个丢了。
+    _VISUAL_HANDOFF_TARGETS = (
+        "official-embedder-bge-m3",
+        "official-reranker",
+        "official-ocr-mineru-local",
+    )
+
+    #: 让路名单里必须排除的：调用方自己。`before_serve` 是视觉插件在"真要占显卡前"
+    #: 调用的，让 WEMM 去喊自己让路等于自我驱逐。
+    _VISUAL_HANDOFF_SKIP = ("official-visual-wemm",)
+
+    def _make_room_for_visual_index(self) -> None:
+        """页级视觉索引真要占显卡之前的"让路"：把别的 GPU 消费者从显卡上请下去。
 
         对齐 obsidian-rag/index.py:1784-1806 `_release_for_wemm`（经 wemm_indexer.py 的
-        `before_serve` 回调）。2026-09-29 真机：文字嵌入做完后 bge-m3 还带着 GPU 名额，
-        名额优先级比 WEMM 高，WEMM 抢不到 → 4 个库的页级索引整轮被跳过、页库全记失败。
+        `before_serve` 回调）**与** index.py:703-742 `_vram_maybe_evict_wemm`（按
+        「先 MinerU 后 WEMM」的顺序请求子进程服务卸载）。两段都要：前者卸核心自己进程里
+        的文字模型，后者卸**独立子进程**里的模型——2026-09-29 真机上前者做了、后者没做，
+        WEMM 服务端一直等不到 5.5GB 显存，本轮页级索引全废（BC-11）。
+
         只在视觉插件"确有页要渲染"时才被调用（无页可渲染的纯 md 增量不会白白卸模型，
         下次搜索也不必重新装）。每个插件独立隔离：一个卸不掉不能连累另一个，也绝不
-        抛出来拖垮页级索引；模型下次真正用到时会懒加载回来。"""
-        for plugin_id in ("official-embedder-bge-m3", "official-reranker"):
+        抛出来拖垮页级索引；模型下次真正用到时会懒加载回来。
+        """
+        for plugin_id in self._VISUAL_HANDOFF_TARGETS:
+            if plugin_id in self._VISUAL_HANDOFF_SKIP:
+                continue
             plugin = self.runtime.plugins.get(plugin_id)
             if plugin is None or plugin.instance is None or plugin.state.value != "enabled":
                 continue
@@ -2882,6 +3386,17 @@ class Pipeline:
                 logging.getLogger("rag_redo.core.pipeline").warning(
                     "页级视觉索引前释放 %s 的显存失败（忽略）：%s: %s", plugin_id, type(exc).__name__, exc
                 )
+        # 让路之后报一次实测空闲显存：WEMM 服务端的 `WEMM_MIN_VRAM_GB` 闸门就卡在这个数上，
+        # 真机 2026-09-29 反复卡在「空闲显存 5.5GB < 需求 5.5GB」的边界，必须能从 worker 日志
+        # 里一眼看出让路到底腾出了多少，而不是只能去猜是哪个进程还占着。
+        from . import gpu_arbiter
+
+        free_gb = gpu_arbiter.vram_free_gb(max_age=0.0)
+        logging.getLogger("rag_redo.core.pipeline").info(
+            "页级视觉索引前让路完成：已请求 %s 卸载，当前空闲显存 %s",
+            list(self._VISUAL_HANDOFF_TARGETS),
+            "探测失败" if free_gb is None else f"{free_gb:.2f}GB",
+        )
 
     def release_gpu_memory(self) -> dict:
         """手动立即释放显存（2026-09-29 操作者需求；旧项目 guiweb 没有对应

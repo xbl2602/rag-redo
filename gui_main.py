@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import atexit
+import mimetypes
 import multiprocessing
 import os
 import sys
@@ -277,6 +278,10 @@ def _serve(runtime: PluginRuntime) -> None:
 
     api = gui_plugin.instance.make_api(pipeline, lib_mgr_plugin.instance)
     html_path = REPO_ROOT / "plugins" / "official-gui-shell" / "official_gui_shell" / "assets" / "index.html"
+    # 图谱页的星图是 ES 模块（BC-18）：浏览器要求服务器把 .js 标成 JavaScript 类型，否则拒绝执行。
+    # pywebview 的本地服务按 mimetypes 猜类型，而 Windows 上 mimetypes 会用注册表覆盖自带的表——
+    # 有的电脑被别的软件把 .js 登记成 text/plain，星图就整页加载失败（普通脚本不受影响，别处看不出来）。
+    mimetypes.add_type("text/javascript", ".js")
 
     window = webview.create_window(
         WINDOW_SPEC["title"],

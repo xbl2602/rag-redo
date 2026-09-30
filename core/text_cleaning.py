@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import re
 
+from . import html_table as _ht
+
 # 索引文本管线版本：清洗/锚点逻辑变化时递增，index_library 的 text_pipeline
 # 签名随之变化，触发旧 generation 受控重切块/重嵌入（对齐旧项目 META_VERSION
 # 机制；此版本从 2 起——隐含的"1"是加入清洗与锚点之前的管线）。
-TEXT_PIPELINE_VERSION = 3  # v3: 提取噪声清洗（问题48 v10/v11 双轨）——旧 META_VERSION 11 的对应物
+TEXT_PIPELINE_VERSION = 4  # v4: HTML 表格摊平成竖线表格（BC-07，2026-09-30）；v3: 提取噪声清洗（问题48 v10/v11 双轨）——旧 META_VERSION 11 的对应物
 
 
 def _clean_scalar(s: str) -> str:
@@ -231,6 +233,137 @@ def strip_dead_image_refs(text: str) -> str:
     """剥离指向本地图片的死引用（保留 alt 文本与远端图）。返回清洗后的文本。（旧 1277）"""
     text = _MD_IMG_RE.sub(_md_img_repl, text)
     return _HTML_IMG_RE.sub(_html_img_repl, text)
+
+
+# ---------------------------------------------------------------------------
+# HTML 表格摊平（BC-07，2026-09-30，操作者批准）
+#
+# MinerU 把表格输出成 HTML（`<table><tr><td rowspan=1 colspan=1>…`），而切块器只认 `|` 开头的
+# 竖线表格。不摊平的后果（本机 196 份 MinerU 识别结果的体检）：HTML 表格被当普通文字按句号切断
+# （96 块被切断）、标签占篇幅 40% 以上的块有 471 个、`td`/`tr`/`rowspan` 成了 BM25 词表里的高频词。
+# 摊平成竖线表格之后，切块器"整张不切、并入直接上下文"的既有设计原样适用，不必再懂 HTML。
+#
+# 只动索引层：提取缓存与 read_document 交付的原文仍是 HTML，GUI 渲染器另有 HTML 表格的呈现。
+# ---------------------------------------------------------------------------
+
+_FLATTEN_INLINE_TEXT = {
+    _ht.BR: " ",
+    _ht.SUP_OPEN: "^",  # m<sup>2</sup> → m^2、10<sup>-6</sup> → 10^-6：上标不写记号就成了另一个数
+    _ht.SUP_CLOSE: "",
+    _ht.SUB_OPEN: "",  # H<sub>2</sub>O → H2O：下标本来就是这么写的
+    _ht.SUB_CLOSE: "",
+}
+_IMG_PLACEHOLDER_RE = re.compile(r"!\[([^\]]*)\]\(img\)")
+
+
+def _plain_cell_text(cell: "_ht.HtmlCell") -> str:
+    text = _IMG_PLACEHOLDER_RE.sub(lambda m: m.group(1), cell.raw)
+    for sentinel, replacement in _FLATTEN_INLINE_TEXT.items():
+        text = text.replace(sentinel, replacement)
+    return re.sub(r"\s+", " ", text).strip().replace("|", "\\|")
+
+
+def _table_grid(rows: "list[list[_ht.HtmlCell]]") -> list[list[str]]:
+    """行列 → 等宽的文字网格。colspan 的后续列补空格子（一个 11 列宽的标题格不该重复 11 遍）；
+    rowspan 的文字在被占的每一行重复一遍（每一行单独拿出来读也带着行标题，检索按行命中时不丢）。"""
+    pending: dict[int, tuple[str, int]] = {}  # 列号 → (要重复的文字, 还要占几行)
+    grid: list[list[str]] = []
+    for row in rows:
+        out: list[str] = []
+        col = 0
+
+        def fill_occupied() -> None:
+            nonlocal col
+            while col in pending:
+                text, remain = pending[col]
+                out.append(text)
+                if remain <= 1:
+                    del pending[col]
+                else:
+                    pending[col] = (text, remain - 1)
+                col += 1
+
+        for cell in row:
+            fill_occupied()
+            text = _plain_cell_text(cell)
+            out.append(text)
+            if cell.rowspan > 1:
+                pending[col] = (text, cell.rowspan - 1)
+            for k in range(1, cell.colspan):
+                out.append("")
+                if cell.rowspan > 1:
+                    pending[col + k] = ("", cell.rowspan - 1)
+            col += cell.colspan
+        while pending and col <= max(pending):  # 行尾（或中间跳过的列）还被上面的 rowspan 占着
+            if col in pending:
+                fill_occupied()
+            else:
+                out.append("")
+                col += 1
+        grid.append(out)
+    width = max((len(r) for r in grid), default=0)
+    return [r + [""] * (width - len(r)) for r in grid]
+
+
+def _pipe_row(cells: list[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
+def _flatten_block(raw: str) -> list[tuple[str, list[str]]]:
+    """一段 HTML 表格原文 → [("text"|"table", 行列表)]：表格摊平成竖线表格（第一行当表头）。"""
+    out: list[tuple[str, list[str]]] = []
+    for kind, payload in _ht.parse_html_table_block(raw):
+        if kind == "text":
+            lines = [ln.strip() for ln in str(payload).splitlines() if ln.strip()]
+            if lines:
+                out.append(("text", lines))
+            continue
+        grid = _table_grid(payload)  # type: ignore[arg-type]
+        if not grid or not grid[0]:
+            continue
+        lines = [_pipe_row(grid[0]), _pipe_row(["---"] * len(grid[0]))]
+        lines.extend(_pipe_row(r) for r in grid[1:])
+        out.append(("table", lines))
+    return out
+
+
+def flatten_html_tables(text: str) -> str:
+    """把 HTML 表格摊平成竖线表格（GFM）。返回清洗后的文本；没有 HTML 表格就原样返回。
+
+    只认"像表格"的行（行首是表格标签、同一行里 `<table` 后跟 `<tr`/`<td`、含闭合的
+    `</td>` `</tr>` `</table>`），所以"用 <td> 表示单元格"这样的说明文字不会被误伤；围栏
+    代码块里的 HTML 一律不动。被切断成半截的旧表格块也能处理（文字不丢）。表格前后各留一个
+    空行，让它成为独立的表格段。单元格里的原始标签与属性一个都不带进输出。
+    """
+    if "<" not in text:
+        return text
+    lines = text.splitlines()
+    out: list[str] = []
+    in_fence = False
+    changed = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _BOILER_FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if in_fence or not _ht.is_html_table_line(line):
+            out.append(line)
+            i += 1
+            continue
+        raw, i = _ht.take_html_table_block(lines, i)
+        changed = True
+        for kind, block_lines in _flatten_block(raw):
+            if kind == "text":
+                out.extend(block_lines)
+                continue
+            if out and out[-1].strip():
+                out.append("")
+            out.extend(block_lines)
+            out.append("")
+    return "\n".join(out) if changed else text
 
 
 def strip_sidecar_noise(body: str, sidecar: object) -> str:

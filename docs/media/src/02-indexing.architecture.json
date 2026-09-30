@@ -1,0 +1,245 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "建索引：一篇笔记怎么变成能搜的样子",
+    "locale": "zh-CN",
+    "animation": "trace",
+    "quality_profile": "standard",
+    "viewBox": [
+      810,
+      660
+    ],
+    "legend": {
+      "mode": "hidden"
+    }
+  },
+  "components": [
+    {
+      "id": "pick",
+      "type": "frontend",
+      "label": "挑出要收录的文件",
+      "sublabel": "路径勾选 · 格式授权",
+      "pos": [
+        90,
+        40
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "text",
+      "type": "backend",
+      "label": "读取内容",
+      "sublabel": "Markdown · Word · PDF 文字页",
+      "pos": [
+        90,
+        170
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "chunk",
+      "type": "backend",
+      "label": "清洗并切成小段",
+      "sublabel": "按标题切块 · 保留双链",
+      "pos": [
+        220,
+        300
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "embed",
+      "type": "backend",
+      "label": "向量化",
+      "sublabel": "BGE-M3 · 用显卡",
+      "pos": [
+        90,
+        430
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "bm25",
+      "type": "backend",
+      "label": "关键词表",
+      "sublabel": "BM25 · 中文分词",
+      "pos": [
+        350,
+        430
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "gen",
+      "type": "database",
+      "label": "新一版索引",
+      "sublabel": "写完才一次性切换",
+      "pos": [
+        220,
+        560
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "ocr",
+      "type": "cloud",
+      "label": "整本走 OCR",
+      "sublabel": "有页面没文字时",
+      "pos": [
+        350,
+        170
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "fail",
+      "type": "security",
+      "label": "失败记账",
+      "sublabel": "读不出 · 空文件 · 待 OCR",
+      "pos": [
+        610,
+        170
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "skip",
+      "type": "external",
+      "label": "没变的直接跳过",
+      "sublabel": "旧内容原样保留",
+      "pos": [
+        610,
+        40
+      ],
+      "size": [
+        170,
+        64
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "c1",
+      "from": "pick",
+      "to": "text",
+      "label": "读取",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        175,
+        150
+      ]
+    },
+    {
+      "id": "c2",
+      "from": "text",
+      "to": "chunk",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "c3",
+      "from": "chunk",
+      "to": "embed",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "c4",
+      "from": "chunk",
+      "to": "bm25",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "c5",
+      "from": "embed",
+      "to": "gen",
+      "label": "写入",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "left",
+      "labelAt": [
+        175,
+        507
+      ]
+    },
+    {
+      "id": "c6",
+      "from": "bm25",
+      "to": "gen",
+      "label": "写入",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "right",
+      "labelAt": [
+        435,
+        507
+      ]
+    },
+    {
+      "id": "c7",
+      "from": "text",
+      "to": "ocr",
+      "label": "有页没字",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "c8",
+      "from": "ocr",
+      "to": "chunk",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "c9",
+      "from": "ocr",
+      "to": "fail",
+      "label": "读不出",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "c10",
+      "from": "pick",
+      "to": "skip",
+      "label": "没改动",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "left"
+    }
+  ]
+}

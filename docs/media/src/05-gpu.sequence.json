@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "显卡与后台进程：排队，不打架",
+    "locale": "zh-CN",
+    "animation": "trace",
+    "quality_profile": "standard",
+    "column_fit": "spread",
+    "viewBox": [
+      740,
+      840
+    ],
+    "legend": {
+      "mode": "hidden"
+    }
+  },
+  "participants": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "你",
+      "sublabel": "提问 / 点按钮"
+    },
+    {
+      "id": "search",
+      "type": "backend",
+      "label": "搜索模块",
+      "sublabel": "嵌入 + 重排"
+    },
+    {
+      "id": "arb",
+      "type": "security",
+      "label": "显卡裁判",
+      "sublabel": "谁先谁后"
+    },
+    {
+      "id": "ocr",
+      "type": "cloud",
+      "label": "本机 OCR",
+      "sublabel": "看图服务同理"
+    }
+  ],
+  "segments": [
+    {
+      "from": 160,
+      "to": 252,
+      "label": "① 后台正在扫描 PDF"
+    },
+    {
+      "from": 286,
+      "to": 544,
+      "label": "② 你来搜索：检索优先"
+    },
+    {
+      "from": 580,
+      "to": 764,
+      "label": "③ 自动或手动释放"
+    }
+  ],
+  "messages": [
+    {
+      "id": "m1",
+      "from": "ocr",
+      "to": "arb",
+      "y": 190,
+      "label": "申请显卡",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m2",
+      "from": "arb",
+      "to": "ocr",
+      "y": 232,
+      "label": "批准，开始占用",
+      "variant": "return"
+    },
+    {
+      "id": "m3",
+      "from": "user",
+      "to": "search",
+      "y": 312,
+      "label": "搜索",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m4",
+      "from": "search",
+      "to": "arb",
+      "y": 354,
+      "label": "申请显卡（检索优先）",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m5",
+      "from": "arb",
+      "to": "ocr",
+      "y": 396,
+      "label": "请让出：卸载模型",
+      "variant": "security"
+    },
+    {
+      "id": "m6",
+      "from": "ocr",
+      "to": "arb",
+      "y": 438,
+      "label": "已卸载，进程还在",
+      "variant": "return"
+    },
+    {
+      "id": "m7",
+      "from": "arb",
+      "to": "search",
+      "y": 480,
+      "label": "批准",
+      "variant": "return"
+    },
+    {
+      "id": "m8",
+      "from": "search",
+      "to": "user",
+      "y": 522,
+      "label": "返回结果",
+      "variant": "return"
+    },
+    {
+      "id": "m9",
+      "from": "search",
+      "to": "arb",
+      "y": 606,
+      "label": "空闲一阵：自动归还",
+      "variant": "dashed"
+    },
+    {
+      "id": "m10",
+      "from": "user",
+      "to": "search",
+      "y": 648,
+      "label": "点「释放显存」",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m11",
+      "from": "search",
+      "to": "arb",
+      "y": 690,
+      "label": "卸载模型、归还名额",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m12",
+      "from": "arb",
+      "to": "ocr",
+      "y": 732,
+      "label": "让子进程也卸载",
+      "variant": "dashed"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "ocr",
+      "from": 184,
+      "to": 240,
+      "type": "cloud"
+    },
+    {
+      "participant": "arb",
+      "from": 184,
+      "to": 240,
+      "type": "security"
+    },
+    {
+      "participant": "search",
+      "from": 306,
+      "to": 528,
+      "type": "backend"
+    },
+    {
+      "participant": "arb",
+      "from": 348,
+      "to": 486,
+      "type": "security"
+    },
+    {
+      "participant": "ocr",
+      "from": 390,
+      "to": 444,
+      "type": "cloud"
+    },
+    {
+      "participant": "search",
+      "from": 642,
+      "to": 696,
+      "type": "backend"
+    },
+    {
+      "participant": "arb",
+      "from": 684,
+      "to": 738,
+      "type": "security"
+    }
+  ]
+}

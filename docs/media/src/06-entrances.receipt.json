@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "architecture",
+  "input": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\06-entrances.architecture.json",
+  "output": "C:\\Users\\xbl26\\projects\\rag-redo\\docs\\media\\src\\06-entrances.html",
+  "specification": {
+    "sha256": "1a57c7bd08e21e56a910d42d854eb10d55e73076700cc958c0785daae5937966",
+    "bytes": 3500
+  },
+  "artifact": {
+    "sha256": "45eb4cd48097652ac81f4cd8b4926d622483fe3b63bed67c7ca0000b25237d8b",
+    "bytes": 802703
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "standard",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}
