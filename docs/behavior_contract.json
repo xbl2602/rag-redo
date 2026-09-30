@@ -20,7 +20,10 @@
         "rag-redo/plugins/official-ocr-mineru-cloud/official_ocr_mineru_cloud/extract.py::MineruCloudExtractor",
         "rag-redo/plugins/official-ocr-mineru-cloud/official_ocr_mineru_cloud/plugin.py:16-21",
         "rag-redo/plugins/official-ocr-mineru-local/official_ocr_mineru_local/plugin.py:136-179",
-        "rag-redo/plugins/official-extractor-pdf-text/official_extractor_pdf_text/extract.py:_is_repeated_watermark"
+        "rag-redo/plugins/official-extractor-pdf-text/official_extractor_pdf_text/extract.py:_is_repeated_watermark",
+        "rag-redo/plugins/official-extractor-pdf-text/official_extractor_pdf_text/extract.py:uses_fast_mode",
+        "rag-redo/plugins/official-extractor-pdf-text/official_extractor_pdf_text/plugin.py:PdfTextExtractorPlugin.mode",
+        "rag-redo/plugins/official-gui-shell/official_gui_shell/settings_schema.py:pdf_text_mode"
       ],
       "test_refs": [
         "rag-redo/plugins/official-extractor-pdf-text/tests/test_extract.py::TestExtractPdfText.test_mixed_pdf_routes_whole_document_to_scanned_failure",
@@ -34,9 +37,11 @@
         "rag-redo/plugins/official-extractor-pdf-text/tests/test_extract.py::TestExtractPdfText.test_pages_with_different_short_text_are_still_a_text_layer",
         "rag-redo/plugins/official-extractor-pdf-text/tests/test_extract.py::TestExtractPdfText.test_a_single_page_is_never_judged_a_watermark",
         "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_watermark_only_scan_is_routed_to_ocr_not_recorded_as_empty",
-        "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_watermark_only_scan_without_ocr_is_scanned_terminal_not_empty"
+        "rag-redo/tests/test_pipeline_e2e.py::TestOcrChainTryFallback.test_watermark_only_scan_without_ocr_is_scanned_terminal_not_empty",
+        "rag-redo/plugins/official-extractor-pdf-text/tests/test_extract.py::TestPdfTextModes",
+        "rag-redo/plugins/official-extractor-pdf-text/tests/test_extract.py::TestPdfTextModeSetting"
       ],
-      "acceptance": "PDF 任一页 strip 后少于 10 个字符时整本进入扫描件路由，不得返回文字页半份结果；扫描后端默认 none、无 Key 保留精确 scanned，缓存按云端→本地→文字层优先，切换后端不破坏既有 OCR 缓存。【新增规则，旧项目没有（2026-09-29，操作者确认）】扫描 App（如 CamScanner）在每页盖的文字水印（\"CamScanner\" 恰好 10 个字符）会达到“每页 >= 10 字符”的文字页门槛：旧项目与 rag-redo 此前都把这类扫描件当成文字层 PDF，转出来只有水印，切块清洗后为空，记成终态 empty，OCR 从未被调用（真机 Y2S1 库 7 个文件）。新规则：至少两页、且每一页折叠空白后的文字完全相同、长度不超过 40 字符时，视为水印、无文字层，整本按扫描件路由（未开 OCR 时落 scanned 终态，开了则走 OCR）。只有一页、页面还有各不相同的正文、或重复的是长文时不受影响；“恰好 10 个字符算文字页”的边界规则不变。提取器版本升到 0.3.0，使旧数据（含被记成 empty 的这类文件）在下一轮索引里重试。已知局限：单页水印扫描件无法据此识别（没有“每页都一样”的证据）。",
+      "acceptance": "PDF 任一页 strip 后少于 10 个字符时整本进入扫描件路由，不得返回文字页半份结果；扫描后端默认 none、无 Key 保留精确 scanned，缓存按云端→本地→文字层优先，切换后端不破坏既有 OCR 缓存。【新增规则，旧项目没有（2026-09-29，操作者确认）】扫描 App（如 CamScanner）在每页盖的文字水印（\"CamScanner\" 恰好 10 个字符）会达到“每页 >= 10 字符”的文字页门槛：旧项目与 rag-redo 此前都把这类扫描件当成文字层 PDF，转出来只有水印，切块清洗后为空，记成终态 empty，OCR 从未被调用（真机 Y2S1 库 7 个文件）。新规则：至少两页、且每一页折叠空白后的文字完全相同、长度不超过 40 字符时，视为水印、无文字层，整本按扫描件路由（未开 OCR 时落 scanned 终态，开了则走 OCR）。只有一页、页面还有各不相同的正文、或重复的是长文时不受影响；“恰好 10 个字符算文字页”的边界规则不变。提取器版本升到 0.3.0，使旧数据（含被记成 empty 的这类文件）在下一轮索引里重试。已知局限：单页水印扫描件无法据此识别（没有“每页都一样”的证据）。【操作者确认（2026-09-30）：有文字层 PDF 的三种转换方式，设置项 pdf_text_mode】装了 pymupdf-layout 时 pymupdf4llm 每页跑一遍 AI 版面分析（旧项目与本项目此前一直如此），真机每页 0.25~0.5 秒、占满全部 CPU 核（Y2S1 约 7600 页首次转换估计 40~55 分钟，用户看到的“转换阶段 CPU 尖峰、显卡闲着”）。新增三种方式：layout（全部版面分析，旧行为）；fast（经典规则式转换：不找表格、不分析矢量图形，讲义/幻灯片每页约 6~9 毫秒、厚教材快约 6 倍，只用 1~2 个核；代价是标题层级偶尔认错、图片里的文字不收、表格变普通文字行）；auto（默认：超过 200 页的 PDF 用 fast，其余 layout）。扫描件判定（文字层门槛、水印规则）与模式无关，逐条不变。两种方式产出的 extractor_version 相同（提取缓存按“插件:版本”找正文，写进版本号会让快速方式转好的正文下一轮找不到）；切换模式只影响之后需要转换的 PDF（新加、改过、失败待重试），已经转好的不重转；模式进插件能力签名，此前转换失败（scanned/extract-failed）的文件下一轮按新模式重试一次。快速方式直接调 pymupdf_rag，不切进程级 use_layout 开关（同进程另一份文件正在按版面分析转换时切它会串台）。",
       "blocker": ""
     },
     {

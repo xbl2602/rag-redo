@@ -101,6 +101,19 @@ GROUPS: tuple[SettingGroup, ...] = (
                 ),
             ),
             SettingField(
+                "pdf_text_mode", "str", "PDF 文字转换方式",
+                "有文字层的 PDF 怎么转成文字：精细 = 每页做 AI 版面分析（标题、表格、图里的字最准，"
+                "但每页约 0.3 秒、会占满 CPU）；快速 = 规则式转换（快约 6~30 倍，标题偶尔认错、"
+                "图里的字不收、表格变成普通文字行）；自动 = 超过 200 页的大文件用快速，其余用精细。"
+                "只影响之后新转换的 PDF，已经转好的不会重转",
+                "auto",
+                choices=(
+                    ("auto", "自动：超过 200 页的用快速，其余精细（默认）"),
+                    ("layout", "精细：全部做 AI 版面分析（最慢，结构最准）"),
+                    ("fast", "快速：全部规则式转换（最快，结构略差）"),
+                ),
+            ),
+            SettingField(
                 "mineru_api_key", "str", "MinerU API Key",
                 "云端 OCR 用：mineru.net → 个人中心 → API Token；也可用环境变量 MINERU_API_KEY，"
                 "这里填了以这里为准。敏感信息，不进任何日志；补上 Key 后下轮索引自动重试此前因没 Key 跳过的扫描件",
