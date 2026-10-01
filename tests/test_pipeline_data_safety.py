@@ -637,6 +637,65 @@ class TestLibraryKeyCollision(_DataSafetyBase):
         self.assertEqual(relations.read_library("a b", "gen"), {"a.md": ["b.md"]})
 
 
+class TestManifestSegmentsAreRememberedNotReparsed(unittest.TestCase):
+    """回收旧数据时只需要清单里“还在用哪几段”的三个字段，同一份没变的清单不再整份重读
+    （2026-10-01 真机：每个库每轮收尾把所有库的全部清单各读一遍，Y2S1 一份 15MB）。
+    清单一变（换了文件）必须读到新内容，删了就是没有——记错一段就会误删正在用的数据。"""
+
+    def setUp(self) -> None:
+        import shutil
+        import tempfile
+
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.store = IndexManifestStore(self.tmp / "manifests")
+
+    def _manifest(self, generation: str, vector: list[str], extract: list[str], lexical: list[str]) -> dict:
+        from core.index_generation import INDEX_MANIFEST_VERSION
+
+        return {
+            "format_version": INDEX_MANIFEST_VERSION,
+            "library_id": "库 a",
+            "generation": generation,
+            "files": {"a.md": {"status": "indexed", "chunk_ids": ["c1"]}},
+            "vector_segments": vector,
+            "extract_segments": extract,
+            "lexical_segments": lexical,
+        }
+
+    def test_segments_are_the_union_of_the_three_fields(self):
+        self.assertTrue(self.store.write(self._manifest("g2", ["g1", "g2"], ["g0"], ["g2"])))
+        self.assertEqual(self.store.segments("库 a", "g2"), frozenset({"g0", "g1", "g2"}))
+        self.assertEqual(self.store.referenced_generations("库 a", ["g2"]), {"g0", "g1", "g2"})
+
+    def test_unchanged_manifest_is_not_parsed_again(self):
+        self.assertTrue(self.store.write(self._manifest("g2", ["g1"], [], [])))
+        self.assertEqual(self.store.segments("库 a", "g2"), frozenset({"g1"}))
+        with patch.object(IndexManifestStore, "read", side_effect=AssertionError("没变的清单不该再整份读")):
+            self.assertEqual(self.store.segments("库 a", "g2"), frozenset({"g1"}))
+            # 另一个 store 对象（下一个库的那一轮、另一个 Pipeline）同样认得
+            self.assertEqual(IndexManifestStore(self.tmp / "manifests").segments("库 a", "g2"), frozenset({"g1"}))
+
+    def test_a_rewritten_manifest_is_read_again(self):
+        self.assertTrue(self.store.write(self._manifest("g2", ["g1"], [], [])))
+        self.assertEqual(self.store.segments("库 a", "g2"), frozenset({"g1"}))
+        # 同样长短的新内容：只靠“大小 + 修改时间”在同一时刻重写时会认错，换了文件就一定重读
+        self.assertTrue(self.store.write(self._manifest("g2", ["g9"], [], [])))
+        self.assertEqual(self.store.segments("库 a", "g2"), frozenset({"g9"}))
+
+    def test_missing_cleared_or_unreadable_manifest_has_no_segments(self):
+        self.assertIsNone(self.store.segments("库 a", "nope"))
+        self.assertIsNone(self.store.segments("库 a", ""))
+        self.assertTrue(self.store.write(self._manifest("g2", ["g1"], [], [])))
+        self.assertEqual(self.store.segments("库 a", "g2"), frozenset({"g1"}))
+        self.store.clear("库 a", "g2")
+        self.assertIsNone(self.store.segments("库 a", "g2"))
+        broken = self.store._path_for("库 a", "g3")
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_text("{半截", encoding="utf-8")
+        self.assertIsNone(self.store.segments("库 a", "g3"))
+
+
 # ---------------------------------------------------------------- 缺陷 6
 
 class TestFreshnessSignatureCheck(_DataSafetyBase):

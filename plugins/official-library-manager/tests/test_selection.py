@@ -475,6 +475,67 @@ class TestNeutralDirExcludeUsesRelativePath(unittest.TestCase):
         self.assertTrue(decisions["notes/a.md"])
 
 
+class TestEnumeratingLibraryFiles(unittest.TestCase):
+    """列库文件改用 `os.scandir`（2026-10-01 提速）：结果必须与原来的
+    `rglob("*")` + `is_file()` 逐条一致——这是唯一的文件漏斗入口，多一个少一个都会让
+    文件静默进出索引。"""
+
+    def _reference(self, root: Path) -> list[str]:
+        return sorted(str(p.relative_to(root)).replace("\\", "/") for p in root.rglob("*") if p.is_file())
+
+    def _tree(self) -> Path:
+        import shutil
+        import tempfile
+
+        root = Path(tempfile.mkdtemp()) / "库 根"
+        self.addCleanup(shutil.rmtree, root.parent, ignore_errors=True)
+        for rel in (
+            "a.md",
+            "B.pdf",
+            "子目录/笔记 一.md",
+            "子目录/更深/表.docx",
+            ".obsidian/workspace.json",
+            ".hidden/.dotfile",
+            "TEMP/x.txt",
+            "无后缀文件",
+            "名字.带.很多.点.md",
+        ):
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x", encoding="utf-8")
+        (root / "空目录" / "空子目录").mkdir(parents=True)
+        return root
+
+    def test_same_files_as_rglob_including_hidden_dirs_unicode_and_spaces(self):
+        from official_library_manager.plugin import LibraryManagerPlugin
+
+        root = self._tree()
+        self.assertEqual(LibraryManagerPlugin._enumerate_files(str(root)), self._reference(root))
+
+    def test_symlinks_match_rglob_when_the_system_allows_creating_them(self):
+        import os
+
+        from official_library_manager.plugin import LibraryManagerPlugin
+
+        root = self._tree()
+        try:
+            os.symlink(root / "a.md", root / "指向文件的链接.md")
+            os.symlink(root / "子目录", root / "指向目录的链接", target_is_directory=True)
+            os.symlink(root / "不存在.md", root / "断掉的链接.md")
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"这台机器不让建符号链接：{type(exc).__name__}")
+        listed = LibraryManagerPlugin._enumerate_files(str(root))
+        self.assertEqual(listed, self._reference(root))
+        self.assertIn("指向文件的链接.md", listed)
+        self.assertNotIn("断掉的链接.md", listed)
+        self.assertFalse(any(path.startswith("指向目录的链接/") for path in listed))
+
+    def test_missing_root_is_empty(self):
+        from official_library_manager.plugin import LibraryManagerPlugin
+
+        self.assertEqual(LibraryManagerPlugin._enumerate_files(str(self._tree() / "没有这个目录")), [])
+
+
 class TestExplicitVerdictIsSharedByTreeAndFunnel(unittest.TestCase):
     """`explicit_verdict` 是"谁具体听谁的"的唯一实现：建索引的文件漏斗（`decide_included`）
     和 GUI 勾选树的展示都吃它。这里固定它的口径，并断言漏斗与它在整张矩阵上永不打架

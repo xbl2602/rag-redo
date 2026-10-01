@@ -17,7 +17,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from unittest.mock import patch
 
 from core import atomic
-from core.index_progress import IndexProgress, IndexWorkerManager, StatusUnreadableError, _read_json
+from core.index_progress import IndexProgress, IndexWorkerManager, StatusUnreadableError, _ThrottledStatusWriter, _read_json
 from core.singleton import pid_alive
 
 
@@ -69,6 +69,8 @@ PLUGIN_SOURCE = textwrap.dedent(
             ]
 
         def extract(self, library_id, path, root):
+            if self.mode == "slow_last" and path == "z_last.md":
+                time.sleep(3.0)
             try:
                 text = (Path(root) / path).read_text(encoding="utf-8")
             except OSError as exc:
@@ -359,6 +361,32 @@ class TestIndexWorkerManager(unittest.TestCase):
         self.assertIsNotNone(after["stall_grace_until"])
         self.assertEqual(after["health"], "healthy")
         self._wait_stage("lib1", "done")
+
+    def test_progress_held_back_by_the_throttle_reaches_the_file_long_before_the_next_heartbeat(self):
+        """一串文件飞快做完、停在最后一个文件上很久：停住前那一下进度被节流压下了，也必须在
+        一个节流间隔后补写进文件，不能等到下一次心跳（真机心跳 5 秒一次）。"""
+        for index in range(60):
+            (self.lib1 / f"f{index:02d}.md").write_text(f"text {index}", encoding="utf-8")
+        (self.lib1 / "z_last.md").write_text("last", encoding="utf-8")
+        self._set_mode("slow_last")
+        manager = IndexWorkerManager(
+            self.plugin_dir,
+            self.data_dir,
+            ["test-index-plugin"],
+            heartbeat_interval=8.0,
+            heartbeat_timeout=30.0,
+            stall_timeout=30.0,
+            ack_timeout=10.0,
+        )
+        self.addCleanup(manager.shutdown)
+        result = manager.start("lib1", source="test")
+        self.assertTrue(result.started, result.message)
+        self.assertTrue(
+            _wait_until(lambda: (manager.status("lib1") or {}).get("current_path") == "z_last.md", 2.5),
+            manager.status("lib1"),
+        )
+        self.assertEqual((manager.status("lib1") or {}).get("phase"), "extracting")
+        self.assertTrue(_wait_until(lambda: (manager.status("lib1") or {}).get("stage") == "done", 15.0))
 
     def test_embedding_phase_percent_counts_chunks_and_gives_no_file_based_eta(self):
         """索引先全部转换切块、再连续向量化：向量化阶段文件数已走满，percent 只能按块数算
@@ -738,6 +766,55 @@ class TestIndexWorkerManager(unittest.TestCase):
         stopped, message = self.manager.stop("never-started", "x")
         self.assertFalse(stopped)
         self.assertIn("没有可停止的索引任务", message)
+
+
+class TestProgressFileWritesAreThrottled(unittest.TestCase):
+    """worker 不再每报一次进度就写一遍状态文件（2026-10-01 真机：一轮没变化的增量里
+    “Obsidian Vault”6,076 个文件逐个写，9.8 秒里 7.4 秒花在写进度上）。压下的只是中间几次：
+    最新的进度最晚一个节流间隔后一定在文件里。"""
+
+    def _writer(self, interval: float = 0.25):
+        clock = [100.0]
+        writes: list[int] = []
+        state = {"files_done": 0}
+        writer = _ThrottledStatusWriter(
+            lambda: writes.append(state["files_done"]),
+            min_interval_s=interval,
+            clock=lambda: clock[0],
+        )
+        return writer, writes, state, clock
+
+    def test_a_burst_of_events_is_written_once_and_the_latest_value_is_flushed(self):
+        writer, writes, state, clock = self._writer()
+        for done in range(1, 6077):
+            state["files_done"] = done
+            writer.on_event()
+        self.assertEqual(writes, [1])
+        self.assertTrue(writer.pending)
+        writer.flush_pending()  # 心跳线程下一拍
+        self.assertEqual(writes, [1, 6076])
+        self.assertFalse(writer.pending)
+        writer.flush_pending()  # 没有新进度时不重复写
+        self.assertEqual(writes, [1, 6076])
+
+    def test_events_spaced_beyond_the_interval_are_written_at_once(self):
+        writer, writes, state, clock = self._writer()
+        for done in range(1, 4):
+            state["files_done"] = done
+            writer.on_event()
+            clock[0] += 0.3
+        self.assertEqual(writes, [1, 2, 3])
+        self.assertFalse(writer.pending)
+
+    def test_a_heartbeat_write_carries_the_pending_progress_and_clears_it(self):
+        writer, writes, state, clock = self._writer()
+        writer.on_event()
+        state["files_done"] = 7
+        writer.on_event()
+        self.assertTrue(writer.pending)
+        writer.write_now()  # 心跳到点
+        self.assertEqual(writes, [0, 7])
+        self.assertFalse(writer.pending)
 
 
 class TestWorkerOutputEncoding(unittest.TestCase):

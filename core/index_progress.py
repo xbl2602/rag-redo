@@ -116,6 +116,49 @@ def _atomic_write_json(path: Path, data: object) -> bool:
         return False
 
 
+#: worker 两次把进度写进状态文件之间至少隔这么久（秒）。
+#: 2026-10-01 真机（data-real 副本实测）：一轮什么都没变的增量，“Obsidian Vault”6,076 个
+#: 文件每个都报一次“未变化/已跳过”，每报一次就原子写一遍状态文件，9.8 秒里有 7.4 秒花在
+#: 这上面；界面每秒只读一两次，写得再勤也看不到。只按时间节流、不看阶段：转换时每个文件
+#: 都在“正在提取”和“完成一个文件”之间来回切，按阶段变化立刻写就等于没节流。
+PROGRESS_WRITE_MIN_INTERVAL_S = 0.25
+
+
+class _ThrottledStatusWriter:
+    """worker 往状态文件里写进度：离上次写不到 `min_interval_s` 的先记下“有没写的”，
+    由心跳线程按 `min_interval_s` 的节奏补写（`flush_pending`）。写的永远是内存里那份
+    最新的进度，压下的只是中间几次，最后一次不会丢——进度停住不动时（一个文件转很久、
+    换到向量化阶段），停住前的那一下最晚 `min_interval_s` 后就在文件里了。
+    调用方负责在同一把锁里调用。"""
+
+    def __init__(
+        self,
+        write: Callable[[], object],
+        min_interval_s: float = PROGRESS_WRITE_MIN_INTERVAL_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._write = write
+        self._min_interval_s = float(min_interval_s)
+        self._clock = clock
+        self._last_at: float | None = None
+        self.pending = False
+
+    def on_event(self) -> None:
+        if self._last_at is None or self._clock() - self._last_at >= self._min_interval_s:
+            self.write_now()
+        else:
+            self.pending = True
+
+    def write_now(self) -> None:
+        self._write()
+        self._last_at = self._clock()
+        self.pending = False
+
+    def flush_pending(self) -> None:
+        if self.pending:
+            self.write_now()
+
+
 class StatusUnreadableError(OSError):
     """状态文件**存在**，但重试之后仍然读不了（被别的进程占着不放等）。"""
 
@@ -461,14 +504,26 @@ def _index_one_library(
 
         progress_lock = threading.Lock()
         heartbeat_stop = threading.Event()
+        status_writer = _ThrottledStatusWriter(
+            lambda: _atomic_write_json(status_path, dataclasses.asdict(progress))
+        )
 
         def _heartbeat() -> None:
-            while not heartbeat_stop.wait(heartbeat_interval):
+            # 心跳照旧每 heartbeat_interval 写一次、查一次发起进程；中间按进度节流的节奏醒来，
+            # 把被压下的最新进度补写进去（见 `_ThrottledStatusWriter`）。
+            tick = min(heartbeat_interval, PROGRESS_WRITE_MIN_INTERVAL_S)
+            next_beat = time.monotonic() + heartbeat_interval
+            while not heartbeat_stop.wait(tick):
+                if time.monotonic() < next_beat:
+                    with progress_lock:
+                        status_writer.flush_pending()
+                    continue
+                next_beat = time.monotonic() + heartbeat_interval
                 if launcher_pid > 0 and not pid_alive(launcher_pid):
                     os._exit(129)
                 with progress_lock:
                     progress.heartbeat_at = time.time()
-                    _atomic_write_json(status_path, dataclasses.asdict(progress))
+                    status_writer.write_now()
 
         def _on_progress(event: IndexProgressEvent) -> None:
             now = time.time()
@@ -487,7 +542,7 @@ def _index_one_library(
                 else:
                     progress.stall_grace_until = None
                 progress.progress_at = now
-                _atomic_write_json(status_path, dataclasses.asdict(progress))
+                status_writer.on_event()
 
         terminal_stage = "failed"
         terminal_error: str | None = None

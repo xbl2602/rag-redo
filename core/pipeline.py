@@ -2401,12 +2401,7 @@ class Pipeline:
         referenced_generations = self._manifests.referenced_generations(library_id, [generation])
         candidates = set(known_generations)
         for known_generation in list(candidates):
-            data = self._manifests.read(library_id, known_generation)
-            if data:
-                for field in ("vector_segments", "extract_segments", "lexical_segments"):
-                    values = data.get(field, [])
-                    if isinstance(values, list):
-                        candidates.update(str(value) for value in values if value)
+            candidates.update(self._manifests.segments(library_id, known_generation) or ())
         for candidate in sorted(candidates - keep_generations - referenced_generations):
             self.discard_index_generation(library_id, candidate)
             self._manifests.clear(library_id, candidate)
@@ -2548,11 +2543,7 @@ class Pipeline:
         generations.update(self._generations.history(library_id))
         for generation in self._manifests.list_generations(library_id):
             generations.add(generation)
-            manifest = self._manifests.read(library_id, generation)
-            for field in ("vector_segments", "lexical_segments", "extract_segments"):
-                values = manifest.get(field, []) if manifest else []
-                if isinstance(values, list):
-                    generations.update(str(value) for value in values if value)
+            generations.update(self._manifests.segments(library_id, generation) or ())
         try:
             status = self._index_progress.status(library_id)
         except Exception:
