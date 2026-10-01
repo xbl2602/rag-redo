@@ -22,6 +22,7 @@ from core.conversion_cache import (  # noqa: E402
     format_round_summary,
     human_bytes,
     missing_pages,
+    needs_attention,
     needs_conversion,
     page_ranges,
     reason_text,
@@ -150,11 +151,65 @@ class TestTextState(_Fixture):
         for code in (
             "not-indexed", "scanned", "deferred", "extract-failed", "unreadable", "empty", "tbd",
             "cache-missing", "pages-off", "pages-not-built", "pages-partial", "pages-failed",
+            "ocr-off", "too-many-pages", "ocr-deferred", "ocr-failed",
         ):
             label, step = reason_text(code)
             self.assertTrue(label and step, code)
         self.assertEqual(reason_text("没见过的"), ("没见过的", ""))
         self.assertEqual(reason_text(None), ("", ""))
+
+    # ---- PDF 按页分流（2026-10-01，BC-01）---------------------------------------------------
+
+    def test_a_pdf_with_unrecognized_picture_pages_is_partial_with_the_pages_and_why(self) -> None:
+        report = self.build(
+            records={
+                "papers/a.pdf": {
+                    "status": "indexed",
+                    "extractor_id": "official-extractor-pdf-text",
+                    "extractor_version": "0.4.0",
+                    "missing_pages": [12, 743, 744],
+                    "missing_reason": "too-many-pages",
+                }
+            }
+        )
+        item = report.files[0]
+        self.assertEqual((item.text_state, item.text_reason), ("partial", "too-many-pages"))
+        self.assertEqual(item.text_missing_pages, (12, 743, 744))
+        self.assertEqual(item.text_file, str(self.cached), "正文照样转好了，缓存文件照样报出来")
+        self.assertTrue(needs_attention(item), "有图片页没识别要标黄")
+        self.assertEqual(report.text_done, 0)
+        text = render_catalog(report, library_root="D:/vault", now=0)
+        self.assertIn("⚠️ 第 12、743–744 页没识别（要识别的页数超过本机上限）", text)
+        self.assertIn("[打开](", text)
+
+    def test_recognized_picture_pages_are_reported_on_a_done_pdf(self) -> None:
+        report = self.build(
+            records={
+                "papers/a.pdf": {
+                    "status": "indexed",
+                    "extractor_id": "official-extractor-pdf-text",
+                    "ocr_pages": [2, 3],
+                    "ocr_by": "official-ocr-mineru-local",
+                }
+            },
+            pages_enabled=False,
+        )
+        item = report.files[0]
+        self.assertEqual(item.text_state, "done")
+        self.assertEqual((item.text_ocr_pages, item.text_ocr_by), ((2, 3), "official-ocr-mineru-local"))
+        self.assertFalse(needs_attention(item))
+
+    def test_a_whole_scan_over_the_page_limit_says_so_instead_of_asking_to_turn_mineru_on(self) -> None:
+        report = self.build(
+            records={
+                "big.pdf": {
+                    "status": "terminal",
+                    "failure_state": "scanned",
+                    "failure_detail": "scanned:too-many-pages: 901 页超过本机识别上限 200 页",
+                }
+            }
+        )
+        self.assertEqual((report.files[0].text_state, report.files[0].text_reason), ("failed", "too-many-pages"))
 
 
 class TestPagesState(_Fixture):
@@ -220,7 +275,8 @@ class TestRoundSummary(_Fixture):
         self.assertEqual((summary.pages_reused, summary.pages_new, summary.pages_missing), (0, 1, 1))
         self.assertEqual(
             format_round_summary(summary),
-            "转换缓存：转文字 复用 0 / 新转 1 / 缺 2；页库 复用 0 / 新建 1 / 缺 1",
+            "转换缓存：转文字 复用 0 / 新转 1（MinerU 本地解析 1）/ 缺 2；图片页 本轮没有送识别的；"
+            "页库 复用 0 / 新建 1 / 缺 1",
         )
 
     def test_reused_cache_is_not_counted_as_new_and_page_library_off_says_so(self) -> None:
@@ -229,6 +285,42 @@ class TestRoundSummary(_Fixture):
         self.assertEqual((summary.text_reused, summary.text_new, summary.text_missing), (1, 0, 0))
         self.assertEqual((summary.pages_reused, summary.pages_new, summary.pages_missing), (0, 0, 0))
         self.assertTrue(format_round_summary(summary).endswith("；页库 没开"))
+
+    def test_the_line_says_who_recognized_how_many_picture_pages_and_how_many_are_still_missing(self) -> None:
+        """2026-10-01 操作者反馈：改了识别相关的设置，看不出是没生效还是静默失败，连送没送 MinerU
+        云端都不知道。每轮这一行写明本轮谁识别了几页、还有几页没识别；转好了只差几页图的书
+        正文已经进了索引，不算“缺”（BC-19/BC-01）。"""
+        report = self.build(
+            records={
+                "papers/a.pdf": {
+                    "status": "indexed",
+                    "extractor_id": "official-extractor-pdf-text",
+                    "ocr_pages": [3, 4],
+                    "ocr_by": "official-ocr-mineru-local",
+                    "missing_pages": [9],
+                    "missing_reason": "too-many-pages",
+                },
+            },
+            pages_enabled=False,
+        )
+        summary = round_summary(report, fresh_paths={"papers/a.pdf"})
+        self.assertEqual((summary.text_reused, summary.text_new, summary.text_missing), (0, 1, 0))
+        self.assertEqual(summary.ocr_pages_by, (("MinerU 本地解析", 2),))
+        self.assertEqual((summary.pages_unrecognized, summary.files_unrecognized), (1, 1))
+        self.assertEqual(
+            format_round_summary(summary),
+            "转换缓存：转文字 复用 0 / 新转 1（official-extractor-pdf-text 1）/ 缺 0；"
+            "图片页 本轮 MinerU 本地解析 识别 2 页，还有 1 页没识别（1 份，原因见诊断页）；页库 没开",
+        )
+
+    def test_a_library_without_pdfs_has_no_picture_page_part(self) -> None:
+        report = self.build(
+            records={"c.docx": {"status": "indexed", "extractor_id": "official-extractor-docx"}},
+            locate=lambda path: self.cached,
+            pages_enabled=False,
+        )
+        line = format_round_summary(round_summary(report, fresh_paths=set()))
+        self.assertNotIn("图片页", line)
 
 
 class TestHumanReadableHelpers(unittest.TestCase):

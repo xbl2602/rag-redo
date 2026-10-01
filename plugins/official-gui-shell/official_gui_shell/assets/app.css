@@ -577,6 +577,8 @@ td.g{color:var(--sec);font-size:12px}
 .sg-group-desc{font-size:12px;color:var(--ph);margin:2px 0 10px}
 .f-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 0;border-bottom:1px solid var(--hair);flex-wrap:wrap}
 .f-row:last-child{border-bottom:none}
+.f-row.f-row-off .f-label,.f-row.f-row-off .f-help{opacity:.5}
+.f-row.f-row-off .f-ctl{opacity:.45;pointer-events:none}
 .f-meta{min-width:0;flex:1}
 .f-label{font-size:13.5px;color:var(--text);font-weight:500;display:flex;align-items:center;gap:6px}
 .f-help{font-size:12px;color:var(--ph);margin-top:1px}
@@ -743,6 +745,9 @@ td.g{color:var(--sec);font-size:12px}
 .toast.warn svg{color:var(--warn)}
 .toast.err{border-color:rgba(248,113,113,0.5)}
 .toast.err svg{color:var(--err)}
+/* 长提示（索引失败的原因、保存后什么时候生效）：换行显示，不撑出屏幕 */
+.toast.long{white-space:normal;max-width:min(640px,calc(100vw - 48px));border-radius:14px;line-height:1.55;align-items:flex-start}
+.toast.long svg{margin-top:3px}
 
 /* 角标 */
 .stamp{

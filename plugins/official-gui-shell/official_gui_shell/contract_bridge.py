@@ -106,6 +106,32 @@ def _exc_text(exc: BaseException) -> str:
     return str(exc)
 
 
+#: 界面上显示的索引失败原因最多多少字（完整的在日志里）
+FAILURE_TEXT_LIMIT = 200
+
+
+def _failed_libraries(statuses: list[tuple[Any, dict[str, Any]]]) -> list[dict[str, Any]]:
+    """最近一次索引失败的库：库名、原因（类型 + 摘要）、什么时候、哪一轮。
+
+    2026-10-01 操作者反馈：Y2S1 每轮都在写库时崩，界面却照常显示“就绪 · N 块”，跟成功了
+    一样，原因只在日志文件里，改了设置也不知道是没生效还是静默失败。每个库只看它最近一次：
+    之后跑成功了自然消失；停止（cancelled）是用户自己的决定，不算失败。"""
+    failed = []
+    for cfg, status in statuses:
+        if status.get("stage") != "failed":
+            continue
+        error = str(status.get("error") or status.get("message") or "未知错误").strip()
+        if len(error) > FAILURE_TEXT_LIMIT:
+            error = error[:FAILURE_TEXT_LIMIT] + "…"
+        failed.append({
+            "library": cfg.name,
+            "error": error,
+            "at": status.get("finished_at"),
+            "run": str(status.get("run_id") or ""),
+        })
+    return sorted(failed, key=lambda item: float(item["at"] or 0.0))
+
+
 def _cpu_percent() -> float | None:
     """本机 CPU 总占用（旧 store.cpu_percent）。第一次调用只是"打底"，返回 None，
     一秒后才有数（契约：`cpu` 首次为 null）。没有 psutil 一律 None（fail-open）。"""
@@ -437,6 +463,8 @@ class _LegacyContractMixin:
             "chunks_done": 0, "chunks_total": 0, "pct": 0.0, "elapsed": None,
             "library": "", "busy": False, "task": "idle", "heartbeat": "idle",
             "heartbeat_note": None,
+            # 最近一次跑失败的库（见 `_failed_libraries`）：前端据此变红、弹一次提示
+            "failed": _failed_libraries(statuses),
         }
         if not active:
             finished = [(c, s) for c, s in statuses if s.get("finished_at") is not None]
@@ -1229,6 +1257,12 @@ class _LegacyContractMixin:
                     "secret": setting_is_secret(field.key),
                     "choices": [list(choice) for choice in field.choices],
                     "suggest": [list(choice) for choice in field.suggest],
+                    # 只有另一项取这些值时这一项才能改（前端据此变灰，不另写判断）
+                    "enabled_when": (
+                        {"key": field.enabled_when[0], "values": list(field.enabled_when[1])}
+                        if field.enabled_when
+                        else None
+                    ),
                     "value": format_setting_value(field.kind, value),
                 })
             groups.append({
@@ -1256,6 +1290,10 @@ class _LegacyContractMixin:
             self._log("设置保存失败：%s" % errors, is_error=True)
             return {"errors": errors}
         settings = self._pipeline.runtime.settings  # type: ignore[attr-defined]
+        # 真正改了的项：前端保存时把页面上所有字段一起发回，此前日志把 32 项全列一遍、提示永远是
+        # “已热读生效”，看不出改了什么、什么时候起作用（2026-10-01 操作者反馈）
+        changed = [key for key, value in parsed.items() if settings.get(key, FIELDS[key].default) != value]
+        before = {key: settings.get(key, FIELDS[key].default) for key in changed}
         try:
             for key, value in parsed.items():
                 if value == FIELDS[key].default:
@@ -1264,8 +1302,26 @@ class _LegacyContractMixin:
                     settings.set(key, value)
         except Exception as exc:  # noqa: BLE001 - 写盘失败要让前端看见
             return {"errors": {"__file__": "写入失败：%s" % exc}}
-        self._log("设置已保存并热读生效（%s）" % ", ".join(parsed))
-        return {"errors": {}}
+        if changed:
+            self._log("设置已保存，改了：%s" % "；".join(
+                "%s（%s）" % (
+                    FIELDS[key].label,
+                    "已改，内容不记" if setting_is_secret(key)
+                    else "%s → %s" % (
+                        format_setting_value(FIELDS[key].kind, before[key]) or "空",
+                        format_setting_value(FIELDS[key].kind, parsed[key]) or "空",
+                    ),
+                )
+                for key in changed
+            ))
+        else:
+            self._log("设置已保存（没有改动）")
+        notes: list[str] = []
+        for key in changed:
+            note = FIELDS[key].after_change
+            if note and note not in notes:
+                notes.append(note)
+        return {"errors": {}, "changed": [FIELDS[key].label for key in changed], "notes": notes}
 
     # ==================================================================
     # 图谱 / 语义边

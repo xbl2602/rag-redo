@@ -603,10 +603,28 @@ def _note_batch_failure(err: str) -> None:
         print("[mineru-local] 合批时显存不足 -> 本服务余下时间只一份一份解", file=sys.stderr)
 
 
-def _real_ocr(full_path: Path) -> str:
+def _page_limit(max_pages) -> int:
+    """这次请求用的页数上限：宿主带了就用宿主的（设置项 mineru_local_max_pages，改了不用重启服务），
+    没带（老宿主）就用启动参数 --max-pages。0 = 不限。"""
+    if max_pages is None:
+        return MINERU_MAX_PAGES
+    try:
+        return max(0, int(max_pages))
+    except (TypeError, ValueError):
+        return MINERU_MAX_PAGES
+
+
+def _too_many_pages(pages, limit: int) -> "str | None":
+    if limit and pages is not None and pages > limit:
+        return f"too-many-pages: {pages} 页超过本机识别上限 {limit} 页（可在设置里调大上限，或打开“超过上限送云端”）"
+    return None
+
+
+def _real_ocr(full_path: Path, max_pages=None) -> str:
     pages = _count_pages(full_path)
-    if pages is not None and pages > MINERU_MAX_PAGES:
-        raise RuntimeError(f"too-many-pages: {pages} 页超过上限 {MINERU_MAX_PAGES} 页，请人工拆分后重建（串行锁下大文件会卡死整轮）")
+    refused = _too_many_pages(pages, _page_limit(max_pages))
+    if refused:
+        raise RuntimeError(refused)
     if pages is not None and pages <= 0:
         raise RuntimeError("empty-pdf: 无有效页面")
     timeout = _mineru_local_timeout(pages)
@@ -622,7 +640,7 @@ def _real_ocr(full_path: Path) -> str:
     return md
 
 
-def _real_ocr_many(full_paths: "list[Path]") -> "list[tuple[str | None, str | None]]":
+def _real_ocr_many(full_paths: "list[Path]", max_pages=None) -> "list[tuple[str | None, str | None]]":
     """几份 PDF 一起解 → 每份（md 或 None，失败原因或 None），顺序与输入一致。
 
     显存管理（操作者 2026-09-29 的硬要求）：①每批不超过 MINERU_BATCH_MAX_FILES 份、
@@ -633,14 +651,13 @@ def _real_ocr_many(full_paths: "list[Path]") -> "list[tuple[str | None, str | No
     global _active_requests
     outcomes: "list[tuple[str | None, str | None] | None]" = [None] * len(full_paths)
     page_counts: "list[int | None]" = []
+    limit = _page_limit(max_pages)
     for index, full_path in enumerate(full_paths):
         pages = _count_pages(full_path)
         page_counts.append(pages)
-        if pages is not None and pages > MINERU_MAX_PAGES:
-            outcomes[index] = (
-                None,
-                f"too-many-pages: {pages} 页超过上限 {MINERU_MAX_PAGES} 页，请人工拆分后重建（串行锁下大文件会卡死整轮）",
-            )
+        refused = _too_many_pages(pages, limit)
+        if refused:
+            outcomes[index] = (None, refused)
         elif pages is not None and pages <= 0:
             outcomes[index] = (None, "empty-pdf: 无有效页面")
     todo = [index for index in range(len(full_paths)) if outcomes[index] is None]
@@ -717,7 +734,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if os.environ.get("RAG_REDO_FAKE_OCR"):
                 text = _fake_ocr(full_path)
             else:
-                text = _real_ocr(full_path)
+                text = _real_ocr(full_path, payload.get("max_pages"))
             self._json(200, {"text": text, "failure_reason": None})
         except Exception as exc:  # noqa: BLE001 - 子进程这一侧也不能让异常直接炸掉HTTP响应
             self._json(200, {"text": None, "failure_reason": f"{type(exc).__name__}: {exc}"})
@@ -741,7 +758,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if os.environ.get("RAG_REDO_FAKE_OCR"):
                 outcomes = [(_fake_ocr(root / rel_paths[index]), None) for index in todo]
             else:
-                outcomes = _real_ocr_many([root / rel_paths[index] for index in todo])
+                outcomes = _real_ocr_many([root / rel_paths[index] for index in todo], payload.get("max_pages"))
             for index, (text, err) in zip(todo, outcomes):
                 results[index] = (
                     {"text": text, "failure_reason": None}

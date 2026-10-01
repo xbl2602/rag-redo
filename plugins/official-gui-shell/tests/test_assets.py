@@ -184,6 +184,56 @@ class TestReleaseGpuButton(unittest.TestCase):
         self.assertIn("release_gpu_memory: function", mock_js)
 
 
+class TestDependentSettingsAndCloudConsent(unittest.TestCase):
+    """设置页（2026-10-01，BC-01/BC-15）：“超过本机上限时”只在扫描件后端选本机时可改——前端按后端
+    给的 enabled_when 通用地变灰，不写具体键名；选成送云端和切到云端识别一样先弹同意框。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app_js = (ASSETS_DIR / "app.js").read_text(encoding="utf-8")
+        cls.mock_js = (ASSETS_DIR / "mock.js").read_text(encoding="utf-8")
+
+    def test_greying_out_is_generic(self) -> None:
+        start = self.app_js.index("function bindEnabledWhen()")
+        body = self.app_js[start : self.app_js.index("function bindPickButtons()")]
+        self.assertIn("data-enkey", body)
+        self.assertNotIn("mineru", body, "变灰逻辑不认具体的设置项")
+        self.assertIn("f.enabled_when", self.app_js)
+        self.assertIn('"enabled_when": {"key": "pdf_scan_backend"', self.mock_js)
+
+    def test_sending_pages_to_the_cloud_asks_for_consent_first(self) -> None:
+        self.assertIn("['pdf_scan_backend', 'pdf_text_backend', 'mineru_local_overflow']", self.app_js)
+
+
+class TestFailuresAndSettingChangesAreVisible(unittest.TestCase):
+    """2026-10-01 操作者反馈：“设置怎么改都不生效，也没有报错提示，根本不知道是没生效还是静默失败”。
+    查下来一是某个库索引失败时界面照常显示“就绪”，二是保存后永远提示“已热读生效”。前端只照后端给的
+    `progress.failed` 和保存结果里的 `changed`/`notes` 显示，不自己判断（BC-15）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app_js = (ASSETS_DIR / "app.js").read_text(encoding="utf-8")
+        cls.mock_js = (ASSETS_DIR / "mock.js").read_text(encoding="utf-8")
+
+    def test_a_failed_index_run_turns_the_status_red_and_says_why_once(self) -> None:
+        island = self.app_js[self.app_js.index("function paintIsland("): self.app_js.index("function paintHeartCap(")]
+        self.assertIn("p.failed", island)
+        self.assertIn("索引失败", island)
+        cap = self.app_js[self.app_js.index("function paintHeartCap("): self.app_js.index("function paintStepper(")]
+        self.assertIn("hb-dead", cap)
+        self.assertIn("last.error", cap)
+        snapshot = self.app_js[self.app_js.index("function onSnapshot("):]
+        self.assertIn("S.failSeen[key]", snapshot, "每个库的每一轮只提示一次")
+        self.assertIn("toggleLog(true)", snapshot)
+        self.assertIn("failed: []", self.mock_js)
+
+    def test_saving_settings_says_what_changed_and_when_it_takes_effect(self) -> None:
+        self.assertNotIn("已保存，配置已热读生效", self.app_js)
+        self.assertIn("res.changed", self.app_js)
+        self.assertIn("res.notes", self.app_js)
+        self.assertIn("changed: changed, notes: notes", self.mock_js)
+
+
 class TestConversionCachesAreVisible(unittest.TestCase):
     """BC-19：转换缓存看得见（2026-09-30 操作者确认，旧项目没有这个能力）。
 
@@ -218,6 +268,12 @@ class TestConversionCachesAreVisible(unittest.TestCase):
                 self.assertIn(f"{method}: function", self.mock_js)
         self.assertIn("ccCardLine(l.name)", self.app_js, "库卡片上那一行")
         self.assertIn('id="giCc"', self.app_js, "文件详情里的转换缓存一节")
+
+    def test_a_partially_recognized_pdf_shows_its_missing_pages(self) -> None:
+        """PDF 按页分流（2026-10-01，BC-01）：转好了但有图片页没识别的，清单与详情都写出页码。"""
+        self.assertIn("t.state === 'partial'", self.app_js)
+        self.assertIn("页没识别", self.app_js)
+        self.assertIn("state: 'partial'", self.mock_js, "演示数据里有一份这样的书")
 
     def test_reason_labels_live_only_in_core(self) -> None:
         import sys

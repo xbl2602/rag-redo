@@ -139,10 +139,10 @@ var REASON_ADVICE = {
 };
 
 /* ============ Toast / 弹层 ============ */
-function toast(msg, kind) {
+function toast(msg, kind, ms) {
   var wrap = $('toastWrap');
   var t = document.createElement('div');
-  t.className = 'toast' + (kind ? ' ' + kind : '');
+  t.className = 'toast' + (kind ? ' ' + kind : '') + (msg.length > 48 ? ' long' : '');
   var icon = kind === 'err'
     ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>'
     : (kind === 'warn'
@@ -155,7 +155,7 @@ function toast(msg, kind) {
   setTimeout(function () {
     t.classList.remove('show');
     setTimeout(function () { t.remove(); }, 350);
-  }, 3200);
+  }, ms || 3200);
 }
 var escStack = [];
 function openModal(id) {
@@ -290,18 +290,27 @@ function paintIsland(p, chunks) {
     return;
   }
   island.classList.remove('run', 'live');
-  island.classList.toggle('dead', p.heartbeat === 'dead');
+  var fails = p.failed || [];
+  island.classList.toggle('dead', p.heartbeat === 'dead' || fails.length > 0);
   island.classList.toggle('stalled', p.heartbeat === 'stalled');
   var msg;
   if (p.heartbeat === 'dead') msg = '索引疑似卡死';
+  else if (fails.length) msg = '索引失败 · ' + fails.map(function (f) { return f.library; }).join('、') + '（搜索仍用上次的结果）';
   else if (p.heartbeat === 'stalled') msg = '心跳停滞 · ' + (p.heartbeat_note || '等待进展');
   else if (p.heartbeat === 'done') msg = '索引完成 · ' + fmtInt(chunks) + ' 块';
   else if (p.busy) msg = '另一进程索引中';
   else msg = '就绪 · <b class="mono">' + fmtInt(chunks) + '</b> 块';
-  $('islandMsg').innerHTML = p.heartbeat === 'idle' && !p.busy ? msg : esc(msg.replace(/<[^>]+>/g, ''));
+  $('islandMsg').innerHTML = p.heartbeat === 'idle' && !p.busy && !fails.length ? msg : esc(msg.replace(/<[^>]+>/g, ''));
 }
 function paintHeartCap(p) {
   var cap = $('heartCap');
+  var fails = p.failed || [];
+  if (!p.running && p.heartbeat !== 'dead' && fails.length) {
+    var last = fails[fails.length - 1];
+    cap.className = 'hb-cap hb-dead';
+    $('heartTxt').textContent = '索引失败 · ' + last.library + '：' + last.error;
+    return;
+  }
   cap.className = 'hb-cap hb-' + (p.running ? 'run' : (p.heartbeat || 'idle'));
   var label = p.running ? (HB_NAME.running) : (HB_NAME[p.heartbeat] || p.heartbeat);
   if (p.heartbeat_note && (p.running || p.heartbeat === 'stalled')) label += ' · ' + p.heartbeat_note;
@@ -369,6 +378,15 @@ function onSnapshot(snap) {
     toggleLog(true);
   }
   if (p.heartbeat !== 'dead') S.deadAlarmed = false;
+  // 索引失败（每个库的每一轮只提示一次）：此前失败了界面照样显示“就绪”，原因只在日志文件里
+  S.failSeen = S.failSeen || {};
+  (p.failed || []).forEach(function (f) {
+    var key = f.library + '|' + f.run;
+    if (S.failSeen[key]) return;
+    S.failSeen[key] = true;
+    toast('「' + f.library + '」索引失败：' + f.error + '。搜索仍用上一次成功的结果，详细原因见日志', 'err', 10000);
+    toggleLog(true);
+  });
   S.lastHeartbeat = p.heartbeat;
   // WEMM 状态行 + 整机占用行（问题47：显存/GPU/CPU/功耗只读显示）
   var w = snap.wemm || {};
@@ -1533,8 +1551,9 @@ function ccJump(name) {
 }
 function ccTextCell(r) {
   var t = r.text;
-  if (t.state === 'done') {
-    return '<span class="badge badge-hi">已转好</span> <span class="cc-sub">' + esc(t.route_name || t.route || '') + ' · ' + ccBytes(t.bytes) + '</span>';
+  if (t.state === 'done' || t.state === 'partial') {
+    return '<span class="badge badge-hi">已转好</span> <span class="cc-sub">' + esc(t.route_name || t.route || '') + ' · ' + ccBytes(t.bytes) + '</span>'
+      + (t.state === 'partial' ? ' <span class="badge badge-lo">第 ' + esc(t.missing) + ' 页没识别</span>' : '');
   }
   var cls = t.state === 'failed' || t.state === 'missing' ? 'cc-bad' : 'badge-lo';
   return '<span class="badge ' + cls + '">' + esc(t.label || t.state) + '</span>';
@@ -1584,12 +1603,17 @@ function renderConv() {
 /* 一份文件的详情：清单里展开、星图文件详情里都用这一份 */
 function ccDetailHtml(d) {
   var t = d.text, p = d.pages, h = '<div class="cc-block"><h5>转文字</h5>';
-  if (t.state === 'done') {
+  if (t.state === 'done' || t.state === 'partial') {
     h += '<div class="gi-kv"><span class="k">谁转的</span><span class="v">' + esc(t.route_name || t.route || '') + (t.route_version ? ' ' + esc(t.route_version) : '') + '</span></div>'
       + '<div class="gi-kv"><span class="k">多少</span><span class="v">' + (t.chars != null ? fmtInt(t.chars) + ' 字 · ' : '') + ccBytes(t.bytes) + ' · ' + esc(fmtTs(t.updated)) + '</span></div>'
       + '<div class="cc-path mono" title="缓存文件">' + esc(t.file || '') + '</div>'
       + '<div class="cc-acts"><button class="btn btn-sm" data-cc="read">在窗口里阅读</button>'
       + '<button class="btn btn-sm btn-ghost" data-cc="reveal">在资源管理器中显示</button></div>';
+    if (t.ocr_pages) h += '<div class="gi-kv"><span class="k">识别补上</span><span class="v">第 ' + esc(t.ocr_pages) + ' 页（图片页，' + esc(t.ocr_by || '') + '）</span></div>';
+    if (t.state === 'partial') {
+      h += '<div class="gi-kv"><span class="k">没识别</span><span class="v cc-warn">第 ' + esc(t.missing) + ' 页（图片页，先用了它上面仅有的字）</span></div>'
+        + '<div class="fd-line fd-why">' + esc(t.label) + '</div>' + (t.next ? '<div class="fd-line fd-fix">下一步：' + esc(t.next) + '</div>' : '');
+    }
   } else {
     h += '<div class="fd-line fd-why">' + esc(t.label) + '</div>' + (t.next ? '<div class="fd-line fd-fix">下一步：' + esc(t.next) + '</div>' : '');
   }
@@ -1793,6 +1817,27 @@ function buildSettings() {
   });
   bindSuggest();
   bindPickButtons();
+  bindEnabledWhen();
+}
+/* 只有另一项取某些值时才能改的设置（后端 enabled_when 声明，前端只管变灰，不另写判断） */
+function bindEnabledWhen() {
+  var rows = $('sgPanelWrap').querySelectorAll('[data-enkey]');
+  function apply() {
+    Array.prototype.forEach.call(rows, function (row) {
+      var ctl = $('f_' + row.getAttribute('data-enkey'));
+      var allowed = JSON.parse(row.getAttribute('data-envals') || '[]');
+      var on = !ctl || allowed.indexOf(ctl.type === 'checkbox' ? (ctl.checked ? 'true' : 'false') : ctl.value) >= 0;
+      row.classList.toggle('f-row-off', !on);
+      Array.prototype.forEach.call(row.querySelectorAll('select,input,button'), function (el) { el.disabled = !on; });
+    });
+  }
+  var keys = {};
+  Array.prototype.forEach.call(rows, function (row) { keys[row.getAttribute('data-enkey')] = true; });
+  Object.keys(keys).forEach(function (k) {
+    var ctl = $('f_' + k);
+    if (ctl) ctl.addEventListener('change', apply);
+  });
+  apply();
 }
 function bindPickButtons() {
   Array.prototype.forEach.call($('sgPanelWrap').querySelectorAll('[data-pickfor]'), function (btn) {
@@ -1835,7 +1880,10 @@ function fieldRow(f) {
           + (cur ? '✓ ' : '') + esc(s[0]) + ' · ' + esc(s[1]) + '</button>';
       }).join('') + '</div>';
   }
-  return '<div class="f-row"><div class="f-meta">'
+  var en = f.enabled_when
+    ? ' data-enkey="' + esc(f.enabled_when.key) + '" data-envals="' + esc(JSON.stringify(f.enabled_when.values)) + '"'
+    : '';
+  return '<div class="f-row"' + en + '><div class="f-meta">'
     + '<div class="f-label">' + esc(f.label) + (f.rebuild ? '<span class="rebuild-mark" title="修改后需全量重建">⟳ 重建</span>' : '') + '</div>'
     + '<div class="f-help">' + esc(f.hint || '') + '</div>'
     + '<div class="f-err" id="ferr_' + f.key + '"></div>'
@@ -1871,7 +1919,7 @@ $('saveBtn').addEventListener('click', function () {
     });
   });
   // 云端同意门禁
-  ['pdf_scan_backend', 'pdf_text_backend'].forEach(function (k) {
+  ['pdf_scan_backend', 'pdf_text_backend', 'mineru_local_overflow'].forEach(function (k) {
     var nv = updates[k], ov = SET.orig[k];
     if (nv && nv.indexOf('mineru-cloud') >= 0 && (ov == null || ov.indexOf('mineru-cloud') < 0)) gated.push(k);
   });
@@ -1908,7 +1956,10 @@ $('saveBtn').addEventListener('click', function () {
       }
       $('setErr').style.display = 'none';
       Object.keys(updates).forEach(function (k) { SET.orig[k] = updates[k]; });
-      toast('已保存，配置已热读生效');
+      var changed = res.changed || [], notes = res.notes || [];
+      if (!changed.length) { toast('已保存（没有改动）'); return; }
+      toast('已保存：改了「' + changed.join('」「') + '」' + (notes.length ? '。' + notes.join('；') : '，已生效'),
+        notes.length ? 'warn' : undefined, notes.length ? 10000 : undefined);
     }).catch(function () { toast('保存失败', 'err'); });
   });
 });

@@ -55,7 +55,7 @@ RAG REDO 是 obsidian-rag 项目的完全重构，不复用旧项目的代码或
 
 | 扩展点 | 类型 | 对应旧项目能力 |
 |---|---|---|
-| `extractor:<ext>` | 多值 | md/txt 原生、pdf 文字层(pymupdf4llm)、docx(python-docx)、MinerU 云端 OCR、MinerU 本机 OCR（可选 `extract_many` 一次收几份，编排层据此给扫描件合批，接口与失败语义见 `core/contracts.py`） |
+| `extractor:<ext>` | 多值 | md/txt 原生、pdf 文字层(pymupdf4llm)、docx(python-docx)、MinerU 云端 OCR、MinerU 本机 OCR（可选 `extract_many` 一次收几份，编排层据此给扫描件合批，接口与失败语义见 `core/contracts.py`）。PDF 按页分流（BC-01）：文字层提取器逐页判图片页、在结果里列出 `image_pages`，可选 `write_page_range` 切出几页；识别提供者可选 `page_budget`（一本书最多识别几页）、`max_pages_per_request`（一次最多几页）、`overflow_active`（本机超上限时愿不愿接手）；编排层只把图片页送识别、按页码拼回（`core/pdf_pages.py`）。可选 `output_settings()`：会改变转换结果的设置（PDF 转换方式、图片页判法），结果带 `extractor_settings` 记进清单，设置变了编排层把它转的文件按新设置重转 |
 | `chunker` | 单例 | 现有切块策略 |
 | `embedder` | 单例 | BGE-M3 |
 | `vector_store` | 单例 | Chroma；可选的只读方法 `file_vectors()` 按文件平均已存的块向量（返回 `core.contracts.FileVectorSet`），供总览星图排序分组（BC-18）——没实现它的向量库，总览里的文件照样列出、只是不分组 |

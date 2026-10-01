@@ -68,6 +68,26 @@ _REASONS: dict[str, tuple[str, str]] = {
         "占位内容太多",
         "文件里大部分是 [TBD] 之类的占位，按设置跳过；补上内容后会自动重新转。",
     ),
+    # ---- PDF 按页分流（2026-10-01，BC-01）：文字页已进索引，图片页里的字没识别 ----
+    "ocr-off": (
+        "图片页没识别：没开扫描件识别",
+        "文字页已经进了索引；想把图片页里的字也收进来，在设置里把「扫描件 OCR 后端」选成 MinerU"
+        "（本机或云端），下一轮会自动补识别这些页。",
+    ),
+    "too-many-pages": (
+        "要识别的页数超过本机上限",
+        "在设置里调大「本机识别页数上限」（0 = 不限），或把「超过本机上限时」选成送 MinerU 云端，"
+        "下一轮会自动识别。",
+    ),
+    "ocr-deferred": (
+        "图片页没识别：识别服务这轮没起来",
+        "下一轮会自动重试；一直这样就去诊断页看 MinerU 的日志。",
+    ),
+    "ocr-failed": (
+        "图片页识别出错",
+        "多半是当时的环境问题（缺 Key、额度用完、网络断了、本机解析出错）；换后端、补好 Key 或调了设置后，"
+        "下一轮自动重试。",
+    ),
     "cache-missing": (
         "正文文件不见了",
         "索引记着已经转好，但缓存文件被删了或挪走了：在库页点「全量重建」重新转一遍。",
@@ -110,11 +130,20 @@ def needs_conversion(path: str) -> bool:
 
 def _failure_code(record: Mapping[str, object]) -> str:
     """清单记录里的失败状态 → 稳定原因代码（与图谱读模型同一套判断口径）。"""
+    if "too-many-pages" in str(record.get("failure_detail") or ""):
+        # 整本扫描件超过本机识别页数上限：记的是 scanned，但“去开 MinerU”这个下一步不对
+        return "too-many-pages"
     for key in ("failure_state", "failure_reason"):
         value = str(record.get(key) or "").strip().lower()
         if value in _REASONS:
             return value
     return "extract-failed"
+
+
+def _page_list(value: object) -> tuple[int, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(sorted({int(v) for v in value if isinstance(v, int) or str(v).isdigit()}))
 
 
 def _text_entry(
@@ -136,8 +165,15 @@ def _text_entry(
     except OSError:
         return {"text_state": "missing", "text_reason": "cache-missing"}
     route = str(record.get("extractor_id") or "") or None
+    missing = _page_list(record.get("missing_pages"))
     return {
-        "text_state": "done",
+        # 转好了，但有图片页里的字没识别（PDF 按页分流，BC-01）：原因代码与失败原因共用一套人话
+        "text_state": "partial" if missing else "done",
+        "text_reason": (str(record.get("missing_reason") or "") or "ocr-failed") if missing else None,
+        "text_missing_pages": missing,
+        "text_ocr_pages": _page_list(record.get("ocr_pages")),
+        "text_ocr_by": str(record.get("ocr_by") or "") or None,
+        "text_ocr_by_name": route_names.get(str(record.get("ocr_by") or "")) or (str(record.get("ocr_by") or "") or None),
         "text_route": route,
         "text_route_version": str(record.get("extractor_version") or "") or None,
         "text_route_name": route_names.get(route or "") or route,
@@ -233,29 +269,60 @@ def round_summary(report: ConversionCacheLibrary, fresh_paths: Iterable[str]) ->
     """一轮索引的“复用多少、新转多少、还缺多少”。`fresh_paths` 是这一轮真的跑了提取器的文件
     （沿用正文缓存、沿用转换暂存的都不算新转——它们没有再花 MinerU 的时间和额度）。"""
     fresh = set(fresh_paths)
-    done = [item for item in report.files if item.text_state == "done"]
-    text_new = sum(1 for item in done if item.path in fresh)
+    # 转好了、只是有几页图没识别的书（partial）正文已经进了索引，不算“缺”——没识别的页单独数
+    done = [item for item in report.files if item.text_state in {"done", "partial"}]
+    fresh_done = [item for item in done if item.path in fresh]
     built = [item for item in report.files if item.pages_state in {"done", "partial"}]
     pages_new = sum(1 for item in built if item.pages_rebuilt)
+    new_by: dict[str, int] = {}
+    ocr_by: dict[str, int] = {}
+    for item in fresh_done:
+        route = item.text_route_name or item.text_route or "?"
+        new_by[route] = new_by.get(route, 0) + 1
+        if item.text_ocr_pages:
+            name = item.text_ocr_by_name or item.text_ocr_by or "?"
+            ocr_by[name] = ocr_by.get(name, 0) + len(item.text_ocr_pages)
+    unrecognized = [item for item in report.files if item.text_missing_pages]
     return ConversionRoundSummary(
-        text_reused=len(done) - text_new,
-        text_new=text_new,
+        text_reused=len(done) - len(fresh_done),
+        text_new=len(fresh_done),
         text_missing=report.text_total - len(done),
         pages_enabled=report.pages_enabled,
         pages_reused=(len(built) - pages_new) if report.pages_enabled else 0,
         pages_new=pages_new if report.pages_enabled else 0,
         pages_missing=(report.pdf_total - len(built)) if report.pages_enabled else 0,
+        text_new_by=tuple(sorted(new_by.items(), key=lambda kv: (-kv[1], kv[0]))),
+        ocr_pages_by=tuple(sorted(ocr_by.items(), key=lambda kv: (-kv[1], kv[0]))),
+        pages_unrecognized=sum(len(item.text_missing_pages) for item in unrecognized),
+        files_unrecognized=len(unrecognized),
+        has_pdf=report.pdf_total > 0,
     )
 
 
 def format_round_summary(summary: ConversionRoundSummary) -> str:
-    """每轮日志里的那一行。"""
-    text = f"转文字 复用 {summary.text_reused} / 新转 {summary.text_new} / 缺 {summary.text_missing}"
+    """每轮日志里的那一行（GUI 日志面板、命令行 `index` 都显示它）。新转的写明谁转的、图片页
+    写明本轮谁识别了几页、还有几页没识别——用户改了 PDF / 识别相关的设置，看这一行就知道起没
+    起作用、有没有送云端（2026-10-01）。"""
+    new = f"新转 {summary.text_new}"
+    if summary.text_new_by:
+        new += "（" + "、".join(f"{name} {count}" for name, count in summary.text_new_by) + "）"
+    gap = "" if new.endswith("）") else " "  # 全角括号后面不再空一格
+    text = f"转文字 复用 {summary.text_reused} / {new}{gap}/ 缺 {summary.text_missing}"
+    parts = [text]
+    if summary.has_pdf:
+        ocr = (
+            "本轮 " + "、".join(f"{name} 识别 {count} 页" for name, count in summary.ocr_pages_by)
+            if summary.ocr_pages_by
+            else "本轮没有送识别的"
+        )
+        if summary.pages_unrecognized:
+            ocr += f"，还有 {summary.pages_unrecognized} 页没识别（{summary.files_unrecognized} 份，原因见诊断页）"
+        parts.append(f"图片页 {ocr}")
     if summary.pages_enabled:
-        pages = f"页库 复用 {summary.pages_reused} / 新建 {summary.pages_new} / 缺 {summary.pages_missing}"
+        parts.append(f"页库 复用 {summary.pages_reused} / 新建 {summary.pages_new} / 缺 {summary.pages_missing}")
     else:
-        pages = "页库 没开"
-    return f"转换缓存：{text}；{pages}"
+        parts.append("页库 没开")
+    return "转换缓存：" + "；".join(parts)
 
 
 def needs_attention(item: ConversionCacheFile) -> bool:
@@ -341,8 +408,12 @@ def render_catalog(report: ConversionCacheLibrary, *, library_root: str, now: fl
         "|---|---|---|---|---|---|---|",
     ]
     for item in report.files:
-        if item.text_state == "done":
+        if item.text_state in {"done", "partial"}:
             text_cell = "✅"
+            if item.text_state == "partial":
+                text_cell = (
+                    f"⚠️ 第 {page_ranges(item.text_missing_pages)} 页没识别（{reason_text(item.text_reason)[0]}）"
+                )
             route = item.text_route_name or item.text_route or ""
             if item.text_route_version:
                 route = f"{route} {item.text_route_version}"

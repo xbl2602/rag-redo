@@ -14,9 +14,29 @@ for p in (_REPO_ROOT, _PLUGIN_DIR):
         sys.path.insert(0, str(p))
 
 from official_vector_store_chroma.store import (  # noqa: E402
+    UPSERT_BATCH,
     ChromaVectorStore,
     chroma_collection_name,
 )
+
+
+class _RecordingCollection:
+    """只记录每次 upsert 收到什么的假集合。
+
+    验的是**分批行为**（批大小、不重不漏、平行列表不错位），不需要真的让
+    Chroma 处理 7000 条——那既慢又吃内存，而且真库的上限是内部常量、测试里
+    不该去依赖它的具体数值。"""
+
+    def __init__(self) -> None:
+        self.batches: list[dict] = []
+
+    def upsert(self, *, ids, embeddings, documents=None, metadatas=None) -> None:
+        self.batches.append({
+            "ids": list(ids),
+            "embeddings": [list(v) for v in embeddings],
+            "documents": None if documents is None else list(documents),
+            "metadatas": None if metadatas is None else list(metadatas),
+        })
 
 
 class TestChromaVectorStore(unittest.TestCase):
@@ -65,6 +85,85 @@ class TestChromaVectorStore(unittest.TestCase):
 
     def test_empty_upsert_is_noop(self):
         self.store.upsert("lib1", [], [])  # 不应该抛异常
+
+    def test_upsert_splits_into_batches_and_loses_nothing(self):
+        """超过单次上限的写入必须分批，且不重不漏（2026-10-01 真机事故）。
+
+        Chroma 对一次调用能接受的记录数有硬上限，chromadb 1.5.9 实测 5461，
+        超了抛 `InternalError: ValueError: Batch size of N is greater than max
+        batch size of 5461`。原先 `upsert()` 整批丢进去、**完全不���批**，
+        于是 Y2S1 块数涨到 21251 时第一次撞上，写入阶段直接崩、整轮索引作废
+        （已发布的还是旧代，总览显示的块数因此对不上）。Y2S1 之前只有 2050
+        块，永远碰不到上限，所以这个 bug 一直藏着。
+
+        这里不真灌 7000 个向量进 Chroma（慢且吃内存），而是塞一个记录每批
+        大小的假集合——要验的是**分批行为**，不是 Chroma 自己。
+        """
+        total = UPSERT_BATCH * 3 + 517  # 刻意不是整数倍，验证最后一批是余数
+        recorder = _RecordingCollection()
+        self._with_collection(recorder, lambda: self.store.upsert(
+            "lib1",
+            [f"c{i}" for i in range(total)],
+            [[float(i), 0.0, 0.0] for i in range(total)],
+            documents=[f"正文{i}" for i in range(total)],
+            metadatas=[{"path": f"f{i}.md"} for i in range(total)],
+        ))
+
+        sizes = [len(batch["ids"]) for batch in recorder.batches]
+        self.assertGreater(len(sizes), 1, "只调了一次——没分批，超过上限就会崩")
+        self.assertLessEqual(max(sizes), UPSERT_BATCH, f"某批超过上限：{sizes}")
+        self.assertEqual(sum(sizes), total, f"总数对不上（漏写或多写）：{sizes}")
+
+        # 不重不漏：每批的 id 拼起来必须恰好是输入的排列。
+        seen: list[str] = []
+        for batch in recorder.batches:
+            seen.extend(batch["ids"])
+        self.assertEqual(len(seen), total)
+        self.assertEqual(set(seen), {f"c{i}" for i in range(total)}, "有块丢失或重复")
+        self.assertEqual(len(set(seen)), len(seen), "有块被写了两遍")
+
+        # 四个参数是平行列表：错开一位就会把 A 的正文写到 B 的向量上，而且不报错。
+        for index, batch in enumerate(recorder.batches):
+            for offset, chunk_id in enumerate(batch["ids"]):
+                n = int(chunk_id[1:])
+                self.assertEqual(batch["embeddings"][offset][0], float(n),
+                                 f"第 {index} 批里向量和 id 错位了")
+                self.assertEqual(batch["documents"][offset], f"正文{n}",
+                                 f"第 {index} 批里正文和 id 错位了")
+                self.assertEqual(batch["metadatas"][offset]["path"], f"f{n}.md",
+                                 f"第 {index} 批里元数据和 id 错位了")
+
+    def test_upsert_batching_keeps_none_documents_and_metadatas(self):
+        """`documents=None` / `metadatas=None` 时整批保持 None。
+
+        不能拿空列表代替：Cha 里收到空列表和 None 语义不同（空列表 = 声明了
+        这个字段但没有值），会被当成"元数据缺字段"而不是"这条记录没元数据"。
+        """
+        recorder = _RecordingCollection()
+        self._with_collection(recorder, lambda: self.store.upsert(
+            "lib1", [f"c{i}" for i in range(UPSERT_BATCH + 5)], [[1.0, 0.0, 0.0]] * (UPSERT_BATCH + 5)
+        ))
+        self.assertEqual(len(recorder.batches), 2)
+        for batch in recorder.batches:
+            self.assertIsNone(batch["documents"])
+            self.assertIsNone(batch["metadatas"])
+
+    def _with_collection(self, collection, action) -> None:
+        """把 `_ensure_collection` 换成给定的假集合，跑一次动作后复原。"""
+        original = self.store._ensure_collection  # noqa: SLF001
+        calls: list = []
+
+        def _fake(library_id, generation=None):
+            calls.append((library_id, generation))
+            return collection
+
+        self.store._ensure_collection = _fake  # noqa: SLF001
+        try:
+            action()
+        finally:
+            self.store._ensure_collection = original  # noqa: SLF001
+        # 集合只该取一次：每批都去取一遍虽然幂等，但白花开销、也不像个正经实现。
+        self.assertEqual(len(calls), 1, f"_ensure_collection 被调了 {len(calls)} 次")
 
     def test_persists_across_instances(self):
         self.store.upsert("lib1", ["c1"], [[1.0, 0.0, 0.0]])

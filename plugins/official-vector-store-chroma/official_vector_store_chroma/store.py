@@ -31,6 +31,22 @@ _LOGGER = logging.getLogger("rag_redo.vector_store_chroma")
 #: 一索引就炸，且错误信息完全指不到"库名里有中文"这个真因。
 _LEGAL_CHROMA_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{1,510}[a-zA-Z0-9]$")
 
+#: 单次 upsert 的批大小。
+#:
+#: Chroma 对一次调用能接受的记录数有**硬上限**，超了直接抛
+#: `InternalError: ValueError: Batch size of N is greater than max batch size of 5461`
+#: （chromadb 1.5.9 实测）。原先 `upsert()` 把整批块一次性丢进去、**完全不
+#: 分批**，所以只要某个库的写入批超过这个上限，那一轮索引就会在写入阶段崩掉、
+#: 新索引一个块都发布不出去（文字索引也跟着一起丢）。Y2S1 之前只有 2050 块，
+#: 永远碰不到上限，这个 bug 就一直藏着；等块数涨到 21251（47.7MB 正文 ÷
+#: `MAX_CHARS=600`）时第一次暴露，把整轮索引打崩。
+#:
+#: 为什么是 2000 而不是照抄 5461：5461 是 Chroma **内部**常量、会随版本变化，
+#: 照抄等于把同一个 bug 换个地方埋着（哪天它变成 4000 就又炸）。留足余量、
+#: 取一个明显安全的整数，换 Chroma 版本也不用改这里。
+#: 真要调大，得先确认目标 chromadb 版本的实际上限，别直接照抄报错信息里的数。
+UPSERT_BATCH = 2000
+
 
 def chroma_collection_name(library_id: str, generation: str | None = None) -> str:
     """库 id / (库 id, generation) → 集合名。**唯一的命名算法出口**。
@@ -154,9 +170,25 @@ class ChromaVectorStore:
     ) -> None:
         if not chunk_ids:
             return
-        self._ensure_collection(library_id, generation).upsert(
-            ids=chunk_ids, embeddings=vectors, documents=documents, metadatas=metadatas
-        )
+        collection = self._ensure_collection(library_id, generation)
+        # 按批写出：Chroma 单次调用有记录数硬上限（见 UPSERT_BATCH 的注释），
+        # 整批丢进去会在库大到一定程度时把整轮索引打崩。
+        #
+        # 四个参数是**平行列表**（第 i 个块对应第 i 条向量/正文/元数据），必须
+        # 用同一个切片边界一起切，不能各自判断长度——错开一位就会把 A 文件的
+        # 文字写到 B 文件的向量上，而且不报错、检索出来是乱的。
+        # `documents` / `metadatas` 可以是 None（调用方不需要正文/元数据），
+        # None 就整批保持 None，不能拿空列表代替：Chroma 收到空列表和 None
+        # 语义不同（空列表 = 没有元数据字段可写）。
+        total = len(chunk_ids)
+        for start in range(0, total, UPSERT_BATCH):
+            stop = min(start + UPSERT_BATCH, total)
+            collection.upsert(
+                ids=chunk_ids[start:stop],
+                embeddings=vectors[start:stop],
+                documents=None if documents is None else documents[start:stop],
+                metadatas=None if metadatas is None else metadatas[start:stop],
+            )
 
     def get_by_ids(
         self,

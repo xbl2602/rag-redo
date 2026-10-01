@@ -681,6 +681,39 @@ class TestApi(unittest.TestCase):
         self.assertEqual(scan["pages"]["label"], "有页面没编上")
         json.dumps(detail)  # pywebview 用 json.dumps 序列化返回值
 
+    def test_a_pdf_with_unrecognized_picture_pages_shows_which_pages_and_why(self):
+        """PDF 按页分流（2026-10-01，BC-01/BC-19）：转好了、但有图片页没识别的，清单一行带上页码与原因。"""
+        from core.contracts import ConversionCacheFile, ConversionCacheLibrary
+
+        self.api.register_library("lib1", "测试库", str(self.vault))
+        item = ConversionCacheFile(
+            path="book.pdf", extension="pdf", text_state="partial", text_reason="too-many-pages",
+            text_route="official-extractor-pdf-text", text_route_name="文字层 PDF 提取器",
+            text_ocr_pages=(1, 2, 9), text_ocr_by="official-ocr-mineru-local", text_ocr_by_name="MinerU 本地解析",
+            text_missing_pages=(40, 41, 42, 77),
+        )
+        report = ConversionCacheLibrary(
+            library_id="lib1", name="测试库", files=(item,), text_dir=str(self.tmp), catalog_file="x", pages_enabled=False,
+        )
+        with patch.object(self.pipeline, "conversion_caches", return_value=(report,)):
+            row = self.api.conversion_caches("测试库")["rows"][0]
+        self.assertTrue(row["attention"])
+        self.assertEqual(row["text"]["state"], "partial")
+        self.assertEqual((row["text"]["ocr_pages"], row["text"]["ocr_by"]), ("1–2、9", "MinerU 本地解析"))
+        self.assertEqual(row["text"]["missing"], "40–42、77")
+        self.assertEqual(row["text"]["label"], "要识别的页数超过本机上限")
+        self.assertIn("本机识别页数上限", row["text"]["next"])
+
+    def test_settings_that_depend_on_another_setting_say_so(self):
+        """“超过本机上限时”只在扫描件后端选本机时可选：桥接层带上 enabled_when，前端据此变灰。"""
+        fields = {f["key"]: f for g in self.api.get_settings()["groups"] for f in g["fields"]}
+        self.assertEqual(
+            fields["mineru_local_overflow"]["enabled_when"], {"key": "pdf_scan_backend", "values": ["mineru-local"]}
+        )
+        self.assertIsNone(fields["pdf_image_page_rule"]["enabled_when"])
+        self.assertEqual(fields["mineru_local_max_pages"]["value"], "200")
+        self.assertEqual(fields["mineru_local_overflow"]["value"], "off", "送云端默认关")
+
     def test_conversion_caches_are_reused_briefly_and_refreshed_when_indexing_ends(self):
         report, _cached = self._conversion_fixture()
         with patch.object(self.pipeline, "conversion_caches", return_value=(report,)) as reader:

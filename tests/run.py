@@ -73,6 +73,7 @@ CORE_SUITES = [
     "test_graph",
     "test_overview_map",
     "test_conversion_cache",
+    "test_pdf_pages",
     "test_singleton",
     "test_paths",
     "test_runtime",

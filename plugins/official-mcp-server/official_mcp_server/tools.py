@@ -10,7 +10,7 @@ import base64
 import time
 from typing import Any
 
-from core.conversion_cache import needs_attention, pages_summary, reason_text
+from core.conversion_cache import needs_attention, page_ranges, pages_summary, reason_text
 from core.pipeline import DEFAULT_CONFIDENCE_WARN_THRESHOLD, Pipeline, confidence_tier
 
 #: 视觉检索插件"现在不能查"的原因码集合（official-visual-wemm 的
@@ -327,6 +327,8 @@ def register_tools(server, pipeline: Pipeline, lib_mgr) -> None:
                         "text_state": item.text_state,
                         "text_reason": reason_text(item.text_reason)[0] or None,
                         "text_next_step": reason_text(item.text_reason)[1] or None,
+                        # PDF 按页分流（BC-01）：正文转好了、但这些图片页里的字没识别（text_state=partial）
+                        "text_missing_pages": page_ranges(item.text_missing_pages) or None,
                         "pages_state": item.pages_state,
                         "pages": pages_summary(item) if item.pages_state not in {"n/a", "off"} else None,
                         "pages_reason": reason_text(item.pages_reason)[0] or None,

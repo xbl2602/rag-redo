@@ -48,6 +48,26 @@ class ExtractedDocument:
     content_hash: str  # 源文件内容指纹，供增量判断是否需要重新抽取
     failure_state: str | None = None
     capability_signature: str | None = None
+    # ---- PDF 按页分流（2026-10-01 操作者确认，BC-01）----------------------------
+    #: 文字层提取器判出来的“图片页”（页码从 1 起）：这些页要送识别。文字页和图片页混着的书，
+    #: `text` 是文字层转出来的整本（图片页只有它上面仅有的几个字），由编排层把图片页送识别后
+    #: 按页拼回；一页有字的都没有的书是失败（scanned），这里列出全书页码，整本送识别。
+    image_pages: tuple[int, ...] = ()
+    #: 文字层逐页的正文（下标 0 是第 1 页），只在混合的书上有——编排层按页拼接识别结果用。
+    page_texts: tuple[str, ...] | None = None
+    #: 最终结果里由识别补上的页，以及是谁识别的（插件 id）。
+    ocr_pages: tuple[int, ...] = ()
+    ocr_by: str | None = None
+    #: 图片页里没能识别的页（正文里这些页只有文字层仅有的几个字），以及原因代码：
+    #: ocr-off（没开扫描件识别）/ too-many-pages（超过本机识别页数上限、又没开送云端）/
+    #: ocr-deferred（识别服务暂时不可用，下一轮再试）/ ocr-failed（识别出错）。
+    #: 条件变了（开了识别、调了上限、服务恢复）下一轮自动补识别（BC-04）。
+    missing_pages: tuple[int, ...] = ()
+    missing_reason: str | None = None
+    #: 转出这份正文时用的、会改变转换结果的设置（提取器 `output_settings()` 的返回值，比如
+    #: PDF 文字层的“转换方式 + 哪些页算图片页”）。核心记进清单；用户改了这些设置，下一轮把
+    #: 这个提取器转的文件按新设置重转（2026-10-01 操作者确认，BC-01）。没有这类设置的提取器留 None。
+    extractor_settings: str | None = None
 
     def __post_init__(self) -> None:
         if (self.text is None) == (self.failure_reason is None):
@@ -65,6 +85,18 @@ class ExtractedDocument:
 # 每一份的成功/失败形状与逐份调用 `extract` 完全一样（服务暂时不可用就每份都是 "deferred"）；
 # 不抛异常。编排层只在同时有 ≥2 份等着它时才用，只攒到一份照旧调 `extract`；它抛了异常或
 # 条数对不上，编排层就把这几份退回逐份 `extract`。合批的分组上限与显存把关由插件自己负责。
+#
+# PDF 按页分流用到的可选方法（2026-10-01，BC-01；编排层见 core/pipeline.py 与 core/pdf_pages.py）：
+# - 文字层提取器 `write_page_range(src, first, last, dest) -> None`：把第 first～last 页（从 1 起）
+#   另存成一份 PDF，编排层把图片页切出来送识别用；
+# - 识别提供者 `page_budget() -> int | None`：一本书最多在它这里识别几页（None = 不限）；
+# - 识别提供者 `max_pages_per_request() -> int | None`：一次请求最多几页，编排层据此把长段切开；
+# - 识别提供者 `overflow_active() -> bool`：本机识别超过页数上限时，愿不愿意接手（云端，设置里开）。
+#
+# 可选 `output_settings() -> str`（2026-10-01，BC-01）：会改变它转出来的正文的设置，压成一个
+# 短字符串（不含 `:` 和 `+`）。成功的结果要在 `extractor_settings` 里带上转换时用的那一份。
+# 编排层发现清单里记的和现在的不一样，就把这个提取器转的文件按新设置重转——与“插件代码升级
+# 才作废旧正文”（`plugin.toml` 版本）是两回事：这里只牵连它自己转的文件，别的提取器转的不动。
 
 
 # ---- 切块阶段 ------------------------------------------------------------
@@ -372,7 +404,8 @@ class OverviewMapResponse:
 class ConversionCacheFile:
     """一份“需要转换”的文件（不是纯文字的格式：PDF、Word……）两种缓存的现状。
 
-    `text_state`：done（有转好的正文）/ pending（还没轮到或在等转换服务，会自动补上）/
+    `text_state`：done（有转好的正文）/ partial（转好了，但有图片页里的字没识别，见
+    `text_missing_pages`）/ pending（还没轮到或在等转换服务，会自动补上）/
     failed（转换失败的终态）/ missing（索引记着转好了，正文文件却不见了）。
     `pages_state`：n/a（不是 PDF，页库只做 PDF）/ off（页库没开）/ none（还没建）/
     done / partial（部分页面没编上）/ failed。
@@ -389,6 +422,10 @@ class ConversionCacheFile:
     text_file: str | None = None  # 正文缓存文件的绝对路径
     text_bytes: int = 0
     text_updated: float | None = None  # 缓存文件的修改时间（Unix 秒）
+    text_ocr_pages: tuple[int, ...] = ()  # PDF 里由识别补上的图片页（页码从 1 起）
+    text_ocr_by: str | None = None  # 识别这些页的插件 id
+    text_ocr_by_name: str | None = None  # 该插件在 plugin.toml 里的名字（界面直接显示）
+    text_missing_pages: tuple[int, ...] = ()  # 图片页里没能识别的页（原因见 text_reason）
     pages_state: str = "n/a"
     pages_reason: str | None = None
     pages_detail: str | None = None  # 页库插件记下的原始说明（例如显存不足的两个数字）
@@ -452,6 +489,17 @@ class ConversionRoundSummary:
     pages_reused: int = 0
     pages_new: int = 0
     pages_missing: int = 0
+    # ---- 2026-10-01：让用户看得出设置到底起没起作用（操作者反馈“改了设置不知道是没生效还是
+    # 静默失败”，连送没送 MinerU 云端都看不出来）----------------------------------------------
+    #: 这一轮新转的文件按“谁转的”分：（插件显示名，份数）——整本扫描件送了哪个识别一眼可见
+    text_new_by: tuple[tuple[str, int], ...] = ()
+    #: 这一轮按页分流补上的图片页，按识别者分：（插件显示名，页数）（BC-01）
+    ocr_pages_by: tuple[tuple[str, int], ...] = ()
+    #: 跑完还没识别的图片页总数、涉及几份 PDF（原因与补法见诊断页“转换缓存”）
+    pages_unrecognized: int = 0
+    files_unrecognized: int = 0
+    #: 这个库里有没有 PDF：没有就不写“图片页”那一段
+    has_pdf: bool = False
 
 
 # ---- 页级视觉导航（visual_index 扩展点，比如 official-visual-wemm）--------

@@ -42,7 +42,7 @@ import time
 from pathlib import Path
 
 from . import paths
-from .conversion_cache import format_round_summary, human_bytes, needs_attention, pages_summary, reason_text
+from .conversion_cache import format_round_summary, human_bytes, needs_attention, page_ranges, pages_summary, reason_text
 from .runtime import PluginRuntime
 from .singleton import FileByteLock, ProcessSingletonGuard
 
@@ -499,9 +499,13 @@ def _print_conversion_caches(pipeline, lib_mgr, args: argparse.Namespace) -> int
         if not shown:
             print("  （没有缺的）" if not args.all_files else "  （这个库里没有需要转换的文件）")
         for item in shown:
-            if item.text_state == "done":
+            if item.text_state in {"done", "partial"}:
                 route = item.text_route_name or item.text_route or ""
                 text = f"转文字 {route} · {human_bytes(item.text_bytes)}"
+                if item.text_state == "partial":
+                    # PDF 按页分流（BC-01）：正文转好了，但有图片页里的字没识别
+                    label, step = reason_text(item.text_reason)
+                    text += f" · 第 {page_ranges(item.text_missing_pages)} 页没识别：{label}（{step}）"
             else:
                 label, step = reason_text(item.text_reason)
                 text = f"转文字：{label}（{step}）"

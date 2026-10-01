@@ -64,6 +64,11 @@ _MINERU_INSTALL_HINT = 'uv tool install --python 3.12 -U "mineru[all]"'
 # 见 obsidian-rag/gpu_arbiter.py:294、540-545 用 `Popen(stdout=logf,
 # stderr=logf)` 指向真实文件）
 LOG_FILE_NAME = "mineru_local_server.log"
+#: 本机识别页数上限的默认值（设置项 `mineru_local_max_pages`，0 = 不限）：一本书要本机识别的页数
+#: 超过它就不在本机识别——串行锁下大文件会占着显卡很久，别的扫描件只能排队。数值对齐旧项目
+#: obsidian-rag/config.py 的 mineru_local_max_pages=200；旧项目在配置文件里可改，rag-redo 一度
+#: 写死在 server.py，2026-10-01 操作者要求放进设置页（BC-01）。
+DEFAULT_MAX_PAGES = 200
 
 
 def _content_hash(data: bytes) -> str:
@@ -196,7 +201,31 @@ class MineruLocalOcrPlugin:
     def index_signature(self) -> str:
         selected = self._settings.get("pdf_scan_backend", "none") if self._settings is not None else "none"
         readiness = "ready" if _resolve_mineru_python(settings=self._settings) else "noready"
-        return f"selected:{selected}:{readiness}"
+        # 页数上限也进能力签名：调大以后，此前因为超上限没识别的书下一轮自动补上（BC-04）
+        return f"selected:{selected}:{readiness}:max{self.page_budget() or 0}"
+
+    def page_budget(self) -> int | None:
+        """一本书最多在本机识别几页（设置项 `mineru_local_max_pages`，0 = 不限 → None）。
+        编排层据此决定“超过上限的送云端还是标出来”（core/pipeline.py，BC-01）。"""
+        raw = self._settings.get("mineru_local_max_pages", DEFAULT_MAX_PAGES) if self._settings is not None else DEFAULT_MAX_PAGES
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = DEFAULT_MAX_PAGES
+        return value if value > 0 else None
+
+    def max_pages_per_request(self) -> int | None:
+        """一次请求的页数没有另外的限制（合批的分组上限由子进程自己把关）。"""
+        return None
+
+    def _over_budget(self, library_id: str, path: str, pages: "int | None", content_hash: str) -> "ExtractedDocument | None":
+        budget = self.page_budget()
+        if budget is None or pages is None or pages <= budget:
+            return None
+        # 与子进程拒收时同一个形状（落 scanned，见 `_document`），不白占一次请求
+        return self._fail(
+            library_id, path, f"scanned:too-many-pages: {pages} 页超过本机识别上限 {budget} 页", content_hash
+        )
 
     def _start_handle(self) -> None:
         assert self._plugin_dir is not None and self._runtime_command is not None
@@ -290,9 +319,15 @@ class MineruLocalOcrPlugin:
         # 客户端这一侧的HTTP超时要覆盖住 server.py 那一侧的单文件处理预算
         # （300s+30s×页数）再加60s网络余量，否则大文件会在还没解析完时就被
         # 这一跳掐断——对齐 obsidian-rag/extractors.py 的 caller 端算超时。
-        timeout = _mineru_local_timeout(_count_pages(full_path)) + 60.0
+        pages = _count_pages(full_path)
+        refused = self._over_budget(library_id, path, pages, content_hash)
+        if refused is not None:
+            return refused
+        timeout = _mineru_local_timeout(pages) + 60.0
         try:
-            result = self._handle.call("extract", {"path": path, "root": str(root)}, timeout=timeout)
+            result = self._handle.call(
+                "extract", {"path": path, "root": str(root), "max_pages": self.page_budget() or 0}, timeout=timeout
+            )
         except SubprocessServiceError as exc:
             return self._fail(library_id, path, f"extract-failed: {type(exc).__name__}", content_hash)
         return self._document(library_id, path, result, content_hash)
@@ -315,8 +350,13 @@ class MineruLocalOcrPlugin:
             except OSError as exc:
                 docs[index] = self._fail(library_id, path, f"读取失败: {type(exc).__name__}: {exc}")
                 continue
+            pages = _count_pages(full_path)
+            refused = self._over_budget(library_id, path, pages, hashes[index])
+            if refused is not None:
+                docs[index] = refused
+                continue
             todo.append(index)
-            timeout += _mineru_local_timeout(_count_pages(full_path))
+            timeout += _mineru_local_timeout(pages)
         if todo and not self._ensure_alive():
             for index in todo:
                 docs[index] = self._fail(library_id, paths[index], "deferred")
@@ -325,7 +365,7 @@ class MineruLocalOcrPlugin:
             try:
                 result = self._handle.call(
                     "extract_many",
-                    {"paths": [paths[index] for index in todo], "root": str(root)},
+                    {"paths": [paths[index] for index in todo], "root": str(root), "max_pages": self.page_budget() or 0},
                     timeout=timeout,
                 )
                 items = result.get("results")

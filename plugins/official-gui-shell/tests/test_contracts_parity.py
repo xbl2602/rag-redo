@@ -466,7 +466,9 @@ class TestSettingsPage(unittest.TestCase):
         self.assertEqual(fields["mineru_api_key"]["value"], "")
         self.assertEqual([c[0] for c in fields["mineru_model_version"]["choices"]], ["vlm", "pipeline"])
         self.assertEqual(fields["mineru_model_version"]["value"], "vlm")
-        self.assertEqual(self.api.save_settings({"mineru_api_key": "0123456789", "mineru_model_version": "pipeline"}), {"errors": {}})
+        saved = self.api.save_settings({"mineru_api_key": "0123456789", "mineru_model_version": "pipeline"})
+        self.assertEqual(saved["errors"], {})
+        self.assertEqual(saved["changed"], ["MinerU API Key", "MinerU 云端模型版本"])
         self.assertEqual(self.settings.get("mineru_api_key", ""), "0123456789")  # 全数字也不被转成整数
         self.assertEqual(self.settings.get("mineru_model_version", "vlm"), "pipeline")
         again = {f["key"]: f for g in self.api.get_settings()["groups"] for f in g["fields"]}
@@ -477,8 +479,27 @@ class TestSettingsPage(unittest.TestCase):
         """前端保存时把每个字段都发回：值等于默认值就清除该键，不把默认值钉死。"""
         page = self.api.get_settings()
         updates = {f["key"]: f["value"] for g in page["groups"] for f in g["fields"]}
-        self.assertEqual(self.api.save_settings(updates), {"errors": {}})
+        self.assertEqual(self.api.save_settings(updates), {"errors": {}, "changed": [], "notes": []})
         self.assertEqual(self.settings.all(), {})
+
+    def test_saving_says_what_changed_and_when_it_takes_effect(self) -> None:
+        """2026-10-01 操作者反馈：改了 PDF 那几项看不出任何变化，不知道是没生效还是静默失败——此前
+        保存后永远提示“已热读生效”，日志把 32 项全列一遍。现在只记真正改了的项（改前 → 改后，密钥
+        只说改了），要下一轮索引才起作用的项写清什么时候、要花多久。"""
+        page = self.api.get_settings()
+        updates = {f["key"]: f["value"] for g in page["groups"] for f in g["fields"]}
+        updates["pdf_text_mode"] = "fast"
+        updates["mineru_api_key"] = "sk-secret-123"
+        with patch.object(self.api, "_log") as log:
+            result = self.api.save_settings(updates)
+        self.assertEqual(result["errors"], {})
+        self.assertEqual(result["changed"], ["PDF 文字转换方式", "MinerU API Key"])
+        self.assertTrue(any("按新方式重转" in note for note in result["notes"]), result["notes"])
+        line = log.call_args.args[0]
+        self.assertIn("PDF 文字转换方式（auto → fast）", line)
+        self.assertIn("MinerU API Key（已改，内容不记）", line)
+        self.assertNotIn("sk-secret-123", line)
+        self.assertNotIn("单块返回字符上限", line, "没改的项不列")
 
     def test_every_field_round_trips_through_save_and_read_back(self) -> None:
         from official_gui_shell.settings_schema import FIELDS
@@ -507,7 +528,9 @@ class TestSettingsPage(unittest.TestCase):
                 value = text = f"值-{key}"
             expected[key] = value
             updates[key] = text
-        self.assertEqual(self.api.save_settings(updates), {"errors": {}})
+        saved = self.api.save_settings(updates)
+        self.assertEqual(saved["errors"], {})
+        self.assertEqual(sorted(saved["changed"]), sorted(field.label for field in FIELDS.values()))
         for key, want in expected.items():
             with self.subTest(key=key):
                 got = self.settings.get(key, FIELDS[key].default)
@@ -533,14 +556,14 @@ class TestSettingsPage(unittest.TestCase):
         bad = self.api.save_settings({"pdf_scan_backend": "totally-fake"})
         self.assertIn("pdf_scan_backend", bad["errors"])
         ok = self.api.save_settings({"pdf_scan_backend": "mineru-local", "not_a_real_key": "1"})
-        self.assertEqual(ok, {"errors": {}})
+        self.assertEqual((ok["errors"], ok["changed"]), ({}, ["扫描件 OCR 后端"]))
         self.assertEqual(self.settings.all(), {"pdf_scan_backend": "mineru-local"})
 
     def test_previously_dropped_values_now_stick(self) -> None:
         """审计里 4/4 探针值被丢弃或损坏：default_libraries='vault' 被忽略、全数字 API Key 变成整数。"""
         self.assertEqual(self.api.save_settings({
             "default_libraries": "vault", "hyde_llm_api_key": "0123456789", "hyde_llm_max_tokens": "300",
-        }), {"errors": {}})
+        })["errors"], {})
         self.assertEqual(self.settings.get("default_libraries", []), ["vault"])
         self.assertEqual(self.settings.get("hyde_llm_api_key", ""), "0123456789")
         self.assertEqual(self.settings.get("hyde_llm_max_tokens", 200), 300)
@@ -583,6 +606,34 @@ class TestProgressSnapshot(unittest.TestCase):
         self.assertEqual((progress["running"], progress["phase"], progress["heartbeat"], progress["task"]),
                          (False, "idle", "idle", "idle"))
         self.assertIsNone(progress["elapsed"])
+        self.assertEqual(progress["failed"], [])
+
+    def test_a_failed_index_run_says_which_library_and_why(self) -> None:
+        """2026-10-01 操作者反馈：Y2S1 每轮都在写库时崩，界面却照常显示“就绪 · N 块”，跟成功了一样，
+        原因只在日志文件里。快照把最近一次失败的库和原因交给前端（前端变红、弹一次提示）。"""
+        error = "InternalError: ValueError: Batch size of 9785 is greater than max batch size of 5461"
+        status = self._status(
+            stage="failed", phase="writing", active=False, can_stop=False,
+            finished_at=time.time(), message=error, error=error,
+        )
+        progress = self._snapshot_with(status)["progress"]
+        self.assertFalse(progress["running"])
+        self.assertEqual(progress["failed"], [
+            {"library": "进度库", "error": error, "at": status["finished_at"], "run": "r1"},
+        ])
+
+    def test_stopped_running_or_finished_runs_are_not_reported_as_failed(self) -> None:
+        for stage in ("done", "cancelled", "running"):
+            with self.subTest(stage=stage):
+                finished = None if stage == "running" else time.time()
+                progress = self._snapshot_with(self._status(stage=stage, finished_at=finished))["progress"]
+                self.assertEqual(progress["failed"], [])
+
+    def test_a_long_failure_reason_is_cut_short_for_the_screen(self) -> None:
+        status = self._status(stage="failed", finished_at=time.time(), error="RuntimeError: " + "x" * 1000)
+        error = self._snapshot_with(status)["progress"]["failed"][0]["error"]
+        self.assertEqual(len(error), 201)
+        self.assertTrue(error.endswith("…"))
 
     def test_a_broken_vram_probe_never_empties_the_whole_snapshot(self) -> None:
         """可选能力（页级视觉导航）出问题时，**整帧快照不能跟着废掉**。

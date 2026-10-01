@@ -190,5 +190,46 @@ class TestPluginSignatureFollowsTheKey(_EnvIsolated):
         self.assertTrue(self.plugin.extractor._client.has_key())
 
 
+class TestTakesOverWhenLocalOcrIsOverItsPageLimit(TestPluginSignatureFollowsTheKey):
+    """超过本机识别页数上限送云端（2026-10-01 操作者确认，BC-01）：默认关；只有扫描件后端选
+    “本机”、设置里选了“送 MinerU 云端”、并且有 Key 时才接手——会上传文件、耗云端额度。"""
+
+    def _turn_on(self, backend="mineru-local", overflow="mineru-cloud", key=SENTINEL):
+        self.rt.settings.set("pdf_scan_backend", backend)
+        self.rt.settings.set("mineru_local_overflow", overflow)
+        if key:
+            self.rt.settings.set("mineru_api_key", key)
+
+    def test_off_by_default(self) -> None:
+        self.rt.settings.set("pdf_scan_backend", "mineru-local")
+        self.rt.settings.set("mineru_api_key", SENTINEL)
+        self.assertFalse(self.plugin.overflow_active())
+
+    def test_on_only_with_local_backend_the_setting_and_a_key(self) -> None:
+        self._turn_on()
+        self.assertTrue(self.plugin.overflow_active())
+        for backend in ("none", "mineru-cloud"):
+            self._turn_on(backend=backend)
+            self.assertFalse(self.plugin.overflow_active(), backend)
+
+    def test_no_key_means_no_upload(self) -> None:
+        self._turn_on(key="")
+        self.assertFalse(self.plugin.overflow_active())
+
+    def test_one_upload_carries_at_most_200_pages(self) -> None:
+        """MinerU 官网文档（精准解析 API）：单份不超过 200MB、200 页；编排层据此把长段切开。"""
+        self.assertEqual(self.plugin.max_pages_per_request(), 200)
+        self.assertIsNone(self.plugin.page_budget())
+
+    def test_switching_overflow_changes_the_capability_signature(self) -> None:
+        self.rt.settings.set("pdf_scan_backend", "mineru-local")
+        self.rt.settings.set("mineru_api_key", SENTINEL)
+        before = self.plugin.index_signature()
+        self.rt.settings.set("mineru_local_overflow", "mineru-cloud")
+        after = self.plugin.index_signature()
+        self.assertNotEqual(before, after)
+        self.assertTrue(after.endswith(":key"), after)
+
+
 if __name__ == "__main__":
     unittest.main()

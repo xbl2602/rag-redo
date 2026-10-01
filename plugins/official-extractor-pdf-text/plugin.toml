@@ -1,6 +1,6 @@
 id = "official-extractor-pdf-text"
 name = "文字层 PDF 提取器"
-version = "0.3.0"
+version = "0.4.0"
 api_version = ">=0.1,<0.2"
 
 [provides]

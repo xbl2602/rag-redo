@@ -2289,21 +2289,21 @@ class TestOcrChainTryFallback(unittest.TestCase):
         self.assertEqual(report.failed, 1)
         self.assertEqual(report.files[0].extract_failure, "scanned")
 
-    def test_mixed_pdf_routes_whole_document_to_selected_local_ocr(self):
+    def test_mixed_pdf_sends_only_its_picture_page_to_the_selected_local_ocr(self):
+        """2026-10-01 操作者确认改掉“混合 PDF 整本送识别”（BC-01）：文字页直接转，只有图片页送识别、
+        按页码拼回；只多一页空白页（没字也没图）的不算混合，不送识别。"""
         (self.vault / "scanned-contract.pdf").unlink()
-        import pymupdf
-
-        doc = pymupdf.open()
-        page = doc.new_page()
-        page.insert_text((72, 72), "native text page content")
-        doc.new_page()
-        doc.save(str(self.vault / "mixed-contract.pdf"))
-        doc.close()
+        _write_layout_pdf(self.vault / "mixed-contract.pdf", [("native text page content " * 3, 0.0), ("", 0.9)])
+        _write_layout_pdf(self.vault / "blank-page.pdf", [("native text page content " * 3, 0.0), ("", 0.0)])
         report = self.pipeline.index_library("scan-lib")
-        self.assertEqual(report.succeeded, 1, report.files)
+        self.assertEqual(report.succeeded, 2, report.files)
         generation = self.pipeline._generations.active("scan-lib")
-        manifest = self.pipeline._manifests.read("scan-lib", generation)
-        self.assertEqual(manifest["files"]["mixed-contract.pdf"]["extractor_id"], "official-ocr-mineru-local")
+        files = self.pipeline._manifests.read("scan-lib", generation)["files"]
+        mixed = files["mixed-contract.pdf"]
+        self.assertEqual(mixed["extractor_id"], "official-extractor-pdf-text")
+        self.assertEqual((mixed.get("ocr_pages"), mixed.get("ocr_by")), ([2], "official-ocr-mineru-local"))
+        self.assertEqual(files["blank-page.pdf"]["extractor_id"], "official-extractor-pdf-text")
+        self.assertNotIn("ocr_pages", files["blank-page.pdf"])
 
     def test_existing_ocr_cache_is_reused_after_backend_changes_to_none(self):
         self.pipeline.index_library("scan-lib")
@@ -2595,6 +2595,293 @@ class TestStoppedRunKeepsConvertedFilesAndScansAreBatched(_MixedLibraryCase):
             report = self.pipeline.index_library("mixed-lib")
         self.assertEqual(report.succeeded, 6, report.files)
         self.assertIn("text-layer.pdf", [call.args[1] for call in text_extract.call_args_list])
+
+
+class TestChangingPdfConversionSettingsReconvertsConvertedBooks(_MixedLibraryCase):
+    """2026-10-01 操作者反馈“设置里 PDF 那几项不论怎么改都不生效”，并确认：改了“PDF 文字转换
+    方式”或“哪些页算图片页”，下一轮把已经用文字层转好的 PDF 全按新设置重转——此前只影响之后
+    新转的 PDF，已经转好的永远不重转，改完看不出任何变化。整本扫描件的识别结果保留，笔记不受
+    牵连（BC-01）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        first = self.pipeline.index_library("mixed-lib")
+        self.assertEqual(first.succeeded, 4, first.files)
+        self.pdf_text = self._plugin_instance("official-extractor-pdf-text")
+        self.local = self._plugin_instance("official-ocr-mineru-local")
+
+    def _reindex(self):
+        """再跑一轮增量，返回（报告，交给文字层插件转的文件，送本机识别的次数）。"""
+        with (
+            patch.object(self.pdf_text, "extract", wraps=self.pdf_text.extract) as text_extract,
+            patch.object(self.local, "extract", wraps=self.local.extract) as ocr,
+            patch.object(self.local, "extract_many", wraps=self.local.extract_many) as ocr_many,
+        ):
+            report = self.pipeline.index_library("mixed-lib")
+        converted = sorted(call.args[1] for call in text_extract.call_args_list)
+        return report, converted, ocr.call_count + ocr_many.call_count
+
+    def _settings_of(self, name: str):
+        return self._active_manifest()["files"][name].get("extractor_settings")
+
+    def _stop_after_converting(self) -> None:
+        """这一轮转换都做完、卡在向量化时出错，没发布（转好的留在暂存里，BC-20）。"""
+        embedder = self._plugin_instance("official-embedder-bge-m3")
+        with patch.object(embedder, "embed_chunks", side_effect=RuntimeError("停在向量化")):
+            with self.assertRaisesRegex(RuntimeError, "停在向量化"):
+                self.pipeline.index_library("mixed-lib", generation_id="stopped")
+        self.pipeline.discard_index_generation("mixed-lib", "stopped")
+
+    def test_the_settings_a_book_was_converted_with_are_recorded(self):
+        self.assertEqual(self._settings_of("text-layer.pdf"), "mode=auto;pages=coverage-and-chars")
+        self.assertIsNone(self._settings_of("scanned.pdf"), "整本识别的不是文字层插件转的")
+        self.assertIsNone(self._settings_of("cooking.md"))
+
+    def test_changing_the_text_mode_reconverts_text_layer_pdfs_and_nothing_else(self):
+        self.runtime.settings.set("pdf_text_mode", "fast")
+        self.assertEqual(self.pipeline.stale_libraries("mixed-lib"), ["mixed-lib"], "搜索前的自动同步也要发现")
+        report, converted, ocr_calls = self._reindex()
+        self.assertEqual(converted, ["text-layer.pdf"])
+        self.assertEqual(ocr_calls, 0, "整本扫描件的识别结果保留，不重新识别")
+        self.assertEqual((report.changed, report.unchanged), (1, 3))
+        self.assertEqual(self._settings_of("text-layer.pdf"), "mode=fast;pages=coverage-and-chars")
+        # 按新设置转过就记上了：再跑一轮什么都不重转
+        self.assertEqual(self.pipeline.stale_libraries("mixed-lib"), [])
+        _report, converted, _ocr = self._reindex()
+        self.assertEqual(converted, [])
+
+    def test_changing_which_pages_count_as_pictures_reconverts_too(self):
+        self.runtime.settings.set("pdf_image_page_rule", "coverage-only")
+        _report, converted, ocr_calls = self._reindex()
+        self.assertEqual(converted, ["text-layer.pdf"])
+        self.assertEqual(ocr_calls, 0)
+        self.assertEqual(self._settings_of("text-layer.pdf"), "mode=auto;pages=coverage-only")
+
+    def test_a_book_converted_before_settings_were_recorded_is_reconverted_once(self):
+        manifest = self._active_manifest()
+        del manifest["files"]["text-layer.pdf"]["extractor_settings"]
+        self.assertTrue(self.pipeline._manifests.write(manifest))
+        _report, converted, _ocr = self._reindex()
+        self.assertEqual(converted, ["text-layer.pdf"])
+        _report, converted, _ocr = self._reindex()
+        self.assertEqual(converted, [])
+
+    def test_a_stash_converted_with_the_old_settings_is_not_passed_off_as_new(self):
+        """书改过、按旧设置转好了却没发布，留下一份暂存（BC-20）；之后改了设置，这份不能拿来
+        冒充新设置的结果。"""
+        import pymupdf
+
+        doc = pymupdf.open()
+        doc.new_page().insert_text((72, 72), "rewritten text layer about kitchen recipes")
+        doc.save(str(self.vault / "text-layer.pdf"))
+        doc.close()
+        self._stop_after_converting()
+        self.runtime.settings.set("pdf_text_mode", "fast")
+        _report, converted, _ocr = self._reindex()
+        self.assertEqual(converted, ["text-layer.pdf"], "旧设置转的暂存不能用")
+        self.assertEqual(self._settings_of("text-layer.pdf"), "mode=fast;pages=coverage-and-chars")
+
+    def test_a_round_stopped_after_reconverting_does_not_reconvert_again(self):
+        """按新设置转好、这一轮却没发布（停止/出错）：下一轮直接用暂存，不再转一遍（BC-20）。"""
+        self.runtime.settings.set("pdf_text_mode", "fast")
+        self._stop_after_converting()
+        _report, converted, _ocr = self._reindex()
+        self.assertEqual(converted, [], "按新设置转好的暂存可以直接用")
+        self.assertEqual(self._settings_of("text-layer.pdf"), "mode=fast;pages=coverage-and-chars")
+
+
+def _write_layout_pdf(path: Path, spec: list[tuple[str, float]]) -> None:
+    """逐页造 PDF：(这一页的字, 图占页面比例)；字为空就不写，比例为 0 就不放图。"""
+    import pymupdf
+
+    doc = pymupdf.open()
+    for text, fraction in spec:
+        page = doc.new_page()
+        if text:
+            page.insert_textbox(pymupdf.Rect(50, 50, 550, 400), text)
+        if fraction:
+            pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 40, 40), False)
+            pix.clear_with(180)
+            rect = page.rect
+            page.insert_image(pymupdf.Rect(rect.x0, rect.y1 - rect.height * fraction, rect.x1, rect.y1), pixmap=pix)
+    doc.save(str(path))
+    doc.close()
+
+
+def _pdf_page_count(path: Path) -> int:
+    import pymupdf
+
+    doc = pymupdf.open(str(path))
+    try:
+        return doc.page_count
+    finally:
+        doc.close()
+
+
+class TestOnlyPicturePagesGoToOcr(_MixedLibraryCase):
+    """按页分流（2026-10-01 操作者确认，BC-01/BC-04/BC-19）：真机 Y2S1 里三本厚教材每本只有几页没字，
+    却整本被送去本机识别、又撞上 200 页上限，一个字都没进索引。现在文字页直接转，只把图片页切出来
+    送识别、按页码拼回；送不了识别时文字照转、图片页记下来，条件变了下一轮自动补识别。"""
+
+    ALPHA = "Alpha chapter explains conduction through a plane wall in detail. " * 5
+    GAMMA = "Gamma chapter explains convection over a flat plate in detail. " * 5
+
+    def setUp(self) -> None:
+        super().setUp()
+        _write_layout_pdf(self.vault / "textbook.pdf", [(self.ALPHA, 0.0), ("", 0.9), (self.GAMMA, 0.0)])
+        self.local = self._plugin_instance("official-ocr-mineru-local")
+        self.cloud = self._plugin_instance("official-ocr-mineru-cloud")
+
+    def _record(self, name: str = "textbook.pdf") -> dict:
+        return self._active_manifest()["files"][name]
+
+    def _text(self, name: str = "textbook.pdf") -> str:
+        return self.pipeline.read_document("mixed-lib", name).text
+
+    def _cache_row(self, name: str = "textbook.pdf"):
+        report = self.pipeline.conversion_caches("mixed-lib")[0]
+        return next(item for item in report.files if item.path == name)
+
+    def test_only_the_picture_page_is_recognized_and_put_back_in_place(self):
+        sent: list[int] = []
+        real_extract = self.local.extract
+
+        def _spy(library_id, path, root):
+            if path != "scanned.pdf":
+                sent.append(_pdf_page_count(Path(root) / path))
+            return real_extract(library_id, path, root)
+
+        with patch.object(self.local, "extract", side_effect=_spy):
+            report = self.pipeline.index_library("mixed-lib")
+        self.assertEqual(report.failed, 0, report.files)
+        self.assertEqual(sent, [1], "只把那一页图片页切出来送识别，不是整本")
+        text = self._text()
+        alpha, ocr, gamma = text.index("Alpha chapter"), text.index("[fake-ocr]"), text.index("Gamma chapter")
+        self.assertLess(alpha, ocr)
+        self.assertLess(ocr, gamma, "识别结果要拼回第 2 页原来的位置")
+        record = self._record()
+        self.assertEqual(record["extractor_id"], "official-extractor-pdf-text")
+        self.assertEqual(record.get("ocr_pages"), [2])
+        self.assertEqual(record.get("ocr_by"), "official-ocr-mineru-local")
+        self.assertFalse(record.get("missing_pages"))
+        row = self._cache_row()
+        self.assertEqual(row.text_state, "done")
+        self.assertEqual(row.text_ocr_pages, (2,))
+
+    def test_without_ocr_the_text_is_kept_and_the_picture_page_is_listed_then_filled_later(self):
+        self.runtime.settings.set("pdf_scan_backend", "none")
+        self.pipeline.index_library("mixed-lib")
+        self.assertEqual(self._record()["status"], "indexed")
+        self.assertIn("Gamma chapter", self._text(), "图片页识别不了，文字页照样进索引")
+        record = self._record()
+        self.assertEqual(record.get("missing_pages"), [2])
+        self.assertEqual(record.get("missing_reason"), "ocr-off")
+        row = self._cache_row()
+        self.assertEqual(row.text_state, "partial")
+        self.assertEqual(row.text_reason, "ocr-off")
+        self.assertEqual(row.text_missing_pages, (2,))
+        # 没有任何变化时不白跑：下一轮不重转这本书
+        pdf_text = self._plugin_instance("official-extractor-pdf-text")
+        with patch.object(pdf_text, "extract", side_effect=AssertionError("不该重转")):
+            self.pipeline.index_library("mixed-lib")
+        # 打开识别（能力变了）：搜索前自动同步判它过期，下一轮自动补识别
+        self.runtime.settings.set("pdf_scan_backend", "mineru-local")
+        self.assertTrue(self.pipeline.failure_will_retry({**self._record(), "path": "textbook.pdf"}))
+        self.pipeline.index_library("mixed-lib")
+        self.assertEqual(self._record().get("ocr_pages"), [2])
+        self.assertFalse(self._record().get("missing_pages"))
+        self.assertIn("[fake-ocr]", self._text())
+
+    def test_over_the_local_page_limit_the_picture_pages_are_listed_until_the_limit_is_raised(self):
+        _write_layout_pdf(
+            self.vault / "textbook.pdf",
+            [(self.ALPHA, 0.0), ("", 0.9), ("", 0.9), (self.GAMMA, 0.0)],
+        )
+        self.runtime.settings.set("mineru_local_max_pages", 1)
+        with patch.object(self.local, "extract", wraps=self.local.extract) as single:
+            self.pipeline.index_library("mixed-lib")
+        self.assertEqual([c.args[1] for c in single.call_args_list], ["scanned.pdf"], "超上限的不送本机识别")
+        record = self._record()
+        self.assertEqual(record.get("missing_pages"), [2, 3])
+        self.assertEqual(record.get("missing_reason"), "too-many-pages")
+        self.assertIn("Gamma chapter", self._text())
+        self.runtime.settings.set("mineru_local_max_pages", 0)
+        self.pipeline.index_library("mixed-lib")
+        self.assertEqual(self._record().get("ocr_pages"), [2, 3])
+        self.assertFalse(self._record().get("missing_pages"))
+
+    def _fake_cloud(self, uploads: list[int]):
+        def _cloud_extract(library_id, path, root):
+            pages = _pdf_page_count(Path(root) / path)
+            uploads.append(pages)
+            return ExtractedDocument(
+                library_id=library_id, path=path, text=f"[fake-cloud] {pages} pages", failure_reason=None,
+                extracted_by="official-ocr-mineru-cloud", extractor_version="0.3.0", content_hash="h",
+            )
+
+        return _cloud_extract
+
+    def test_over_the_limit_the_cloud_takes_over_when_allowed_in_uploads_of_limited_size(self):
+        _write_layout_pdf(
+            self.vault / "textbook.pdf",
+            [(self.ALPHA, 0.0), ("", 0.9), ("", 0.9), ("", 0.9), (self.GAMMA, 0.0)],
+        )
+        self.runtime.settings.set("mineru_local_max_pages", 2)
+        self.runtime.settings.set("mineru_local_overflow", "mineru-cloud")
+        self.runtime.settings.set("mineru_api_key", "sk-test-overflow")
+        uploads: list[int] = []
+        with (
+            patch.object(self.cloud, "extract", side_effect=self._fake_cloud(uploads)),
+            patch.object(self.cloud, "max_pages_per_request", return_value=2),
+            patch.object(self.local, "extract", wraps=self.local.extract) as local_single,
+        ):
+            self.pipeline.index_library("mixed-lib")
+        self.assertEqual(uploads, [2, 1], "3 页图片页、每份最多 2 页：切成两份上传")
+        self.assertEqual([c.args[1] for c in local_single.call_args_list], ["scanned.pdf"])
+        record = self._record()
+        self.assertEqual(record.get("ocr_by"), "official-ocr-mineru-cloud")
+        self.assertEqual(record.get("ocr_pages"), [2, 3, 4])
+        text = self._text()
+        self.assertLess(text.index("Alpha chapter"), text.index("[fake-cloud]"))
+        self.assertLess(text.rindex("[fake-cloud]"), text.index("Gamma chapter"))
+
+    def test_a_whole_scan_over_the_limit_goes_to_the_cloud_in_pieces_when_allowed(self):
+        _write_layout_pdf(self.vault / "big-scan.pdf", [("", 1.0)] * 3)
+        self.runtime.settings.set("mineru_local_max_pages", 2)
+        self.pipeline.index_library("mixed-lib")
+        scan = self._record("big-scan.pdf")
+        self.assertEqual(scan.get("status"), "terminal", "没开送云端：整本扫描件超上限照旧记“等识别”")
+        self.assertIn("too-many-pages", str(scan.get("failure_detail")))
+        self.runtime.settings.set("mineru_local_overflow", "mineru-cloud")
+        self.runtime.settings.set("mineru_api_key", "sk-test-overflow")
+        uploads: list[int] = []
+        with (
+            patch.object(self.cloud, "extract", side_effect=self._fake_cloud(uploads)),
+            patch.object(self.cloud, "max_pages_per_request", return_value=2),
+        ):
+            self.pipeline.index_library("mixed-lib")
+        self.assertEqual(uploads, [2, 1])
+        scan = self._record("big-scan.pdf")
+        self.assertEqual(scan.get("status"), "indexed")
+        self.assertEqual(scan.get("extractor_id"), "official-ocr-mineru-cloud")
+
+    def test_a_temporarily_unavailable_ocr_service_is_tried_again_next_round(self):
+        real_extract = self.local.extract
+
+        def _down(library_id, path, root):
+            if path == "scanned.pdf":
+                return real_extract(library_id, path, root)
+            return ExtractedDocument(
+                library_id=library_id, path=path, text=None, failure_reason="deferred",
+                extracted_by="official-ocr-mineru-local", extractor_version="0.2.0", content_hash="h",
+            )
+
+        with patch.object(self.local, "extract", side_effect=_down):
+            self.pipeline.index_library("mixed-lib")
+        self.assertEqual(self._record().get("missing_reason"), "ocr-deferred")
+        self.assertTrue(self.pipeline.failure_will_retry({**self._record(), "path": "textbook.pdf"}))
+        self.pipeline.index_library("mixed-lib")  # 服务恢复，什么设置都没改
+        self.assertEqual(self._record().get("ocr_pages"), [2])
 
 
 class _FakeLlmHttpClient:

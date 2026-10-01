@@ -138,7 +138,8 @@ class TestBusinessCli(unittest.TestCase):
             self._run("libraries", "add", str(self.vault), "--id", "test-lib")
             code, out = self._run("index", "--library", "test-lib")
             self.assertEqual(code, 0, out)
-            self.assertIn("转换缓存：转文字 复用 0 / 新转 1 / 缺 0", out)
+            # 新转的写明谁转的；库里没有 PDF，就没有“图片页”那一段（2026-10-01，BC-19）
+            self.assertIn("转换缓存：转文字 复用 0 / 新转 1（DOCX 提取器 1）/ 缺 0；页库 复用 0 / 新建 0 / 缺 0", out)
             code, out = self._run("caches", "--library", "test-lib")
             self.assertEqual(code, 0, out)
             self.assertIn("转文字：1/1 份已转好", out)

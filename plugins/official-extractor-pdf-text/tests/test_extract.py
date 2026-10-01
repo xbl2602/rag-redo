@@ -79,11 +79,15 @@ class TestExtractPdfText(unittest.TestCase):
         self.assertIsNone(doc.text)
         self.assertIn("scanned", doc.failure_reason)
 
-    def test_mixed_pdf_routes_whole_document_to_scanned_failure(self):
+    def test_a_blank_page_no_longer_sends_a_text_book_to_ocr(self):
+        """2026-10-01 操作者确认改掉的旧规则（BC-01）：以前“有一页没字就整本当扫描件”，
+        厚教材因为封面、空白页整本被送去识别、又撞上 200 页上限，一个字都没进索引。
+        现在没字也没图的空白页直接跳过，这本书按文字层转。"""
         _make_mixed_pdf(self.tmp / "mixed.pdf")
         doc = extract("lib1", "mixed.pdf", self.tmp)
-        self.assertIsNone(doc.text)
-        self.assertEqual(doc.failure_reason, "scanned")
+        self.assertIsNotNone(doc.text, doc.failure_reason)
+        self.assertIn("valid text layer", doc.text)
+        self.assertEqual(doc.image_pages, ())
 
     def test_exactly_ten_characters_is_a_text_page(self):
         _make_threshold_pdf(self.tmp / "ten.pdf", "1234567890")
@@ -170,6 +174,108 @@ def _make_pages_pdf(path: Path, pages: int) -> None:
     doc.close()
 
 
+def _add_image(page, fraction: float) -> None:
+    """在这一页放一张灰色图，占页面面积约 `fraction`（宽度撑满，按比例取高度）。"""
+    rect = page.rect
+    height = rect.height * fraction
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 40, 40), False)
+    pix.clear_with(180)
+    page.insert_image(pymupdf.Rect(rect.x0, rect.y1 - height, rect.x1, rect.y1), pixmap=pix)
+
+
+def _make_layout_pdf(path: Path, spec: list[tuple[str, float]]) -> None:
+    """按 (这一页的字, 图占页面比例) 逐页造 PDF；字为空就不写字，比例为 0 就不放图。"""
+    doc = pymupdf.open()
+    for text, fraction in spec:
+        page = doc.new_page()
+        if text:
+            page.insert_textbox(pymupdf.Rect(50, 50, 550, 400), text)
+        if fraction:
+            _add_image(page, fraction)
+    doc.save(path)
+    doc.close()
+
+
+def _plugin_with(settings):
+    class _Ctx:
+        logger = __import__("logging").getLogger("rag_redo.test.pdf_text")
+
+    ctx = _Ctx()
+    ctx.settings = settings
+    plugin = PdfTextExtractorPlugin()
+    plugin.on_load(ctx)
+    return plugin
+
+
+_LONG = "This page is mostly running text about heat transfer and fluid flow. " * 6  # 约 400 字
+_SHORT = "Figure 3.2 Forging dies"  # 23 字：大图配一句图题
+
+
+class TestPagesAreJudgedOneByOne(unittest.TestCase):
+    """按页分流（2026-10-01 操作者确认，BC-01）：满足任一条就是图片页——①几乎没字（不到 10 个）
+    但有图；②图占两成以上，并且（默认）这页字不到 200 个 / 或者（coverage-only）不管字多少。
+    没字也没图的是空白页，跳过。只有图片页送识别，文字页直接转。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        _make_layout_pdf(
+            self.tmp / "book.pdf",
+            [
+                (_LONG, 0.0),  # 1 文字页
+                ("", 0.9),  # 2 没字的整页图（扫描页、封面）→ 图片页
+                (_SHORT, 0.6),  # 3 大图 + 一句图题 → 图片页（旧规则当它是文字页，图里的字全丢）
+                (_LONG, 0.3),  # 4 一整页正文配一张插图 → 默认是文字页；“只看图”时是图片页
+                ("", 0.0),  # 5 空白页 → 跳过
+                (_LONG, 0.1),  # 6 小图标、页眉 logo → 文字页
+            ],
+        )
+
+    def test_default_rule_needs_a_big_picture_and_little_text(self):
+        doc = extract("lib1", "book.pdf", self.tmp)
+        self.assertIsNotNone(doc.text, doc.failure_reason)
+        self.assertEqual(doc.image_pages, (2, 3))
+        self.assertIsNotNone(doc.page_texts)
+        self.assertEqual(len(doc.page_texts), 6)
+        self.assertEqual(doc.text, "".join(doc.page_texts), "整本正文就是逐页正文按顺序拼起来")
+        self.assertIn("Forging dies", doc.page_texts[2], "图片页先带着它上面仅有的字，识别不了时不至于一无所有")
+
+    def test_coverage_only_rule_ignores_how_much_text_the_page_has(self):
+        doc = extract("lib1", "book.pdf", self.tmp, image_rule="coverage-only")
+        self.assertEqual(doc.image_pages, (2, 3, 4))
+
+    def test_a_pure_text_book_keeps_the_whole_document_conversion(self):
+        _make_layout_pdf(self.tmp / "plain.pdf", [(_LONG, 0.0), ("", 0.0), (_LONG, 0.05)])
+        doc = extract("lib1", "plain.pdf", self.tmp)
+        self.assertIsNotNone(doc.text)
+        self.assertEqual(doc.image_pages, ())
+        self.assertIsNone(doc.page_texts, "纯文字的书不需要逐页正文")
+
+    def test_a_book_without_any_real_text_is_still_a_whole_scan(self):
+        _make_layout_pdf(self.tmp / "scan.pdf", [("", 1.0), ("", 1.0), ("", 0.0)])
+        doc = extract("lib1", "scan.pdf", self.tmp)
+        self.assertIsNone(doc.text)
+        self.assertEqual(doc.failure_reason, "scanned")
+        self.assertEqual(doc.image_pages, (1, 2, 3), "整本送识别：列出全书页码，编排层据此看页数上限")
+
+    def test_the_rule_enters_the_capability_signature(self):
+        plugin_default = _plugin_with({})
+        plugin_only = _plugin_with({"pdf_image_page_rule": "coverage-only"})
+        self.assertNotEqual(plugin_default.index_signature(), plugin_only.index_signature())
+        self.assertEqual(_plugin_with({"pdf_image_page_rule": "nonsense"}).image_rule(),
+                         "coverage-and-chars")
+
+    def test_write_page_range_cuts_out_exactly_those_pages(self):
+        plugin = _plugin_with({})
+        plugin.write_page_range(self.tmp / "book.pdf", 2, 3, self.tmp / "part.pdf")
+        part = pymupdf.open(str(self.tmp / "part.pdf"))
+        try:
+            self.assertEqual(part.page_count, 2)
+            self.assertIn("Forging dies", part[1].get_text())
+        finally:
+            part.close()
+
+
 class TestPdfTextModes(unittest.TestCase):
     """PDF 文字层转换三种方式（设置项 `pdf_text_mode`，2026-09-30 操作者确认，BC-01）：
     auto（默认，大文件用快速模式）/ layout（全部用 AI 版面分析，旧行为）/ fast（全部快速模式）。
@@ -253,8 +359,29 @@ class TestPdfTextModeSetting(unittest.TestCase):
     def test_plugin_passes_the_configured_mode_to_the_extractor(self):
         plugin = self._plugin({"pdf_text_mode": "fast"})
         with patch("official_extractor_pdf_text.plugin.extract") as fake:
+            fake.return_value.text = None  # 这里只看传给转换的参数；没转出正文，插件原样返回
             plugin.extract("lib1", "a.pdf", Path("."))
         self.assertEqual(fake.call_args.kwargs.get("mode"), "fast")
+
+    def test_output_settings_name_both_settings_that_change_the_converted_text(self):
+        """2026-10-01 操作者确认（BC-01）：改了转换方式或图片页判法，下一轮把已经转好的 PDF 按新设置
+        重转——编排层拿这串字和清单里记的比；里面不能有 `:` 和 `+`（转换暂存路由用它们分段）。"""
+        changed = self._plugin({"pdf_text_mode": "fast", "pdf_image_page_rule": "coverage-only"}).output_settings()
+        default = self._plugin({}).output_settings()
+        self.assertEqual(changed, "mode=fast;pages=coverage-only")
+        self.assertEqual(default, "mode=auto;pages=coverage-and-chars")
+        for text in (changed, default):
+            self.assertNotIn(":", text)
+            self.assertNotIn("+", text)
+
+    def test_a_converted_book_carries_the_settings_it_was_converted_with(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        _make_text_pdf(tmp / "a.pdf")
+        _make_blank_pdf(tmp / "scan.pdf")
+        plugin = self._plugin({"pdf_text_mode": "fast"})
+        self.assertEqual(plugin.extract("lib1", "a.pdf", tmp).extractor_settings, "mode=fast;pages=coverage-and-chars")
+        self.assertIsNone(plugin.extract("lib1", "scan.pdf", tmp).extractor_settings, "没转出来的不记")
 
 
 if __name__ == "__main__":

@@ -34,6 +34,17 @@ def _process_is_gone(pid: int) -> bool:
     return not pid_alive(pid)
 
 
+
+def _write_pdf_pages(path: Path, pages: int) -> None:
+    import pymupdf
+
+    doc = pymupdf.open()
+    for _ in range(pages):
+        doc.new_page()
+    doc.save(str(path))
+    doc.close()
+
+
 class TestMineruLocalOcrPlugin(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -603,11 +614,11 @@ class TestServerBatchesScansWithinVramLimits(unittest.TestCase):
             mock.patch.object(self.server, "_do_parse", mock.Mock(side_effect=single)),
         ]
 
-    def _run(self, paths, **kwargs):
+    def _run(self, paths, max_pages=None, **kwargs):
         patches = self._patched(**kwargs)
         mocks = [p.start() for p in patches]
         try:
-            return self.server._real_ocr_many(paths), mocks[2], mocks[3]
+            return self.server._real_ocr_many(paths, max_pages=max_pages), mocks[2], mocks[3]
         finally:
             for p in reversed(patches):
                 p.stop()
@@ -686,6 +697,17 @@ class TestServerBatchesScansWithinVramLimits(unittest.TestCase):
         self.assertIn("too-many-pages", outcomes[0][1])
         self.assertEqual(outcomes[1][0], "single:a.pdf")
         self.assertEqual(many.call_count, 0)
+
+    def test_a_request_can_raise_or_lift_the_page_limit(self):
+        """页数上限改成设置项（2026-10-01 操作者确认，BC-01；旧项目 config.py 的
+        mineru_local_max_pages 同样可改，0 = 不限）：每次请求带上当前上限，改设置不用重启服务。"""
+        paths = self._paths(**{"huge.pdf": 999})
+        refused, _, _ = self._run(paths, max_pages=500)
+        self.assertIn("too-many-pages", refused[0][1])
+        self.assertIn("500", refused[0][1])
+        for limit in (1000, 0):
+            outcomes, _, single = self._run(paths, max_pages=limit)
+            self.assertEqual(outcomes[0][0], "single:huge.pdf", f"上限 {limit} 时不该拒收")
 
     def test_free_vram_probe_prefers_torch_because_nvidia_smi_under_reports(self):
         """torch 优先、nvidia-smi 兜底——顺序不能反。
@@ -768,6 +790,43 @@ class TestPluginExtractMany(unittest.TestCase):
         self.assertIn("fake-ocr", docs[3].text)
         self.assertEqual(docs[0].extracted_by, "official-ocr-mineru-local")
         self.assertTrue(docs[0].content_hash)
+
+    def test_page_budget_defaults_to_200_and_zero_means_no_limit(self):
+        self.assertEqual(self.instance.page_budget(), 200)
+        self.rt.settings.set("mineru_local_max_pages", 350)
+        self.assertEqual(self.instance.page_budget(), 350)
+        self.rt.settings.set("mineru_local_max_pages", 0)
+        self.assertIsNone(self.instance.page_budget())
+
+    def test_a_file_over_the_limit_is_refused_without_calling_the_service(self):
+        _write_pdf_pages(self.tmp / "three.pdf", 3)
+        self.rt.settings.set("mineru_local_max_pages", 2)
+        from unittest import mock
+
+        with mock.patch.object(self.instance._handle, "call", side_effect=AssertionError("不该送去识别")):
+            doc = self.instance.extract("lib", "three.pdf", self.tmp)
+            many = self.instance.extract_many("lib", ["three.pdf"], self.tmp)
+        for result in (doc, many[0]):
+            self.assertIsNone(result.text)
+            self.assertTrue(result.failure_reason.startswith("scanned:"), result.failure_reason)
+            self.assertIn("too-many-pages", result.failure_reason)
+
+    def test_the_limit_travels_with_each_request(self):
+        _write_pdf_pages(self.tmp / "two.pdf", 2)
+        self.rt.settings.set("mineru_local_max_pages", 50)
+        from unittest import mock
+
+        real_call = self.instance._handle.call
+        with mock.patch.object(self.instance._handle, "call", side_effect=real_call) as call:
+            self.instance.extract("lib", "two.pdf", self.tmp)
+            self.instance.extract_many("lib", ["two.pdf", "two.pdf"], self.tmp)
+        payloads = [c.args[1] for c in call.call_args_list if c.args and c.args[0] in ("extract", "extract_many")]
+        self.assertEqual([payload.get("max_pages") for payload in payloads], [50, 50])
+
+    def test_the_limit_enters_the_capability_signature(self):
+        before = self.instance.index_signature()
+        self.rt.settings.set("mineru_local_max_pages", 400)
+        self.assertNotEqual(before, self.instance.index_signature())
 
     def test_too_many_pages_is_classified_as_scanned_like_the_legacy_router(self):
         doc = self.instance._document(

@@ -3,6 +3,8 @@
   "_comment_bc16": "2026-09-29 操作者确认新增：index.html/app.js/mock.js 的 bytes/sha256 已按 BC-16（手动释放显存按钮，见 docs/behavior_contract.json）真实更新，不是漂移——旧项目从没有这个按钮，这是本仓库唯一一处刻意打破 BC-15『逐字节复刻』要求的地方，仅此一处、有据可查。app.css 未改动，哈希不变。",
   "_comment_bc18": "2026-09-30 操作者确认：图谱页换成总览星图（BC-18，见 docs/behavior_contract.json），index.html/app.js/app.css/mock.js 的 bytes/sha256 按此真实更新，不是漂移；旧图谱的双链/语义/归属线、库边界、着色模式随之移除（读模型 graph()/semantic_edges() 契约方法保留）。starmap_assets 固定星图模块与本地放置的 three.js r160（MIT，npm three@0.160.0 原样文件）。",
   "_comment_bc19": "2026-09-30 操作者确认：诊断页加“转换缓存”清单、库卡片加“转文字/页库”一行、文件详情加转换缓存一节（BC-19，见 docs/behavior_contract.json），原“WEMM 页库明细”表并入清单；index.html/app.js/app.css/mock.js 的 bytes/sha256 按此真实更新，不是漂移。契约方法 wemm_status 原样保留（前端不再调用）。",
+  "_comment_bc01_pages": "2026-10-01 操作者确认：PDF 按页分流（BC-01）——设置页加“哪些页算图片页”“本机识别页数上限”“超过本机上限时”三项，后者只在扫描件后端选本机时可改（前端按 enabled_when 通用变灰），选成送云端与切到云端识别一样先弹同意框；转换缓存清单与文件详情显示“第几页由识别补上 / 第几页没识别”。app.js/app.css/mock.js 的 bytes/sha256 按此真实更新，不是漂移（BC-15 已登记这次偏离）。",
+  "_comment_settings_visible": "2026-10-01 操作者反馈“设置怎么改都不生效，也没有报错提示”：某个库索引失败时动态岛与心跳胶囊变红、写明哪个库和原因，并弹一次提示、打开日志（数据来自快照 progress.failed）；保存设置后的提示写明改了哪几项、要下一轮索引才起作用的项什么时候生效（保存结果的 changed/notes），不再一律“已热读生效”。长提示换行显示、不撑出屏幕。app.js/app.css/mock.js 的 bytes/sha256 按此真实更新，不是漂移（BC-15 已登记这次偏离）。",
   "legacy_source": {
     "contracts": "obsidian-rag/guiweb/contracts.md",
     "bridge": "obsidian-rag/guiweb/bridge.py",
@@ -18,18 +20,18 @@
     },
     {
       "name": "app.css",
-      "bytes": 61343,
-      "sha256": "C4F7590F26E4F78636ED7B00332269BB0AA424D99AEA74E8E228B706FFBD7CA6"
+      "bytes": 61737,
+      "sha256": "658029F83B658D0DCCDB036650617ADC1019D1F42B6E39CB72E6467F0772703A"
     },
     {
       "name": "app.js",
-      "bytes": 118325,
-      "sha256": "6A11A7AC722CE77701B41435ECB39CB017844B2B8BC8DC5A09AE1030F06B7327"
+      "bytes": 121621,
+      "sha256": "FE29DEF8F02E2A78B10AE9CDE4AF7125232FBE42F98CB196C348B2F52EB844F6"
     },
     {
       "name": "mock.js",
-      "bytes": 84489,
-      "sha256": "D0A924FAA56F0CC3C7E06F94AA8275F531289053EB84333E5D768296DF7DD9D6"
+      "bytes": 87992,
+      "sha256": "CEE9747AE742F22B8C5F1DAD8D9F2F38FF8EE94D6EBFF16D6C4BC40E65373408"
     }
   ],
   "starmap_assets": [

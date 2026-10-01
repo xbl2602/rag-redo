@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field, replace as dataclasses_replace
@@ -26,6 +27,16 @@ from .contracts import Chunk, ConversionCacheLibrary, ConversionRoundSummary, Do
 from .graph import build_graph, select_semantic_edges
 from .overview_map import OVERVIEW_LAYOUT_VERSION, build_overview, chunk_groups_from_manifest
 from .conversion_cache import PLAIN_TEXT_EXTENSIONS, build_library_report, render_catalog, round_summary
+from .pdf_pages import (
+    MISSING_OCR_DEFERRED,
+    MISSING_OCR_OFF,
+    MISSING_TOO_MANY_PAGES,
+    RETRY_EVERY_ROUND,
+    missing_reason_for,
+    page_runs,
+    splice_pages,
+    split_runs,
+)
 from .atomic import atomic_write_text
 from .extract_cache import ExtractCache
 from . import index_integrity
@@ -93,6 +104,88 @@ class _PendingFile:
     extracted_by: str
     extractor_version: str
     content_hash: str
+    #: 要记进清单的提取附加信息（按页分流的记账、转换时用的设置），见 `_record_extras_of`
+    record_extras: dict = field(default_factory=dict)
+
+
+def _record_extras_of(doc: ExtractedDocument) -> dict:
+    """提取结果里要写进索引清单的附加信息：PDF“哪些页由识别补上、哪些图片页没识别、为什么”
+    （BC-01/BC-04/BC-19），以及转换时用的设置（`extractor_settings`，设置变了下一轮重转，BC-01）。
+    只在有值时写：纯文字的书、Word、笔记的清单记录不多出空字段。"""
+    fields: dict = {}
+    if doc.ocr_pages:
+        fields["ocr_pages"] = list(doc.ocr_pages)
+        fields["ocr_by"] = doc.ocr_by
+    if doc.missing_pages:
+        fields["missing_pages"] = list(doc.missing_pages)
+        fields["missing_reason"] = doc.missing_reason
+    if doc.extractor_settings:
+        fields["extractor_settings"] = doc.extractor_settings
+    return fields
+
+
+def _doc_extras_from_record(record: dict) -> dict:
+    """正文从提取缓存读回来时，把清单里记着的附加信息一并带上——不然重新切块一次，“哪几页
+    没识别”就丢了、条件变了也不会再补识别；“用什么设置转的”丢了，下一轮又会白白重转一遍。"""
+    return {
+        "ocr_pages": tuple(int(p) for p in record.get("ocr_pages") or ()),
+        "ocr_by": record.get("ocr_by") or None,
+        "missing_pages": tuple(int(p) for p in record.get("missing_pages") or ()),
+        "missing_reason": record.get("missing_reason") or None,
+        "extractor_settings": record.get("extractor_settings") or None,
+    }
+
+
+#: 转换暂存路由里“插件:版本”与“转换设置”之间的分隔符（设置文本保证不含它，见 core/contracts.py）
+_SETTINGS_SEP = "+"
+
+
+def _stash_route(extracted_by: str, version: str, settings: str | None) -> str:
+    """转换暂存的路由：带上转换时用的设置——设置改了，上一轮按旧设置转好的暂存自然查不到，
+    不会拿它冒充新设置的结果（2026-10-01，BC-01/BC-20）。"""
+    route = f"{extracted_by}:{version}"
+    return f"{route}{_SETTINGS_SEP}{settings}" if settings else route
+
+
+def _split_stash_route(route: str) -> tuple[str, str, str | None]:
+    """`_stash_route` 的反向：（插件 id，版本，转换设置或 None）。"""
+    extracted_by, _sep, rest = route.rpartition(":")
+    version, sep, settings = rest.partition(_SETTINGS_SEP)
+    return extracted_by, version, (settings if sep else None)
+
+
+def _settings_outdated(record: dict, current: dict[str, str]) -> bool:
+    """这份已入库的文件是不是用旧设置转的（2026-10-01 操作者确认：改了 PDF 转换方式、哪些页算
+    图片页，下一轮把已经转好的按新设置重转，BC-01）。
+
+    只看产出它的提取器：它有“会改变转换结果的设置”（`current` 里有它，见
+    `Pipeline._extractor_output_settings`），而清单里记的和现在的不一样。清单里没记（这个功能
+    之前转的）也算不一样——重转一次就记上了。没有这类设置的提取器（Word、笔记、整本扫描件的
+    识别）和这一轮没起来的提取器永远不算，免得它们转的文件被白白牵连。"""
+    if str(record.get("status") or "") != "indexed":
+        return False
+    now = current.get(str(record.get("extractor_id") or ""))
+    return now is not None and str(record.get("extractor_settings") or "") != now
+
+
+def _missing_pages_will_retry(record: dict, capability_signature: str) -> bool:
+    """清单里记着“有图片页没识别”的 PDF，下一轮要不要重转：识别服务这轮没起来的每轮都再试；
+    其余（没开识别、超过页数上限、识别出错）要等能力签名变了（开了识别、调了上限、打开送云端、
+    补了 Key……）才再试——稳定的结果不每轮白花资源（AGENTS.md §5，BC-04）。"""
+    if not record.get("missing_pages"):
+        return False
+    if str(record.get("missing_reason") or "") in RETRY_EVERY_ROUND:
+        return True
+    return str(record.get("capability_signature") or "") != str(capability_signature)
+
+
+def _ocr_failure_state(doc: ExtractedDocument | None) -> str:
+    if doc is None:
+        return "extract-failed"
+    reason = str(doc.failure_reason or "").strip().lower()
+    if doc.failure_state == "deferred" or reason == "deferred" or reason.startswith("deferred:"):
+        return "deferred"
+    return "extract-failed"
 
 #: 提取试验台（`Pipeline.preview_extract`）的后端覆盖名 → provider 插件 id。
 #: 键名沿用旧项目 guiweb/bridge.py::preview_start 的 `backend` 取值
@@ -415,13 +508,220 @@ class Pipeline:
             active = getattr(extractor, "is_active", None)
             if callable(active) and not active():
                 continue
+            if last_result is not None and last_result.text is None and last_result.image_pages:
+                # 整本扫描件要交给这家识别：先看它的页数上限，超了就不在这里识别（送云端或记下来）
+                blocked = self._whole_scan_over_budget(
+                    library_id, path, root, last_result, provider_ids[index], extractor, provider_ids
+                )
+                if blocked is not None:
+                    return blocked, None
             if pause_before_batch and callable(getattr(extractor, "extract_many", None)):
                 return last_result, index
             result = extractor.extract(library_id, path, root)
+            if result.text is not None and result.image_pages:
+                # 文字页和图片页混着的书：只把图片页送识别，按页码拼回（2026-10-01，BC-01）
+                return self._finish_pdf_pages(library_id, path, root, result, extractor, provider_ids[index + 1 :]), None
             last_result = result
             if result.text is not None:
                 return result, None
         return last_result, None
+
+    # ---- PDF 按页分流（2026-10-01 操作者确认，BC-01/BC-04）-------------------------------
+    # 以前“有一页没字就整本送识别”，真机 Y2S1 的三本厚教材（每本只有 2～4 页没字）整本撞上本机
+    # 识别 200 页的上限、一个字都没进索引。现在文字层提取器逐页判出图片页，这里只把图片页切成
+    # 小 PDF 送识别、按页码拼回；送不了（没开识别、超过上限又没开送云端、识别出错）时文字照转，
+    # 图片页记进清单，条件变了下一轮自动补（`_missing_pages_will_retry`）。纯规则在 core/pdf_pages.py。
+
+    def _plugin_version(self, plugin_id: str) -> str:
+        state = self.runtime.plugins.get(plugin_id)
+        manifest = getattr(state, "manifest", None)
+        return str(manifest.version) if manifest is not None else "-"
+
+    @staticmethod
+    def _optional_int(plugin, name: str) -> int | None:
+        method = getattr(plugin, name, None)
+        if not callable(method):
+            return None
+        try:
+            value = method()
+        except Exception:  # noqa: BLE001 - 可选查询出错按“没有这项限制”处理，不拖垮提取
+            return None
+        return int(value) if isinstance(value, int) and value > 0 else None
+
+    def _overflow_provider(self, provider_ids: list[str]) -> tuple[str, object] | None:
+        """本机识别超过页数上限时愿意接手的提供者（云端，设置里开了才算，见它的 `overflow_active`）。"""
+        for plugin_id in provider_ids:
+            plugin = self._plugin(plugin_id)
+            check = getattr(plugin, "overflow_active", None)
+            try:
+                if callable(check) and check():
+                    return plugin_id, plugin
+            except Exception:  # noqa: BLE001 - 查不了就当没开
+                continue
+        return None
+
+    def _first_active_ocr(self, provider_ids: list[str]) -> tuple[str, object] | None:
+        for plugin_id in provider_ids:
+            plugin = self._plugin(plugin_id)
+            active = getattr(plugin, "is_active", None)
+            if callable(active) and not active():
+                continue
+            return plugin_id, plugin
+        return None
+
+    def _ocr_pages(
+        self,
+        library_id: str,
+        path: str,
+        root: Path,
+        *,
+        tool,
+        ocr,
+        page_texts: tuple[str, ...],
+        image_pages: tuple[int, ...],
+    ) -> tuple[str, tuple[int, ...], tuple[int, ...], str | None, ExtractedDocument | None]:
+        """把图片页连成段（太长的按这家一次最多几页切开）、另存成小 PDF 交给 `ocr` 识别，按页码拼回。
+        返回（整本正文, 识别补上的页, 没识别的图片页, 没识别的原因, 第一份识别成功的结果）。
+        小 PDF 放在系统临时目录，用完即删，不进任何持久化目录。"""
+        runs = split_runs(page_runs(image_pages), self._optional_int(ocr, "max_pages_per_request"))
+        run_texts: dict[tuple[int, int], str | None] = {}
+        failures: list[str] = []
+        first_ok: ExtractedDocument | None = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="rag_redo_pages_") as tmp:
+                tmp_root = Path(tmp)
+                names = []
+                for first, last in runs:
+                    name = f"p{first:05d}-{last:05d}.pdf"
+                    tool.write_page_range(root / path, first, last, tmp_root / name)
+                    names.append(name)
+                docs: list[ExtractedDocument] | None = None
+                many = getattr(ocr, "extract_many", None)
+                if callable(many) and len(names) > 1:
+                    try:
+                        docs = list(many(library_id, names, tmp_root))
+                    except Exception as exc:  # noqa: BLE001 - 合批接口炸了：逐段重走，不拖垮整轮
+                        logging.getLogger("rag_redo.core.pipeline").warning("图片页合批识别出错，改为逐段识别：%s", exc)
+                        docs = None
+                    if docs is not None and len(docs) != len(names):
+                        docs = None
+                if docs is None:
+                    docs = [ocr.extract(library_id, name, tmp_root) for name in names]
+        except Exception as exc:  # noqa: BLE001 - 切页/识别出任何错都折叠成“这些页没识别”（§5）
+            logging.getLogger("rag_redo.core.pipeline").warning(
+                "图片页识别出错（%s），这些页先用文字层：%s", type(exc).__name__, path
+            )
+            docs = [None] * len(runs)
+        for run, doc in zip(runs, docs):
+            if doc is not None and doc.text is not None and doc.text.strip():
+                run_texts[run] = doc.text
+                first_ok = first_ok or doc
+            else:
+                run_texts[run] = None
+                failures.append(_ocr_failure_state(doc))
+        text, recognized, missing = splice_pages(page_texts, image_pages, run_texts)
+        return text, recognized, missing, (missing_reason_for(failures) if missing else None), first_ok
+
+    def _finish_pdf_pages(
+        self, library_id: str, path: str, root: Path, doc: ExtractedDocument, tool, rest_ids: list[str]
+    ) -> ExtractedDocument:
+        """文字页和图片页混着的书：图片页送识别、拼回；送不了就文字照转、图片页记下来。"""
+        image_pages = tuple(doc.image_pages)
+
+        def _unrecognized(reason: str) -> ExtractedDocument:
+            return dataclasses_replace(doc, page_texts=None, missing_pages=image_pages, missing_reason=reason)
+
+        chosen = self._first_active_ocr(rest_ids)
+        if chosen is None:
+            return _unrecognized(MISSING_OCR_OFF)
+        ocr_id, ocr = chosen
+        budget = self._optional_int(ocr, "page_budget")
+        if budget is not None and len(image_pages) > budget:
+            overflow = self._overflow_provider(rest_ids)
+            if overflow is None:
+                return _unrecognized(MISSING_TOO_MANY_PAGES)
+            ocr_id, ocr = overflow
+        page_texts = doc.page_texts or tuple("" for _ in range(max(image_pages, default=0)))
+        text, recognized, missing, reason, _first_ok = self._ocr_pages(
+            library_id, path, root, tool=tool, ocr=ocr, page_texts=page_texts, image_pages=image_pages
+        )
+        return dataclasses_replace(
+            doc,
+            text=text,
+            page_texts=None,
+            ocr_pages=recognized,
+            ocr_by=ocr_id if recognized else None,
+            missing_pages=missing,
+            missing_reason=reason,
+        )
+
+    def _whole_scan_over_budget(
+        self,
+        library_id: str,
+        path: str,
+        root: Path,
+        scan: ExtractedDocument,
+        ocr_id: str,
+        ocr,
+        provider_ids: list[str],
+    ) -> ExtractedDocument | None:
+        """整本扫描件的页数超过 `ocr` 的上限时怎么办；没超返回 None（照常交给它，含合批）。
+        超了：开了送云端就切成几份送云端；没开就记成等识别（scanned，写明超上限，调大上限或
+        打开送云端后能力签名变化、下一轮自动重试）。"""
+        budget = self._optional_int(ocr, "page_budget")
+        pages = len(scan.image_pages)
+        if budget is None or pages <= budget:
+            return None
+        overflow = self._overflow_provider(provider_ids)
+        if overflow is None:
+            return ExtractedDocument(
+                library_id=library_id,
+                path=path,
+                text=None,
+                failure_reason=f"scanned:too-many-pages: {pages} 页超过本机识别上限 {budget} 页",
+                extracted_by=ocr_id,
+                extractor_version=self._plugin_version(ocr_id),
+                content_hash=scan.content_hash,
+            )
+        overflow_id, overflow_plugin = overflow
+        tool = self._plugin(scan.extracted_by) if scan.extracted_by in self.runtime.plugins else None
+        if tool is None or not callable(getattr(tool, "write_page_range", None)):
+            return None
+        total = max(scan.image_pages)
+        text, recognized, missing, reason, first_ok = self._ocr_pages(
+            library_id,
+            path,
+            root,
+            tool=tool,
+            ocr=overflow_plugin,
+            page_texts=tuple("" for _ in range(total)),
+            image_pages=tuple(scan.image_pages),
+        )
+        if not recognized or first_ok is None:
+            deferred = reason == MISSING_OCR_DEFERRED
+            return ExtractedDocument(
+                library_id=library_id,
+                path=path,
+                text=None,
+                failure_reason="deferred" if deferred else "extract-failed: 超过本机上限，送云端也没识别出来",
+                extracted_by=overflow_id,
+                extractor_version=self._plugin_version(overflow_id),
+                content_hash=scan.content_hash,
+                failure_state="deferred" if deferred else "extract-failed",
+            )
+        return ExtractedDocument(
+            library_id=library_id,
+            path=path,
+            text=text,
+            failure_reason=None,
+            extracted_by=first_ok.extracted_by,
+            extractor_version=first_ok.extractor_version,
+            content_hash=scan.content_hash,
+            ocr_pages=recognized,
+            ocr_by=overflow_id,
+            missing_pages=missing,
+            missing_reason=reason,
+        )
 
     def _batch_extractor_active(self, extension: str) -> bool:
         """这种格式的提取链上有没有启用中的、能合批的提供者（目前只有本机 MinerU）。"""
@@ -624,10 +924,31 @@ class Pipeline:
                     versions.setdefault(point, []).append([plugin_id, str(manifest.version)])
         return versions
 
-    def _stash_routes(self, extension: str) -> list[str]:
+    def _extractor_output_settings(self) -> dict[str, str]:
+        """这一轮起来了的提取器里，有“会改变转换结果的设置”（可选方法 `output_settings()`，
+        见 core/contracts.py）的，各自现在的取值。没起来的不在里面：它转的文件这一轮也转不了，
+        不该因此判成要重转。"""
+        current: dict[str, str] = {}
+        for point in self.runtime.registry.provider_points():
+            if not point.startswith("extractor:"):
+                continue
+            for plugin_id in sorted(self.runtime.registry.providers_of(point)):
+                plugin = self.runtime.plugins.get(plugin_id)
+                getter = getattr(plugin.instance, "output_settings", None) if plugin is not None else None
+                if plugin_id in current or not callable(getter):
+                    continue
+                try:
+                    current[plugin_id] = str(getter())
+                except Exception:  # noqa: BLE001 - 插件读设置出错只当它没有这类设置，不拖垮整轮
+                    continue
+        return current
+
+    def _stash_routes(self, extension: str, output_settings: dict[str, str] | None = None) -> list[str]:
         """转换暂存可以认的路由：这种格式**装着的**全部提取器的“插件:版本”，顺序同
         `_extractor_cache_routes`。按装着的而不是这一轮起来了的算——暂存的正文是那个版本的
-        代码产出的，本机 MinerU 这一轮没起来，并不妨碍用它上一轮已经转好的结果。"""
+        代码产出的，本机 MinerU 这一轮没起来，并不妨碍用它上一轮已经转好的结果。有转换设置的
+        提取器（`output_settings`）只认按现在的设置转好的那一份（见 `_stash_route`）。"""
+        settings = output_settings or {}
         entries = self._extractor_code_versions().get(f"extractor:{extension}", [])
         preferred = (
             ("official-ocr-mineru-cloud", "official-ocr-mineru-local", "official-extractor-pdf-text")
@@ -636,7 +957,7 @@ class Pipeline:
         )
         order = {plugin_id: index for index, plugin_id in enumerate(preferred)}
         ordered = sorted(entries, key=lambda entry: (order.get(entry[0], len(order)), entry[0]))
-        return [f"{plugin_id}:{version}" for plugin_id, version in ordered]
+        return [_stash_route(plugin_id, version, settings.get(plugin_id)) for plugin_id, version in ordered]
 
     def _pipeline_signatures(self) -> dict[str, list[list[str]]]:
         signatures: dict[str, list[list[str]]] = dict(self._extractor_code_versions())
@@ -684,7 +1005,10 @@ class Pipeline:
             # 本机 MinerU 某轮没起来、或换了扫描件后端，含 PDF 的库就一直被
             # `library_freshness` 判为过期，每次搜索前都白跑一轮同步（与 index_library
             # 只对失败记录比能力签名的口径不一致）。
-            return False
+            # 唯一的例外：有图片页没识别的 PDF（2026-10-01，BC-01/BC-04），口径与 index_library 同一个函数。
+            return _missing_pages_will_retry(
+                record, self._extraction_capability_signature(str(record.get("path") or ""))
+            )
         state = normalize_failure_state(
             str(record.get("failure_state") or record.get("failure_reason") or "")
         )
@@ -886,6 +1210,8 @@ class Pipeline:
         old_files = self._manifest_files(old_manifest)
         signatures = self._pipeline_signatures()
         capabilities = self._extractor_capabilities()
+        # 会改变转换结果的设置（PDF 转换方式、哪些页算图片页）：清单里记的和这个不一样就重转
+        output_settings = self._extractor_output_settings()
         old_signatures = old_manifest.get("signatures", {}) if old_manifest else {}
 
         # ---- 一致性自愈（对齐 obsidian-rag/index.py:1903-1910）------------
@@ -1072,6 +1398,17 @@ class Pipeline:
                         plan["action"] = "unchanged"
                     else:
                         plan["action"] = "changed"
+                    if plan["action"] in {"unchanged", "rebuilt"} and _missing_pages_will_retry(
+                        old, plan["capability_signature"]
+                    ):
+                        # 有图片页没识别、而这回能识别了（或服务这轮恢复了）：重转这本书补上（BC-04）
+                        plan["action"] = "retried"
+                    elif plan["action"] in {"unchanged", "rebuilt"} and _settings_outdated(old, output_settings):
+                        # 用旧设置转的（改了 PDF 转换方式 / 哪些页算图片页）：按新设置重转（2026-10-01
+                        # 操作者确认，BC-01）。已发布的正文缓存是旧设置转的，不能读（见 `reconvert`
+                        # 的另外两处用法）；按新设置转好的暂存可以用（路由带设置）。
+                        plan["action"] = "rebuilt"
+                        plan["reconvert"] = True
                 else:
                     old_state = normalize_failure_state(
                         str(old.get("failure_state") or old.get("failure_reason") or "")
@@ -1101,7 +1438,9 @@ class Pipeline:
                     plan["size"], plan["mtime_ns"], plan["content_hash"] = self._file_fingerprint(root / path)
                 except OSError as exc:
                     plan["fingerprint_error"] = f"读取文件失败：{type(exc).__name__}: {exc}"
-            plan["needs_source"] = plan["action"] in {"added", "changed", "retried"} or file_force_extract
+            plan["needs_source"] = (
+                plan["action"] in {"added", "changed", "retried"} or file_force_extract or bool(plan.get("reconvert"))
+            )
             plan["needs_chunks"] = plan["needs_source"] or force_chunks or force_embed
             plan["needs_embed"] = plan["needs_chunks"]
             plans.append(plan)
@@ -1193,11 +1532,15 @@ class Pipeline:
         def _stash_result(plan: dict, doc: ExtractedDocument) -> None:
             # 三条提取路径（合批预取、合批落单、逐份）拿到新结果都经过这里，在这里记“新转”
             fresh_paths.add(str(plan["path"]))
-            if not _stash_usable(plan) or doc.text is None:
+            if not _stash_usable(plan) or doc.text is None or doc.missing_pages:
+                # 有图片页没识别的结果不进暂存：暂存只存正文，“哪几页没识别”会丢，下一轮就不补了
                 return
             try:
                 self._extract_cache.write_stash(
-                    library_id, str(plan["content_hash"]), f"{doc.extracted_by}:{doc.extractor_version}", doc.text
+                    library_id,
+                    str(plan["content_hash"]),
+                    _stash_route(doc.extracted_by, doc.extractor_version, doc.extractor_settings),
+                    doc.text,
                 )
             except (OSError, ValueError) as exc:
                 # 暂存只是“停下不白干”的保险，写不进去不影响本轮结果
@@ -1208,11 +1551,13 @@ class Pipeline:
                 return None
             path = str(plan["path"])
             extension = Path(path).suffix.lower().lstrip(".")
-            hit = self._extract_cache.read_stash(library_id, str(plan["content_hash"]), self._stash_routes(extension))
+            hit = self._extract_cache.read_stash(
+                library_id, str(plan["content_hash"]), self._stash_routes(extension, output_settings)
+            )
             if hit is None:
                 return None
             text, route = hit
-            extracted_by, _sep, extractor_version = route.rpartition(":")
+            extracted_by, extractor_version, settings = _split_stash_route(route)
             return ExtractedDocument(
                 library_id=library_id,
                 path=path,
@@ -1221,6 +1566,7 @@ class Pipeline:
                 extracted_by=extracted_by,
                 extractor_version=extractor_version,
                 content_hash=str(plan["content_hash"]),
+                extractor_settings=settings,
             )
 
         # ---- 扫描件合批（2026-09-29 操作者确认“尝试，但务必做好显存管理”）----------------
@@ -1241,7 +1587,9 @@ class Pipeline:
             if plan["fingerprint_error"] or (plan["action"] == "unchanged" and not plan["needs_chunks"]):
                 return False
             cache_first = (not plan["needs_source"]) or (
-                plan["action"] in {"unchanged", "rebuilt"} and plan["content_hash"] == plan["old"].get("content_hash")
+                plan["action"] in {"unchanged", "rebuilt"}
+                and plan["content_hash"] == plan["old"].get("content_hash")
+                and not plan.get("reconvert")
             )
             if cache_first and self._read_extract_cache(library_id, str(plan["path"]), cache_segments) is not None:
                 return False
@@ -1381,7 +1729,11 @@ class Pipeline:
             # obsidian-rag/index.py:2142-2148 的"不动 meta"语义。
             doc: ExtractedDocument | None = None
             if plan["needs_source"]:
-                if plan["action"] in {"unchanged", "rebuilt"} and plan["content_hash"] == old.get("content_hash"):
+                if (
+                    plan["action"] in {"unchanged", "rebuilt"}
+                    and plan["content_hash"] == old.get("content_hash")
+                    and not plan.get("reconvert")  # 用旧设置转的正文不能拿来冒充新设置的结果
+                ):
                     cached = self._read_extract_cache(library_id, path, cache_segments)
                     if cached is not None:
                         doc = ExtractedDocument(
@@ -1392,6 +1744,7 @@ class Pipeline:
                             extracted_by=str(old.get("extractor_id", "core.pipeline")),
                             extractor_version=str(old.get("extractor_version", "-")),
                             content_hash=str(plan["content_hash"] or old.get("content_hash", "")),
+                            **_doc_extras_from_record(old),
                         )
                         self._extract_cache.write(
                             library_id,
@@ -1428,6 +1781,7 @@ class Pipeline:
                         extracted_by=str(old.get("extractor_id", "core.pipeline")),
                         extractor_version=str(old.get("extractor_version", "-")),
                         content_hash=str(plan["content_hash"] or old.get("content_hash", "")),
+                        **_doc_extras_from_record(old),
                     )
                 if doc is None:
                     doc = _extract_with_stash(path, plan, f"正在重新提取：{path}")
@@ -1595,6 +1949,7 @@ class Pipeline:
                     extracted_by=doc.extracted_by,
                     extractor_version=doc.extractor_version,
                     content_hash=doc.content_hash or plan["content_hash"],
+                    record_extras=_record_extras_of(doc),
                 )
             )
             files_done += 1
@@ -1715,6 +2070,7 @@ class Pipeline:
                         for section_id in item.section_counts
                     },
                     "links": item.raw_links,
+                    **item.record_extras,
                 }
                 item.file_report.extracted = True
                 item.file_report.chunk_count = len(chunks)
@@ -2724,6 +3080,7 @@ class Pipeline:
         lib_mgr = self._singleton("library_manager")
         entries = lib_mgr.resolve_libraries(libraries or "all", exclude)
         signatures = self._pipeline_signatures()
+        output_settings = self._extractor_output_settings()
         report: dict[str, LibraryFreshness] = {}
         for entry in entries:
             library_id = entry.library_id
@@ -2793,7 +3150,8 @@ class Pipeline:
             if not stale:
                 for path in scoped_paths:
                     record = records[path]
-                    if self.failure_will_retry({"path": path, **record}):
+                    if self.failure_will_retry({"path": path, **record}) or _settings_outdated(record, output_settings):
+                        # 后一个：改了 PDF 转换方式 / 哪些页算图片页，下一轮要按新设置重转（BC-01）
                         stale = True
                         break
                     try:

@@ -66,6 +66,10 @@ def _conversion_row(item: Any) -> dict[str, Any]:
             "bytes": item.text_bytes,
             "updated": item.text_updated,
             "file": item.text_file,
+            # PDF 按页分流（BC-01）：哪些图片页由识别补上、谁识别的；哪些没识别（原因见 reason）
+            "ocr_pages": page_ranges(item.text_ocr_pages),
+            "ocr_by": item.text_ocr_by_name or item.text_ocr_by,
+            "missing": page_ranges(item.text_missing_pages),
         },
         "pages": {
             "state": item.pages_state,
