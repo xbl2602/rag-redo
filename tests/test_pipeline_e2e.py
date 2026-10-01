@@ -3018,5 +3018,105 @@ class TestLibrarySummaryPipeline(unittest.TestCase):
         self.assertEqual(self.pipeline.get_library_summary("test-lib").text, "AI想覆盖的新简介")
 
 
+class TestConvertingSeveralPdfsAtOnce(_MixedLibraryCase):
+    """2026-10-01 真机 Y2S1 增量：转换阶段后台只有一个线程在转、显卡闲着，进度条和文件数几乎
+    不动。操作者确认两件事一起做：①转换阶段已经转好的文件算进进度（BC-15）；②快速方式下几本
+    PDF 在后台同时转，结果与逐本转相同（BC-01）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        import pymupdf
+
+        for index in range(3):
+            doc = pymupdf.open()
+            for page in range(2):
+                doc.new_page().insert_text((72, 72), f"book {index} page {page} about heat transfer")
+            doc.save(str(self.vault / f"book-{index}.pdf"))
+            doc.close()
+        self.runtime.settings.set("pdf_text_mode", "fast")
+        self.pdf_text = self._plugin_instance("official-extractor-pdf-text")
+
+    def _converted_texts(self) -> dict[str, str]:
+        manifest = self._active_manifest()
+        texts = {}
+        for path in ("text-layer.pdf", "book-0.pdf", "book-1.pdf", "book-2.pdf"):
+            for segment in reversed(manifest["extract_segments"]):
+                text = self.pipeline._extract_cache.read_any("mixed-lib", path, segment)
+                if text is not None:
+                    texts[path] = text
+                    break
+        return texts
+
+    def _index_counting_background_results(self) -> int:
+        taken: list[str] = []
+        real_take = self.pdf_text._ahead.take
+
+        def counting_take(library_id, path, *args):
+            job = real_take(library_id, path, *args)
+            if job is not None:
+                taken.append(path)
+            return job
+
+        with patch.object(self.pdf_text._ahead, "take", side_effect=counting_take):
+            report = self.pipeline.index_library("mixed-lib")
+        extracted = {item.path for item in report.files if item.extracted}
+        self.assertTrue({"text-layer.pdf", "book-0.pdf", "book-1.pdf", "book-2.pdf"} <= extracted, report.files)
+        return len(taken)
+
+    def test_text_pdfs_are_converted_in_the_background_and_come_out_the_same(self):
+        for backend in ("mineru-local", "none"):  # 扫描件合批那条路、逐本转那条路
+            with self.subTest(backend=backend):
+                self.runtime.settings.set("pdf_scan_backend", backend)
+                with patch.object(self.pdf_text, "prefetch", return_value=[]):  # 参照：逐本当场转
+                    self.pipeline.index_library("mixed-lib", fresh_extract=True)
+                one_by_one = self._converted_texts()
+                self.assertEqual(len(one_by_one), 4, one_by_one)
+                self.pipeline.index_library("mixed-lib", fresh_extract=True)
+                self.assertEqual(self._converted_texts(), one_by_one, "提前转的结果与当场转的不一样")
+                self.assertIsNone(self.pdf_text._ahead._pool, "一轮转完后台子进程要收掉")
+
+    def test_most_books_really_come_from_the_background(self):
+        self.runtime.settings.set("pdf_scan_backend", "none")
+        self.assertGreaterEqual(self._index_counting_background_results(), 2)
+
+    def test_progress_counts_books_converted_ahead_and_never_goes_back(self):
+        class _Converter:
+            """假的“后台同时转”：什么都不转（真正转换照旧在本进程里），只报“已经转好 2 本”，
+            并让每一本第一次都“还没好”，逼编排层在等的时候报一次进度。"""
+
+            def __init__(self):
+                self.waited: set[str] = set()
+
+            def prefetch(self, library_id, paths, root):
+                return list(paths)
+
+            def prefetch_wait(self, library_id, path, timeout):
+                first = path not in self.waited
+                self.waited.add(path)
+                return not first
+
+            def prefetch_ready(self, library_id):
+                return 2
+
+            def prefetch_cancel(self, library_id, paths=None):
+                pass
+
+        self.runtime.settings.set("pdf_scan_backend", "none")
+        events = []
+        with patch.object(Pipeline, "_pdf_converter", return_value=_Converter()):
+            report = self.pipeline.index_library("mixed-lib", progress_callback=events.append)
+        done = [event.files_done for event in events]
+        self.assertEqual(done, sorted(done), "进度条不能往回退")
+        self.assertEqual(done[-1], len(report.files))
+        completed = 0
+        ahead_of_bookkeeping = False
+        for event in events:
+            if event.phase == "file_complete":
+                completed += 1
+            elif event.phase == "extracting" and event.files_done > completed:
+                ahead_of_bookkeeping = True
+        self.assertTrue(ahead_of_bookkeeping, "转换阶段已转好的文件要算进进度")
+
+
 if __name__ == "__main__":
     unittest.main()

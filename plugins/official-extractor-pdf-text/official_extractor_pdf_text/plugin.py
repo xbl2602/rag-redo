@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+from .ahead import AheadConverter
 from .extract import DEFAULT_PDF_TEXT_MODE, EXTRACTOR_VERSION, PDF_TEXT_MODES, extract
 from .pages import DEFAULT_IMAGE_PAGE_RULE, IMAGE_PAGE_RULES
 from .pages import write_page_range as _write_page_range
@@ -19,6 +20,7 @@ class PdfTextExtractorPlugin:
     def __init__(self) -> None:
         self._settings = None
         self._logger = None
+        self._ahead = AheadConverter()
 
     def on_load(self, ctx):
         self._settings = ctx.settings
@@ -29,10 +31,11 @@ class PdfTextExtractorPlugin:
         ctx.logger.info("PDF文字层提取器已启用")
 
     def on_disable(self, ctx):
+        self._ahead.close()
         ctx.logger.info("PDF文字层提取器已禁用")
 
     def on_unload(self, ctx):
-        pass
+        self._ahead.close()
 
     def mode(self) -> str:
         """设置项 `pdf_text_mode`（含义见 extract.py 模块 docstring）；每次现读，改了设置不用重启。"""
@@ -65,10 +68,38 @@ class PdfTextExtractorPlugin:
         log = self._logger.info if self._logger is not None else None
         # 只读一次设置：转换用的和记下来的必须是同一份（转到一半用户改了设置也不会记错）
         mode, image_rule = self.mode(), self.image_rule()
-        doc = extract(library_id, path, root, mode=mode, image_rule=image_rule, log=log)
+        doc = None
+        job = self._ahead.take(library_id, path, Path(root), mode, image_rule)
+        if job is not None:
+            try:
+                doc, lines = job.result()
+            except Exception as exc:  # noqa: BLE001 - 提前转的子进程出事了：在本进程里照常转一遍
+                if log is not None:
+                    log(f"提前转换没成（{type(exc).__name__}），改在本进程转：{path}")
+            else:
+                for line in lines:
+                    if log is not None:
+                        log(line)
+        if doc is None:
+            doc = extract(library_id, path, root, mode=mode, image_rule=image_rule, log=log)
         if doc.text is None:
             return doc
         return replace(doc, extractor_settings=output_settings_text(mode, image_rule))
+
+    # ---- 几本同时转（2026-10-01，BC-01；接口说明见 core/contracts.py，实现见 ahead.py）----
+
+    def prefetch(self, library_id: str, paths: list[str], root: Path) -> list[str]:
+        """编排层告诉它接下来要转哪几本：会走快速方式的在后台几本同时转，返回收下的那些。"""
+        return self._ahead.submit(library_id, list(paths), Path(root), self.mode(), self.image_rule())
+
+    def prefetch_wait(self, library_id: str, path: str, timeout: float) -> bool:
+        return self._ahead.wait(library_id, path, timeout)
+
+    def prefetch_ready(self, library_id: str) -> int:
+        return self._ahead.ready(library_id)
+
+    def prefetch_cancel(self, library_id: str, paths: list[str] | None = None) -> None:
+        self._ahead.cancel(library_id, paths)
 
     def write_page_range(self, src: Path, first: int, last: int, dest: Path) -> None:
         """把第 first～last 页另存成一份 PDF（编排层把图片页切出来送识别，BC-01）。"""

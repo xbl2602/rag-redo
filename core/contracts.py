@@ -93,6 +93,17 @@ class ExtractedDocument:
 # - 识别提供者 `max_pages_per_request() -> int | None`：一次请求最多几页，编排层据此把长段切开；
 # - 识别提供者 `overflow_active() -> bool`：本机识别超过页数上限时，愿不愿意接手（云端，设置里开）。
 #
+# 几本同时转（2026-10-01，BC-01；目前只有文字层 PDF 提取器实现，编排层见 core/pipeline.py）：
+# - `prefetch(library_id, paths, root) -> list[str]`：编排层按顺序交来接下来要转的几本，提取器
+#   在后台提前转（只收它愿意提前转的、收到它的并发上限为止），返回收下的那些；之后编排层照旧对
+#   每一本调 `extract`，提取器把提前转好的结果交出来——结果必须与当场转的完全相同。
+# - `prefetch_wait(library_id, path, timeout) -> bool`：最多等 timeout 秒，这一本转好（或没在
+#   提前转）返回 True；编排层借这段时间报进度。
+# - `prefetch_ready(library_id) -> int`：已经提前转好、还没被取走的有几本（进度条用）。
+# - `prefetch_cancel(library_id, paths=None) -> None`：不要了（paths=None 表示这个库全部）；
+#   没有别的活就把后台子进程收掉。编排层在每个库转换阶段开始和结束时各调一次。
+# 都不抛异常的约定同 `extract`：编排层仍然包了一层，出错就退回逐本转。
+#
 # 可选 `output_settings() -> str`（2026-10-01，BC-01）：会改变它转出来的正文的设置，压成一个
 # 短字符串（不含 `:` 和 `+`）。成功的结果要在 `extractor_settings` 里带上转换时用的那一份。
 # 编排层发现清单里记的和现在的不一样，就把这个提取器转的文件按新设置重转——与“插件代码升级

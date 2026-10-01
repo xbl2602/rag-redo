@@ -384,5 +384,92 @@ class TestPdfTextModeSetting(unittest.TestCase):
         self.assertIsNone(plugin.extract("lib1", "scan.pdf", tmp).extractor_settings, "没转出来的不记")
 
 
+class TestConvertingSeveralAtOnce(unittest.TestCase):
+    """几本同时转（2026-10-01 操作者确认，BC-01）：快速方式只用一个核，编排层把接下来要转的几本
+    交过来，插件在后台几个子进程里同时转；交出去的结果必须与当场转的一模一样。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _plugin(self, mode: str) -> PdfTextExtractorPlugin:
+        plugin = _plugin_with({"pdf_text_mode": mode})
+        self.addCleanup(plugin.on_unload, None)
+        return plugin
+
+    def test_a_book_converted_ahead_is_identical_to_converting_it_on_the_spot(self):
+        _make_text_pdf(self.tmp / "a.pdf", "Alpha body text for converting ahead")
+        _make_layout_pdf(self.tmp / "b.pdf", [(_LONG, 0.0), ("", 0.8), (_LONG, 0.0)])  # 中间一页是图片页
+        _make_pages_pdf(self.tmp / "c.pdf", 3)
+        names = ["a.pdf", "b.pdf", "c.pdf"]
+        plugin = self._plugin("fast")
+        self.assertEqual(plugin.prefetch("lib1", names, self.tmp), names)
+        for name in names:
+            self.assertTrue(plugin.prefetch_wait("lib1", name, 120))
+        self.assertEqual(plugin.prefetch_ready("lib1"), 3)
+        ahead = {name: plugin.extract("lib1", name, self.tmp) for name in names}
+        self.assertEqual(plugin.prefetch_ready("lib1"), 0)
+        on_the_spot = {name: self._plugin("fast").extract("lib1", name, self.tmp) for name in names}
+        self.assertEqual(ahead, on_the_spot)
+        self.assertEqual(ahead["b.pdf"].image_pages, (2,))
+
+    def test_layout_conversion_is_not_done_ahead(self):
+        """精细方式自己就占满所有核，几本同时转只会互相抢：不收，也不起子进程。"""
+        _make_text_pdf(self.tmp / "a.pdf")
+        plugin = self._plugin("layout")
+        self.assertEqual(plugin.prefetch("lib1", ["a.pdf"], self.tmp), [])
+        self.assertIsNone(plugin._ahead._pool)  # noqa: SLF001 - 确认没白起子进程
+
+    def test_auto_mode_only_takes_books_that_go_the_fast_way(self):
+        _make_pages_pdf(self.tmp / "long.pdf", FAST_MODE_MIN_PAGES + 1)
+        _make_text_pdf(self.tmp / "short.pdf")
+        plugin = self._plugin("auto")
+        self.assertEqual(plugin.prefetch("lib1", ["short.pdf", "long.pdf"], self.tmp), ["long.pdf"])
+
+    def test_at_most_twice_the_workers_are_queued_at_once(self):
+        from concurrent.futures import Future
+
+        from official_extractor_pdf_text.ahead import AheadConverter
+
+        class _NeverFinishes:
+            def submit(self, *args, **kwargs):
+                return Future()
+
+            def terminate_workers(self):
+                pass
+
+            def shutdown(self, **kwargs):
+                pass
+
+        names = [f"{i}.pdf" for i in range(5)]
+        for name in names:
+            _make_text_pdf(self.tmp / name)
+        converter = AheadConverter(workers=1)
+        converter._pool = _NeverFinishes()  # noqa: SLF001 - 让收下的都一直“在转”
+        self.assertEqual(converter.submit("lib1", names, self.tmp, "fast", "coverage-and-chars"), names[:2])
+        converter.close()
+
+    def test_cancelling_drops_the_results_and_closes_the_workers(self):
+        _make_text_pdf(self.tmp / "a.pdf")
+        plugin = self._plugin("fast")
+        plugin.prefetch("lib1", ["a.pdf"], self.tmp)
+        plugin.prefetch_cancel("lib1")
+        self.assertIsNone(plugin._ahead._pool)  # noqa: SLF001 - 一轮转完子进程要收掉，不常驻
+        self.assertEqual(plugin.prefetch_ready("lib1"), 0)
+        self.assertTrue(plugin.prefetch_wait("lib1", "a.pdf", 0.1), "没在提前转的不用等")
+        self.assertIsNotNone(plugin.extract("lib1", "a.pdf", self.tmp).text, "丢掉之后照常当场转")
+
+    def test_a_worker_that_died_falls_back_to_converting_here(self):
+        from concurrent.futures import Future
+
+        _make_text_pdf(self.tmp / "a.pdf", "Fallback body text")
+        plugin = self._plugin("fast")
+        broken: Future = Future()
+        broken.set_exception(RuntimeError("worker died"))
+        with patch.object(plugin._ahead, "take", return_value=broken):  # noqa: SLF001
+            doc = plugin.extract("lib1", "a.pdf", self.tmp)
+        self.assertIn("Fallback body text", doc.text)
+
+
 if __name__ == "__main__":
     unittest.main()

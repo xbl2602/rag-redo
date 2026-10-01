@@ -87,6 +87,11 @@ _STASH_SKIP_EXTENSIONS = PLAIN_TEXT_EXTENSIONS
 _EXTRACT_BATCH_FILES = 8
 #: 攒一批时最多往后看几份要提取的 PDF（有文字层的在这一步就逐份转掉，别一口气把整库都转了）。
 _EXTRACT_LOOKAHEAD_FILES = 32
+#: 几本同时转：每走到一本要转的 PDF，往后看几份，把同样要转的交给文字层提取器在后台提前转
+#: （它自己按子进程数决定收几本，见 official-extractor-pdf-text 的 ahead.py）。
+_CONVERT_AHEAD_LOOKAHEAD_FILES = 16
+#: 等后台某一本转好时，每隔几秒看一眼有没有别的几本转好了，好让进度条跟着走。
+_CONVERT_AHEAD_POLL_S = 2.0
 
 
 @dataclass
@@ -734,6 +739,20 @@ class Pipeline:
                 return True
         return False
 
+    def _pdf_converter(self):
+        """PDF 提取链上第一个启用中的提供者——它有 `prefetch`（几本同时转，BC-01）就返回它，
+        否则 None。只认第一个：链里先被调 `extract` 的是它，提前转的结果才会被取到。"""
+        for plugin_id in sorted(self.runtime.registry.providers_of("extractor:pdf")):
+            plugin = self.runtime.plugins.get(plugin_id)
+            extractor = getattr(plugin, "instance", None)
+            if extractor is None:
+                continue
+            active = getattr(extractor, "is_active", None)
+            if callable(active) and not active():
+                continue
+            return extractor if callable(getattr(extractor, "prefetch", None)) else None
+        return None
+
     def preview_extract(self, path: str, *, backend: str = "") -> "PreviewExtraction":
         """提取试验台：对**任意**本地文件跑一次提取，不写提取缓存、不落
         generation、不碰任何索引数据，也不要求该文件在某个已注册库里。
@@ -1314,6 +1333,20 @@ class Pipeline:
         chunks_done = 0
         plans: list[dict] = []
         current_alive_paths: set[str] = set()
+        #: 已经提前转好、主循环还没走到的文件（扫描件合批时一起过了提取链的那几份）。
+        prefetched: dict[str, ExtractedDocument] = {}
+        #: 能在后台几本同时转的 PDF 提取器（有 `prefetch`，见 core/contracts.py），没有就是 None。
+        pdf_converter = self._pdf_converter()
+        #: 进度条上的“已完成文件数”只增不减（见 `_emit`）。
+        shown_done = 0
+
+        def _ahead_ready() -> int:
+            if pdf_converter is None:
+                return 0
+            try:
+                return int(pdf_converter.prefetch_ready(library_id))
+            except Exception:  # noqa: BLE001 - 只是进度条上的数，查不了按 0
+                return 0
 
         def _emit(
             phase: str,
@@ -1324,11 +1357,17 @@ class Pipeline:
             stall_grace_s: float = 0.0,
             message: str = "",
         ) -> None:
+            # 已转好、还没走到的文件也算进进度（2026-10-01 操作者反馈“转换阶段进度条几乎不动，
+            # 包括文件数”，BC-15）：合批时会往后提前转几十份，后台也会几本同时转，只数主循环
+            # 走完的那些，转换阶段文件数就一直停着、最后一下子跳满。只增不减：主循环取走一份到
+            # 记完账之间会少数一份，不能让进度条往回退。
+            nonlocal shown_done
+            shown_done = min(files_total, max(shown_done, files_done + len(prefetched) + _ahead_ready()))
             if progress_callback is not None:
                 progress_callback(
                     IndexProgressEvent(
                         phase=phase,
-                        files_done=files_done,
+                        files_done=shown_done,
                         files_total=files_total,
                         current_path=current_path,
                         chunks_done=chunks_done if chunks_done_value is None else chunks_done_value,
@@ -1574,8 +1613,7 @@ class Pipeline:
         # 几份合成一批实测快 1.7～2 倍、显存只多 0.1～0.3GB。做法：主循环第一次要真正提取某个
         # PDF 时，往后看几份同样要提取的 PDF，一起过一遍提取链——有文字层的照常逐份转，走到
         # 本机 OCR 的攒起来一次交给它（`extract_many`，分组上限与显存把关在它的子进程里）；
-        # 结果放进 `prefetched`，主循环走到那几份时直接取。进度条因此一次跳几份。
-        prefetched: dict[str, ExtractedDocument] = {}
+        # 结果放进 `prefetched`，主循环走到那几份时直接取（进度条把它们算进已完成，见 `_emit`）。
         batch_pdf = self._batch_extractor_active("pdf")
         pdf_plans = [
             plan for plan in plans if plan["included"] and Path(str(plan["path"])).suffix.lower() == ".pdf"
@@ -1595,6 +1633,61 @@ class Pipeline:
                 return False
             return _stashed_doc(plan) is None
 
+        # ---- 几本同时转（2026-10-01 操作者确认，BC-01）--------------------------------------
+        # 真机 Y2S1：快速方式转文字只用一个核，一本 901 页的教材转 110 秒，期间显卡闲着、进度条
+        # 不动。现在每走到一本要转的 PDF，把往后几本同样要转的一起交给文字层提取器，它在后台几个
+        # 子进程里同时转（`prefetch`，接口见 core/contracts.py）；主循环照旧按顺序一本本取，取的
+        # 是同一个 `extract` 的结果，与逐本转完全相同。识别图片页（显卡）时后台也在转下一本。
+        ahead_submitted: set[str] = set()
+        ahead_checked: dict[str, bool] = {}
+
+        def _convert_ahead(plan: dict) -> None:
+            if pdf_converter is None or str(plan["path"]) not in pdf_position:
+                return
+            start = pdf_position[str(plan["path"])]
+            candidates: list[str] = []
+            for other in pdf_plans[start : start + _CONVERT_AHEAD_LOOKAHEAD_FILES]:
+                path = str(other["path"])
+                if path in ahead_submitted or path in prefetched:
+                    continue
+                if other is not plan:
+                    if path not in ahead_checked:
+                        ahead_checked[path] = _will_extract(other)
+                    if not ahead_checked[path]:
+                        continue
+                candidates.append(path)
+            if not candidates:
+                return
+            try:
+                ahead_submitted.update(pdf_converter.prefetch(library_id, candidates, root))
+            except Exception as exc:  # noqa: BLE001 - 提前转不了就逐本转，不拖垮整轮
+                logging.getLogger("rag_redo.core.pipeline").info("PDF 提前转换没起来，改为逐本转：%s", exc)
+
+        def _await_ahead(path: str, message: str) -> None:
+            """这一本在后台转：等它转好；期间别的几本转好了就报一次进度（只在真有进展时报，
+            不然停滞看门狗就看不出卡死了）。"""
+            if pdf_converter is None or path not in ahead_submitted:
+                return
+            while True:
+                try:
+                    finished = pdf_converter.prefetch_wait(library_id, path, _CONVERT_AHEAD_POLL_S)
+                except Exception:  # noqa: BLE001 - 等不了就直接去取，取的时候会等到它转完
+                    return
+                if finished:
+                    return
+                if files_done + len(prefetched) + _ahead_ready() > shown_done:
+                    _emit("extracting", current_path=path, stall_grace_s=300.0, message=message)
+
+        def _drop_ahead(paths: list[str] | None = None) -> None:
+            if pdf_converter is None:
+                return
+            try:
+                pdf_converter.prefetch_cancel(library_id, paths)
+            except Exception:  # noqa: BLE001 - 收尾：丢不掉的等插件停用时一起收
+                pass
+
+        _drop_ahead()  # 上一轮出错没收尾、留下的提前转换
+
         def _prefetch_pdf_batch(first: dict) -> None:
             waiting: list[tuple[dict, int]] = []
             looked = 0
@@ -1609,7 +1702,9 @@ class Pipeline:
                 if plan is not first and (path in prefetched or not _will_extract(plan)):
                     continue
                 looked += 1
+                _convert_ahead(plan)
                 _emit("extracting", current_path=path, stall_grace_s=300.0, message=f"正在提取：{path}")
+                _await_ahead(path, f"正在提取：{path}")
                 doc, paused_at = self._run_extract_chain(library_id, path, root, pause_before_batch=True)
                 if paused_at is None:
                     if doc is not None:
@@ -1663,13 +1758,17 @@ class Pipeline:
                 return prefetched.pop(path)
             stashed = _stashed_doc(plan)
             if stashed is not None:
+                if path in ahead_submitted:
+                    _drop_ahead([path])  # 同样内容的另一份刚转完进了暂存（比如“- Copy”）：不用再转
                 _emit("extracting", current_path=path, message=f"沿用上次已转好的结果：{path}")
                 return stashed
             if batch_pdf and path in pdf_position:
                 _prefetch_pdf_batch(plan)
                 if path in prefetched:
                     return prefetched.pop(path)
+            _convert_ahead(plan)
             _emit("extracting", current_path=path, stall_grace_s=300.0, message=message)
+            _await_ahead(path, message)
             doc = self._extract(library_id, path, root)
             _stash_result(plan, doc)
             return doc
@@ -1954,6 +2053,8 @@ class Pipeline:
             )
             files_done += 1
             _emit("file_complete", current_path=path, message=f"已转换切块：{path}")
+
+        _drop_ahead()  # 转换阶段结束：没被取走的（中途判成不用转的）丢掉，后台子进程收掉
 
         # ---- 第二段：全部待嵌块连续向量化（对齐旧 index.py:2238-2255）--------------------
         # 分片只为给进度心跳/停滞看门狗喘气，不是“一个文件一次”：跨文件攒成连续的调用，
