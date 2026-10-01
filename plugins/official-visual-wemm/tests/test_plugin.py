@@ -91,6 +91,9 @@ class TestVisualWemmPlugin(unittest.TestCase):
             self.rt.plugins["official-visual-wemm"].error,
         )
         self.instance = self.rt.plugins["official-visual-wemm"].instance
+        # 启用时不拉起看图服务（BC-11，用到时才开，见 TestServiceStartsOnFirstUse）；这组用例
+        # 测的是“服务已经在用”之后的行为，先模拟一次“第一次用到”。
+        self.assertTrue(self.instance._ensure_alive())  # noqa: SLF001
 
         def _cleanup_runtime() -> None:
             if self.rt.plugins["official-visual-wemm"].state.value == "enabled":
@@ -110,7 +113,7 @@ class TestVisualWemmPlugin(unittest.TestCase):
         else:
             os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = self._skip_bootstrap_backup
 
-    def test_enable_acquires_gpu_lease(self):
+    def test_first_use_acquires_gpu_lease(self):
         self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "official-visual-wemm")
 
     def test_worker_process_takes_over_and_parent_can_reacquire_later(self):
@@ -127,6 +130,8 @@ class TestVisualWemmPlugin(unittest.TestCase):
             "runtime.enable('official-visual-wemm')\n"
             "plugin = runtime.plugins['official-visual-wemm']\n"
             "print('WORKER_ENABLED', plugin.instance._enabled, flush=True)\n"
+            # 启用时不抢显卡（BC-11）：worker 真用到看图服务（有页要编）才把名额抢过去
+            "print('WORKER_STARTED', plugin.instance._ensure_alive(), flush=True)\n"
             "runtime.disable('official-visual-wemm')\n"
             "runtime.unload('official-visual-wemm')\n"
         )
@@ -138,6 +143,7 @@ class TestVisualWemmPlugin(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("WORKER_ENABLED True", result.stdout)
+        self.assertIn("WORKER_STARTED True", result.stdout)
         self.assertIsNone(self.rt.resource_arbiter.holder_of("gpu:0"))
         self.assertTrue(self.instance._handle.is_alive)
         self.instance.index_library("lib-after-worker", self.vault, ["doc.pdf"])
@@ -594,6 +600,9 @@ class TestVisualWemmBackendGate(unittest.TestCase):
         self.addCleanup(runtime.disable, "official-visual-wemm")
         instance = runtime.plugins["official-visual-wemm"].instance
         self.assertTrue(instance.is_active())
+        # 开着也是用到时才抢名额、才拉服务（BC-11）
+        self.assertIsNone(runtime.resource_arbiter.holder_of("gpu:0"))
+        self.assertTrue(instance._ensure_alive())  # noqa: SLF001
         self.assertEqual(runtime.resource_arbiter.holder_of("gpu:0"), "official-visual-wemm")
 
     def test_turning_backend_on_takes_effect_without_restarting_the_app(self):
@@ -632,6 +641,100 @@ class TestVisualWemmBackendGate(unittest.TestCase):
         self.assertIsNone(instance._handle)  # noqa: SLF001
         self.assertIsNone(runtime.resource_arbiter.holder_of("gpu:0"))
         self.assertEqual(instance._read_state("lib1", "legacy")["files"], {})  # noqa: SLF001
+
+
+class TestServiceStartsOnFirstUse(unittest.TestCase):
+    """用到时才开（2026-10-01 操作者确认，BC-11）：开着页库时，启用插件既不抢显卡名额
+    也不拉看图服务；只有真有页要编、真有页可查时才拉。此前界面、每个 agent 的服务、每次
+    后台索引一启动就各拉一个（后台索引启动因此多 2 秒），哪怕这一轮一页都不用编。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        backups = {key: os.environ.get(key) for key in ("RAG_REDO_FAKE_WEMM", "RAG_REDO_SKIP_ENV_BOOTSTRAP")}
+
+        def _restore() -> None:
+            for key, value in backups.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(_restore)
+        os.environ["RAG_REDO_FAKE_WEMM"] = "1"
+        os.environ["RAG_REDO_SKIP_ENV_BOOTSTRAP"] = "1"
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        _make_pdf(self.vault / "doc.pdf", ["第一页 alpha", "第二页 beta"])
+
+    def _enabled(self):
+        """一个新进程里刚启用好的插件（同一个数据目录 = 同一台机器上的下一次启动）。"""
+        runtime = PluginRuntime(REPO_ROOT / "plugins", state_file=self.tmp / "state.json", data_dir=self.tmp / "data")
+        runtime.scan()
+        runtime.load("official-visual-wemm")
+        runtime.enable("official-visual-wemm")
+        self.assertEqual(runtime.plugins["official-visual-wemm"].state, PluginState.ENABLED)
+
+        def _close() -> None:
+            if runtime.plugins["official-visual-wemm"].state == PluginState.ENABLED:
+                runtime.disable("official-visual-wemm")
+            if runtime.plugins["official-visual-wemm"].state == PluginState.DISABLED:
+                runtime.unload("official-visual-wemm")
+
+        self.addCleanup(_close)
+        return runtime, runtime.plugins["official-visual-wemm"].instance, _close
+
+    def _build_pages_then_close(self) -> None:
+        runtime, instance, close = self._enabled()
+        instance.index_library("lib1", self.vault, ["doc.pdf"], generation="g1")
+        self.assertTrue(instance._generations.commit("lib1", "g1"))  # noqa: SLF001
+        close()
+
+    def test_enabling_takes_neither_the_gpu_nor_starts_the_service(self):
+        runtime, instance, _ = self._enabled()
+        self.assertTrue(instance.is_active(), "页库默认开着——开着也不该一启用就拉服务")
+        self.assertIsNone(instance._handle)  # noqa: SLF001
+        self.assertIsNone(runtime.resource_arbiter.holder_of("gpu:0"))
+
+    def test_indexing_pages_starts_the_service_and_takes_the_gpu(self):
+        runtime, instance, _ = self._enabled()
+        instance.index_library("lib1", self.vault, ["doc.pdf"], generation="g1")
+        self.assertTrue(instance._handle.is_alive)  # noqa: SLF001
+        self.assertEqual(runtime.resource_arbiter.holder_of("gpu:0"), "official-visual-wemm")
+        self.assertEqual(instance._read_state("lib1", "g1")["files"]["doc.pdf"]["status"], "indexed")  # noqa: SLF001
+
+    def test_a_round_with_no_pages_to_encode_never_starts_the_service(self):
+        self._build_pages_then_close()
+        runtime, instance, _ = self._enabled()
+        instance.index_library(
+            "lib1", self.vault, ["doc.pdf"], generation="g2", changed_paths=[], previous_generation="g1",
+        )
+        self.assertIsNone(instance._handle)  # noqa: SLF001
+        self.assertIsNone(runtime.resource_arbiter.holder_of("gpu:0"))
+        record = instance._read_state("lib1", "g2")["files"]["doc.pdf"]  # noqa: SLF001
+        self.assertEqual((record["status"], len(record["page_ids"])), ("indexed", 2))
+
+    def test_looking_up_a_library_without_pages_does_not_start_the_service(self):
+        runtime, instance, _ = self._enabled()
+        self.assertEqual(instance.navigate("没有页库的库", "查询"), [])
+        self.assertIsNone(instance._handle)  # noqa: SLF001
+        self.assertIsNone(runtime.resource_arbiter.holder_of("gpu:0"))
+
+    def test_looking_up_pages_starts_the_service_and_registers_on_the_gpu(self):
+        self._build_pages_then_close()
+        runtime, instance, _ = self._enabled()
+        hits = instance.navigate("lib1", "查询", top_k=5)
+        self.assertEqual({hit.page_index for hit in hits}, {0, 1})
+        self.assertTrue(instance._handle.is_alive)  # noqa: SLF001
+        # 名额空着时也要登记成自己的：不登记，别的显卡用户就不知道看图服务占着显存
+        self.assertEqual(runtime.resource_arbiter.holder_of("gpu:0"), "official-visual-wemm")
+
+    def test_status_and_releasing_the_gpu_do_not_start_the_service(self):
+        runtime, instance, _ = self._enabled()
+        self.assertFalse(instance.status()["subprocess_alive"])
+        instance.release_gpu()
+        self.assertIsNone(instance._handle)  # noqa: SLF001
+        self.assertIsNone(runtime.resource_arbiter.holder_of("gpu:0"))
 
 
 class TestVisualWemmNavigateVeto(unittest.TestCase):
@@ -890,6 +993,9 @@ class TestVisualIndexStopsWhenTheServiceIsUnreachable(unittest.TestCase):
         self.rt.load("official-visual-wemm")
         self.rt.enable("official-visual-wemm")
         self.instance = self.rt.plugins["official-visual-wemm"].instance
+        # 启用时不拉起看图服务（BC-11，用到时才开，见 TestServiceStartsOnFirstUse）；这组用例
+        # 测的是“服务已经在用”之后的行为，先模拟一次“第一次用到”。
+        self.assertTrue(self.instance._ensure_alive())  # noqa: SLF001
 
         def _cleanup_runtime() -> None:
             if self.rt.plugins["official-visual-wemm"].state.value == "enabled":
@@ -1015,6 +1121,9 @@ class TestVramGateIsReportedTruthfully(unittest.TestCase):
         self.rt.load("official-visual-wemm")
         self.rt.enable("official-visual-wemm")
         self.instance = self.rt.plugins["official-visual-wemm"].instance
+        # 启用时不拉起看图服务（BC-11，用到时才开，见 TestServiceStartsOnFirstUse）；这组用例
+        # 测的是“服务已经在用”之后的行为，先模拟一次“第一次用到”。
+        self.assertTrue(self.instance._ensure_alive())  # noqa: SLF001
 
         def _cleanup_runtime() -> None:
             if self.rt.plugins["official-visual-wemm"].state.value == "enabled":

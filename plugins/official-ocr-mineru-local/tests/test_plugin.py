@@ -72,6 +72,9 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
         self.instance = self.rt.plugins["official-ocr-mineru-local"].instance
         self.plugin_module = sys.modules[type(self.instance).__module__]
         self.addCleanup(lambda: self.rt.disable("official-ocr-mineru-local"))
+        # 启用时不拉起本机 MinerU（BC-11，用到时才开，见 TestServiceStartsOnFirstUse）；这组
+        # 用例测的是“服务已经在用”之后的行为，先模拟一次“第一次用到”。
+        self.assertTrue(self.instance._ensure_alive())  # noqa: SLF001
 
     def _restore_env(self) -> None:
         if self._env_backup is None:
@@ -94,7 +97,7 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
         self.assertIsNone(plugin._handle)
         self.assertIsNone(runtime.resource_arbiter.holder_of("gpu:0"))
 
-    def test_enable_acquires_gpu_lease(self):
+    def test_first_use_acquires_gpu_lease(self):
         self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "official-ocr-mineru-local")
 
     def test_worker_process_takes_over_and_parent_can_reacquire_later(self):
@@ -111,6 +114,8 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
             "runtime.enable('official-ocr-mineru-local')\n"
             "plugin = runtime.plugins['official-ocr-mineru-local']\n"
             "print('WORKER_ENABLED', plugin.instance._enabled, flush=True)\n"
+            # 启用时不抢显卡（BC-11）：worker 真要识别时才把名额抢过去
+            "print('WORKER_STARTED', plugin.instance._ensure_alive(), flush=True)\n"
             "runtime.disable('official-ocr-mineru-local')\n"
             "runtime.unload('official-ocr-mineru-local')\n"
         )
@@ -122,6 +127,7 @@ class TestMineruLocalOcrPlugin(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("WORKER_ENABLED True", result.stdout)
+        self.assertIn("WORKER_STARTED True", result.stdout)
         self.assertIsNone(self.rt.resource_arbiter.holder_of("gpu:0"))
         self.assertTrue(self.instance._handle.is_alive)
         (self.tmp / "after-worker.pdf").write_bytes(b"%PDF-fake-scanned-content")
@@ -256,6 +262,7 @@ class TestMineruLocalLogLocation(unittest.TestCase):
 
     def test_subprocess_output_actually_lands_in_that_log_file(self):
         log_file = Path(self.instance.log_file())
+        self.assertTrue(self.instance._ensure_alive())  # noqa: SLF001 - 启用时不拉起，第一次用到才拉（BC-11）
         self.assertTrue(log_file.is_file(), f"子进程启动后日志文件应已创建：{log_file}")
         content = log_file.read_text(encoding="utf-8", errors="replace")
         self.assertIn("mineru-local", content)
@@ -770,6 +777,47 @@ class TestServerBatchesScansWithinVramLimits(unittest.TestCase):
             mock.patch.object(self.server.subprocess, "run", return_value=smi),
         ):
             self.assertAlmostEqual(self.server._vram_free_gb(max_age=0.0), 3.0)
+
+
+class TestServiceStartsOnFirstUse(unittest.TestCase):
+    """用到时才开（2026-10-01 操作者确认，BC-11）：选了本机 MinerU，启用插件时也不抢显卡
+    名额、不拉子进程；第一次真要识别一份扫描件才拉。此前界面、每个 agent 的服务、每次后台
+    索引一启动就各拉一个，哪怕这一轮一页扫描件都没有。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._env_backup = os.environ.get("RAG_REDO_FAKE_OCR")
+        os.environ["RAG_REDO_FAKE_OCR"] = "1"
+        self.addCleanup(TestMineruLocalOcrPlugin._restore_env, self)
+        self.rt = PluginRuntime(REPO_ROOT / "plugins", state_file=self.tmp / "state.json", data_dir=self.tmp / "data")
+        self.rt.scan()
+        self.rt.settings.set("pdf_scan_backend", "mineru-local")
+        self.rt.load("official-ocr-mineru-local")
+        self.rt.enable("official-ocr-mineru-local")
+        self.addCleanup(lambda: self.rt.disable("official-ocr-mineru-local"))
+        self.instance = self.rt.plugins["official-ocr-mineru-local"].instance
+
+    def test_enabling_takes_neither_the_gpu_nor_starts_the_service(self):
+        self.assertTrue(self.instance.is_active())
+        self.assertIsNone(self.instance._handle)  # noqa: SLF001
+        self.assertIsNone(self.rt.resource_arbiter.holder_of("gpu:0"))
+
+    def test_files_that_need_no_recognition_do_not_start_it(self):
+        (self.tmp / "note.md").write_text("x", encoding="utf-8")
+        self.assertIsNone(self.instance.extract("lib", "note.md", self.tmp).text)
+        docs = self.instance.extract_many("lib", ["note.md", "missing.pdf"], self.tmp)
+        self.assertEqual([doc.text for doc in docs], [None, None])
+        self.instance.release_gpu()
+        self.assertIsNone(self.instance._handle)  # noqa: SLF001
+        self.assertIsNone(self.rt.resource_arbiter.holder_of("gpu:0"))
+
+    def test_the_first_scan_to_recognise_starts_it_and_takes_the_gpu(self):
+        (self.tmp / "scan.pdf").write_bytes(b"%PDF-fake-scanned-content")
+        doc = self.instance.extract("lib", "scan.pdf", self.tmp)
+        self.assertIn("fake-ocr", doc.text)
+        self.assertTrue(self.instance._handle.is_alive)  # noqa: SLF001
+        self.assertEqual(self.rt.resource_arbiter.holder_of("gpu:0"), "official-ocr-mineru-local")
 
 
 class TestPluginExtractMany(unittest.TestCase):

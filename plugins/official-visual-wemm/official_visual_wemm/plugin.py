@@ -49,9 +49,14 @@ REQUIRED_PLUGINS 列表里另一个 subprocess_service 插件
 两个门禁不一致。现在门禁条件对齐 LEGACY 的同名设置项 `wemm_backend`
 （obsidian-rag/config.py:122 默认 "on"；取值 on/local 才算开，见
 obsidian-rag/wemm_indexer.py:132、obsidian-rag/wemm_retriever.py:37），
-读的是 `ctx.settings` 通用设置存储——**用户改了设置不需要重启**，因为
-门禁只在 `on_enable` 拦一次"是否立刻抢租约"，真正的拉起发生在每次真正
-使用前读当前设置值。
+读的是 `ctx.settings` 通用设置存储——**用户改了设置不需要重启**，真正的
+拉起发生在每次真正使用前读当前设置值。
+
+**用到时才开（2026-10-01 操作者确认，BC-11）**：开着 WEMM 时 `on_enable` 也不再
+抢租约、拉子进程——界面、每个 agent 的服务、每次后台索引一启动就各拉一个看图服务
+（后台索引启动因此多 2 秒），哪怕这一轮一页都不用编、也没人查页。现在只有真有页
+要编码（`index_library` → `_ensure_alive`）或真有页可查（`navigate` →
+`_ensure_query_service`）时才抢、才拉；查一个没有页库的库不拉服务。
 
 **navigate 的 veto 期语义（2026-09-24 补齐，缺陷 C）**：抢不到 GPU 租约
 时以前只 `return []`，调用方（official-mcp-server 的 `navigate_knowledge`）
@@ -301,6 +306,11 @@ class VisualWemmPlugin:
         ctx.logger.info("WEMM页级视觉导航已加载")
 
     def on_enable(self, ctx):
+        """只记下启动子进程要用的东西，**不抢显卡名额、不拉起子进程**：第一次真有页要编码
+        （`index_library` → `_ensure_alive`）或真要查（`navigate` → `_ensure_query_service`）
+        时才抢、才拉。2026-10-01 操作者确认（BC-11）：此前开着页库时，界面、每个 agent 的
+        服务、每次后台索引一启动就各拉一个看图服务（后台索引启动因此多 2 秒），哪怕这一轮
+        一页都不用编、也没人查页。WEMM 关着时两条路照旧什么都不做（`is_active` 门禁）。"""
         self._resource_arbiter = ctx.resource_arbiter
         self._plugin_id = ctx.plugin_id
         self._plugin_dir = Path(__file__).parent
@@ -308,21 +318,6 @@ class VisualWemmPlugin:
         self._runtime_command = ctx.runtime.command
         self._runtime_env_bootstrap = ctx.runtime.env_bootstrap
         self._enabled = True
-        if not self.is_active():
-            # 用户没开 WEMM：连租约都不抢、连子进程都不拉。对齐
-            # official-ocr-mineru-local/plugin.py:144-154 的同款门禁，以及
-            # LEGACY "wemm_backend off → 静默跳过（零开销）"。
-            self._logger.info("WEMM后端未开启（wemm_backend=%s），本轮不占用GPU、不拉起子进程", self.backend())
-            return
-        acquired = ctx.resource_arbiter.acquire(
-            GPU_RESOURCE_ID,
-            ctx.plugin_id,
-            priority=GPU_PRIORITY,
-            on_preempt=self._soft_evict,
-            preempt_equal=True,
-        )
-        if acquired:
-            self._start_handle()
 
     def force_load_enabled(self) -> bool:
         """用户是否开启了「强制加载页级视觉导航」（设置项 `wemm_force_load`）。
@@ -459,6 +454,14 @@ class VisualWemmPlugin:
             self._logger.warning("WEMM子进程重新拉起失败：%s", exc)
             return False
 
+    def _raise_if_backend_off(self) -> None:
+        if not self.is_active():
+            raise VisualVetoError(
+                _VETO_BACKEND_OFF,
+                "（WEMM 视觉导航未开启：把设置里的 wemm_backend 设为 on/local 后重新调用本工具"
+                "——看图服务会按需自动拉起，页索引随 reindex_knowledge/自动同步自动建。）",
+            )
+
     def _ensure_query_service(self) -> None:
         """查询态的"确保看图服务可用"，**失败一律抛 `VisualVetoError`**，
         绝不静默退化成空列表（缺陷 C：调用方必须能区分"GPU 忙/服务不可用"
@@ -470,18 +473,16 @@ class VisualWemmPlugin:
         跑、显存正忙）一律不做；模型真需要重新加载时，子进程那一侧自己的
         显存门槛等待会处理（server.py 的 `_wait_for_vram`）。
 
-        `on_enable` 只在"用户没开 WEMM"时跳过抢租约，所以用户中途把开关
+        `on_enable` 从不抢租约、不拉服务（BC-11，2026-10-01），所以用户中途把开关
         打开后**不重启**也能在这里被正常拉起（每次现读设置，见 `backend()`）。"""
-        if not self.is_active():
-            raise VisualVetoError(
-                _VETO_BACKEND_OFF,
-                "（WEMM 视觉导航未开启：把设置里的 wemm_backend 设为 on/local 后重新调用本工具"
-                "——看图服务会按需自动拉起，页索引随 reindex_knowledge/自动同步自动建。）",
-            )
+        self._raise_if_backend_off()
         if self._handle is not None and self._handle.is_alive:
             return  # 服务已在：直接查，不拉起、不抢租约
-        holder = self._resource_arbiter.holder_of(GPU_RESOURCE_ID) if self._resource_arbiter is not None else None
-        if holder is not None and holder != self._plugin_id:
+        holder =self._resource_arbiter.holder_of(GPU_RESOURCE_ID) if self._resource_arbiter is not None else None
+        # 名额没人占时也要先登记成自己的再拉服务（2026-10-01）：此前只在“别人占着”时才抢，
+        # 启用时已经抢好、空着的情况只发生在服务空闲自退出之后；现在启用时不再抢，
+        # 第一次查页就走这里——不登记，别的显卡用户就不知道看图服务占着显存。
+        if holder != self._plugin_id and self._resource_arbiter is not None:
             acquired = self._resource_arbiter.acquire(
                 GPU_RESOURCE_ID,
                 self._plugin_id,
@@ -1225,7 +1226,7 @@ class VisualWemmPlugin:
             # server 里"未装该插件时 navigate_knowledge 返回空结果不是失败"
             # 的承诺，保持原样返回空列表。
             return []
-        self._ensure_query_service()
+        self._raise_if_backend_off()
         generation = self._generations.active(library_id) if self._generations is not None else None
         state = self._read_state(library_id, generation or "legacy")
         files = state.get("files", {})
@@ -1241,7 +1242,9 @@ class VisualWemmPlugin:
         }
         segments = [str(value) for value in state.get("segments", []) if value]
         if not active_ids or not segments:
+            # 这个库（这份 PDF）没有页可查：不为它拉起看图服务（BC-11，用到时才开）
             return []
+        self._ensure_query_service()
         try:
             result = self._handle.call("embed", {"kind": "text", "content": query, "dim": WEMM_DIM}, timeout=60.0)
         except SubprocessServiceError as exc:

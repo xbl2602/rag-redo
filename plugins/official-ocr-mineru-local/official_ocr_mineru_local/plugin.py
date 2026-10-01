@@ -33,7 +33,8 @@ official-visual-wemm 处于同一优先级层级——两者都是"按需占用"
 subprocess_service GPU 消费者，谁刚需要谁能把对方挤开（`preempt_equal`，
 对应旧项目 WEMM/MinerU 互相抢占显存的真实行为）；`on_preempt` 回调只
 请求子进程"软驱逐"（`/evict`），不整个杀掉子进程；`_ensure_alive()` 在
-真正调用前按需重新拉起。
+真正调用前按需拉起。启用插件时既不抢名额也不拉子进程，第一次真要识别才做
+（2026-10-01 操作者确认“用到时才开”，BC-11）。
 
 **单文件超时随页数缩放（对齐 obsidian-rag/extractors.py::_mineru_local_
 timeout）**：300s + 30s×页数（200页封顶约105min，pipeline GPU 尚无基准
@@ -161,23 +162,16 @@ class MineruLocalOcrPlugin:
         return str(self._log_path) if self._log_path is not None else None
 
     def on_enable(self, ctx):
+        """只记下启动子进程要用的东西，**不抢显卡名额、不拉起子进程**：第一次真要识别时
+        （`extract`/`extract_many` → `_ensure_alive`）才抢、才拉。2026-10-01 操作者确认
+        （BC-11）：此前界面、每个 agent 的服务、每次后台索引一启动就各拉一个本机 MinerU，
+        哪怕这一轮一页扫描件都没有。"""
         self._resource_arbiter = ctx.resource_arbiter
         self._plugin_id = ctx.plugin_id
         self._plugin_dir = Path(__file__).parent
         self._runtime_health_check = ctx.runtime.health_check
         self._runtime_command = ctx.runtime.command
         self._enabled = True
-        if not self.is_active():
-            return
-        acquired = ctx.resource_arbiter.acquire(
-            GPU_RESOURCE_ID,
-            ctx.plugin_id,
-            priority=GPU_PRIORITY,
-            on_preempt=self._soft_evict,
-            preempt_equal=True,
-        )
-        if acquired:
-            self._start_handle()
 
     def on_disable(self, ctx):
         self._enabled = False

@@ -59,7 +59,7 @@ gpu = false
                               ↓ ok
                           load → on_load(ctx)
                               ↓ 用户启用
-                          enable → on_enable(ctx)   # subprocess_service在这一步拉起子进程
+                          enable → on_enable(ctx)   # subprocess_service只记下启动参数；占显卡的子进程第一次真用到时才拉起（BC-11）
                               ↓ 用户禁用
                           disable → on_disable(ctx) # 释放资源、停子进程
                               ↓
