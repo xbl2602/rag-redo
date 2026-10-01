@@ -409,12 +409,18 @@
       "redo_refs": [
         "rag-redo/AGENTS.md:1-11",
         "rag-redo/CLAUDE.md:1-11",
-        "rag-redo/tests/test_agents_contract.py"
+        "rag-redo/tests/test_agents_contract.py",
+        "rag-redo/tests/run.py:run_suites",
+        "rag-redo/tests/related_suites.py:select_suites"
       ],
       "test_refs": [
-        "tests/test_agents_contract.py::TestAgentsContract"
+        "tests/test_agents_contract.py::TestAgentsContract",
+        "rag-redo/tests/test_run_entry.py::TestSuitesRunSideBySide",
+        "rag-redo/tests/test_run_entry.py::TestRunnerBookkeeping",
+        "rag-redo/tests/test_run_entry.py::TestPickingRelatedSuites",
+        "rag-redo/tests/test_run_entry.py::TestPickingInThisRepository"
       ],
-      "acceptance": "AGENTS/CLAUDE 正文同步；契约 ID 唯一且被规范引用；每条契约有旧项目证据、当前实现和测试映射。",
+      "acceptance": "AGENTS/CLAUDE 正文同步；契约 ID 唯一且被规范引用；每条契约有旧项目证据、当前实现和测试映射。【操作者确认（2026-10-01）：统一测试入口几套同时跑，开发中途可以只跑相关套件】全量回归原本挨个跑一遍要 7～10 分钟（约 1,700 条用例；85% 的时间在 8 套真启动的集成测试上——真的拉起页级视觉服务、索引进程、桌面窗口入口——大部分在等进程起停，20 线程只用着 1 个）。现在每一套都在自己的子进程里跑（核心套件也是），默认同时跑 min(6, 线程数/2) 套、按上次耗时最慢的先开跑，用例一条不少；每套的输出先收进临时文件、跑完整块打印（没过的连同全部输出，过了的只报一行）。不用管道收：测试残留的服务攥着继承来的输出句柄时，管道要等它退出，整轮回归会卡住。“结果：N/M 套通过”和退出码不变；--jobs 1 退回挨个跑。--changed [文件…]：按 import 关系、插件 id、路径字符串静态挑出相关套件，规范门禁每次都跑；只用于开发中途，提交前仍必须跑全量（AGENTS.md §9/§12）。核心测试文件没登记进 CORE_SUITES 时，跑完点名提醒。真机实测（20 线程笔记本，2026-10-01）：改前挨个跑 450～470 秒（机器空闲）、620 秒（与另一个 agent 的回归同时跑）；改后默认 6 份同时跑 170 秒（60/60 套），同时跑 4 份反而 225 秒，故默认取 6。上次超过 70 秒的大套件按用例轮流拆成至多 4 份（页级视觉、端到端各 4 份，命令行 2 份），同一个类的用例散到几份里时每份各跑一遍 setUpClass。",
       "blocker": ""
     },
     {
